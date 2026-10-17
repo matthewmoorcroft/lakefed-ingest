@@ -704,6 +704,16 @@ def check_sink_mode(cfg: dict, sink_fqn: str, sink_columns: List[str]) -> None:
                                                         col=OP_COLUMN, mode=write_mode(cfg)))
 
 
+# The sinks checked so far in this run, and their columns: ensure_sink_table asks Unity Catalog about
+# each sink once per run instead of once per batch. Each run starts with forget_sinks().
+_known_sinks: dict = {}
+
+
+def forget_sinks() -> None:
+    """Start a run: the next ``ensure_sink_table`` of every sink asks the catalog again."""
+    _known_sinks.clear()
+
+
 def ensure_sink_table(spark, cfg: dict, sink_fqn: str, slots=None) -> None:
     """Create the Delta bronze sink if absent, typed from the source via a 0-row JDBC read (so the
     JDBC dialect infers the Spark schema natively), then check the sink's mode (dedicated vs
@@ -711,7 +721,14 @@ def ensure_sink_table(spark, cfg: dict, sink_fqn: str, slots=None) -> None:
 
     A consolidated sink is created with the ``__client_id__`` column and liquid clustering on it, so
     each client's slice is cheap to find and concurrent clients' writes touch separate files. An
-    append sink is created with the client_attrs and APPEND_COLUMNS too."""
+    append sink is created with the client_attrs and APPEND_COLUMNS too.
+
+    The catalog is asked once per sink per run (``forget_sinks``): later calls check the row's mode
+    against the columns found then. The mode columns never change within a run."""
+    known = _known_sinks.get(sink_fqn)
+    if known is not None:
+        check_sink_mode(cfg, sink_fqn, known)
+        return
     if not spark.catalog.tableExists(sink_fqn):
         def create():
             with _unit(slots, cfg):
@@ -726,7 +743,9 @@ def ensure_sink_table(spark, cfg: dict, sink_fqn: str, slots=None) -> None:
                 finally:
                     spark.catalog.dropTempView(view)
         with_write_retry(create, what=f"create {sink_fqn}")
-    check_sink_mode(cfg, sink_fqn, spark.table(sink_fqn).columns)
+    columns = list(spark.table(sink_fqn).columns)
+    check_sink_mode(cfg, sink_fqn, columns)
+    _known_sinks[sink_fqn] = columns
 
 
 def _bare_ident(name) -> str:
