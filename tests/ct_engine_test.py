@@ -1306,6 +1306,56 @@ def test_existing_sinks_query_and_fallback():
     assert ce.existing_sinks(_Spark(False), [dict(cfgs[0], sink_schema="`Bronze`")]) == {"main.bronze.orders"}
 
 
+# ---- sink checks: once per sink per run ---------------------------------------------------------
+
+@pytest.fixture
+def counted_catalog(monkeypatch):
+    """A fake Spark whose catalog lookups are counted: (spark, calls)."""
+    ce.forget_sinks()
+    spark, calls = _FakeSpark(), []
+
+    def table_exists(name):
+        calls.append(("exists", name))
+        return True
+
+    def table(name):
+        calls.append(("columns", name))
+        return _Table()
+    spark.catalog.tableExists, spark.table = table_exists, table
+    monkeypatch.setattr(_Table, "columns", ["__client_id__", "id", "v", "__change_op"])
+    yield spark, calls
+    ce.forget_sinks()
+
+
+def test_ensure_sink_table_checks_each_sink_once_per_run(counted_catalog):
+    spark, calls = counted_catalog
+    app = dict(_CONS, write_mode="append")
+    for _ in range(3):
+        ce.ensure_sink_table(spark, app, "c.s.t")
+    assert calls == [("exists", "c.s.t"), ("columns", "c.s.t")]
+    ce.ensure_sink_table(spark, app, "c.s.other")                  # another sink is checked on its own
+    assert calls[2:] == [("exists", "c.s.other"), ("columns", "c.s.other")]
+    ce.forget_sinks()                                              # the next run checks again
+    ce.ensure_sink_table(spark, app, "c.s.t")
+    assert calls[4:] == [("exists", "c.s.t"), ("columns", "c.s.t")]
+
+
+def test_a_known_sink_still_refuses_a_row_of_the_wrong_mode(counted_catalog):
+    spark, calls = counted_catalog
+    ce.ensure_sink_table(spark, dict(_CONS, write_mode="append"), "c.s.t")
+    with pytest.raises(ValueError, match="has a '__client_id__' column"):
+        ce.ensure_sink_table(spark, dict(_CONS, client_id=None, write_mode="append"), "c.s.t")
+    assert len(calls) == 2                                         # judged on the known columns
+
+
+def test_a_failed_check_is_not_remembered(counted_catalog):
+    spark, calls = counted_catalog
+    with pytest.raises(ValueError):
+        ce.ensure_sink_table(spark, dict(_CONS, client_id=None, write_mode="append"), "c.s.t")
+    ce.ensure_sink_table(spark, dict(_CONS, write_mode="append"), "c.s.t")
+    assert calls == [("exists", "c.s.t"), ("columns", "c.s.t")] * 2
+
+
 # ---- session settings for a run ---------------------------------------------------------------
 
 class _Conf:
