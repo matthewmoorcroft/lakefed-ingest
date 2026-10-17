@@ -769,6 +769,25 @@ def existing_sinks(spark, configs) -> Optional[set]:
     return found
 
 
+def apply_session_conf(spark, text) -> dict:
+    """Set this run's Spark session settings from ``text``, a JSON object of setting -> value (job
+    parameter ``spark_conf``; blank: none), so one cluster can run collections with different code
+    generation or write settings. Values are set as strings (JSON booleans as true/false). Returns
+    what was set."""
+    if text is None or not str(text).strip():
+        return {}
+    try:
+        settings = json.loads(text)
+    except ValueError as e:
+        raise ValueError(f"spark_conf is not JSON: {e}") from e
+    if not isinstance(settings, dict):
+        raise ValueError("spark_conf must be a JSON object of setting -> value")
+    applied = {str(k): (str(v).lower() if isinstance(v, bool) else str(v)) for k, v in settings.items()}
+    for key, value in applied.items():
+        spark.conf.set(key, value)
+    return applied
+
+
 def _is_partitioned(cfg: dict) -> bool:
     v = cfg.get("load_partitioned")
     return v is True or str(v).lower() == "true"

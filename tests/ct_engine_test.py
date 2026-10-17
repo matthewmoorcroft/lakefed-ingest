@@ -1299,3 +1299,30 @@ def test_existing_sinks_query_and_fallback():
     # An already-quoted part (allowed by sink_fqn) is looked up unquoted, never as SQL text.
     assert ce.sink_lookup_key(dict(cfgs[0], sink_catalog="`Main`")) == "main.bronze.orders"
     assert ce.existing_sinks(_Spark(False), [dict(cfgs[0], sink_schema="`Bronze`")]) == {"main.bronze.orders"}
+
+
+# ---- session settings for a run ---------------------------------------------------------------
+
+class _Conf:
+    def __init__(self):
+        self.values = {}
+
+    def set(self, key, value):
+        self.values[key] = value
+
+
+def test_apply_session_conf_sets_each_setting_as_a_string():
+    spark = type("S", (), {"conf": _Conf()})()
+    applied = ce.apply_session_conf(spark, '{"spark.sql.codegen.wholeStage": false, "spark.x.n": 200}')
+    assert spark.conf.values == {"spark.sql.codegen.wholeStage": "false", "spark.x.n": "200"}
+    assert applied == spark.conf.values
+
+
+def test_apply_session_conf_ignores_blank_and_refuses_anything_but_an_object():
+    spark = type("S", (), {"conf": _Conf()})()
+    assert ce.apply_session_conf(spark, "") == {} and ce.apply_session_conf(spark, "  ") == {}
+    assert ce.apply_session_conf(spark, None) == {}
+    for bad in ('["a"]', '"x"', "{not json"):
+        with pytest.raises(ValueError, match="spark_conf"):
+            ce.apply_session_conf(spark, bad)
+    assert spark.conf.values == {}
