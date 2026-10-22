@@ -110,6 +110,33 @@ def test_workslots_set_pool_uses_slot_id():
     assert all(p in {"pool0", "pool1", "pool2"} for p in seen)
 
 
+def test_workslots_runs_on_when_the_pool_is_refused():
+    # Standard access mode can refuse sparkContext: the units still run, without FAIR pools, and the
+    # pool is asked for only until the first refusal.
+    calls, ran = [], []
+
+    def refuse(pool):
+        calls.append(pool)
+        raise RuntimeError("[JVM_ATTRIBUTE_NOT_SUPPORTED] sparkContext is not supported")
+
+    slots = parallel.WorkSlots(2, set_pool=refuse)
+    with slots.acquire():
+        ran.append("one")
+    with slots.acquire_many(2):
+        ran.append("many")
+    assert ran == ["one", "many"]
+    assert len(calls) == 1
+    assert "JVM_ATTRIBUTE_NOT_SUPPORTED" in slots.pool_error
+    assert slots.in_flight == 0
+
+
+def test_workslots_pool_error_is_none_when_pools_work():
+    slots = parallel.WorkSlots(2, set_pool=lambda pool: None)
+    with slots.acquire():
+        pass
+    assert slots.pool_error is None
+
+
 def test_workslots_returns_slot_on_exception():
     slots = parallel.WorkSlots(1)
     with pytest.raises(ValueError):
