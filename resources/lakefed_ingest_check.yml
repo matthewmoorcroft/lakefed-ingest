@@ -1,0 +1,94 @@
+# The check job: one run checks a group of collections on serverless, then starts lakefed_ingest only
+# for the collections with work, each for its databases with work, and ends (check_launch.ipynb). A
+# quiet cycle starts no ingest cluster.
+#
+# A group is `task_collections`: a schedule's members when an operations-app schedule in group mode
+# starts it (one wrapper job per schedule), or blank for every collection with enabled rows. Without an
+# app schedule, this job's own schedule (paused) is the cadence. The runs are started with run-now, as
+# the app's Run now starts them: no For each, and no job is created. The job's run-as identity needs
+# CAN_MANAGE_RUN on lakefed_ingest (the deployer has it on both).
+resources:
+  jobs:
+    lakefed_ingest_check:
+      name: "lakefed_ingest_check"
+      description: "Checks a group of collections, then starts lakefed_ingest for those with work (no For each)."
+      # One run per group at a time is enough; groups of different schedules may check at once. Two checks
+      # of the same collection take turns on its lock, and the second leaves it to the first.
+      max_concurrent_runs: 20
+      queue:
+        enabled: true
+      schedule:
+        # Paused by default: the fallback cadence when no app schedule in group mode starts this job.
+        quartz_cron_expression: "0 0/15 * * * ?"
+        timezone_id: UTC
+        pause_status: PAUSED
+      tasks:
+        - task_key: check
+          environment_key: lakebase_client
+          notebook_task:
+            notebook_path: ../src/lakefed_ingest/check_launch.ipynb
+            base_parameters:
+              task_collections: "{{job.parameters.task_collections}}"
+              ingest_job_id: ${resources.jobs.lakefed_ingest.id}
+              launch_id: "{{task.run_id}}"
+              db_instance: "{{job.parameters.db_instance}}"
+              db_name: "{{job.parameters.db_name}}"
+              secret_scope: "{{job.parameters.secret_scope}}"
+              trust_server_certificate: "{{job.parameters.trust_server_certificate}}"
+              snapshot_isolation: "{{job.parameters.snapshot_isolation}}"
+              reseed_on_new_columns: "{{job.parameters.reseed_on_new_columns}}"
+              freshness_interval_s: "{{job.parameters.freshness_interval_s}}"
+              detection_chunk: "{{job.parameters.detection_chunk}}"
+              parallelism: "{{job.parameters.parallelism}}"
+              append_batch_size: "{{job.parameters.append_batch_size}}"
+              max_seeds_per_run: "{{job.parameters.max_seeds_per_run}}"
+              max_queries_per_source: "{{job.parameters.max_queries_per_source}}"
+              table_retries: "{{job.parameters.table_retries}}"
+              table_retry_budget: "{{job.parameters.table_retry_budget}}"
+              spark_conf: "{{job.parameters.spark_conf}}"
+      environments:
+        - environment_key: lakebase_client
+          spec:
+            environment_version: "4"
+            dependencies:
+              - "psycopg[binary]"
+              - "databricks-sdk==0.145.0"
+      tags:
+        business_unit: ""
+        project: lakefed_ingest
+      parameters:
+        # The group: comma-separated collections; blank = every collection with an enabled control row.
+        - name: task_collections
+          default: ""
+        - name: db_instance
+          default: ${var.lakebase_instance}
+        - name: db_name
+          default: ${var.lakebase_database}
+        # The check reads the sources as the ingest does, with the same settings.
+        - name: secret_scope
+          default: ${var.secret_scope}
+        - name: trust_server_certificate
+          default: ${var.trust_server_certificate}
+        - name: snapshot_isolation
+          default: ${var.snapshot_isolation}
+        - name: reseed_on_new_columns
+          default: ${var.reseed_on_new_columns}
+        - name: freshness_interval_s
+          default: ${var.freshness_interval_s}
+        - name: detection_chunk
+          default: ${var.detection_chunk}
+        # Passed on to each ingest run only when set; blank keeps lakefed_ingest's own default.
+        - name: parallelism
+          default: ""
+        - name: append_batch_size
+          default: ""
+        - name: max_seeds_per_run
+          default: ""
+        - name: max_queries_per_source
+          default: ""
+        - name: table_retries
+          default: ""
+        - name: table_retry_budget
+          default: ""
+        - name: spark_conf
+          default: ""

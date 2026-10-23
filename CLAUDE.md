@@ -102,6 +102,12 @@ secret). See `README.md`, `docs/deploy.md`, `docs/monitoring.md`, `docs/lakebase
   transient source error, 0 = off; `table_retry.py`), `table_retry_budget` (retries per run),
   `db_instance`, `db_name`.
   The tuning parameters' defaults are bundle variables of the same name (`databricks.yml`).
+- `lakefed_ingest_check` → `check_launch.ipynb` (serverless): checks a group of collections
+  (`task_collections`, blank = every collection with enabled rows; `initial_check.run_check`), stamps
+  unchanged databases, records each collection's databases with work in `check_work`, starts
+  `lakefed_ingest` once per collection with work by run-now (`work_id`; `launcher.py`), watches the
+  runs for `confirm_s` (a run Databricks skips fails the check) and ends. No For each. Its own schedule
+  (paused) is the fallback cadence; an app schedule in group mode starts it with its members.
 - `lakefed_ingest_discover` → `discover_tables.ipynb`: table discovery for bulk onboarding (params
   `discovery_id`, `spec` JSON); writes `discovery` / `discovered_table`. Runs on the bundle's
   single-node all-purpose cluster `lakefed_ingest utility` (`resources.clusters.lakefed_ingest_utility`,
@@ -153,6 +159,8 @@ secret). See `README.md`, `docs/deploy.md`, `docs/monitoring.md`, `docs/lakebase
 | `src/lakefed_ingest/load_strategies.py` | Per-`load_type` strategy, position encoding, `supported()` matrix (+ placeholder pairs); cdc placeholder |
 | `src/lakefed_ingest/cursor_engine.py` | Cursor (watermark) strategy, SQL Server: type lookup, high watermark (rowversion capped below MIN_ACTIVE_ROWVERSION), typed literals, (lo, hi] read + upsert MERGE |
 | `src/lakefed_ingest/planner.py` | Strategy routing + skip-no-change planning, database check stamps (no Spark/DB; unit-tested with fakes) |
+| `src/lakefed_ingest/initial_check.py` | The check: which databases of a group of collections need an ingest, and each collection's work list (pure; `run_check` takes the Lakebase calls) |
+| `src/lakefed_ingest/launcher.py` | Starts one `lakefed_ingest` run per collection with work by run-now, confirms they started (skipped = failure), never more than the job has room for |
 | `src/lakefed_ingest/parallel.py` | Thread pool, FAIR pools, `WorkSlots` budget, `SourceLimiter` (per-source permits) |
 | `src/lakefed_ingest/partitions.py` | Partitioned-seed planning |
 | `src/lakefed_ingest/discovery.py` | Table discovery for bulk onboarding (catalog queries + recommended control-row settings); run by `discover_tables.ipynb` / job `lakefed_ingest_discover` |
