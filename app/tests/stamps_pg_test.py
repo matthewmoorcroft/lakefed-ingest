@@ -70,3 +70,10 @@ def test_the_overview_counts_late_tables_with_the_stamps(pg):
     assert row["sla_breached_tables"] == 2
     sql, params = q.tables_sql("c1", None, "sla_breached", 100)
     assert sorted(r["src_table"] for r in _rows(pg, sql, params)) == ["b", "c"]
+
+
+def test_the_edit_pages_last_success_counts_the_stamp(pg):
+    ids = dict(pg.execute("select src_table, id from lakefed_ingest.control").fetchall())
+    stamped, = _rows(pg, q.checkpoint_for_sql(), (ids["a"],))
+    behind, = _rows(pg, q.checkpoint_for_sql(), (ids["b"],))
+    assert stamped["last_success_at"] > behind["last_success_at"]

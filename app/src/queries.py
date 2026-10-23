@@ -1443,9 +1443,11 @@ def changes_sql(control_id: Optional[int], limit: int) -> Tuple[str, tuple]:
 
 
 def checkpoint_for_sql() -> str:
-    """One table's checkpoint. Param: control_id."""
-    return (f"select phase, status, position, strategy, detail, last_success_at, updated_at, source_identity, "
-            f"sink_identity, merge_key from {SCHEMA}.checkpoint where control_id = %s")
+    """One table's checkpoint, its last success counting its database's check stamp (LAST_SUCCESS).
+    Param: control_id."""
+    return (f"select cp.phase, cp.status, cp.position, cp.strategy, cp.detail, {LAST_SUCCESS} as last_success_at, "
+            f"cp.updated_at, cp.source_identity, cp.sink_identity, cp.merge_key from {SCHEMA}.checkpoint cp "
+            f"join {SCHEMA}.control t on t.id = cp.control_id {DATABASE_CHECK_JOIN} where cp.control_id = %s")
 
 
 # ---- schedules ----------------------------------------------------------------------------------
