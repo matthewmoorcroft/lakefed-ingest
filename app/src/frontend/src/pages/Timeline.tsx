@@ -9,7 +9,7 @@ import { ErrorBox, Notice, fmtTime } from "../components";
 interface Timeline { start: string; end: string; collections: { task_collection: string; runs: Row[]; planned: string[]; skipped: string[]; schedules: string[] }[] }
 
 const LABEL_W = 230, CHART_W = 1000, ROW_H = 26, AXIS_H = 26;
-const COLOR: Record<string, string> = { completed: "#0f7b4f", failed: "#b42318", running: "#2563eb", skipped: "#d4a017" };
+const COLOR: Record<string, string> = { completed: "var(--s-current)", failed: "var(--s-failing)", running: "var(--s-flight)", skipped: "var(--s-late)" };
 
 export default function TimelinePage() {
   const [hours, setHours] = useState(24);
@@ -51,8 +51,8 @@ export default function TimelinePage() {
           <svg viewBox={`0 0 ${LABEL_W + CHART_W + 10} ${height}`} width="100%" role="img" aria-label="Runs per collection over time">
             {ticks.map((ms) => (
               <g key={ms}>
-                <line x1={x(ms)} x2={x(ms)} y1={AXIS_H - 4} y2={height} stroke="#e2e6eb" />
-                <text x={x(ms)} y={14} fontSize={11} textAnchor="middle" fill="#5f6b7a">
+                <line x1={x(ms)} x2={x(ms)} y1={AXIS_H - 4} y2={height} style={{ stroke: "var(--border)" }} />
+                <text x={x(ms)} y={14} fontSize={11} textAnchor="middle" style={{ fill: "var(--muted)" }}>
                   {new Date(ms).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
                 </text>
               </g>
@@ -61,17 +61,17 @@ export default function TimelinePage() {
               const y = AXIS_H + i * ROW_H;
               return (
                 <g key={r.task_collection}>
-                  <rect x={0} y={y} width={LABEL_W + CHART_W + 10} height={ROW_H} fill={i % 2 ? "#fafbfc" : "#fff"} />
-                  <text x={6} y={y + 17} fontSize={12} fill="#1d2433">
+                  <rect x={0} y={y} width={LABEL_W + CHART_W + 10} height={ROW_H} style={{ fill: i % 2 ? "var(--db-surface-subtle)" : "var(--db-surface-base)" }} />
+                  <text x={6} y={y + 17} fontSize={12} style={{ fill: "var(--text)" }}>
                     {r.task_collection.length > 30 ? r.task_collection.slice(0, 29) + "…" : r.task_collection}
                     <title>{r.task_collection}{r.schedules.length ? `\n${r.schedules.join("\n")}` : "\nnot scheduled"}</title>
                   </text>
-                  {r.planned.map((p) => <line key={p} x1={x(p)} x2={x(p)} y1={y + 3} y2={y + ROW_H - 3} stroke="#9aa5b1" strokeWidth={1} />)}
+                  {r.planned.map((p) => <line key={p} x1={x(p)} x2={x(p)} y1={y + 3} y2={y + ROW_H - 3} strokeWidth={1} style={{ stroke: "var(--db-border-strong, #9aa5b1)" }} />)}
                   {r.runs.map((run) => {
                     const sx = Math.max(LABEL_W, x(run.started_at)), ex = x(run.finished_at ?? d.end);
                     return (
                       <rect key={run.run_id} x={sx} y={y + 6} width={Math.max(2, ex - sx)} height={ROW_H - 12} rx={2}
-                        fill={COLOR[run.status] ?? "#5f6b7a"} opacity={0.85}>
+                        opacity={0.85} style={{ fill: COLOR[run.status] ?? "var(--muted)" }}>
                         <title>{`run ${run.run_id}: ${run.status}\n${fmtTime(run.started_at)} – ${run.finished_at ? fmtTime(run.finished_at) : "running"}`
                           + `\n${Math.round(((run.finished_at ? new Date(run.finished_at).getTime() : t1) - new Date(run.started_at).getTime()) / 6000) / 10} min`
                           + (run.ok !== null && run.ok !== undefined ? `\nok ${run.ok}, failed ${run.failed}, unchanged ${run.skipped}` : "")}</title>
@@ -79,7 +79,7 @@ export default function TimelinePage() {
                     );
                   })}
                   {r.skipped.map((s) => (
-                    <text key={s} x={x(s)} y={y + 10} fontSize={11} textAnchor="middle" fill="#b42318">▼<title>{`trigger skipped at ${fmtTime(s)}: previous run still going`}</title></text>
+                    <text key={s} x={x(s)} y={y + 10} fontSize={11} textAnchor="middle" style={{ fill: "var(--bad)" }}>▼<title>{`trigger skipped at ${fmtTime(s)}: previous run still going`}</title></text>
                   ))}
                 </g>
               );

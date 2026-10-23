@@ -42,7 +42,7 @@ function PlanView({ result }: { result: PlanResult }) {
       </Notice>
       <Grid rows={rows} height={Math.min(80 + rows.length * 42, 320)}
         columns={autoColumns(rows, { changes: { minWidth: 320 }, notes: { flex: 1, minWidth: 320, tooltipField: "notes" },
-          errors: { minWidth: 240, cellStyle: { color: "#b42318" }, tooltipField: "errors" },
+          errors: { minWidth: 240, cellStyle: { color: "var(--bad)" }, tooltipField: "errors" },
           reseed: { cellRenderer: (p: any) => p.value ? <Badge value="seeding" /> : null } })} />
     </>
   );
