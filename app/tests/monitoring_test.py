@@ -26,11 +26,11 @@ def test_monitoring_statements_are_parameterized_and_schema_qualified():
     assert q.run_events_sql().endswith(f"limit {q.RUN_EVENTS_LIMIT}")
 
 
-def test_running_runs_report_progress_over_the_whole_collection():
+def test_running_runs_report_progress_over_the_runs_tables():
     sql = q.running_runs_sql()
     for column in ("enabled_tables", "tables_checked", "last_activity_at", "server"):
         assert f"as {column}" in sql
-    assert "cp.last_success_at >= r.started_at" in sql
+    assert f"{q.LAST_SUCCESS} >= r.started_at" in sql and "coalesce(r.total, " in sql
 
 
 def test_overview_adds_exclusive_states_and_rows_without_changing_existing_columns():

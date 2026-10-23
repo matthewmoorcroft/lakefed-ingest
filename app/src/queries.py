@@ -212,10 +212,13 @@ def running_runs_sql() -> str:
     are bulk-advanced without events, so these count tables that needed work) and elapsed time against
     the collection's typical run (median of its last 20 finished runs).
 
-    tables_checked out of enabled_tables is the run's progress over the whole collection: the engine
-    stamps checkpoint.last_success_at on every unchanged table once change detection ends, and on every
-    loaded table as it finishes, both on the database's clock like started_at. last_activity_at is when
-    a table of the run last started or finished, the sign that the run is alive."""
+    tables_checked out of enabled_tables is the run's progress: the engine stamps
+    checkpoint.last_success_at on every unchanged table once change detection ends (or one database_check
+    stamp for a wholly unchanged database, LAST_SUCCESS), and on every loaded table as it finishes, both on
+    the database's clock like started_at. enabled_tables is the tables the run planned (ingest_run.total
+    while it runs; fewer than the collection's for a run on a check's work list), else the collection's
+    enabled tables. last_activity_at is when a table of the run last started or finished, the sign that the
+    run is alive."""
     return f"""
 select r.run_id, r.task_collection, r.job_run_id, r.started_at, r.parallelism,
        round(extract(epoch from (now() - r.started_at)))::int as elapsed_s,
@@ -226,11 +229,12 @@ select r.run_id, r.task_collection, r.job_run_id, r.started_at, r.parallelism,
           from (select started_at, finished_at from {SCHEMA}.ingest_run x
                 where x.task_collection = r.task_collection and x.finished_at is not null and x.status <> 'skipped'
                 order by x.started_at desc limit 20) x)                                                as typical_s,
-       (select count(*) from {SCHEMA}.control t
-         where t.task_collection = r.task_collection and t.task_enabled)                              as enabled_tables,
+       coalesce(r.total, (select count(*) from {SCHEMA}.control t
+         where t.task_collection = r.task_collection and t.task_enabled))                     as enabled_tables,
        (select count(*) from {SCHEMA}.control t join {SCHEMA}.checkpoint cp on cp.control_id = t.id
+         {DATABASE_CHECK_JOIN}
          where t.task_collection = r.task_collection and t.task_enabled
-           and cp.last_success_at >= r.started_at)                                           as tables_checked,
+           and {LAST_SUCCESS} >= r.started_at)                                               as tables_checked,
        (select max(coalesce(e.finished_at, e.started_at)) from {SCHEMA}.ingest_event e
          where e.run_id = r.run_id)                                                          as last_activity_at,
        (select min({SERVER}) from {SCHEMA}.control t where t.task_collection = r.task_collection)      as server
@@ -303,13 +307,14 @@ select {SERVER} as server,
        count(*) filter (where t.task_enabled)                       as tables,
        count(distinct t.task_collection)                            as collections,
        {STATE_COUNTS},
-       max(cp.last_success_at) filter (where t.task_enabled)        as newest_success_at,
-       min(cp.last_success_at) filter (where t.task_enabled)        as oldest_success_at,
+       max({LAST_SUCCESS}) filter (where t.task_enabled)            as newest_success_at,
+       min({LAST_SUCCESS}) filter (where t.task_enabled)            as oldest_success_at,
        count(distinct t.task_collection) filter (where exists (
            select 1 from {SCHEMA}.ingest_run r where r.task_collection = t.task_collection
            and r.status = 'running'))                               as running_collections
 from {SCHEMA}.control t
 left join {SCHEMA}.checkpoint cp on cp.control_id = t.id
+{DATABASE_CHECK_JOIN}
 group by 1
 order by 1"""
 
@@ -342,11 +347,12 @@ select {SERVER} as server,
        count(*) filter (where t.task_enabled) as tables,
        {STATE_COUNTS},
        count(*) filter (where t.task_enabled
-                        and cp.last_success_at >= (select started_at from run)) as checked_this_run,
-       min(cp.last_success_at) filter (where t.task_enabled) as oldest_success_at,
-       max(cp.last_success_at) filter (where t.task_enabled) as newest_success_at
+                        and {LAST_SUCCESS} >= (select started_at from run)) as checked_this_run,
+       min({LAST_SUCCESS}) filter (where t.task_enabled) as oldest_success_at,
+       max({LAST_SUCCESS}) filter (where t.task_enabled) as newest_success_at
 from {SCHEMA}.control t
 left join {SCHEMA}.checkpoint cp on cp.control_id = t.id
+{DATABASE_CHECK_JOIN}
 where t.task_collection = %s
 group by 1, 2
 order by 2, 1"""
@@ -863,8 +869,9 @@ def connection_databases_sql() -> str:
     """The databases lakefed tracks on one source: by UC connection name or host, each with its
     collections, enabled tables and newest success. Params: connection name, host."""
     return (f"select t.src_database, string_agg(distinct t.task_collection, ', ') as collections, "
-            f"count(*) filter (where t.task_enabled) as tables, max(cp.last_success_at) as newest_success_at "
+            f"count(*) filter (where t.task_enabled) as tables, max({LAST_SUCCESS}) as newest_success_at "
             f"from {SCHEMA}.control t left join {SCHEMA}.checkpoint cp on cp.control_id = t.id "
+            f"{DATABASE_CHECK_JOIN} "
             f"where t.src_connection = %s or lower(t.src_host) = lower(%s) "
             f"group by 1 order by 1")
 

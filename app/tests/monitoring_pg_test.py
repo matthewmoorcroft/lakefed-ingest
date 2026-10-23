@@ -106,6 +106,22 @@ def test_running_run_progress_counts_tables_stamped_since_it_started(pg):
     assert r["last_activity_at"] is not None and r["server"] == "srv1"
 
 
+def test_a_work_list_runs_progress_is_over_its_planned_tables_and_counts_stamps(pg):
+    # The run planned only db2 (10 tables); db2 was checked unchanged a minute ago at version 50, which
+    # vouches for its tables at 50 (t1..t8; t9 and t10 have no position).
+    with pg.transaction(force_rollback=True):   # the module's other tests share the fixture
+        pg.execute("update lakefed_ingest.ingest_run set total = 10 where run_id = 2")
+        pg.execute("update lakefed_ingest.checkpoint set strategy = 'ct', position = '50' "
+                   "where src_database = 'db2' and src_table not in ('t9', 't10')")
+        pg.execute("insert into lakefed_ingest.database_check (task_collection, source, src_database, checked_version, "
+                   "tables, checked_at) values ('c1', %s, 'db2', 50, 10, now() - interval '1 minute')",
+                   (q.database_source({"src_host": "Host-A", "src_port": None, "secret_key": None}),))
+        r = rows(pg, q.running_runs_sql())[0]
+        assert (r["enabled_tables"], r["tables_checked"]) == (10, 7 + 8)
+        db2 = {d["src_database"]: d for d in rows(pg, q.collection_databases_sql(), ("c1", "c1"))}["db2"]
+        assert db2["checked_this_run"] == 8
+
+
 def test_servers_roll_up_their_databases(pg):
     s = rows(pg, q.servers_sql())[0]
     assert (s["server"], s["databases"], s["tables"]) == ("srv1", 2, 20)
