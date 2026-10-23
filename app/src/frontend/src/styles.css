@@ -140,6 +140,8 @@ table.data td.num, table.data th.num { text-align: right; white-space: nowrap; }
 table.data td a b { font-weight: var(--db-font-weight-normal); }
 table.data td .sub { display: block; font-size: var(--db-font-size-sm); color: var(--muted); font-weight: var(--db-font-weight-normal); }
 .table-wrap { overflow-x: auto; }
+.table-wrap.fill { overflow-y: auto; }
+.table-wrap.fill table.data thead th { position: sticky; top: 0; background: var(--card); z-index: 1; }
 
 /* Failures grouped by cause */
 .err-group { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 4px var(--db-space-4); padding: var(--db-space-3) 0; border-top: 1px solid var(--border); }

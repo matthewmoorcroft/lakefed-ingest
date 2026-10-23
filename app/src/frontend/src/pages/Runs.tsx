@@ -2,7 +2,7 @@ import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { type ColDef } from "ag-grid-community";
 import { api, qs, type Row } from "../api";
-import { Badge, ErrorBox, Grid, PageHead, RunStatus, Section, autoColumns, fmtDuration, fmtInt } from "../components";
+import { Badge, ErrorBox, FillBox, Grid, PageHead, RunStatus, Section, autoColumns, fmtDuration, fmtInt } from "../components";
 
 /** Tables that needed a read: the run's total less those found unchanged. */
 const worked = (r: Row) => (r.total === null || r.total === undefined ? null : Number(r.total) - Number(r.skipped || 0));
@@ -66,7 +66,7 @@ export default function Runs() {
       <Section title="Recent runs" note={<>Worked: tables that needed a read (unchanged tables are advanced in bulk). Tables/s: worked
         tables over the run's time. Rows written: the run's own, per-table counts plus its batches' total, "at least" when some
         loads recorded none. Select a run for its databases.</>}>
-        <Grid rows={runs.data} height={360} selection="single" onSelect={(r) => { setRun(r[0] ?? null); setShowEvents(false); }}
+        <Grid rows={runs.data} fillShare={run ? 0.45 : 1} selection="single" onSelect={(r) => { setRun(r[0] ?? null); setShowEvents(false); }}
           columns={COLUMNS} getRowId={(r) => String(r.run_id)} options={{ autoSizeStrategy: { type: "fitGridWidth" } }} />
       </Section>
       {run && (
@@ -74,7 +74,7 @@ export default function Runs() {
           actions={<button onClick={() => setShowEvents(!showEvents)}>{showEvents ? "Hide" : "Show"} its table events</button>}
           note="Each database of the run: tables loaded, in flight and failed, and the rows its loads wrote.">
           <ErrorBox error={databases.error} />
-          <div className="table-wrap">
+          <FillBox min={200}>
             <table className="data">
               <thead><tr><th>Database</th><th className="num">Loaded</th><th className="num">In flight</th><th className="num">Failed</th>
                 <th className="num">Rows written</th></tr></thead>
@@ -91,7 +91,7 @@ export default function Runs() {
                 {databases.data && !dbs.length && <tr><td colSpan={5} className="muted">No table events: every table was unchanged.</td></tr>}
               </tbody>
             </table>
-          </div>
+          </FillBox>
         </Section>
       )}
       {run && showEvents && (
@@ -99,7 +99,7 @@ export default function Runs() {
           <p className="muted small">Tables found unchanged by change detection are counted in the run's
             "Unchanged" without an event.</p>
           <ErrorBox error={events.error} />
-          <Grid rows={events.data} height={420}
+          <Grid rows={events.data}
             columns={autoColumns(events.data ?? [], { status: statusCol, error: { flex: 1, minWidth: 400, tooltipField: "error" } })} />
         </Section>
       )}

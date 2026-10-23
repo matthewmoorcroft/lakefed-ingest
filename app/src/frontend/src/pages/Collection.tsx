@@ -2,7 +2,7 @@ import { useQuery } from "@tanstack/react-query";
 import { Link, useParams } from "react-router-dom";
 import { api, type Row } from "../api";
 import {
-  ErrorBox, PageHead, ProgressBar, ProgressKey, Section, Stamp, StateBar, StateKey, Tag,
+  ErrorBox, FillBox, PageHead, ProgressBar, ProgressKey, Section, Stamp, StateBar, StateKey, Tag,
   fmtAgo, fmtClock, fmtDuration, fmtInt, progressOf, progressText, type Progress,
 } from "../components";
 
@@ -59,7 +59,7 @@ export default function CollectionPage() {
       <Section title="Databases" actions={<button className="ghost" onClick={() => download(name, dbs)}>Download CSV</button>}
         note={<>Rows in first loads are what each table's first load wrote, which is the source's row count at that moment, so the
           total can be checked against a count taken at the source. Rows in changes are written since, in the last 24 hours.</>}>
-        <div className="table-wrap">
+        <FillBox>
           <table className="data">
             <thead><tr><th>Database</th>{run && <th>This run</th>}{run && <th className="num">Checked</th>}{run && <th className="num">In flight</th>}
               <th>State now</th><th className="num">Failing</th><th className="num">First load</th><th className="num">Oldest success</th>
@@ -97,7 +97,7 @@ export default function CollectionPage() {
               )}
             </tbody>
           </table>
-        </div>
+        </FillBox>
         {run ? <ProgressKey /> : <StateKey />}
         {unattributed.length > 0 && <p className="small muted" style={{ marginTop: 8 }}>Batched appends over several databases wrote{" "}
           {unattributed.map((b) => `${fmtInt(b.rows)} rows in run #${b.run_id}`).join(", ")}; batches record one total, so these

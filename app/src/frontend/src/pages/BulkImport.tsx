@@ -4,7 +4,7 @@ import { AgGridReact } from "ag-grid-react";
 import { type ColDef } from "ag-grid-community";
 import { api, type Row } from "../api";
 import { useSettings } from "../App";
-import { Badge, ConfirmButton, ErrorBox, Grid, Notice, PageHead, Section, Tag, autoColumns, fmtAgo, fmtInt, fmtTime, gridTheme } from "../components";
+import { Badge, ConfirmButton, ErrorBox, FillBox, Grid, Notice, PageHead, Section, Tag, autoColumns, fmtAgo, fmtInt, fmtTime, gridTheme } from "../components";
 
 const EDITABLE = ["include", "load_type", "primary_key", "cursor_column", "load_partitioned", "partition_col",
   "partition_size_mb", "sink_catalog", "sink_schema", "sink_table", "client_id", "freshness_sla_minutes"];
@@ -56,7 +56,7 @@ function Connections({ picked, onPick }: { picked: Connection | null; onPick: (c
           <p className="small muted">Databases lakefed already ingests from this source. Listing the server's other databases needs
             discovery through the connection, which is not built yet; add new ones in the discovery form below.</p>
           <ErrorBox error={tracked.error} />
-          <div className="table-wrap" style={{ maxHeight: 320, overflowY: "auto" }}>
+          <FillBox min={200}>
             <table className="data">
               <thead><tr><th>Database</th><th>Collections</th><th className="num">Tables</th><th className="num">Last success</th></tr></thead>
               <tbody>
@@ -67,7 +67,7 @@ function Connections({ picked, onPick }: { picked: Connection | null; onPick: (c
                 {tracked.data && !tracked.data.length && <tr><td colSpan={4} className="muted">Nothing tracked on this source yet.</td></tr>}
               </tbody>
             </table>
-          </div>
+          </FillBox>
         </div>
       )}
     </Section>
@@ -233,7 +233,7 @@ export default function BulkImport() {
         </div>
         {!discoveries.data?.length && <p className="muted">No discoveries yet.</p>}
         {dbs.data && (
-          <Grid rows={dbs.data} height={Math.min(60 + dbs.data.length * 42, 240)}
+          <Grid rows={dbs.data} fitRows
             columns={autoColumns(dbs.data, { status: { cellRenderer: (p: any) => <Badge value={p.value} /> },
               error: { flex: 1, minWidth: 300, tooltipField: "error" } })} />
         )}
@@ -326,7 +326,7 @@ export default function BulkImport() {
                 {register.data && result.counts.registered ? " Their first run seeds them." : ""}
               </Notice>
               {result.results.some((r: Row) => r.errors?.length) && (
-                <Grid height={260} rows={result.results.filter((r: Row) => r.errors?.length).map((r: Row) => ({ ...r, errors: r.errors.join("; ") }))}
+                <Grid fitRows rows={result.results.filter((r: Row) => r.errors?.length).map((r: Row) => ({ ...r, errors: r.errors.join("; ") }))}
                   columns={autoColumns([{ table: "", status: "", errors: "" }], { status: { cellRenderer: (p: any) => <Badge value={p.value} /> }, errors: { flex: 1 } })} />
               )}
             </>

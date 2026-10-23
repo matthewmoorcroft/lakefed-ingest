@@ -44,10 +44,50 @@ export function autoColumns(rows: Row[], overrides: Record<string, Partial<ColDe
   }));
 }
 
+/** Space kept free below a panel that fills the window: the card's padding and the page's bottom margin. */
+const FILL_GAP = 64;
+
+/**
+ * The height that lets an element reach the bottom of the window from where it starts on the page, so a page's
+ * main table uses the screen's height and scrolls inside itself. ``share`` takes a part of the space left (for a
+ * page with two panels), ``reserve`` leaves room in pixels for a panel below, ``min`` keeps it usable on short
+ * windows. Kept up to date as the window or page changes.
+ */
+export function useFillHeight<T extends HTMLElement>(min = 280, share = 1, reserve = 0): [(element: T | null) => void, number] {
+  const [element, setElement] = useState<T | null>(null);
+  const [height, setHeight] = useState(min);
+  useEffect(() => {
+    if (!element) return;
+    const measure = () => {
+      const top = element.getBoundingClientRect().top + window.scrollY;
+      setHeight(Math.max(min, Math.floor((window.innerHeight - top - FILL_GAP - reserve) * share)));
+    };
+    measure();
+    const observer = new ResizeObserver(measure);
+    observer.observe(document.body);
+    window.addEventListener("resize", measure);
+    return () => { observer.disconnect(); window.removeEventListener("resize", measure); };
+  }, [element, min, share, reserve]);
+  return [setElement, height];
+}
+
+/** A box for a plain table that fills the window's height and scrolls inside, with its header kept in view. */
+export function FillBox({ children, min, share }: { children: ReactNode; min?: number; share?: number }) {
+  const [ref, height] = useFillHeight<HTMLDivElement>(min, share);
+  return <div ref={ref} className="table-wrap fill" style={{ maxHeight: height }}>{children}</div>;
+}
+
 export function Grid(props: {
   rows: Row[] | undefined;
   columns?: ColDef[];
+  /** A fixed height; by default the grid fills the window's height from where it starts. */
   height?: number | string;
+  /** Size to the rows when they are few (a short list), never taller than the window allows. */
+  fitRows?: boolean;
+  /** Part of the window's remaining height to take, when the page has another panel below. */
+  fillShare?: number;
+  /** Pixels to leave below the grid for a small panel that follows it. */
+  fillReserve?: number;
   selection?: "single" | "multiple";
   onSelect?: (rows: Row[]) => void;
   options?: GridOptions;
@@ -55,6 +95,9 @@ export function Grid(props: {
 }) {
   const cols = useMemo(() => props.columns ?? autoColumns(props.rows ?? []), [props.columns, props.rows]);
   const box = useRef<HTMLDivElement>(null);
+  const [fillRef, fillHeight] = useFillHeight<HTMLDivElement>(props.fitRows ? 140 : 280, props.fillShare ?? 1, props.fillReserve ?? 0);
+  const rowsHeight = 52 + (props.rows?.length ?? 0) * 42 + 4;
+  const height = props.height ?? (props.fitRows ? Math.min(rowsHeight, fillHeight) : fillHeight);
   const byContent = (props.options?.autoSizeStrategy?.type ?? "fitCellContents") === "fitCellContents";
   /** Columns sized to their content, then stretched when they leave the grid's width unused (wide screens). */
   const fill = (gridApi: GridApi) => {
@@ -65,7 +108,7 @@ export function Grid(props: {
     if (used < width - 2) gridApi.sizeColumnsToFit();
   };
   return (
-    <div ref={box} style={{ height: props.height ?? 420, width: "100%" }}>
+    <div ref={(element) => { box.current = element; fillRef(element); }} style={{ height, width: "100%" }}>
       <AgGridReact
         theme={theme}
         rowData={props.rows ?? []}

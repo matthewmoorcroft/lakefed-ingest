@@ -136,7 +136,7 @@ function ScheduleCard({ s, onEdit }: { s: Row; onEdit: () => void }) {
       {warned > 0 && <Notice tone="warn">{warned} collection(s) have warnings: see the warnings column.</Notice>}
       <ErrorBox error={act.error || check.error} />
       <SyncResult result={act.data} />
-      <Grid rows={rows} height={Math.min(90 + rows.length * 42, 380)} columns={[
+      <Grid rows={rows} fitRows columns={[
         { field: "collection", headerName: "Collection", pinned: "left" }, { field: "starts", headerName: "Starts" },
         { field: "next_run", headerName: "Next run" },
         { field: "last_run", headerName: "Last run", cellRenderer: (p: any) => <Badge value={p.value} /> },

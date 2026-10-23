@@ -66,7 +66,7 @@ export default function Tables() {
       )}>
         <p className="muted small">Select one row to edit it, or several to bulk edit, enable, disable, or force a reseed
           (the next run copies them again). Changes are refused while the table's collection is running.</p>
-        <Grid rows={tables.data} height={560} selection="multiple" onSelect={setSelected} getRowId={(r) => String(r.id)}
+        <Grid rows={tables.data} selection="multiple" onSelect={setSelected} getRowId={(r) => String(r.id)}
           columns={autoColumns(tables.data ?? [], {
             status: { cellRenderer: (p: any) => <Badge value={p.value} /> },
             phase: { cellRenderer: (p: any) => <Badge value={p.value} /> },

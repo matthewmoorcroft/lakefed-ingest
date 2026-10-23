@@ -54,7 +54,7 @@ export default function Jobs() {
       )}
       <Section title={`Active runs (${job.data?.active.length ?? "…"})`}>
         {job.data?.active.length ? (
-          <Grid rows={job.data.active} height={220}
+          <Grid rows={job.data.active} fitRows
             columns={[...autoColumns(job.data.active, stateCols), {
               headerName: "", field: "run_id", width: 150, sortable: false, filter: false,
               cellRenderer: (p: any) => (
@@ -65,7 +65,7 @@ export default function Jobs() {
         ) : <p className="muted">No active runs.</p>}
       </Section>
       <Section title="Recent runs">
-        <Grid rows={job.data?.recent} height={360} columns={autoColumns(job.data?.recent ?? [], stateCols)} />
+        <Grid rows={job.data?.recent ?? (job.error ? [] : undefined)} fillReserve={150} columns={autoColumns(job.data?.recent ?? [], stateCols)} />
       </Section>
       <Section title="Schema setup">
         <p className="muted small">Creates or migrates the Lakebase schema. Safe to re-run; upgrades also migrate on the next
