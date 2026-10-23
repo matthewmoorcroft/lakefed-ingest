@@ -200,7 +200,7 @@ def test_start_run_sql_inserts_running_and_returns_id():
     assert ss.RUN_TABLE == "lakefed_ingest.ingest_run" and ss.RUN_TABLE in sql
     assert "'running'" in sql
     assert "returning run_id" in sql
-    assert sql.count("%s") == 4  # task_collection, job_run_id, cluster_id, parallelism
+    assert sql.count("%s") == 5  # task_collection, job_run_id, cluster_id, parallelism, total (planned)
 
 
 def test_record_event_start_sql_inserts_running_and_returns_id():

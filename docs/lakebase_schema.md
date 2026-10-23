@@ -242,7 +242,7 @@ Inserted when a run starts (`status = 'running'`) and finalized when it ends.
 | `parallelism` | The run's concurrency budget |
 | `started_at`, `finished_at` | Timing |
 | `status` | `running` → `completed` \| `failed` (any table failed); `skipped` when another run of the same collection held the lock |
-| `total`, `ok`, `failed` | Table counts |
+| `total`, `ok`, `failed` | Table counts (`total` holds the tables the run planned while it runs) |
 | `skipped` | Tables that were unchanged (nothing to read) |
 | `reseeded` | Tables queued for a reseed |
 | `detail` | JSON with run details: change-detection counts per route, timings, peak concurrency, and with `max_queries_per_source` set, each source's share and peak permits (`source_caps`), the rows batched appends committed (`batch_rows`, with `batch_rows_unknown` tables not counted), and table retry totals (`table_retries`) |

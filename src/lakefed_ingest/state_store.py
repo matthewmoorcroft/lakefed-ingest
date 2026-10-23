@@ -410,11 +410,13 @@ def enqueue_reseed_sql() -> str:
 # point writes), queryable live through the Lakebase UC catalog.
 # --------------------------------------------------------------------------------------
 def start_run_sql() -> str:
-    """Open an ingest_run row (status 'running'); returns the new run_id."""
+    """Open an ingest_run row (status 'running'); returns the new run_id. total starts as the tables the
+    run plans to take (a run on a work list takes fewer than its collection has), until finish_run sets the
+    final count."""
     return (
         f"insert into {RUN_TABLE} "
-        "(task_collection, job_run_id, cluster_id, parallelism, status) "
-        "values (%s, %s, %s, %s, 'running') returning run_id"
+        "(task_collection, job_run_id, cluster_id, parallelism, total, status) "
+        "values (%s, %s, %s, %s, %s, 'running') returning run_id"
     )
 
 
@@ -952,11 +954,12 @@ class StateStore:
                          *identity_values(cfg)))
 
     # ---- Observability / telemetry -----------------------------------------------------
-    def start_run(self, task_collection, job_run_id, cluster_id, parallelism) -> int:
-        """Open an ingest_run row; returns its run_id."""
+    def start_run(self, task_collection, job_run_id, cluster_id, parallelism, planned=None) -> int:
+        """Open an ingest_run row; returns its run_id. planned: the tables the run will take, if known."""
         with self._cursor() as cur:
             cur.execute(start_run_sql(),
-                        (task_collection, job_run_id, cluster_id, int(parallelism)))
+                        (task_collection, job_run_id, cluster_id, int(parallelism),
+                         None if planned is None else int(planned)))
             return int(cur.fetchone()[0])
 
     def record_event_start(self, run_id, cfg, action, phase, pool) -> int:
