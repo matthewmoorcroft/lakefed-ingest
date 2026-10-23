@@ -72,6 +72,21 @@ def _refuse_mixed_sinks(cur, rows):
                                  "a sink is either dedicated to one source table or shared by client_id")
 
 
+def _refuse_split_databases(cur, rows):
+    """After writing control rows, in the same transaction: refuse when a database they belong to would
+    have tables in more than one collection. Its run locks one collection, and the check job reads each
+    database once for its collection, so the database's other tables would be checked and ingested apart."""
+    keys = sorted({q.database_key(r) for r in rows})
+    if not keys:
+        return
+    cur.execute(q.split_databases_sql(), (keys,))
+    split = cur.fetchall()
+    if split:
+        _, database, collections = split[0]
+        raise HTTPException(409, f"database {database} would have tables in more than one collection "
+                                 f"({', '.join(collections)}); move all of its tables together")
+
+
 def _log(cur, user, action, control_id, collection, field=None, old=None, new=None, reseed=None, batch=None):
     as_text = lambda v: None if v is None else str(v)
     cur.execute(q.log_change_sql(), (user or None, action, control_id, collection, field, as_text(old),
@@ -650,6 +665,7 @@ def add_table(row: dict, request: Request):
         cur.execute(q.insert_control_sql(), q.control_params(row))
         new_id = cur.fetchone()[0]
         _refuse_mixed_sinks(cur, [row])
+        _refuse_split_databases(cur, [row])
         _log(cur, _user(request), "add", new_id, row.get("task_collection"))
     return {"id": new_id}
 
@@ -704,7 +720,9 @@ def edit_tables(body: EditRequest, request: Request):
                 if p["reseed"]:
                     cur.execute(q.flip_to_seeding_sql(), (f"reseed after edit: {p['reseed']}", [p["id"]]))
                     cur.execute(q.log_reseed_sql(), (f"edit:{p['reseed']}", [p["id"]]))
-            _refuse_mixed_sinks(cur, [dict(by_id[p["id"]], **{f: v[1] for f, v in p["changes"].items()}) for p in plans])
+            edited = [dict(by_id[p["id"]], **{f: v[1] for f, v in p["changes"].items()}) for p in plans]
+            _refuse_mixed_sinks(cur, edited)
+            _refuse_split_databases(cur, edited)
             summary["applied"] = True
             return {"summary": summary, "plans": plans}
     except psycopg.errors.UniqueViolation:
@@ -864,6 +882,7 @@ def register(discovery_id: str, body: RegisterRequest, request: Request):
                                 "id": res[0] if res else None,
                                 "errors": [] if res else ["sink already used by another control row"]})
             _refuse_mixed_sinks(cur, [row for _, row in valid])     # all or nothing, like an edit
+            _refuse_split_databases(cur, [row for _, row in valid])
     else:
         results += [{"table": name, "status": "valid", "errors": []} for name, _ in valid]
     counts = {}

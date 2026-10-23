@@ -309,4 +309,7 @@ def test_the_database_source_in_sql_is_the_engines():
     engine = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(engine)
     assert q.database_source_sql("t") == engine.database_source_sql("t")
+    for row in ({"src_host": "Srv", "src_port": 1433, "secret_key": "k"}, {"src_connection": "conn"},
+                {"src_host": "srv", "src_port": None, "secret_key": ""}):
+        assert q.database_source(row) == engine.database_source(row)
     assert "database_check dc" in q.DATABASE_CHECK_JOIN and "dc.source = " + q.database_source_sql("t") in q.DATABASE_CHECK_JOIN

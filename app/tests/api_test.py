@@ -55,6 +55,8 @@ class FakeCursor:
             self._rows = [(params[0] not in self.db.running,)]
         elif sql == q.mixed_sinks_for_sql():
             self._rows = [(s,) for s in params[0] if s in self.db.mixed]
+        elif sql == q.split_databases_sql():
+            self._rows = [(k, k.split("\x1f")[1], ["c1", "c2"]) for k in params[0] if k in self.db.split]
         elif sql.startswith("insert into lakefed_ingest.control ("):
             if self.db.unique_violation:
                 import psycopg
@@ -83,6 +85,7 @@ class FakeDB:
     def __init__(self):
         self.statements, self.rolled_back, self.running, self.unique_violation = [], [], set(), False
         self.mixed = set()          # sinks the mixed-sink check reports
+        self.split = set()          # databases (q.database_key) the one-collection check reports split
 
     def of(self, prefix):
         return [p for sql, p in self.statements if sql.startswith(prefix)]
@@ -413,3 +416,29 @@ def test_tables_come_a_page_at_a_time_with_the_cursor_of_the_next(monkeypatch):
     assert seen[-1][:-1] == tuple(body["next_after"])
     available[0] = main.TABLES_PAGE      # exactly one page: no Next
     assert client.get("/api/tables").json()["next_after"] is None
+
+
+
+
+# ---- a database's tables share one collection ------------------------------------------------------
+
+def test_adding_a_table_that_would_put_its_database_in_a_second_collection_is_refused(client):
+    assert client.post("/api/tables", json=ROW).status_code == 200
+    assert client.db.of(q.split_databases_sql()) == [([q.database_key(ROW)],)]
+    client.db.split = {q.database_key(ROW)}
+    r = client.post("/api/tables", json=ROW)
+    assert r.status_code == 409 and "db1" in r.json()["detail"] and "c1, c2" in r.json()["detail"]
+
+
+def test_moving_some_of_a_databases_tables_to_another_collection_is_refused(client):
+    client.db.split = {q.database_key(CONTROL[7])}
+    r = client.post("/api/tables/edit", json={"ids": [7], "changes": {"task_collection": "c2"}, "dry_run": False})
+    assert r.status_code == 409 and "more than one collection" in r.json()["detail"]
+
+
+def test_registering_tables_into_another_collection_than_their_database_is_refused(client):
+    body = {"task_collection": "c9", "shared": {"sink_schema": "bronze"}}
+    client.db.split = {q.database_key(dict(DISCOVERED[0], task_collection="c9"))}
+    r = client.post("/api/discoveries/d1/register", json=body)
+    assert r.status_code == 409 and "db1" in r.json()["detail"]
+

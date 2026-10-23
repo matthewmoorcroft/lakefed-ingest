@@ -1403,6 +1403,29 @@ def mixed_sinks_for_sql() -> str:
             f"having count(*) filter (where client_id is null) > 0 and count(*) > 1")
 
 
+def database_source(row: dict) -> str:
+    """``database_source_sql`` of a control-row dict (the engine's ``state_store.database_source``)."""
+    host = str(row.get("src_host") or row.get("src_connection") or "").lower()
+    credential = row.get("secret_key") or row.get("src_connection") or ""
+    return f"{host}|{int(row.get('src_port') or 0)}|{credential}"
+
+
+def database_key(row: dict) -> str:
+    """One source database (its server identity and name) as one text, the key ``split_databases_sql`` takes."""
+    return f"{database_source(row)}\x1f{row.get('src_database') or ''}"
+
+
+def split_databases_sql() -> str:
+    """Databases among the given keys (``database_key``) whose control rows are in more than one
+    collection. A database's tables share one collection: its run takes the collection's lock and the
+    check job reads the database once for the collection. Param: list of keys. Returns key, database,
+    collections."""
+    key = f"{database_source_sql('t')} || chr(31) || coalesce(t.src_database, '')"
+    return (f"select {key} as key, min(t.src_database) as src_database, "
+            f"array_agg(distinct t.task_collection order by t.task_collection) as collections "
+            f"from {SCHEMA}.control t where {key} = any(%s) group by 1 having count(distinct t.task_collection) > 1")
+
+
 def log_change_sql() -> str:
     """Params: changed_by, action, control_id, task_collection, field, old_value, new_value,
     reseed_reason, batch_id."""
