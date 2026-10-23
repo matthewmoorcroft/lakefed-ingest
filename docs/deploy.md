@@ -189,8 +189,12 @@ identity. From an early deploy, it renames the `ct_checkpoint` / `sweep_run` tab
 CT-specific columns to the generic `checkpoint` / `ingest_run` names in place (data kept).
 
 **Scheduling:** the ingestion job's schedule (paused by default) can't pass parameters, so it only ingests
-the default `task_collection`. For per-collection cadence, deploy a job per collection or trigger runs
-per collection; a launcher job is planned.
+the default `task_collection`. For per-collection cadence, use the operations app's schedules (a wrapper
+job per collection), or the check job, `lakefed_ingest_check`: it checks a group of collections on
+serverless and starts the ingestion job only for those with work. Its own schedule (paused) checks every
+collection; a schedule of the app's `check` variant starts it with that schedule's members. It reads the
+sources like the ingest does, so serverless needs the same network path to them (a UC connection, or
+serverless network connectivity to the servers).
 
 ## Schema changes
 

@@ -64,6 +64,14 @@ Limits: each running collection counts as one task (2,000 per workspace) plus on
 wrapper runs (750 per workspace), all collections are runs of the one ingestion job (its
 `max_concurrent_runs`, default 100, up to 1,000), and each member is a saved job (12,000 per workspace).
 
+**Check first** (the `check` variant, offered when `CHECK_JOB_ID` is set): one wrapper job for the whole
+schedule instead of one per member. At the cadence it starts the check job, `lakefed_ingest_check`, with the
+members as `task_collections`; the check asks each member's source databases whether anything changed,
+stamps the unchanged ones, and starts the ingestion job only for members with work, each for its databases
+with work, with run-now. A quiet cycle starts no ingest cluster. Members are not staggered (one check takes
+them all), the schedule is one saved job and one parent task while the check runs, and switching a schedule
+to or from `check` replaces its wrapper jobs.
+
 ## Guard rails for edits
 
 Data integrity comes first, so edits go through the server's rules, not the browser's:
