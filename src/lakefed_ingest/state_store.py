@@ -506,6 +506,11 @@ def stamp_database_sql() -> str:
     )
 
 
+def enabled_collections_sql() -> str:
+    """The collections with at least one enabled control row, in name order."""
+    return f"select distinct task_collection from {CONTROL_TABLE} where task_enabled order by task_collection"
+
+
 def record_check_work_sql() -> str:
     """One database with work for a run the check job starts. Params: work_id, task_collection, source,
     src_database."""
@@ -888,6 +893,12 @@ class StateStore:
             cur.execute(get_database_checks_sql(), (task_collection,))
             rows = cur.fetchall()
         return {(r[0], r[1]): {"version": int(r[2]), "checked_at": r[3]} for r in rows}
+
+    def enabled_collections(self) -> list:
+        """The collections with at least one enabled control row (a check over every collection)."""
+        with self._cursor() as cur:
+            cur.execute(enabled_collections_sql())
+            return [row[0] for row in cur.fetchall()]
 
     def record_check_work(self, work_id: str, task_collection: str, databases) -> None:
         """Record the databases with work, [(source, src_database)], of the run the check job is about

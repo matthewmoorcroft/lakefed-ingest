@@ -1093,3 +1093,10 @@ def test_the_work_list_is_written_once_per_database_and_read_back_for_one_run():
 def test_old_work_lists_are_pruned():
     sql = ss.prune_check_work_sql()
     assert sql.startswith("delete from lakefed_ingest.check_work where created_at <") and "%s" in sql
+
+
+def test_a_check_without_a_group_takes_every_collection_with_an_enabled_row():
+    conn = FakeConn(fetch=[("c1",), ("c2",)])
+    assert ss.StateStore(conn).enabled_collections() == ["c1", "c2"]
+    assert conn.calls == [(ss.enabled_collections_sql(), None)]
+    assert "where task_enabled" in ss.enabled_collections_sql() and "order by" in ss.enabled_collections_sql()

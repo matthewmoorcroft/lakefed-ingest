@@ -18,8 +18,9 @@
 # Scale pattern: shard tenants/tables into task_collections and run them CONCURRENTLY (one run per
 # collection, each on its own cluster). Runs of different collections don't conflict; a per-collection
 # Lakebase lock skips a duplicate run of the same collection. Trigger per collection via the API
-# (`run-now` with job_parameters); the job's schedule can only sweep its default collection, so
-# scheduled multi-collection runs need a launcher over collections (planned).
+# (`run-now` with job_parameters); the job's schedule can only sweep its default collection. The check
+# job (lakefed_ingest_check.yml) is the launcher over collections: it checks a group of collections
+# first and starts a run only for those with work.
 resources:
   jobs:
     lakefed_ingest:
@@ -33,7 +34,7 @@ resources:
       schedule:
         # Paused by default (15-minute cadence). Job schedules can't pass parameters, so this schedule
         # only ever sweeps the job's DEFAULT task_collection. Per-collection cadence needs a job per
-        # collection (or a target-level override of the default) or a launcher over collections (planned).
+        # collection (the app's schedules), or the check job over a group of collections.
         quartz_cron_expression: "0 0/15 * * * ?"
         timezone_id: UTC
         pause_status: PAUSED
