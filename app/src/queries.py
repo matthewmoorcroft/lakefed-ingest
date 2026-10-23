@@ -179,6 +179,7 @@ with run as (
     where task_collection = %s and status = 'running' order by started_at desc limit 1
 )
 select coalesce(t.src_database, '') as src_database,
+       min({SERVER}) as server,
        count(*) filter (where t.task_enabled) as tables,
        {STATE_COUNTS},
        count(*) filter (where t.task_enabled
@@ -196,7 +197,7 @@ def collection_database_rows_sql() -> str:
     """Rows written per source database of a collection: by first loads (seed, reseed or full) over
     every run, which is the source's row count at each first load, and by changes in the last 24 hours;
     with the loads that recorded no count (batched appends record one total on the run), and the
-    running run's tables in flight and failures. Params: task_collection."""
+    running run's tables loaded, in flight and failed. Params: task_collection."""
     return f"""
 select coalesce(e.src_database, '') as src_database,
        sum(e.rows_merged) filter (where e.status = 'ok' and e.action in ('seed', 'reseed', 'full')) as rows_first_loads,
@@ -205,6 +206,7 @@ select coalesce(e.src_database, '') as src_database,
                         and e.rows_merged is null)                                     as first_loads_uncounted,
        sum(e.rows_merged) filter (where e.status = 'ok' and e.action = 'increment'
                                   and e.finished_at > now() - interval '24 hours')                as rows_changes_24h,
+       count(*) filter (where e.status = 'ok' and r.status = 'running')                          as loaded_this_run,
        count(*) filter (where e.status = 'running' and r.status = 'running')                     as in_flight,
        count(*) filter (where e.status = 'failed' and r.status = 'running')                      as failed_this_run
 from {SCHEMA}.ingest_event e

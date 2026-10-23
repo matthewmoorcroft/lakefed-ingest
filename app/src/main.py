@@ -164,7 +164,7 @@ def collection_databases(name: str):
         for d in db.query(q.collection_databases_sql(), (name, name)):
             r = rows.get(d["src_database"], {})
             d.update({k: r.get(k) for k in ("rows_first_loads", "first_loads", "first_loads_uncounted",
-                                             "rows_changes_24h", "in_flight", "failed_this_run")})
+                                             "rows_changes_24h", "loaded_this_run", "in_flight", "failed_this_run")})
             d["batches"] = [{"run_id": b["run_id"], "rows": b["rows"]} for b in batches
                             if b["databases"] == [d["src_database"]]]
             databases.append(d)

@@ -118,7 +118,9 @@ def test_a_collections_databases_show_this_runs_progress_and_their_rows(pg):
     assert (dbs["db2"]["checked_this_run"], dbs["db2"]["state_failing"], dbs["db2"]["state_first_load"]) == (0, 1, 1)
     written = {d["src_database"]: d for d in rows(pg, q.collection_database_rows_sql(), ("c1",))}
     assert (written["db1"]["rows_first_loads"], written["db1"]["first_loads_uncounted"]) == (1000, 0)
-    assert (written["db1"]["rows_changes_24h"], written["db1"]["in_flight"]) == (7, 1)
+    db1 = written["db1"]
+    assert (db1["rows_changes_24h"], db1["loaded_this_run"], db1["in_flight"]) == (7, 1, 1)
+    assert dbs["db1"]["server"] == "srv1"
     assert (written["db2"]["rows_first_loads"], written["db2"]["first_loads_uncounted"]) == (None, 9)
     assert written["db2"]["failed_this_run"] == 1
     batch = rows(pg, q.collection_batch_runs_sql(), ("c1",))
