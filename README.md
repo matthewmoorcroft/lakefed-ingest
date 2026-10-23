@@ -490,7 +490,19 @@ databricks bundle run lakefed_ingest -t <target> -p <profile> \
 
 The job ships with a paused 15-minute schedule. Job schedules can't pass parameters, so the
 schedule only ingests the job's default `task_collection`; run other collections with `run-now`
-and `job_parameters` (a launcher over collections is planned).
+and `job_parameters`.
+
+**The check first:** the `lakefed_ingest_check` job runs on serverless over a group of collections
+(`task_collections`, blank for every collection with enabled rows), asks each source database
+whether anything changed, stamps the unchanged ones, and starts `lakefed_ingest` (run-now) only for
+the collections with work, each for its databases with work. A quiet cycle starts no ingest cluster.
+
+```bash
+databricks bundle run lakefed_ingest_check -t <target> -p <profile> --params task_collections=<c1>,<c2>
+```
+
+Its schedule (paused) checks every collection; an operations-app schedule of the `check` variant
+starts it with its members instead.
 
 **Monitoring:** run and per-table telemetry, failures, and freshness queries are in
 [docs/monitoring.md](docs/monitoring.md).

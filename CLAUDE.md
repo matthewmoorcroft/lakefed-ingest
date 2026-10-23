@@ -14,7 +14,8 @@ An optional operations app (Databricks App: FastAPI backend + React/TypeScript f
 default version is its own bundle in `app/` (`lakefed_ingest_app`); see `app/README.md`. SQL lives in
 `app/src/queries.py` (unit-tested); Databricks Apps builds the frontend at deploy time. Schedules
 (`app/src/schedules.py`): one wrapper job per (schedule, collection), a cron + `run_job` task that starts the
-ingestion job with `task_collection`; `max_concurrent_runs` 1, no queue (overruns skip triggers).
+ingestion job with `task_collection`; `max_concurrent_runs` 1, no queue (overruns skip triggers). A schedule of
+the `check` variant has one wrapper that starts `lakefed_ingest_check` with its members (`task_collections`).
 
 Never run bundle commands for one version from the other's directory. Local bundle state
 (`.databricks/bundle/<target>/`) is keyed by target only, so each version keeps its own cache in its
