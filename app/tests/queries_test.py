@@ -198,7 +198,7 @@ def test_update_sql_whitelists_columns():
 def test_sla_breach_rule_uses_control_sla_and_creation_for_never_succeeded():
     rule = q.SLA_BREACHED
     assert "t.task_enabled" in rule and "t.freshness_sla_minutes is not null" in rule
-    assert "coalesce(cp.last_success_at, t.created_at)" in rule
+    assert f"coalesce({q.LAST_SUCCESS}, t.created_at)" in rule and "cp.last_success_at" in q.LAST_SUCCESS
     assert rule in q.collections_overview_sql()
     sql, _ = q.tables_sql(None, None, "all", 5)
     assert "as sla_breached" in sql and "as sla_min" in sql
@@ -299,3 +299,14 @@ def test_tables_page_after_a_cursor_with_an_exact_database():
     sql, params = q.tables_sql("c1", None, "all", 100, database="db1", after=["c1", "db1", "dbo", "t5", 42])
     assert "coalesce(t.src_database, '') = %s" in sql and params == ("c1", "db1", "c1", "db1", "dbo", "t5", 42, 100)
     assert sql.rstrip().endswith("order by t.task_collection, coalesce(t.src_database, ''), t.src_schema, t.src_table, t.id limit %s")
+
+
+def test_the_database_source_in_sql_is_the_engines():
+    import importlib.util
+    from pathlib import Path
+    path = Path(__file__).resolve().parents[2] / "src" / "lakefed_ingest" / "state_store.py"
+    spec = importlib.util.spec_from_file_location("engine_state_store", path)
+    engine = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(engine)
+    assert q.database_source_sql("t") == engine.database_source_sql("t")
+    assert "database_check dc" in q.DATABASE_CHECK_JOIN and "dc.source = " + q.database_source_sql("t") in q.DATABASE_CHECK_JOIN

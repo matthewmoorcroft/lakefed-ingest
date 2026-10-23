@@ -16,11 +16,29 @@ SCHEMA = "lakefed_ingest"
 
 # ---- freshness SLA ------------------------------------------------------------------------------
 
+def database_source_sql(alias: str) -> str:
+    """The server, port and credential a control row reads its database through: the key of its
+    database's check stamp (the engine's ``state_store.database_source_sql``; a test keeps them equal)."""
+    return (f"lower(coalesce(nullif({alias}.src_host, ''), nullif({alias}.src_connection, ''), '')) || '|' || "
+            f"coalesce({alias}.src_port, 0) || '|' || "
+            f"coalesce(nullif({alias}.secret_key, ''), nullif({alias}.src_connection, ''), '')")
+
+
+# A wholly unchanged database gets one check stamp (database_check) instead of a last_success_at on each
+# table. The stamp vouches for a ct table in the incremental phase at or past its version; for those, the
+# last success is the later of the two (the engine's planner.stamp_vouches). Aliases: t = control,
+# cp = checkpoint, dc = database_check (DATABASE_CHECK_JOIN).
+DATABASE_CHECK_JOIN = (f"left join {SCHEMA}.database_check dc on dc.task_collection = t.task_collection "
+                       f"and dc.src_database = t.src_database and dc.source = {database_source_sql('t')}")
+LAST_SUCCESS = ("greatest(cp.last_success_at, case when cp.strategy = 'ct' and cp.phase = 'incremental' "
+                "and cp.position ~ '^[0-9]+$' then case when cp.position::bigint >= dc.checked_version "
+                "then dc.checked_at end end)")
+
 # An enabled table with control.freshness_sla_minutes breaches its SLA when its last success (or, if
 # it has never succeeded, its control row's creation) is older than the SLA. Tables without an SLA
-# are never flagged. Aliases: t = control, cp = checkpoint.
+# are never flagged. Aliases as above.
 SLA_BREACHED = ("(t.task_enabled and t.freshness_sla_minutes is not null "
-                "and coalesce(cp.last_success_at, t.created_at) < now() - make_interval(mins => t.freshness_sla_minutes))")
+                f"and coalesce({LAST_SUCCESS}, t.created_at) < now() - make_interval(mins => t.freshness_sla_minutes))")
 
 
 # Where a table's source lives, for grouping by server: the instance group when set (for example the
@@ -159,13 +177,14 @@ with tables as (
            count(*) filter (where t.task_enabled and (cp.control_id is null or cp.phase = 'seeding')) as seeding_tables,
            count(*) filter (where t.task_enabled and t.freshness_sla_minutes is null) as no_sla_tables,
            count(*) filter (where {SLA_BREACHED})                                   as sla_breached_tables,
-           max(cp.last_success_at)                                                  as last_success_at,
+           max({LAST_SUCCESS})                                                      as last_success_at,
            count(distinct {DATABASE}) filter (where t.task_enabled)               as databases,
            count(distinct {SERVER}) filter (where t.task_enabled)                  as servers,
            min({SERVER}) filter (where t.task_enabled)                             as server,
            {STATE_COUNTS}
     from {SCHEMA}.control t
     left join {SCHEMA}.checkpoint cp on cp.control_id = t.id
+    {DATABASE_CHECK_JOIN}
     group by t.task_collection
 ),
 last_run as (
@@ -895,11 +914,12 @@ def tables_sql(collection: Optional[str], search: Optional[str], status_filter: 
     sql = (f"select t.id, t.task_collection, t.task_enabled, t.src_type, t.load_type, "
            f"t.src_database, t.src_schema, t.src_table, "
            f"t.sink_catalog || '.' || t.sink_schema || '.' || t.sink_table as sink, t.client_id, "
-           f"cp.phase, cp.status, cp.last_success_at, "
-           f"round(extract(epoch from (now() - cp.last_success_at)) / 60)::int as lag_min, "
+           f"cp.phase, cp.status, {LAST_SUCCESS} as last_success_at, "
+           f"round(extract(epoch from (now() - {LAST_SUCCESS})) / 60)::int as lag_min, "
            f"t.freshness_sla_minutes as sla_min, {SLA_BREACHED} as sla_breached, "
            f"cp.position, cp.detail "
            f"from {SCHEMA}.control t left join {SCHEMA}.checkpoint cp on cp.control_id = t.id "
+           f"{DATABASE_CHECK_JOIN} "
            f"{where}order by {TABLES_ORDER} limit %s")
     return sql, tuple(params) + (int(limit),)
 
