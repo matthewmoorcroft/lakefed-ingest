@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import json
 import os
+import threading
+import time
 import uuid
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
@@ -94,10 +96,81 @@ def config(request: Request):
                          "partition_size_mb": q.DEFAULT_PARTITION_SIZE_MB}}
 
 
+# Monitoring reads are shared by every viewer and recomputed at most once per MONITOR_CACHE_S seconds,
+# so the app's load on Lakebase does not grow with open tabs. 0 turns the cache off.
+MONITOR_CACHE_S = max(0, int(os.environ.get("MONITOR_CACHE_S", "15")))
+_shared_reads: dict = {}
+_shared_lock = threading.Lock()
+
+
+def _shared(key, compute):
+    """compute() at most once per MONITOR_CACHE_S for key, shared by every request."""
+    if MONITOR_CACHE_S:
+        with _shared_lock:
+            hit = _shared_reads.get(key)
+            if hit and time.time() - hit[1] < MONITOR_CACHE_S:
+                return hit[0]
+    value = compute()
+    if MONITOR_CACHE_S:
+        with _shared_lock:
+            _shared_reads[key] = (value, time.time())
+    return value
+
+
+def _batch_rows_by_collection(hours: int) -> dict:
+    """Rows batched appends wrote per collection in the last `hours` (recorded on the run, not per table)."""
+    out: dict = {}
+    for r in db.query(q.run_batch_rows_sql(), (int(hours),)):
+        rows, _ = q.batch_rows(r["detail"])
+        if rows:
+            out[r["task_collection"]] = out.get(r["task_collection"], 0) + rows
+    return out
+
+
 @app.get("/api/overview")
 def overview():
-    return {"collections": db.query(q.collections_overview_sql()),
-            "running": db.query(q.running_runs_sql())}
+    def compute():
+        collections = db.query(q.collections_overview_sql())
+        batches = _batch_rows_by_collection(24)
+        for c in collections:
+            c["rows_24h"] = int(c.get("rows_24h") or 0) + batches.get(c["task_collection"], 0)
+        return {"collections": collections, "running": db.query(q.running_runs_sql()),
+                "servers": db.query(q.servers_sql()), "read_at": datetime.now(timezone.utc).isoformat(),
+                "cache_s": MONITOR_CACHE_S}
+    return _shared("overview", compute)
+
+
+@app.get("/api/errors/groups")
+def error_groups(hours: int = 24):
+    """Failed tables in the last `hours`, grouped by cause (queries.group_errors)."""
+    hours = max(1, min(int(hours), 168))
+    return _shared(("errors", hours), lambda: q.group_errors(db.query(q.recent_errors_sql(), (hours, 5000))))
+
+
+@app.get("/api/collections/{name}/databases")
+def collection_databases(name: str):
+    """A collection's source databases: state now, this run's progress, rows in first loads and in
+    changes (24 h), and batched appends' totals placed on the databases they loaded."""
+    def compute():
+        rows = {r["src_database"]: r for r in db.query(q.collection_database_rows_sql(), (name,))}
+        running = [r for r in db.query(q.running_runs_sql()) if r["task_collection"] == name]
+        batches = []
+        for b in db.query(q.collection_batch_runs_sql(), (name,)):
+            total, unknown = q.batch_rows(b["detail"])
+            if total or unknown:
+                batches.append({"run_id": b["run_id"], "rows": total, "rows_unknown": unknown,
+                                "databases": sorted(b["databases"] or [])})
+        databases = []
+        for d in db.query(q.collection_databases_sql(), (name, name)):
+            r = rows.get(d["src_database"], {})
+            d.update({k: r.get(k) for k in ("rows_first_loads", "first_loads", "first_loads_uncounted",
+                                             "rows_changes_24h", "in_flight", "failed_this_run")})
+            d["batches"] = [{"run_id": b["run_id"], "rows": b["rows"]} for b in batches
+                            if b["databases"] == [d["src_database"]]]
+            databases.append(d)
+        return {"collection": name, "databases": databases, "running": running[0] if running else None,
+                "batches": batches, "read_at": datetime.now(timezone.utc).isoformat(), "cache_s": MONITOR_CACHE_S}
+    return _shared(("collection", name), compute)
 
 
 @app.get("/api/errors")
@@ -114,8 +187,23 @@ def collections():
 
 @app.get("/api/runs")
 def runs(collection: Optional[str] = None, limit: int = 200):
+    """Recent runs, each with the rows it wrote: its table loads' counts plus its batched appends' total;
+    rows_partial when some loads recorded no count."""
     sql, params = q.runs_sql(collection or None, limit=limit)
-    return db.query(sql, params)
+    out = db.query(sql, params)
+    if out:
+        written = {r["run_id"]: r for r in db.query(q.run_rows_sql(), ([r["run_id"] for r in out],))}
+        for r in out:
+            w = written.get(r["run_id"], {})
+            batched, batched_unknown = q.batch_rows(w.get("detail"))
+            r["rows_written"] = int(w.get("rows_written") or 0) + batched
+            r["rows_partial"] = bool(batched_unknown) if batched else bool(w.get("uncounted"))
+    return out
+
+
+@app.get("/api/runs/{run_id}/databases")
+def run_databases(run_id: int):
+    return db.query(q.run_databases_sql(), (int(run_id),))
 
 
 @app.get("/api/runs/{run_id}/events")
@@ -712,6 +800,50 @@ def timeline(hours: int = 24):
             row["skipped"] += [jobs.ts(t) for t in (_skipped_starts(m["job_id"], start, end, client) or [])]
     return {"start": start.isoformat(), "end": end.isoformat(),
             "collections": [rows[k] for k in sorted(rows)]}
+
+
+# ---- UC connections (bulk import) ----------------------------------------------------------------
+
+DISCOVERABLE_CONNECTION_TYPES = {"SQLSERVER"}
+
+
+def _connections() -> List[dict]:
+    """The Unity Catalog connections this app's identity can see, with host and port from their options."""
+    out = []
+    for c in db.workspace().connections.list():
+        options = c.options or {}
+        kind = getattr(c.connection_type, "value", c.connection_type)
+        out.append({"name": c.name, "connection_type": kind, "host": options.get("host"), "port": options.get("port"),
+                    "owner": c.owner, "comment": c.comment, "discoverable": kind in DISCOVERABLE_CONNECTION_TYPES})
+    return sorted(out, key=lambda c: c["name"])
+
+
+@app.get("/api/connections")
+def connections():
+    """UC connections with what lakefed tracks on each (control rows naming the connection or its host).
+    A listing error (no rights on any connection, for example) is returned, not raised, so the page
+    still offers discovery by host and secret."""
+    def compute():
+        try:
+            found = _connections()
+        except Exception as e:                          # the app's identity may have no rights on connections
+            return {"connections": [], "error": str(e)[:500]}
+        for c in found:
+            dbs = db.query(q.connection_databases_sql(), (c["name"], c["host"] or ""))
+            collections = {x.strip() for d in dbs for x in (d["collections"] or "").split(",") if x.strip()}
+            c["tracked"] = {"databases": len(dbs), "tables": sum(int(d["tables"] or 0) for d in dbs),
+                            "collections": len(collections)}
+        return {"connections": found, "error": None}
+    return _shared("connections", compute)
+
+
+@app.get("/api/connections/{name}/databases")
+def connection_databases(name: str):
+    """The databases lakefed tracks on one connection (by its name or its host)."""
+    found = next((c for c in connections()["connections"] if c["name"] == name), None)
+    if not found:
+        raise HTTPException(404, f"connection '{name}' not found")
+    return db.query(q.connection_databases_sql(), (name, found["host"] or ""))
 
 
 # ---- single-page app ----------------------------------------------------------------------------

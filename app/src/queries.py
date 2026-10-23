@@ -22,10 +22,31 @@ SLA_BREACHED = ("(t.task_enabled and t.freshness_sla_minutes is not null "
                 "and coalesce(cp.last_success_at, t.created_at) < now() - make_interval(mins => t.freshness_sla_minutes))")
 
 
+# Where a table's source lives, for grouping by server: the instance group when set (for example the
+# SQL Server name), else the UC connection, else the host. Alias t = control.
+SERVER = "coalesce(t.source_instance_group, t.src_connection, t.src_host, '')"
+
+# Each enabled table in exactly one state, the first that applies: failing, waiting for a first load,
+# late (SLA breached), else current. Aliases: t = control, cp = checkpoint.
+_FAILING = "cp.status = 'failed'"
+_FIRST_LOAD = "(cp.control_id is null or cp.phase = 'seeding')"
+STATE_COUNTS = (
+    f"count(*) filter (where t.task_enabled and {_FAILING}) as state_failing, "
+    f"count(*) filter (where t.task_enabled and not coalesce({_FAILING}, false) "
+    f"and {_FIRST_LOAD}) as state_first_load, "
+    f"count(*) filter (where t.task_enabled and not coalesce({_FAILING}, false) and not {_FIRST_LOAD} "
+    f"and {SLA_BREACHED}) as state_late, "
+    f"count(*) filter (where t.task_enabled and not coalesce({_FAILING}, false) and not {_FIRST_LOAD} "
+    f"and not {SLA_BREACHED}) as state_current")
+
+
 # ---- overview -----------------------------------------------------------------------------------
 
 def collections_overview_sql() -> str:
-    """One row per task_collection: table counts, the latest run, and current health."""
+    """One row per task_collection: table counts, the latest run, and current health. The state_* counts
+    put each enabled table in exactly one state (STATE_COUNTS) for the state bar; rows_24h is the rows
+    its table loads wrote in the last 24 hours (batched appends record theirs on the run, so they are
+    added from run_batch_rows_sql)."""
     return f"""
 with tables as (
     select t.task_collection,
@@ -35,7 +56,11 @@ with tables as (
            count(*) filter (where t.task_enabled and (cp.control_id is null or cp.phase = 'seeding')) as seeding_tables,
            count(*) filter (where t.task_enabled and t.freshness_sla_minutes is null) as no_sla_tables,
            count(*) filter (where {SLA_BREACHED})                                   as sla_breached_tables,
-           max(cp.last_success_at)                                                  as last_success_at
+           max(cp.last_success_at)                                                  as last_success_at,
+           count(distinct t.src_database) filter (where t.task_enabled)            as databases,
+           count(distinct {SERVER}) filter (where t.task_enabled)                  as servers,
+           min({SERVER}) filter (where t.task_enabled)                             as server,
+           {STATE_COUNTS}
     from {SCHEMA}.control t
     left join {SCHEMA}.checkpoint cp on cp.control_id = t.id
     group by t.task_collection
@@ -49,16 +74,26 @@ last_run as (
 select tb.task_collection, tb.enabled_tables, tb.all_tables, tb.failing_tables, tb.seeding_tables,
        tb.sla_breached_tables, tb.no_sla_tables, tb.last_success_at,
        r.run_id as last_run_id, r.status as last_run_status, r.started_at as last_run_started,
-       r.finished_at as last_run_finished, r.ok as last_run_ok, r.failed as last_run_failed
+       r.finished_at as last_run_finished, r.ok as last_run_ok, r.failed as last_run_failed,
+       tb.databases, tb.servers, tb.server, tb.state_current, tb.state_late, tb.state_first_load, tb.state_failing,
+       w.rows_24h
 from tables tb
 left join last_run r on r.task_collection = tb.task_collection
+left join lateral (select sum(e.rows_merged) as rows_24h from {SCHEMA}.ingest_event e
+                   where e.task_collection = tb.task_collection
+                     and e.finished_at > now() - interval '24 hours') w on true
 order by tb.task_collection"""
 
 
 def running_runs_sql() -> str:
     """Runs still marked running (newest first), with progress: tables finished so far (unchanged tables
     are bulk-advanced without events, so these count tables that needed work) and elapsed time against
-    the collection's typical run (median of its last 20 finished runs)."""
+    the collection's typical run (median of its last 20 finished runs).
+
+    tables_checked out of enabled_tables is the run's progress over the whole collection: the engine
+    stamps checkpoint.last_success_at on every unchanged table once change detection ends, and on every
+    loaded table as it finishes, both on the database's clock like started_at. last_activity_at is when
+    a table of the run last started or finished, the sign that the run is alive."""
     return f"""
 select r.run_id, r.task_collection, r.job_run_id, r.started_at, r.parallelism,
        round(extract(epoch from (now() - r.started_at)))::int as elapsed_s,
@@ -68,7 +103,15 @@ select r.run_id, r.task_collection, r.job_run_id, r.started_at, r.parallelism,
        (select round(percentile_cont(0.5) within group (order by extract(epoch from (x.finished_at - x.started_at)))::numeric)
           from (select started_at, finished_at from {SCHEMA}.ingest_run x
                 where x.task_collection = r.task_collection and x.finished_at is not null and x.status <> 'skipped'
-                order by x.started_at desc limit 20) x)                                                as typical_s
+                order by x.started_at desc limit 20) x)                                                as typical_s,
+       (select count(*) from {SCHEMA}.control t
+         where t.task_collection = r.task_collection and t.task_enabled)                              as enabled_tables,
+       (select count(*) from {SCHEMA}.control t join {SCHEMA}.checkpoint cp on cp.control_id = t.id
+         where t.task_collection = r.task_collection and t.task_enabled
+           and cp.last_success_at >= r.started_at)                                           as tables_checked,
+       (select max(coalesce(e.finished_at, e.started_at)) from {SCHEMA}.ingest_event e
+         where e.run_id = r.run_id)                                                          as last_activity_at,
+       (select min({SERVER}) from {SCHEMA}.control t where t.task_collection = r.task_collection)      as server
 from {SCHEMA}.ingest_run r
 where r.status = 'running'
 order by r.started_at desc"""
@@ -103,6 +146,195 @@ def recent_errors_sql() -> str:
             f"from {SCHEMA}.ingest_event e "
             f"where e.status = 'failed' and e.started_at > now() - make_interval(hours => %s) "
             f"order by e.started_at desc limit %s")
+
+
+def servers_sql() -> str:
+    """One row per source server (SERVER) with its databases' enabled tables by state, how many
+    collections it spans and how many of them are running now."""
+    return f"""
+select {SERVER} as server,
+       count(distinct t.src_database) filter (where t.task_enabled) as databases,
+       count(*) filter (where t.task_enabled)                       as tables,
+       count(distinct t.task_collection)                            as collections,
+       {STATE_COUNTS},
+       max(cp.last_success_at) filter (where t.task_enabled)        as newest_success_at,
+       min(cp.last_success_at) filter (where t.task_enabled)        as oldest_success_at,
+       count(distinct t.task_collection) filter (where exists (
+           select 1 from {SCHEMA}.ingest_run r where r.task_collection = t.task_collection
+           and r.status = 'running'))                               as running_collections
+from {SCHEMA}.control t
+left join {SCHEMA}.checkpoint cp on cp.control_id = t.id
+group by 1
+order by 1"""
+
+
+def collection_databases_sql() -> str:
+    """One row per source database of a collection: its enabled tables by state, its oldest and newest
+    success, and, while a run of the collection is going, how many of its tables that run has checked
+    (stamped since it started). Bounded to one collection, so it needs no roll-up table.
+    Params: task_collection, task_collection."""
+    return f"""
+with run as (
+    select started_at from {SCHEMA}.ingest_run
+    where task_collection = %s and status = 'running' order by started_at desc limit 1
+)
+select coalesce(t.src_database, '') as src_database,
+       count(*) filter (where t.task_enabled) as tables,
+       {STATE_COUNTS},
+       count(*) filter (where t.task_enabled
+                        and cp.last_success_at >= (select started_at from run)) as checked_this_run,
+       min(cp.last_success_at) filter (where t.task_enabled) as oldest_success_at,
+       max(cp.last_success_at) filter (where t.task_enabled) as newest_success_at
+from {SCHEMA}.control t
+left join {SCHEMA}.checkpoint cp on cp.control_id = t.id
+where t.task_collection = %s
+group by 1
+order by 1"""
+
+
+def collection_database_rows_sql() -> str:
+    """Rows written per source database of a collection: by first loads (seed, reseed or full) over
+    every run, which is the source's row count at each first load, and by changes in the last 24 hours;
+    with the loads that recorded no count (batched appends record one total on the run), and the
+    running run's tables in flight and failures. Params: task_collection."""
+    return f"""
+select coalesce(e.src_database, '') as src_database,
+       sum(e.rows_merged) filter (where e.status = 'ok' and e.action in ('seed', 'reseed', 'full')) as rows_first_loads,
+       count(*) filter (where e.status = 'ok' and e.action in ('seed', 'reseed', 'full'))         as first_loads,
+       count(*) filter (where e.status = 'ok' and e.action in ('seed', 'reseed', 'full')
+                        and e.rows_merged is null)                                     as first_loads_uncounted,
+       sum(e.rows_merged) filter (where e.status = 'ok' and e.action = 'increment'
+                                  and e.finished_at > now() - interval '24 hours')                as rows_changes_24h,
+       count(*) filter (where e.status = 'running' and r.status = 'running')                     as in_flight,
+       count(*) filter (where e.status = 'failed' and r.status = 'running')                      as failed_this_run
+from {SCHEMA}.ingest_event e
+join {SCHEMA}.ingest_run r on r.run_id = e.run_id
+where e.task_collection = %s
+group by 1"""
+
+
+def run_databases_sql() -> str:
+    """One row per source database of a run: tables loaded, in flight and failed, and rows written
+    (uncounted: loads with no per-table count, such as members of a batched append). Param: run_id."""
+    return f"""
+select coalesce(src_database, '') as src_database,
+       count(*) filter (where status = 'ok')      as loaded,
+       count(*) filter (where status = 'running') as in_flight,
+       count(*) filter (where status = 'failed')  as failed,
+       sum(rows_merged)                           as rows_written,
+       count(*) filter (where status = 'ok' and rows_merged is null) as uncounted
+from {SCHEMA}.ingest_event
+where run_id = %s
+group by 1
+order by 1"""
+
+
+def run_rows_sql() -> str:
+    """Per run: rows its table loads wrote, how many loads recorded no count, and its detail (which
+    holds a batched append's total). Param: array of run ids."""
+    return (f"select r.run_id, r.detail, "
+            f"(select sum(e.rows_merged) from {SCHEMA}.ingest_event e where e.run_id = r.run_id) as rows_written, "
+            f"(select count(*) from {SCHEMA}.ingest_event e where e.run_id = r.run_id and e.status = 'ok' "
+            f"and e.rows_merged is null) as uncounted "
+            f"from {SCHEMA}.ingest_run r where r.run_id = any(%s)")
+
+
+def run_batch_rows_sql() -> str:
+    """Runs with a detail that started in the last N hours, for their batched appends' row totals.
+    Param: hours."""
+    return (f"select run_id, task_collection, detail from {SCHEMA}.ingest_run "
+            f"where detail is not null and started_at > now() - make_interval(hours => %s)")
+
+
+def collection_batch_runs_sql() -> str:
+    """A collection's runs with a detail, and the databases whose loads in that run recorded no count:
+    a batched append's total belongs to those databases. Param: task_collection."""
+    return (f"select r.run_id, r.detail, array_remove(array_agg(distinct e.src_database), null) as databases "
+            f"from {SCHEMA}.ingest_run r join {SCHEMA}.ingest_event e on e.run_id = r.run_id "
+            f"and e.status = 'ok' and e.rows_merged is null "
+            f"where r.task_collection = %s and r.detail is not null group by r.run_id, r.detail")
+
+
+def batch_rows(detail) -> tuple:
+    """(rows, rows of loads with no count) from a run's detail: batched appends record one total per
+    batch commit (batch_rows) and how many members had none (batch_rows_unknown). (0, 0) without."""
+    try:
+        d = json.loads(detail) if isinstance(detail, str) else (detail or {})
+    except ValueError:
+        return 0, 0
+    if not isinstance(d, dict):
+        return 0, 0
+    return int(d.get("batch_rows") or 0), int(d.get("batch_rows_unknown") or 0)
+
+
+# Failure causes, by the error text, most specific first. Connection and timeout failures usually clear
+# on the next run; the others need a change at the source or in config.
+ERROR_CLASSES = (
+    ("connection", "Could not connect to the source database",
+     ("failed_jdbc.connection", "connection reset", "connection refused", "could not connect", "network",
+      "login timeout", "socket")),
+    ("timeout", "Timed out", ("timeout", "timed out")),
+    ("permission", "Permission denied at the source or sink",
+     ("permission", "denied", "not authorized", "login failed")),
+    ("missing", "A table, column or object is missing", ("invalid object name", "does not exist", "not found",
+                                                          "invalid column")),
+    ("schema", "The schema does not match", ("schema", "mismatch", "cannot cast", "data type")),
+)
+
+
+def classify_error(error: Optional[str]) -> Tuple[str, str]:
+    """(class, label) of an error message; ('other', 'Other errors') when nothing matches."""
+    text = (error or "").lower()
+    for name, label, needles in ERROR_CLASSES:
+        if any(n in text for n in needles):
+            return name, label
+    return "other", "Other errors"
+
+
+def error_signature(error: Optional[str]) -> str:
+    """The error's first line with numbers, quoted names and hex ids blanked, so the same cause on
+    different tables groups together."""
+    first = (error or "").strip().splitlines()[0] if (error or "").strip() else ""
+    first = re.sub(r"'[^']*'|\"[^\"]*\"", "'…'", first)
+    first = re.sub(r"0x[0-9a-fA-F]+|\b\d+\b", "#", first)
+    return first[:240]
+
+
+def group_errors(rows: List[dict]) -> List[dict]:
+    """Failed table events grouped by cause (class and signature), most tables first: tables, databases
+    (with collection and server), first and last time, and one raw example message."""
+    groups: dict = {}
+    for r in rows:
+        name, label = classify_error(r.get("error"))
+        g = groups.setdefault((name, error_signature(r.get("error"))), {
+            "error_class": name, "label": label, "signature": error_signature(r.get("error")),
+            "example": (r.get("error") or "")[:2000], "tables": 0, "databases": {}, "first_at": None, "last_at": None})
+        g["tables"] += 1
+        db = g["databases"].setdefault((r.get("task_collection"), r.get("src_database")), {
+            "task_collection": r.get("task_collection"), "src_database": r.get("src_database"), "tables": []})
+        db["tables"].append(f"{r.get('src_schema')}.{r.get('src_table')}")
+        at = r.get("finished_at")
+        if at:
+            g["first_at"] = min(g["first_at"] or at, at)
+            g["last_at"] = max(g["last_at"] or at, at)
+    out = []
+    for g in sorted(groups.values(), key=lambda g: -g["tables"]):
+        g["databases"] = sorted(g["databases"].values(),
+                                key=lambda d: (str(d["task_collection"]), str(d["src_database"])))
+        out.append(g)
+    return out
+
+
+# ---- UC connections (bulk import) ---------------------------------------------------------------
+
+def connection_databases_sql() -> str:
+    """The databases lakefed tracks on one source: by UC connection name or host, each with its
+    collections, enabled tables and newest success. Params: connection name, host."""
+    return (f"select t.src_database, string_agg(distinct t.task_collection, ', ') as collections, "
+            f"count(*) filter (where t.task_enabled) as tables, max(cp.last_success_at) as newest_success_at "
+            f"from {SCHEMA}.control t left join {SCHEMA}.checkpoint cp on cp.control_id = t.id "
+            f"where t.src_connection = %s or lower(t.src_host) = lower(%s) "
+            f"group by 1 order by 1")
 
 
 # ---- tables (control + checkpoint) --------------------------------------------------------------
