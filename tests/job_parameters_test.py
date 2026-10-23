@@ -1,12 +1,12 @@
 """The ingestion job's parameters line up: every widget the notebook reads is passed by the job task
 and declared as a job parameter, and each tuning parameter defaults to the bundle variable of the same
-name (the collection and the Lakebase names have their own defaults)."""
+name (the collection, the work list and the Lakebase names have their own defaults)."""
 import json
 import re
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-OWN_DEFAULTS = {"task_collection", "db_instance", "db_name"}
+OWN_DEFAULTS = {"task_collection", "work_id", "db_instance", "db_name"}
 
 
 def _widgets():

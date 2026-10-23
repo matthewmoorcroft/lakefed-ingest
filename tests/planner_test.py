@@ -646,3 +646,10 @@ def test_bulk_rows_to_write_reads_a_vouching_database_stamp_as_the_last_success(
     rows = [(1, 100, None, 7), (2, 100, None, 7)]
     assert [r[0] for r in planner.bulk_rows_to_write(rows, cps, 3600, now=_NOW, stamp_of=lambda cid: stamp)] == [2]
     assert [r[0] for r in planner.bulk_rows_to_write(rows, cps, 3600, now=_NOW)] == [1, 2]
+
+
+def test_a_run_given_a_work_list_keeps_only_those_databases_of_its_collection():
+    cfgs = [_cfg(1, "d1", "a"), _cfg(2, "d2", "a"), _cfg(3, "d2", "b", host="h2")]
+    work = {planner.database_key(cfgs[1])}
+    assert [c["id"] for c in planner.select_work(cfgs, work)] == [2]   # same name on another server: not listed
+    assert planner.select_work(cfgs, None) == cfgs                      # no work list: the whole collection

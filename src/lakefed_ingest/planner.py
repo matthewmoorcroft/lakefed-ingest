@@ -447,6 +447,14 @@ def database_keys(cfgs) -> set:
     return {database_key(c) for c in cfgs}
 
 
+def select_work(configs: List[dict], work: Optional[set]) -> List[dict]:
+    """A collection's rows on the databases of a work list ({database_key}), as the check job wrote it
+    for this run (``StateStore.get_check_work``); no work list keeps them all."""
+    if work is None:
+        return list(configs)
+    return [c for c in configs if database_key(c) in work]
+
+
 def stamp_vouches(cp: Optional[dict], stamp: Optional[dict]) -> bool:
     """A database stamp speaks for a table when the table is a CT table in the incremental phase whose
     position is at or past the stamp's version: the database had nothing newer than that position when

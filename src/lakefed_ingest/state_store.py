@@ -36,6 +36,7 @@ RESEED_TABLE = f"{SCHEMA}.reseed_queue"
 RUN_TABLE = f"{SCHEMA}.ingest_run"        # observability: one row per ingestion run
 EVENT_TABLE = f"{SCHEMA}.ingest_event"    # observability: one row per (run, table)
 DATABASE_CHECK_TABLE = f"{SCHEMA}.database_check"   # one check stamp per unchanged source database
+CHECK_WORK_TABLE = f"{SCHEMA}.check_work"           # the check job's work list, per run it starts
 
 SEEDING = "seeding"
 INCREMENTAL = "incremental"  # ct / cursor: seeded, applying increments
@@ -505,6 +506,23 @@ def stamp_database_sql() -> str:
     )
 
 
+def record_check_work_sql() -> str:
+    """One database with work for a run the check job starts. Params: work_id, task_collection, source,
+    src_database."""
+    return (f"insert into {CHECK_WORK_TABLE} (work_id, task_collection, source, src_database) "
+            "values (%s, %s, %s, %s) on conflict do nothing")
+
+
+def get_check_work_sql() -> str:
+    """The databases with work of one collection's run. Params: work_id, task_collection."""
+    return f"select source, src_database from {CHECK_WORK_TABLE} where work_id = %s and task_collection = %s"
+
+
+def prune_check_work_sql() -> str:
+    """Work lists older than a number of days, deleted. Param: days."""
+    return f"delete from {CHECK_WORK_TABLE} where created_at < now() - make_interval(days => %s)"
+
+
 def finish_run_sql() -> str:
     """Finalize an ingest_run row with roll-up counts."""
     return (
@@ -870,6 +888,26 @@ class StateStore:
             cur.execute(get_database_checks_sql(), (task_collection,))
             rows = cur.fetchall()
         return {(r[0], r[1]): {"version": int(r[2]), "checked_at": r[3]} for r in rows}
+
+    def record_check_work(self, work_id: str, task_collection: str, databases) -> None:
+        """Record the databases with work, [(source, src_database)], of the run the check job is about
+        to start for this collection under ``work_id``."""
+        params = [(work_id, task_collection, source, database) for source, database in databases]
+        if params:
+            with self._cursor() as cur:
+                cur.executemany(record_check_work_sql(), params)
+
+    def get_check_work(self, work_id: str, task_collection: str) -> set:
+        """{(source, src_database)}: the databases the check job found work in for this run."""
+        with self._cursor() as cur:
+            cur.execute(get_check_work_sql(), (work_id, task_collection))
+            return {(source, database) for source, database in cur.fetchall()}
+
+    def prune_check_work(self, days: int = 7) -> int:
+        """Delete work lists older than ``days``; returns how many rows went."""
+        with self._cursor() as cur:
+            cur.execute(prune_check_work_sql(), (int(days),))
+            return cur.rowcount or 0
 
     def stamp_databases(self, task_collection: str, stamps, run_id) -> None:
         """Write one check stamp per unchanged database: stamps = [(source, src_database, version,

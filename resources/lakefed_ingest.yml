@@ -56,6 +56,7 @@ resources:
             notebook_path: ../src/lakefed_ingest/ingest.ipynb
             base_parameters:
               task_collection: "{{job.parameters.task_collection}}"
+              work_id: "{{job.parameters.work_id}}"
               db_instance: "{{job.parameters.db_instance}}"
               db_name: "{{job.parameters.db_name}}"
               parallelism: "{{job.parameters.parallelism}}"
@@ -92,6 +93,10 @@ resources:
       parameters:
         - name: task_collection
           default: example_cohort
+        # Set by the check job (check_launch.ipynb): this run ingests only the databases it listed in
+        # check_work under this id. Blank = the whole collection.
+        - name: work_id
+          default: ""
         - name: db_instance
           default: ${var.lakebase_instance}
         - name: db_name

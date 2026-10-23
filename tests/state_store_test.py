@@ -1071,3 +1071,25 @@ def test_stamp_databases_upserts_one_row_per_database_and_reads_them_back():
     conn.calls, conn.fetch = [], [("s1", "db1", 41, "t1")]
     assert store.get_database_checks("coll") == {("s1", "db1"): {"version": 41, "checked_at": "t1"}}
     assert conn.calls == [(ss.get_database_checks_sql(), ("coll",))]
+
+
+# ---- the check job's work list ------------------------------------------------------------------
+
+def test_the_work_list_is_written_once_per_database_and_read_back_for_one_run():
+    conn = FakeConn()
+    store = ss.StateStore(conn)
+    store.record_check_work("w1", "coll", [("s1", "db1"), ("s1", "db2")])
+    (sql, params), = conn.calls
+    assert sql == ss.record_check_work_sql() and "on conflict do nothing" in sql
+    assert params == [("w1", "coll", "s1", "db1"), ("w1", "coll", "s1", "db2")]
+    store.record_check_work("w1", "coll", [])
+    assert len(conn.calls) == 1   # nothing to write: no statement
+
+    conn.calls, conn.fetch = [], [("s1", "db1"), ("s1", "db2")]
+    assert store.get_check_work("w1", "coll") == {("s1", "db1"), ("s1", "db2")}
+    assert conn.calls == [(ss.get_check_work_sql(), ("w1", "coll"))]
+
+
+def test_old_work_lists_are_pruned():
+    sql = ss.prune_check_work_sql()
+    assert sql.startswith("delete from lakefed_ingest.check_work where created_at <") and "%s" in sql
