@@ -12,6 +12,8 @@ from lakebase import workspace
 INGEST_JOB_ID = os.environ.get("INGEST_JOB_ID")
 SETUP_JOB_ID = os.environ.get("SETUP_JOB_ID")
 DISCOVER_JOB_ID = os.environ.get("DISCOVER_JOB_ID")
+# The check job (lakefed_ingest_check): a schedule of the check variant starts it with all its members.
+CHECK_JOB_ID = os.environ.get("CHECK_JOB_ID")
 # Group given CAN_VIEW on the wrapper jobs the app creates for schedules (blank = owner and admins only).
 SCHEDULE_JOB_VIEW_GROUP = os.environ.get("SCHEDULE_JOB_VIEW_GROUP", "users") or None
 
@@ -23,6 +25,16 @@ def ingest_variants() -> dict:
     for k, v in os.environ.items():
         if k.startswith("INGEST_JOB_ID_") and v:
             out[k[len("INGEST_JOB_ID_"):].lower()] = v
+    return out
+
+
+def schedule_variants() -> dict:
+    """What a schedule's wrappers can start: the ingestion job variants, plus ``check`` (one wrapper for the
+    whole schedule, starting the check job with every member) when CHECK_JOB_ID is set."""
+    import schedules
+    out = ingest_variants()
+    if CHECK_JOB_ID:
+        out[schedules.CHECK_VARIANT] = CHECK_JOB_ID
     return out
 
 

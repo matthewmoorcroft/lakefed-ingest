@@ -911,7 +911,8 @@ class ScheduleBody(BaseModel):
 
 
 def _ingest_job_id(variant: str) -> Optional[int]:
-    jid = jobs.ingest_variants().get(variant or "default")
+    """The job a schedule's wrappers start: the ingestion job of its variant, or the check job."""
+    jid = jobs.schedule_variants().get(variant or "default")
     return int(jid) if jid else None
 
 
@@ -938,7 +939,7 @@ def _load_schedule(sid: int, cur=None):
 
 def _validate_schedule(body: ScheduleBody):
     known = [r["task_collection"] for r in db.query(q.collections_sql())]
-    errs = sch.validate(body.model_dump(), known, jobs.ingest_variants())
+    errs = sch.validate(body.model_dump(), known, jobs.schedule_variants())
     if errs:
         raise HTTPException(422, {"errors": errs})
 
@@ -1049,7 +1050,7 @@ def schedule_options():
     except Exception:
         defaults = {}
     return {"cadences": sch.CADENCES, "parameters": list(sch.PARAMETERS), "flags": sch.FLAGS, "defaults": defaults,
-            "variants": sorted(jobs.ingest_variants()),
+            "variants": sorted(jobs.schedule_variants()),
             "collections": [r["task_collection"] for r in db.query(q.collections_sql())], "scheduled": scheduled,
             "view_group": jobs.SCHEDULE_JOB_VIEW_GROUP}
 

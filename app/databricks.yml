@@ -31,6 +31,10 @@ variables:
     description: Id of the table discovery job (bulk import; looked up by name, like ingest_job_id).
     lookup:
       job: lakefed_ingest_discover
+  check_job_id:
+    description: Id of the check job (schedules of the check variant; looked up by name, like ingest_job_id).
+    lookup:
+      job: lakefed_ingest_check
 
 targets:
   dev:

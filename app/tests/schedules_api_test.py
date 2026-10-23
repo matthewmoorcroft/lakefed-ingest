@@ -225,3 +225,15 @@ def test_ingest_runs_started_by_a_wrapper_show_their_schedule(api, monkeypatch):
     opts = api.get("/api/schedules/options").json()
     assert opts["defaults"] == {"parallelism": "32"} and "table_retries" in opts["parameters"]
     assert opts["scheduled"] == {"c1": ["Prod 15"], "c2": ["Prod 15"]}
+
+
+def test_a_check_schedule_is_offered_only_with_the_check_job_and_syncs_one_job(api, monkeypatch):
+    assert "check" not in api.get("/api/schedules/options").json()["variants"]
+    monkeypatch.setattr(main.jobs, "CHECK_JOB_ID", "777")
+    assert api.get("/api/schedules/options").json()["variants"] == ["check", "default"]
+    r = api.post("/api/schedules", json=dict(BODY, job_variant="check"))
+    assert r.status_code == 200, r.text
+    created = [s for s in api.jobs.jobs.values() if s["tags"].get(main.sch.TAG_COLLECTION) == main.sch.GROUP_TAG]
+    assert len(created) == 1 and len(api.jobs.jobs) == 1
+    assert created[0]["tasks"][0]["run_job_task"] == {"job_id": 777, "job_parameters": {
+        "task_collections": "c1,c2", "parallelism": "16"}}

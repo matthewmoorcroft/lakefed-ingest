@@ -7,6 +7,10 @@ starts the ingestion job with ``task_collection`` set. Wrapper jobs allow one ru
 queue, so a run that is still going when the next trigger fires makes Databricks skip that trigger;
 the collection's run lock stays the backstop for manual runs.
 
+A schedule of the ``check`` variant has one wrapper job for all its members instead: it starts the
+check job (``lakefed_ingest_check``) with the members as ``task_collections``, and the check starts the
+ingestion job only for the members with work. Every member records that one job.
+
 Wrapper jobs carry tags naming their schedule, collection and app (the Lakebase database whose
 schedules they implement), so ``sync`` reconciles by tag: it adopts a job whose id was never recorded
 and deletes jobs no active member owns, whatever left them behind.
@@ -48,6 +52,8 @@ TAG_SCHEDULE = "lakefed_ingest_schedule"
 TAG_COLLECTION = "lakefed_ingest_collection"
 TAG_OWNER = "lakefed_ingest_app"     # instance/database: apps of other deployments in the workspace keep out
 JOB_NAME_PREFIX = "lakefed_ingest schedule"
+CHECK_VARIANT = "check"        # one wrapper per schedule, starting the check job (jobs.CHECK_JOB_ID)
+GROUP_TAG = "*"                # TAG_COLLECTION of that wrapper: it starts every member
 _EMAIL = re.compile(r"[^@\s,]+@[^@\s,]+\.[^@\s,]+")
 _NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9 _.,:()-]{0,79}")
 
@@ -250,6 +256,23 @@ def job_settings(schedule: dict, collection: str, offset: int, ingest_job_id: in
     return s
 
 
+def group_job_name(schedule_name: str) -> str:
+    return f"{JOB_NAME_PREFIX}: {schedule_name} / check"
+
+
+def group_job_settings(schedule: dict, collections: Iterable[str], check_job_id: int,
+                       view_group: Optional[str] = None, owner: Optional[str] = None) -> dict:
+    """Jobs API 2.2 settings of a ``check`` schedule's one wrapper job: at the cadence, it starts the check
+    job over every member. Members are not staggered: the check takes them in one go."""
+    s = job_settings(schedule, "", 0, check_job_id, view_group, owner)
+    params = {"task_collections": ",".join(sorted(collections)),
+              **{k: str(v) for k, v in sorted((schedule.get("parameters") or {}).items())}}
+    s["name"] = group_job_name(schedule["name"])
+    s["tasks"] = [{"task_key": "check", "run_job_task": {"job_id": int(check_job_id), "job_parameters": params}}]
+    s["tags"][TAG_COLLECTION] = GROUP_TAG
+    return s
+
+
 def _comparable(s: dict) -> dict:
     """The parts of job settings the app owns, normalized for comparison."""
     task = ((s.get("tasks") or [{}])[0]) or {}
@@ -370,8 +393,14 @@ def sync(schedule: dict, members: List[dict], removed: List[dict], client: JobsC
         tagged = None
         out.append(MemberResult("", None, "error", f"listing the schedule's jobs: {e}"[:500]))
     claimed = set()             # job ids an active member keeps
-    for m in (members if not deleting else []):
+    if schedule.get("job_variant") == CHECK_VARIANT and not deleting:
+        out += _sync_group(schedule, members, client, ingest_job_id, tagged, claimed, view_group, owner)
+        members = []            # the per-member loop below has nothing left to do; deletes go on as usual
+    taken = set()               # job ids given to a member in this sync: a job left by a check schedule
+    for m in (members if not deleting else []):     # is recorded on every member, and only one may keep it
         c = m["task_collection"]
+        if m.get("job_id") and int(m["job_id"]) in taken:
+            m = dict(m, job_id=None)
         if m.get("job_id"):
             claimed.add(int(m["job_id"]))
         if ingest_job_id is None:       # keep its jobs: only the target is unknown
@@ -395,9 +424,11 @@ def sync(schedule: dict, members: List[dict], removed: List[dict], client: JobsC
             if job is None:
                 jid = client.create(desired)
                 claimed.add(jid)
+                taken.add(jid)
                 out.append(MemberResult(c, jid, "created", member_id=m.get("id")))
                 continue
             claimed.add(int(jid))
+            taken.add(int(jid))
             diff = drift(job.get("settings") or {}, desired)
             if diff:
                 client.reset(jid, desired)
@@ -432,10 +463,48 @@ def sync(schedule: dict, members: List[dict], removed: List[dict], client: JobsC
     return out
 
 
+def _sync_group(schedule: dict, members: List[dict], client: JobsClient, check_job_id: Optional[int],
+                tagged: Optional[Dict[int, str]], claimed: set, view_group: Optional[str],
+                owner: Optional[str]) -> List[MemberResult]:
+    """A ``check`` schedule's one wrapper job: find it (a member's recorded job, or a tagged one), create
+    it, or reset it when it drifted; every member records it. The members' own wrapper jobs from another
+    variant are left unclaimed, so the caller deletes them as untracked."""
+    if check_job_id is None:
+        claimed.update(t for t, tc in (tagged or {}).items() if tc == GROUP_TAG)
+        return [MemberResult(m["task_collection"], m.get("job_id"), "error",
+                             "no check job configured for the check variant", m.get("id")) for m in members]
+    desired = group_job_settings(schedule, [m["task_collection"] for m in members], check_job_id, view_group, owner)
+    try:
+        jid, job, action = None, None, "updated"
+        candidates = [int(m["job_id"]) for m in members if m.get("job_id")]
+        candidates += sorted(t for t, tc in (tagged or {}).items() if tc == GROUP_TAG)
+        for candidate in candidates:
+            found = client.get(candidate)
+            if found is not None and ((found.get("settings") or {}).get("tags") or {}).get(TAG_COLLECTION) == GROUP_TAG:
+                jid, job = candidate, found
+                action = "updated" if candidate in [int(m["job_id"]) for m in members if m.get("job_id")] else "adopted"
+                break
+        if job is None:
+            jid, action, diff = client.create(desired), "created", []
+        else:
+            diff = drift(job.get("settings") or {}, desired)
+            if diff:
+                client.reset(jid, desired)
+            elif action == "updated":
+                action = "unchanged"
+        claimed.add(int(jid))
+    except Exception as e:
+        return [MemberResult(m["task_collection"], m.get("job_id"), "error", str(e)[:500], m.get("id")) for m in members]
+    detail = ", ".join(diff)
+    return [MemberResult(m["task_collection"], jid, action if i == 0 else "unchanged", detail if i == 0 else "",
+                         m.get("id")) for i, m in enumerate(sorted(members, key=lambda m: m["task_collection"]))]
+
+
 def check(schedule: dict, members: List[dict], client: JobsClient, ingest_job_id: int,
           owner: Optional[str] = None) -> Dict[str, dict]:
     """Per member: in_sync | drifted (with the fields) | missing | not_synced. Changes nothing."""
     out = {}
+    group = schedule.get("job_variant") == CHECK_VARIANT
     for m in members:
         if not m.get("job_id"):
             out[m["task_collection"]] = {"status": "not_synced"}
@@ -444,7 +513,9 @@ def check(schedule: dict, members: List[dict], client: JobsClient, ingest_job_id
         if job is None:
             out[m["task_collection"]] = {"status": "missing"}
             continue
-        desired = job_settings(schedule, m["task_collection"], int(m["offset_minutes"]), ingest_job_id, owner=owner)
+        desired = (group_job_settings(schedule, [x["task_collection"] for x in members], ingest_job_id, owner=owner)
+                   if group else
+                   job_settings(schedule, m["task_collection"], int(m["offset_minutes"]), ingest_job_id, owner=owner))
         diff = drift(job.get("settings") or {}, desired)
         out[m["task_collection"]] = {"status": "drifted", "fields": diff} if diff else {"status": "in_sync"}
     return out

@@ -65,14 +65,17 @@ function Editor({ initial, options, onDone }: { initial?: Row; options: Options;
         {options.variants.length > 1 && (
           <label>Databricks job
             <select value={f.job_variant} onChange={(e) => setF({ ...f, job_variant: e.target.value })}>
-              {options.variants.map((v) => <option key={v}>{v}</option>)}
+              {options.variants.map((v) => (
+                <option key={v} value={v}>{v === "check" ? "check first: one job for the whole schedule" : v}</option>
+              ))}
             </select>
           </label>
         )}
         <label>Failure emails<input value={f.notify_emails} placeholder="a@example.com, b@example.com"
           onChange={(e) => setF({ ...f, notify_emails: e.target.value })} /></label>
-        <label className="checkbox"><input type="checkbox" checked={f.stagger} onChange={(e) => setF({ ...f, stagger: e.target.checked })} />
-          Stagger start times across the cadence</label>
+        <label className="checkbox"><input type="checkbox" checked={f.stagger && f.job_variant !== "check"}
+          disabled={f.job_variant === "check"} onChange={(e) => setF({ ...f, stagger: e.target.checked })} />
+          Stagger start times across the cadence{f.job_variant === "check" ? " (not with check first: the check takes every member at once)" : ""}</label>
         <label className="checkbox"><input type="checkbox" checked={f.paused} onChange={(e) => setF({ ...f, paused: e.target.checked })} />
           Paused</label>
         <div className="wide">

@@ -306,3 +306,60 @@ def test_a_member_triggered_in_the_current_slot_with_no_group_run_yet_is_startin
     current, past = found[0]["members"], found[1]["members"]
     assert [(m["task_collection"], m["state"]) for m in current] == [("a", "starting"), ("b", "waiting")]
     assert [m["state"] for m in past] == ["no run", "no run"]
+
+
+# ---- the check variant: one wrapper per schedule, starting the check job with every member ---------------
+
+GROUP = dict(SCHED, job_variant=sch.CHECK_VARIANT)
+
+
+def test_a_check_schedule_has_one_wrapper_that_starts_the_check_job_with_every_member():
+    s = sch.group_job_settings(GROUP, ["c2", "c1"], 777, owner=OWNER)
+    task = s["tasks"][0]
+    assert task["run_job_task"] == {"job_id": 777, "job_parameters": {"task_collections": "c1,c2", "parallelism": "32"}}
+    assert s["schedule"]["quartz_cron_expression"] == "0 0/15 * * * ?"     # no stagger: one start per cycle
+    assert s["tags"][sch.TAG_COLLECTION] == sch.GROUP_TAG and s["name"] == sch.group_job_name(GROUP["name"])
+    assert s["max_concurrent_runs"] == 1 and s["queue"] == {"enabled": False}
+
+
+def test_syncing_a_check_schedule_creates_one_job_for_all_members_and_deletes_their_own():
+    per_member = lambda c: sch.job_settings(SCHED, c, 0, 555, owner=OWNER)
+    fake = FakeJobs({10: per_member("c1"), 11: per_member("c2")})           # before: the default variant
+    members = [dict(id=1, task_collection="c1", offset_minutes=0, job_id=10),
+               dict(id=2, task_collection="c2", offset_minutes=7, job_id=11)]
+    out = sch.sync(GROUP, members, [], fake, 777, owner=OWNER)
+    group = [j for j, s in fake.jobs.items() if s["tags"][sch.TAG_COLLECTION] == sch.GROUP_TAG]
+    assert len(group) == 1 and set(fake.jobs) == set(group)                 # 10 and 11 are deleted
+    by_member = {r.member_id: (r.action, r.job_id) for r in out if r.member_id}
+    assert by_member == {1: ("created", group[0]), 2: ("unchanged", group[0])}
+    assert sch.check(GROUP, [dict(m, job_id=group[0]) for m in members], fake, 777, owner=OWNER) == {
+        "c1": {"status": "in_sync"}, "c2": {"status": "in_sync"}}
+    again = sch.sync(GROUP, [dict(m, job_id=group[0]) for m in members], [], fake, 777, owner=OWNER)
+    assert {r.action for r in again} == {"unchanged"} and len(fake.jobs) == 1
+
+
+def test_a_member_added_to_a_check_schedule_updates_the_one_job():
+    fake = FakeJobs({50: sch.group_job_settings(GROUP, ["c1"], 777, owner=OWNER)})
+    members = [dict(id=1, task_collection="c1", offset_minutes=0, job_id=50),
+               dict(id=2, task_collection="c2", offset_minutes=0, job_id=None)]
+    out = sch.sync(GROUP, members, [dict(id=3, task_collection="c3", offset_minutes=0, job_id=50)], fake, 777,
+                   owner=OWNER)
+    assert fake.jobs[50]["tasks"][0]["run_job_task"]["job_parameters"]["task_collections"] == "c1,c2"
+    assert {(r.member_id, r.action) for r in out} == {(1, "updated"), (2, "unchanged"), (3, "kept")}
+    assert set(fake.jobs) == {50}
+
+
+def test_switching_back_from_check_gives_each_member_its_own_job_again():
+    fake = FakeJobs({50: sch.group_job_settings(GROUP, ["c1", "c2"], 777, owner=OWNER)})
+    members = [dict(id=1, task_collection="c1", offset_minutes=0, job_id=50),
+               dict(id=2, task_collection="c2", offset_minutes=7, job_id=50)]
+    out = sch.sync(SCHED, members, [], fake, 555, owner=OWNER)
+    jobs = {r.member_id: r.job_id for r in out if r.member_id}
+    assert jobs[1] != jobs[2] and {fake.jobs[j]["tags"][sch.TAG_COLLECTION] for j in jobs.values()} == {"c1", "c2"}
+    assert set(fake.jobs) == set(jobs.values())
+
+
+def test_the_check_variant_is_valid_only_when_the_check_job_is_configured():
+    body = dict(name="Group", cadence_minutes=15, timezone="UTC", parameters={}, members=["c1"], job_variant="check")
+    assert sch.validate(body, ["c1"], {"default": "1", "check": "2"}) == []
+    assert sch.validate(body, ["c1"], {"default": "1"}) == ["job_variant must be one of default"]
