@@ -184,6 +184,10 @@ create unique index if not exists control_sink_client_uq
 create index if not exists control_collection_idx
     on lakefed_ingest.control (task_collection)
     where task_enabled = true;
+-- A source database's rows: the one-collection check (the app's queries.split_databases_sql, and imports) looks
+-- up the databases it writes here instead of reading the whole table.
+create index if not exists control_database_idx
+    on lakefed_ingest.control (src_database);
 -- The dedicated rows, by sink: each sweep's mixed-sink check starts here (state_store.mixed_sinks_sql).
 create index if not exists control_dedicated_sink_idx
     on lakefed_ingest.control (lower(sink_catalog), lower(sink_schema), lower(sink_table))
