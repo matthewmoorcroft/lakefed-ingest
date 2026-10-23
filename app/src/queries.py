@@ -1419,11 +1419,13 @@ def split_databases_sql() -> str:
     """Databases among the given keys (``database_key``) whose control rows are in more than one
     collection. A database's tables share one collection: its run takes the collection's lock and the
     check job reads the database once for the collection. Param: list of keys. Returns key, database,
-    collections."""
+    collections. The database names (each key's last part) narrow the rows through control_database_idx."""
     key = f"{database_source_sql('t')} || chr(31) || coalesce(t.src_database, '')"
-    return (f"select {key} as key, min(t.src_database) as src_database, "
+    return (f"with k as (select unnest(%s::text[]) as key) "
+            f"select {key} as key, min(t.src_database) as src_database, "
             f"array_agg(distinct t.task_collection order by t.task_collection) as collections "
-            f"from {SCHEMA}.control t where {key} = any(%s) group by 1 having count(distinct t.task_collection) > 1")
+            f"from {SCHEMA}.control t where t.src_database in (select split_part(key, chr(31), -1) from k) "
+            f"and {key} in (select key from k) group by 1 having count(distinct t.task_collection) > 1")
 
 
 def log_change_sql() -> str:

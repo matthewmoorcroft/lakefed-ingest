@@ -583,7 +583,7 @@ def test_split_sql_statements_on_the_real_schema_file():
 SCHEMA_FINGERPRINTS = {
     1: "c035b85032e0df245775f4858dcc2e450ae737e885f326071c7b8546527a96e1",
     2: "8e514a425a7684f353c288677bff216cfe32421980263c197ba453bc10ac989f",
-    3: "bcf0a381ac7e6e539c7b318ecafea7a1910246d64a56d063575777f2de2758b6",
+    3: "b748cce2a28ea27b16807b344ebc891908bfed92658f67b6cf4ed360af3d1551",
 }
 
 
