@@ -91,7 +91,8 @@ secret). See `README.md`, `docs/deploy.md`, `docs/monitoring.md`, `docs/lakebase
 
 ### Jobs (`resources/`)
 - `lakefed_ingest` → task `ingest` → `ingest.ipynb`: one run ingests a `task_collection`. Parameters:
-  `task_collection`, `parallelism` (single budget of concurrent query units), `secret_scope`,
+  `task_collection`, `work_id` (set by the check job: only the databases it listed in `check_work`),
+  `parallelism` (single budget of concurrent query units), `secret_scope`,
   `detection_chunk`, `trust_server_certificate`, `snapshot_isolation` (change reads under SNAPSHOT),
   `reseed_on_new_columns` (false: added select_list columns don't reseed), `append_batch_size` (>1:
   batched appends, see `batch_append.py`), `max_seeds_per_run` (seed budget, 0 = none),
