@@ -1186,6 +1186,15 @@ def test_database_ct_state_reads_the_version_and_every_tables_state_in_one_query
     assert ce.database_ct_state({"src_database": "d"}) == (None, {})
 
 
+def test_database_ct_state_reads_through_a_given_session(monkeypatch):
+    # The initial check calls it from its own threads, with the notebook's session.
+    sessions = []
+    monkeypatch.setattr(ce, "_spark", lambda: pytest.fail("looked up the active session"))
+    monkeypatch.setattr(ce, "_read", lambda spark, cfg, q, **kw: (sessions.append(spark), _Rows([]))[1])
+    assert ce.database_ct_state({"src_database": "d"}, spark="the session") == (None, {})
+    assert sessions == ["the session"]
+
+
 # ---- reads through a Unity Catalog connection (use_remote_query) ---------------------------------------
 
 _REMOTE = dict(_MERGE_CFG, id=7, src_type="sqlserver", src_connection="sales_conn", use_remote_query=True,

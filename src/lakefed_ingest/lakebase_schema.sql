@@ -262,6 +262,36 @@ alter table lakefed_ingest.checkpoint add column if not exists select_list text;
 alter table lakefed_ingest.checkpoint add column if not exists pending_position text;
 alter table lakefed_ingest.checkpoint add column if not exists pending_run_id bigint;
 
+-- Per-database check stamps. When every table of a source database is unchanged, a run (or the
+-- initial check, initial_check.py) writes one row here instead of stamping last_success_at on each
+-- of its tables. The row says: at checked_at the database's CT version was checked_version and the
+-- collection's tables of this database were checked. A table's last success is then the later of its
+-- own last_success_at and checked_at, when it is a CT table in the incremental phase whose position
+-- is at or past checked_version (planner.stamp_vouches). `source` is state_store.database_source.
+create table if not exists lakefed_ingest.database_check (
+    task_collection text        not null,
+    source          text        not null,
+    src_database    text        not null,
+    checked_version bigint      not null,
+    tables          int         not null,
+    run_id          bigint,                                   -- -> ingest_run.run_id that checked it
+    checked_at      timestamptz not null default now(),
+    constraint database_check_pk primary key (task_collection, source, src_database)
+);
+
+-- The initial check's work list. Before it starts a collection's run, the check job (check_launch.ipynb)
+-- writes here the databases of that collection that have work, under one work_id, and starts the run with
+-- that work_id; the run then ingests only those databases. A job parameter would not hold them (job
+-- parameter values are at most 10,000 characters). The check deletes rows older than a week.
+create table if not exists lakefed_ingest.check_work (
+    work_id         text        not null,
+    task_collection text        not null,
+    source          text        not null,
+    src_database    text        not null,
+    created_at      timestamptz not null default now(),
+    constraint check_work_pk primary key (work_id, task_collection, source, src_database)
+);
+
 -- Tables awaiting a full reseed (CT retention lapsed, schema change, or CT versions reset).
 -- Processed by the sweep's reseed handling (phase flips back to seeding).
 create table if not exists lakefed_ingest.reseed_queue (

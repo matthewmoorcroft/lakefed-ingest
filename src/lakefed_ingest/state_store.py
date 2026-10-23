@@ -35,6 +35,7 @@ CHECKPOINT_TABLE = f"{SCHEMA}.checkpoint"
 RESEED_TABLE = f"{SCHEMA}.reseed_queue"
 RUN_TABLE = f"{SCHEMA}.ingest_run"        # observability: one row per ingestion run
 EVENT_TABLE = f"{SCHEMA}.ingest_event"    # observability: one row per (run, table)
+DATABASE_CHECK_TABLE = f"{SCHEMA}.database_check"   # one check stamp per unchanged source database
 
 SEEDING = "seeding"
 INCREMENTAL = "incremental"  # ct / cursor: seeded, applying increments
@@ -125,7 +126,7 @@ def split_sql_statements(ddl: str) -> List[str]:
 # DDL's fingerprint to it, so a schema change can't ship without a bump.
 #   0 = no version recorded (deployed before versions existed)   1 = first recorded version
 #   2 = discovery, control_change, checkpoint identities, freshness SLA, schedules (operations app)
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 # Advisory lock that serializes migrations (the setup job and ingestion runs of any collection): two
 # int keys, so it can't collide with a collection's one-key lock whatever the collection is named,
 # and a class of its own (not SOURCE_LOCK_CLASS).
@@ -230,6 +231,23 @@ def merge_key(cfg: dict) -> Optional[str]:
 def identity_values(cfg: dict) -> tuple:
     """(source_identity, sink_identity, merge_key) recorded on every checkpoint write."""
     return (source_identity(cfg), sink_identity(cfg), merge_key(cfg))
+
+
+def database_source(cfg: dict) -> str:
+    """The server, port and credential a control row reads its database through, as one string: the
+    key a per-database check stamp is kept under, with ``src_database`` and the collection. A blank
+    port reads 0 and a blank host or credential falls back to the connection, exactly as
+    ``database_source_sql`` spells it in SQL, so readers can join a table to its database's stamp."""
+    host = str(cfg.get("src_host") or cfg.get("src_connection") or "").lower()
+    credential = cfg.get("secret_key") or cfg.get("src_connection") or ""
+    return f"{host}|{int(cfg.get('src_port') or 0)}|{credential}"
+
+
+def database_source_sql(alias: str) -> str:
+    """``database_source`` of the control row ``alias`` in SQL."""
+    return (f"lower(coalesce(nullif({alias}.src_host, ''), nullif({alias}.src_connection, ''), '')) || '|' || "
+            f"coalesce({alias}.src_port, 0) || '|' || "
+            f"coalesce(nullif({alias}.secret_key, ''), nullif({alias}.src_connection, ''), '')")
 
 
 def task_identity(cfg: dict) -> tuple:
@@ -462,6 +480,28 @@ def touch_last_success_sql() -> str:
         f"update {CHECKPOINT_TABLE} cc set last_success_at = now() "
         f"from {EVENT_TABLE} e "
         "where e.id = %s and cc.control_id = e.control_id"
+    )
+
+
+def get_database_checks_sql() -> str:
+    """A collection's per-database check stamps. Param: task_collection."""
+    return (f"select source, src_database, checked_version, checked_at from {DATABASE_CHECK_TABLE} "
+            "where task_collection = %s")
+
+
+def stamp_database_sql() -> str:
+    """One database checked and found unchanged: its CT version and the time, in place of a
+    last_success_at on each of its tables (see planner.unchanged_writes). The latest check wins.
+
+    Params: task_collection, source, src_database, checked_version, tables, run_id.
+    """
+    return (
+        f"insert into {DATABASE_CHECK_TABLE} "
+        "(task_collection, source, src_database, checked_version, tables, run_id, checked_at) "
+        "values (%s, %s, %s, %s, %s, %s, now()) "
+        "on conflict (task_collection, source, src_database) do update set "
+        "checked_version = excluded.checked_version, tables = excluded.tables, run_id = excluded.run_id, "
+        "checked_at = now()"
     )
 
 
@@ -823,6 +863,24 @@ class StateStore:
         with self._cursor() as cur:
             cur.executemany(bulk_advance_unchanged_sql(), params)
         return len(params)
+
+    def get_database_checks(self, task_collection: str) -> dict:
+        """{(source, src_database): {'version', 'checked_at'}}: the collection's database stamps."""
+        with self._cursor() as cur:
+            cur.execute(get_database_checks_sql(), (task_collection,))
+            rows = cur.fetchall()
+        return {(r[0], r[1]): {"version": int(r[2]), "checked_at": r[3]} for r in rows}
+
+    def stamp_databases(self, task_collection: str, stamps, run_id) -> None:
+        """Write one check stamp per unchanged database: stamps = [(source, src_database, version,
+        tables)], from ``planner.unchanged_writes``. ``run_id`` is the ingest run that checked them, or
+        None for the check job, which has no ingest run."""
+        params = [(task_collection, source, database, int(version), int(tables),
+                   None if run_id is None else int(run_id))
+                  for source, database, version, tables in stamps]
+        if params:
+            with self._cursor() as cur:
+                cur.executemany(stamp_database_sql(), params)
 
     def record_ct_begin_version(self, cfg: dict, begin_version) -> None:
         """Record the table's CT begin_version on its checkpoint (seed time, or first time seen)."""
