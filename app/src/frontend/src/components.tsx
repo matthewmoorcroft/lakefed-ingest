@@ -1,6 +1,6 @@
-import { useMemo, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { AgGridReact } from "ag-grid-react";
-import { themeQuartz, type ColDef, type GridOptions } from "ag-grid-community";
+import { themeQuartz, type ColDef, type GridApi, type GridOptions } from "ag-grid-community";
 import { ApiError, type Row } from "./api";
 
 // AG Grid in the workspace look: the design system's font, border, header and accent colors (styles.css).
@@ -11,6 +11,20 @@ export const gridTheme = themeQuartz.withParams({
   selectedRowBackgroundColor: "var(--db-surface-selected)",
 });
 const theme = gridTheme;
+
+/** The element's current width in pixels, kept up to date as the window resizes. A callback ref, so it also
+ * measures elements that appear later (after data loads). */
+export function useWidth<T extends HTMLElement>(): [(element: T | null) => void, number] {
+  const [element, setElement] = useState<T | null>(null);
+  const [width, setWidth] = useState(0);
+  useEffect(() => {
+    if (!element) return;
+    const observer = new ResizeObserver(([entry]) => setWidth(entry.contentRect.width));
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, [element]);
+  return [setElement, width];
+}
 
 export function fmtTime(v: unknown): string {
   if (!v) return "";
@@ -40,8 +54,18 @@ export function Grid(props: {
   getRowId?: (r: Row) => string;
 }) {
   const cols = useMemo(() => props.columns ?? autoColumns(props.rows ?? []), [props.columns, props.rows]);
+  const box = useRef<HTMLDivElement>(null);
+  const byContent = (props.options?.autoSizeStrategy?.type ?? "fitCellContents") === "fitCellContents";
+  /** Columns sized to their content, then stretched when they leave the grid's width unused (wide screens). */
+  const fill = (gridApi: GridApi) => {
+    const width = box.current?.clientWidth ?? 0;
+    if (!width || gridApi.isDestroyed()) return;
+    if (byContent) gridApi.autoSizeAllColumns();
+    const used = gridApi.getAllDisplayedColumns().reduce((sum, column) => sum + column.getActualWidth(), 0);
+    if (used < width - 2) gridApi.sizeColumnsToFit();
+  };
   return (
-    <div style={{ height: props.height ?? 420, width: "100%" }}>
+    <div ref={box} style={{ height: props.height ?? 420, width: "100%" }}>
       <AgGridReact
         theme={theme}
         rowData={props.rows ?? []}
@@ -54,6 +78,9 @@ export function Grid(props: {
         onSelectionChanged={(e) => props.onSelect?.(e.api.getSelectedRows())}
         getRowId={props.getRowId ? (p) => props.getRowId!(p.data) : undefined}
         loading={props.rows === undefined}
+        onFirstDataRendered={(e) => fill(e.api)}
+        onRowDataUpdated={(e) => fill(e.api)}
+        onGridSizeChanged={(e) => fill(e.api)}
         {...props.options}
       />
     </div>

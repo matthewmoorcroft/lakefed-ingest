@@ -1,18 +1,21 @@
 import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { api, qs, type Row } from "../api";
-import { ErrorBox, Notice, fmtTime } from "../components";
+import { ErrorBox, Notice, fmtTime, useWidth } from "../components";
 
 // Runs per collection over a window: planned triggers (ticks), runs (bars by outcome) and triggers
 // Databricks skipped because the previous run was still going (red markers).
 
 interface Timeline { start: string; end: string; collections: { task_collection: string; runs: Row[]; planned: string[]; skipped: string[]; schedules: string[] }[] }
 
-const LABEL_W = 230, CHART_W = 1000, ROW_H = 26, AXIS_H = 26;
+const LABEL_W = 230, MIN_CHART_W = 600, ROW_H = 26, AXIS_H = 26;
 const COLOR: Record<string, string> = { completed: "var(--s-current)", failed: "var(--s-failing)", running: "var(--s-flight)", skipped: "var(--s-late)" };
 
 export default function TimelinePage() {
   const [hours, setHours] = useState(24);
+  // The chart is drawn at the card's own width, so it uses the whole screen without scaling its text.
+  const [box, boxWidth] = useWidth<HTMLDivElement>();
+  const CHART_W = Math.max(MIN_CHART_W, boxWidth - LABEL_W - 26);
   const t = useQuery({ queryKey: ["timeline", hours], queryFn: () => api.get<Timeline>(`/timeline${qs({ hours })}`), refetchInterval: 60_000 });
   const d = t.data;
   const t0 = d ? new Date(d.start).getTime() : 0, t1 = d ? new Date(d.end).getTime() : 1;
@@ -47,8 +50,8 @@ export default function TimelinePage() {
         Hover a bar for details.</p>}
       {d && rows.length === 0 && <Notice>No runs or schedules in this window.</Notice>}
       {d && rows.length > 0 && (
-        <div className="card timeline">
-          <svg viewBox={`0 0 ${LABEL_W + CHART_W + 10} ${height}`} width="100%" role="img" aria-label="Runs per collection over time">
+        <div className="card timeline" ref={box}>
+          <svg viewBox={`0 0 ${LABEL_W + CHART_W + 10} ${height}`} width={LABEL_W + CHART_W + 10} height={height} role="img" aria-label="Runs per collection over time">
             {ticks.map((ms) => (
               <g key={ms}>
                 <line x1={x(ms)} x2={x(ms)} y1={AXIS_H - 4} y2={height} style={{ stroke: "var(--border)" }} />

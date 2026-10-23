@@ -50,7 +50,7 @@ a:hover { text-decoration: underline; }
 .sidebar-foot { margin-top: auto; display: flex; flex-direction: column; gap: var(--db-space-2); font-size: var(--db-font-size-sm); color: var(--muted); padding: 0 var(--db-space-2); }
 .sidebar-foot label { display: flex; flex-direction: column; gap: 4px; font-size: 12px; }
 .sidebar .muted { color: var(--muted); }
-.content { flex: 1; padding: var(--db-space-6) var(--db-space-8); min-width: 0; max-width: 1600px; }
+.content { flex: 1; padding: var(--db-space-6) var(--db-space-8); min-width: 0; }
 
 /* Page header */
 .page-head { display: flex; justify-content: space-between; align-items: flex-end; gap: var(--db-space-4); flex-wrap: wrap; margin-bottom: var(--db-space-4); }
@@ -66,7 +66,9 @@ a:hover { text-decoration: underline; }
 .card { background: var(--card); border: 1px solid var(--border); border-radius: var(--db-shape-container-small); padding: var(--db-space-4);
   margin-bottom: var(--db-space-4); min-width: 0; }
 .card-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: var(--db-space-3); gap: var(--db-space-3); flex-wrap: wrap; }
-.card-head p { margin: 2px 0 0; color: var(--muted); font-size: var(--db-font-size-sm); }
+/* Pages use the full width; only running text is capped, for reading. */
+.card-head p { margin: 2px 0 0; color: var(--muted); font-size: var(--db-font-size-sm); max-width: 120ch; }
+p.small, .alert, .empty { max-width: 140ch; }
 .card-actions { display: flex; gap: var(--db-space-2); align-items: center; flex-wrap: wrap; }
 .metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: var(--db-space-3); margin-bottom: var(--db-space-4); }
 .metric { background: var(--card); border: 1px solid var(--border); border-radius: var(--db-shape-container-small); padding: var(--db-space-3) var(--db-space-4); min-width: 0; }
@@ -78,7 +80,7 @@ a:hover { text-decoration: underline; }
 .metric.bad .metric-value { color: var(--bad); }
 
 /* Server cards */
-.server-cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: var(--db-space-3); }
+.server-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: var(--db-space-3); }
 .server-card { border: 1px solid var(--border); border-radius: var(--db-shape-container-small); padding: var(--db-space-3) var(--db-space-4);
   display: flex; flex-direction: column; gap: var(--db-space-2); min-width: 0; background: var(--card); }
 .server-card.selectable { cursor: pointer; }
