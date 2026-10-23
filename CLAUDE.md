@@ -161,7 +161,7 @@ secret). See `README.md`, `docs/deploy.md`, `docs/monitoring.md`, `docs/lakebase
 | `src/lakefed_ingest/cursor_engine.py` | Cursor (watermark) strategy, SQL Server: type lookup, high watermark (rowversion capped below MIN_ACTIVE_ROWVERSION), typed literals, (lo, hi] read + upsert MERGE |
 | `src/lakefed_ingest/planner.py` | Strategy routing + skip-no-change planning, database check stamps (no Spark/DB; unit-tested with fakes) |
 | `src/lakefed_ingest/initial_check.py` | The check: which databases of a group of collections need an ingest, and each collection's work list (pure; `run_check` takes the Lakebase calls) |
-| `src/lakefed_ingest/launcher.py` | Starts one `lakefed_ingest` run per collection with work by run-now, confirms they started (skipped = failure), never more than the job has room for |
+| `src/lakefed_ingest/launcher.py` | Starts one `lakefed_ingest` run per collection with work by run-now, confirms they started (skipped = failure), never more than the job has room for (no limit when its queue is on) |
 | `src/lakefed_ingest/parallel.py` | Thread pool, FAIR pools, `WorkSlots` budget, `SourceLimiter` (per-source permits) |
 | `src/lakefed_ingest/partitions.py` | Partitioned-seed planning |
 | `src/lakefed_ingest/discovery.py` | Table discovery for bulk onboarding (catalog queries + recommended control-row settings); run by `discover_tables.ipynb` / job `lakefed_ingest_discover` |

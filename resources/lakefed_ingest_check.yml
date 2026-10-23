@@ -6,7 +6,9 @@
 # starts it (one wrapper job per schedule), or blank for every collection with enabled rows. Without an
 # app schedule, this job's own schedule (paused) is the cadence. The runs are started with run-now, as
 # the app's Run now starts them: no For each, and no job is created. The job's run-as identity needs
-# CAN_MANAGE_RUN on lakefed_ingest (the deployer has it on both).
+# CAN_MANAGE_RUN on lakefed_ingest (the deployer has it on both). It starts no more runs than
+# lakefed_ingest's max_concurrent_runs leaves room for, unless lakefed_ingest's queue is on: then it
+# starts every run and Databricks queues those beyond the limit.
 resources:
   jobs:
     lakefed_ingest_check:

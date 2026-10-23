@@ -60,6 +60,9 @@ class _Jobs:
     def max_concurrent_runs(self, job_id):
         return 100
 
+    def queue_enabled(self, job_id):
+        return False
+
 
 class _Clock:
     """A clock that a fake sleep moves on."""
@@ -251,6 +254,7 @@ def test_it_starts_no_more_runs_than_the_ingestion_job_has_room_for():
     jobs, clock = _Jobs({"c1": ["RUNNING"], "c2": ["RUNNING"], "c3": ["RUNNING"]}, active=["c9"] * 98), _Clock()
     room = launcher.capacity(jobs.max_concurrent_runs(7), len(jobs.active_runs(7)))
     assert room == 2 and launcher.capacity(100, 140) == 0
+    assert launcher.capacity(4, 140, queue_enabled=True) is None    # the job's queue holds the rest
     requests = launcher.run_requests(_per_collection(c1=["a"], c2=["b"], c3=["c"]))
     summary = launcher.launch(jobs, 7, requests, room=room, confirm_s=0, sleep=clock.sleep, clock=clock)
     assert [s["job_parameters"]["task_collection"] for s in jobs.started] == ["c1", "c2"]

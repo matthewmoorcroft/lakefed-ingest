@@ -13,7 +13,9 @@ each, and no new job (every run is a run of the one saved ingestion job). By def
 the runs and ends; each run reports its own result. Before it ends it watches the runs it started for
 a short while (``confirm_s``): a run Databricks skips (the ingestion job at its ``max_concurrent_runs``,
 with its queue off) ends at once, and the check fails naming it. It starts no more runs than the job
-has room for (``capacity``); the rest are reported, not started, and wait for the next cycle.
+has room for (``capacity``); the rest are reported, not started, and wait for the next cycle. A job with
+its queue on has room for every run: Databricks holds those beyond ``max_concurrent_runs`` in the queue
+and starts them as runs finish.
 ``wait`` keeps the older behaviour: poll every run until all have ended.
 
 The calls go through ``jobs``, an object with ``run_now``, ``get_run``, ``cancel_run``,
@@ -103,8 +105,11 @@ def outcome(state: dict) -> Optional[str]:
     return "failed"
 
 
-def capacity(max_concurrent_runs: int, active: int) -> int:
-    """How many more runs the ingestion job takes now: its ``max_concurrent_runs`` less those going."""
+def capacity(max_concurrent_runs: int, active: int, queue_enabled: bool = False) -> Optional[int]:
+    """How many more runs the ingestion job takes now: its ``max_concurrent_runs`` less those going.
+    None (no limit) when its queue is on: the queue holds the runs beyond it."""
+    if queue_enabled:
+        return None
     return max(0, int(max_concurrent_runs) - int(active))
 
 
@@ -258,3 +263,7 @@ class SdkJobs:
 
     def max_concurrent_runs(self, job_id: int) -> int:
         return int(self.w.jobs.get(int(job_id)).settings.max_concurrent_runs or 1)
+
+    def queue_enabled(self, job_id: int) -> bool:
+        queue = self.w.jobs.get(int(job_id)).settings.queue
+        return bool(queue and queue.enabled)
