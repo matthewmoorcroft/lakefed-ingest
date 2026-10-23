@@ -611,12 +611,13 @@ CT_DATABASE_STATE_SQL = (
     f"FROM (SELECT 1 AS one) AS d LEFT JOIN ({CT_TABLE_STATUS_SQL}) AS x ON 1 = 1")
 
 
-def database_ct_state(cfg: dict, slots=None) -> Tuple[Optional[int], dict]:
+def database_ct_state(cfg: dict, slots=None, spark=None) -> Tuple[Optional[int], dict]:
     """(B) ``current_version`` and ``ct_table_status`` of the database in ONE query (one unit):
     (CT version or None, {(schema, table) lower-cased: (min_valid_version, begin_version)}). Most
-    databases are quiet at scale, and for them this is the only question a cycle asks."""
+    databases are quiet at scale, and for them this is the only question a cycle asks. ``spark``:
+    the session to read through (default: the active one)."""
     with _unit(slots, cfg):
-        rows = _read(_spark(), cfg, CT_DATABASE_STATE_SQL).collect()
+        rows = _read(spark or _spark(), cfg, CT_DATABASE_STATE_SQL).collect()
     as_int = lambda v: int(v) if v is not None else None
     cur = as_int(rows[0]["v"]) if rows else None
     status = {(str(r["sch"]).lower(), str(r["tbl"]).lower()): (as_int(r["mv"]), as_int(r["bv"]))

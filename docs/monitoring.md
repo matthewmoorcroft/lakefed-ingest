@@ -17,6 +17,7 @@ queries below.
 | `ingest_run` | one row per ingestion run | `ingest` (`start_run` at launch, `finish_run` at end) |
 | `ingest_event` | one row per (run, table) | `ingest` worker (`record_event_start` → `record_event_finish`) |
 | `checkpoint.last_success_at` | per source table | stamped on each successful event (freshness/lag) |
+| `database_check` | per (collection, source database) | stamped when the whole database is unchanged, in place of each table's `last_success_at` |
 
 `ingest_event` carries `action` (seed/increment/reseed/full), `stage` (plan/detect/ensure_sink/read/
 seed/merge/load/checkpoint — pinpoints *where* a failure happened; `plan` = the row's
@@ -73,12 +74,23 @@ WHERE run_id = (
 ORDER BY finished_at DESC;
 ```
 
-Per-table freshness / lag:
+Per-table freshness / lag. A table's last success is its own stamp or its database's
+check stamp, whichever is later, when that stamp vouches for it (see `database_check` in
+lakebase_schema.md):
 ```sql
-SELECT src_database, src_schema, src_table, strategy, last_success_at,
-       timestampdiff(MINUTE, last_success_at, current_timestamp()) AS lag_minutes
-FROM lakefed_ingest_lakebase.lakefed_ingest.checkpoint
-ORDER BY last_success_at NULLS FIRST;
+WITH t AS (
+  SELECT cp.src_database, cp.src_schema, cp.src_table, cp.strategy,
+         greatest(cp.last_success_at,
+                  CASE WHEN cp.strategy = 'ct' AND cp.phase = 'incremental'
+                        AND CAST(cp.position AS BIGINT) >= dc.checked_version THEN dc.checked_at END) AS last_success_at
+  FROM lakefed_ingest_lakebase.lakefed_ingest.checkpoint cp
+  JOIN lakefed_ingest_lakebase.lakefed_ingest.control c ON c.id = cp.control_id
+  LEFT JOIN lakefed_ingest_lakebase.lakefed_ingest.database_check dc
+    ON dc.task_collection = c.task_collection AND dc.src_database = c.src_database
+   AND dc.source = concat_ws('|', lower(coalesce(nullif(c.src_host, ''), nullif(c.src_connection, ''), '')),
+                             coalesce(c.src_port, 0), coalesce(nullif(c.secret_key, ''), nullif(c.src_connection, ''), '')))
+SELECT *, timestampdiff(MINUTE, last_success_at, current_timestamp()) AS lag_minutes
+FROM t ORDER BY last_success_at NULLS FIRST;
 ```
 
 Freshness SLA breaches. The SLA is per table, in `control.freshness_sla_minutes` (NULL = no SLA). An

@@ -583,6 +583,7 @@ def test_split_sql_statements_on_the_real_schema_file():
 SCHEMA_FINGERPRINTS = {
     1: "c035b85032e0df245775f4858dcc2e450ae737e885f326071c7b8546527a96e1",
     2: "8e514a425a7684f353c288677bff216cfe32421980263c197ba453bc10ac989f",
+    3: "bcf0a381ac7e6e539c7b318ecafea7a1910246d64a56d063575777f2de2758b6",
 }
 
 
@@ -1028,3 +1029,45 @@ def test_bulk_advance_records_identity_only_when_unknown():
     conn = FakeConn()
     ss.StateStore(conn).bulk_advance_unchanged([(7, 5, None, None, ("s", "k", "m")), (8, 6, None)])
     assert conn.calls[0][1] == [(5, None, None, "s", "k", "m", 7), (6, None, None, None, None, None, 8)]
+
+
+
+# ---- per-database check stamps ------------------------------------------------------------------
+
+def test_database_source_names_the_server_port_and_credential_the_way_the_app_reads_it():
+    jdbc = {"src_host": "Srv.Example.net", "src_port": 1433, "secret_key": "k-db1", "src_database": "db1"}
+    conn = {"src_connection": "lfc_conn", "use_remote_query": True, "src_database": "db1"}
+    assert ss.database_source(jdbc) == "srv.example.net|1433|k-db1"
+    assert ss.database_source(conn) == "lfc_conn|0|lfc_conn"
+    assert ss.database_source({**jdbc, "src_port": None, "secret_key": ""}) == "srv.example.net|0|"
+    # the same identity in SQL, for readers that join control rows to their database's stamp
+    expr = ss.database_source_sql("t")
+    assert "lower(coalesce(nullif(t.src_host, ''), nullif(t.src_connection, ''), ''))" in expr
+    assert "coalesce(t.src_port, 0)" in expr and "coalesce(nullif(t.secret_key, ''), nullif(t.src_connection, ''), '')" in expr
+
+
+def test_ddl_database_check_is_keyed_by_collection_source_and_database():
+    for frag in ("create table if not exists lakefed_ingest.database_check",
+                 "checked_version bigint      not null",
+                 "constraint database_check_pk primary key (task_collection, source, src_database)"):
+        assert frag in _DDL
+
+
+def test_stamp_databases_upserts_one_row_per_database_and_reads_them_back():
+    conn = FakeConn()
+    store = ss.StateStore(conn)
+    store.stamp_databases("coll", [("lfc_conn|0|lfc_conn", "db1", 41, 1000), ("lfc_conn|0|lfc_conn", "db2", 8, 999)],
+                          run_id=12)
+    (sql, params), = conn.calls
+    assert sql == ss.stamp_database_sql()
+    assert "on conflict (task_collection, source, src_database) do update" in sql and "checked_at = now()" in sql
+    assert params == [("coll", "lfc_conn|0|lfc_conn", "db1", 41, 1000, 12), ("coll", "lfc_conn|0|lfc_conn", "db2", 8, 999, 12)]
+    store.stamp_databases("coll", [], run_id=12)
+    assert len(conn.calls) == 1   # nothing to write: no statement
+    store.stamp_databases("coll", [("s", "db3", 9, 5)], run_id=None)   # the check job: no ingest run
+    assert conn.calls[-1][1] == [("coll", "s", "db3", 9, 5, None)]
+    conn.calls = conn.calls[:1]
+
+    conn.calls, conn.fetch = [], [("s1", "db1", 41, "t1")]
+    assert store.get_database_checks("coll") == {("s1", "db1"): {"version": 41, "checked_at": "t1"}}
+    assert conn.calls == [(ss.get_database_checks_sql(), ("coll",))]

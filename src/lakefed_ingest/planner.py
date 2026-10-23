@@ -23,6 +23,7 @@ the advanced checkpoint (at-least-once; the MERGE is idempotent).
 
 from __future__ import annotations
 
+from collections import Counter
 from datetime import datetime, timezone
 from typing import Optional, Callable, Dict, List, Tuple
 
@@ -400,24 +401,115 @@ def apply_seed_budget(plans: List[dict], max_seeds: int) -> Tuple[List[dict], Li
             [p for p in seeds if id(p) not in run])
 
 
-def bulk_rows_to_write(unchanged: list, checkpoints: Dict[int, dict], interval_s: float, now=None) -> list:
+def _refresh_only(row, cp: dict) -> bool:
+    """Writing this unchanged row would only refresh the table's last_success_at: its checkpoint is
+    already at the captured version, ok, and there is no select_list, begin version or identity (a
+    checkpoint written before the identity backstop) to record."""
+    cid, cur, select_list, begin, identity = (tuple(row) + (None, None))[:5]
+    unrecorded = identity is not None and any(cp.get(k) is None for k in ("source_identity", "sink_identity"))
+    return (ct_position(cp) >= int(cur) and select_list is None and cp.get("status") == "ok"
+            and (begin is None or cp.get("ct_begin_version") is not None) and not unrecorded)
+
+
+def bulk_rows_to_write(unchanged: list, checkpoints: Dict[int, dict], interval_s: float, now=None,
+                       stamp_of: Optional[Callable] = None) -> list:
     """The unchanged rows the bulk advance has to write. With ``interval_s`` > 0, a row is left out
     when writing it would only refresh ``last_success_at`` and that stamp is under ``interval_s``
     old: the checkpoint is already at the captured version, ok, and has nothing to record (select_list
     or begin version). At scale nearly every table is quiet nearly every run, so this removes most of
     a run's Lakebase writes; ``last_success_at`` of a quiet table is then at most ``interval_s``
-    stale. ``interval_s`` 0 = write every row (stamped every run)."""
+    stale. ``interval_s`` 0 = write every row (stamped every run). ``stamp_of(control_id)`` gives the
+    table's database check stamp, if any: a table's last success is the later of the two
+    (``last_success``)."""
     if not interval_s or interval_s <= 0:
         return list(unchanged)
     now = now or datetime.now(timezone.utc)
     out = []
     for row in unchanged:
-        cid, cur, select_list, begin = (tuple(row) + (None,))[:4]
-        cp = checkpoints.get(int(cid)) or {}
-        stamp = cp.get("last_success_at")
-        quiet = (ct_position(cp) >= int(cur) and select_list is None and cp.get("status") == "ok"
-                 and (begin is None or cp.get("ct_begin_version") is not None)
-                 and stamp is not None and (now - stamp).total_seconds() < interval_s)
-        if not quiet:
+        cp = checkpoints.get(int(row[0])) or {}
+        stamp = last_success(cp, stamp_of(int(row[0])) if stamp_of else None)
+        if not (_refresh_only(row, cp) and stamp is not None and (now - stamp).total_seconds() < interval_s):
             out.append(row)
     return out
+
+
+# ---- per-database check stamps ------------------------------------------------------------------
+# When a whole source database is unchanged, one row in database_check (its CT version and the time)
+# stands in for a last_success_at on each of its tables. At 1,000 tables a database, that turns a
+# quiet run's Lakebase writes from one per table into one per database.
+
+def database_key(cfg: dict) -> tuple:
+    """(source, src_database): the database a check stamp is kept for, within a collection."""
+    return (ss.database_source(cfg), cfg.get("src_database") or "")
+
+
+def database_keys(cfgs) -> set:
+    return {database_key(c) for c in cfgs}
+
+
+def stamp_vouches(cp: Optional[dict], stamp: Optional[dict]) -> bool:
+    """A database stamp speaks for a table when the table is a CT table in the incremental phase whose
+    position is at or past the stamp's version: the database had nothing newer than that position when
+    it was checked. A table re-seeding, of another strategy, or behind the version is not covered."""
+    if not stamp or not cp or cp.get("position") is None:
+        return False
+    if cp.get("phase") != ss.INCREMENTAL or (cp.get("strategy") or ls.CT) != ls.CT:
+        return False
+    return ct_position(cp) >= int(stamp["version"])
+
+
+def last_success(cp: dict, stamp: Optional[dict] = None):
+    """When the table last ingested or was confirmed current: its own ``last_success_at``, or its
+    database's check time when that stamp vouches for it and is later."""
+    own = cp.get("last_success_at")
+    if not stamp_vouches(cp, stamp) or stamp.get("checked_at") is None:
+        return own
+    return stamp["checked_at"] if own is None else max(own, stamp["checked_at"])
+
+
+def _stamp_is_fresh(stamp: Optional[dict], cur: int, interval_s: float, now) -> bool:
+    return bool(interval_s and interval_s > 0 and stamp and stamp.get("checked_at") is not None
+                and int(stamp["version"]) <= int(cur) and (now - stamp["checked_at"]).total_seconds() < interval_s)
+
+
+def unchanged_writes(group_members, group_outputs, checkpoints: Dict[int, dict], interval_s: float,
+                     stamps: Optional[dict] = None, elsewhere=frozenset(), now=None) -> Tuple[list, list]:
+    """The unchanged tables' bookkeeping, as (rows for the bulk advance, database stamps).
+
+    ``group_members`` and ``group_outputs`` are the detection groups and their ``detect_group``
+    results, in the same order; ``stamps`` the collection's current stamps
+    (``StateStore.get_database_checks``); ``elsewhere`` the ``database_keys`` of rows routed to work
+    before detection (seeds, pending appends, reseeds, other strategies).
+
+    A database is unchanged as a whole when detection planned nothing and nothing failed for it, and
+    no other row of it is routed elsewhere. Its tables that would only refresh their stamp are then
+    covered by ONE stamp per database at the captured version, written unless ``interval_s`` > 0 and
+    the current stamp is younger than that (and not from a higher version, as after a CT reset). Its
+    other unchanged rows (a position to move, a status to clear, something to record) are written per
+    table. Every other database's unchanged rows go through ``bulk_rows_to_write``, which reads a
+    vouching database stamp as their last success. Database stamps are
+    ``(source, src_database, cur, tables)``."""
+    stamps = stamps or {}
+    now = now or datetime.now(timezone.utc)
+    rows, database_stamps = [], []
+    for members, out in zip(group_members, group_outputs):
+        if not out["unchanged"]:
+            continue
+        key_of = {int(c["id"]): database_key(c) for c, _ in members}
+        whole = not out["plans"] and not out["failed"] and out["cur"] is not None and not (set(key_of.values()) & elsewhere)
+        if not whole:
+            rows.extend(bulk_rows_to_write(out["unchanged"], checkpoints, interval_s, now=now,
+                                           stamp_of=lambda cid, k=key_of: stamps.get(k.get(cid))))
+            continue
+        covered = set()
+        for row in out["unchanged"]:
+            cid = int(row[0])
+            if _refresh_only(row, checkpoints.get(cid) or {}):
+                covered.add(key_of[cid])
+            else:
+                rows.append(row)
+        tables = Counter(key_of.values())
+        for key in sorted(covered):
+            if not _stamp_is_fresh(stamps.get(key), out["cur"], interval_s, now):
+                database_stamps.append((key[0], key[1], int(out["cur"]), tables[key]))
+    return rows, database_stamps

@@ -72,6 +72,9 @@ secret). See `README.md`, `docs/deploy.md`, `docs/monitoring.md`, `docs/lakebase
 - `checkpoint` — generic: `strategy` + `position` (text; CT version for `ct`, JSON {col,type,value} for
   `cursor`), phase (`seeding → incremental` for ct and cursor, `loaded` for full), status, freshness,
   `ct_begin_version`, `pending_position`/`pending_run_id` (an append in flight). `reseed_queue` (ct, cursor).
+- `database_check` — one stamp per (collection, source database) found unchanged as a whole (CT version,
+  time), in place of each table's `last_success_at`; `planner.stamp_vouches` says which tables it covers.
+- `check_work` — the check job's work list: the databases with work per (work_id, collection).
 - `ingest_run`, `ingest_event` — telemetry (`run_id`, `position_from/to`). The DB is registered in UC
   (default catalog `lakefed_ingest_lakebase`) for DBSQL monitoring.
 - `schedule`, `schedule_member` — written by the operations app (cadence, members, wrapper `job_id`);
@@ -122,7 +125,8 @@ secret). See `README.md`, `docs/deploy.md`, `docs/monitoring.md`, `docs/lakebase
    Identity backstop (ct / cursor): control row's source / sink / primary key ≠ the checkpoint's recorded
    `source_identity` / `sink_identity` / `merge_key`, or the sink table is missing (one
    `information_schema` query per sink catalog) → reseed. Never merge into a new, empty sink.
-3. Unchanged tables: one bulk Lakebase checkpoint advance.
+3. Unchanged tables: one bulk Lakebase checkpoint advance; a whole unchanged database gets one
+   `database_check` stamp instead (`planner.unchanged_writes`).
 4. Per-table worker: full reload (`load_strategies.FullStrategy` → `ct_engine.seed`), seed (capture V0
    before seed; partitioned seed via staging + atomic swap),
    reseed enqueue, or CHANGETABLE read + idempotent PK MERGE (schema evolution) then checkpoint
@@ -147,7 +151,7 @@ secret). See `README.md`, `docs/deploy.md`, `docs/monitoring.md`, `docs/lakebase
 | `src/lakefed_ingest/source_adapters.py` | Per-engine dialect (`src_type`): JDBC URL/driver/options, quoting, literals, select/size/bounds SQL |
 | `src/lakefed_ingest/load_strategies.py` | Per-`load_type` strategy, position encoding, `supported()` matrix (+ placeholder pairs); cdc placeholder |
 | `src/lakefed_ingest/cursor_engine.py` | Cursor (watermark) strategy, SQL Server: type lookup, high watermark (rowversion capped below MIN_ACTIVE_ROWVERSION), typed literals, (lo, hi] read + upsert MERGE |
-| `src/lakefed_ingest/planner.py` | Strategy routing + skip-no-change planning (no Spark/DB; unit-tested with fakes) |
+| `src/lakefed_ingest/planner.py` | Strategy routing + skip-no-change planning, database check stamps (no Spark/DB; unit-tested with fakes) |
 | `src/lakefed_ingest/parallel.py` | Thread pool, FAIR pools, `WorkSlots` budget, `SourceLimiter` (per-source permits) |
 | `src/lakefed_ingest/partitions.py` | Partitioned-seed planning |
 | `src/lakefed_ingest/discovery.py` | Table discovery for bulk onboarding (catalog queries + recommended control-row settings); run by `discover_tables.ipynb` / job `lakefed_ingest_discover` |

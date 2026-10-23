@@ -11,6 +11,8 @@ as `lakefed_ingest_lakebase.lakefed_ingest.<table>` (see [monitoring.md](monitor
 |---|---|---|
 | `control` | **Configuration.** One row per source table to ingest | You (load control rows) |
 | `checkpoint` | **State.** Where each table is: phase, resume position, status, freshness | The ingestion job |
+| `database_check` | **State.** One check stamp per unchanged source database, in place of a stamp per table | The ingestion job, and the check job |
+| `check_work` | **State.** The databases with work for each run the check job starts | The check job |
 | `reseed_queue` | **Log.** Every reseed the job queued, and why | The ingestion job |
 | `ingest_run` | **Telemetry.** One row per job run | The ingestion job |
 | `ingest_event` | **Telemetry.** One row per table per run | The ingestion job |
@@ -59,6 +61,20 @@ erDiagram
         text pending_position
         bigint pending_run_id
         timestamptz last_success_at
+    }
+    database_check {
+        text task_collection PK
+        text source PK
+        text src_database PK
+        bigint checked_version
+        timestamptz checked_at
+    }
+    check_work {
+        text work_id PK
+        text task_collection PK
+        text source PK
+        text src_database PK
+        timestamptz created_at
     }
     reseed_queue {
         bigserial id PK
@@ -160,7 +176,7 @@ at the start of a run.
 | `source_identity`, `sink_identity`, `merge_key` | What the checkpoint was written for: `engine://host:port/db/schema/table`, the sink (`catalog.schema.table`, plus `#client_id` for a shared sink) and the normalized primary key. A control row that now points elsewhere reseeds (`source_changed`, `sink_changed`, `primary_key_changed`). NULL until first recorded |
 | `ct_begin_version` | `ct`: the table's Change Tracking begin version at seed time. A change means CT was turned off and on, so the table reseeds |
 | `pending_position`, `pending_run_id` | Append sinks (`ct`): set just before a change or seed append, to the position it reaches and the run writing it; cleared when the checkpoint advances. Set at the start of a run means the last run stopped in between: the job checks the sink for that run's rows before doing anything else with the table. A `full` append isn't marked: each run appends one complete snapshot tagged with its `__run_id`, so a run that stopped after its commit leaves a complete snapshot and the next run appends its own |
-| `last_success_at` | When the table last ingested successfully, used for freshness and lag |
+| `last_success_at` | When the table last ingested successfully, used for freshness and lag. A `ct` table whose database has a vouching `database_check` stamp was last confirmed current at the later of the two (see below) |
 | `updated_at` | Last change to this row |
 
 **Lifecycle.** Checkpoints only move forward after the Delta commit succeeds, so a failure never
@@ -187,6 +203,25 @@ key changed, or its sink table no longer exists (`sink_missing`).
 update lakefed_ingest.checkpoint set phase = 'seeding', status = 'ok', pending_position = null, pending_run_id = null
 where control_id in (...);
 ```
+
+## `database_check`: one check stamp per unchanged database
+
+When every table of a source database is unchanged (nothing to read, no seed, reseed or pending
+append), a run writes one row here instead of stamping `last_success_at` on each of its tables: the database's CT version when checked (`checked_version`),
+`checked_at`, the number of `tables` and the `run_id`. It is keyed by the collection, the database's
+server identity (`source`: host or connection, port, credential, as `state_store.database_source`)
+and `src_database`. The stamp vouches for a `ct` table of that database in phase `incremental` whose
+`position` is at or past `checked_version`; for those tables, the last success is
+`greatest(checkpoint.last_success_at, database_check.checked_at)`. A table behind the version (it
+changed since), re-seeding, or of another strategy reads its own stamp only.
+
+## `check_work`: the check job's work list
+
+The check job writes here, under one `work_id`, the databases of a collection that have work, then
+starts that collection's run with the `work_id`; the run ingests only those databases. Keyed by
+`work_id`, the collection, `source` (as in `database_check`) and `src_database`. A job parameter
+could not carry the list (job parameter values are at most 10,000 characters). The check deletes
+rows older than a week.
 
 ## `reseed_queue` — reseed log
 
@@ -217,7 +252,8 @@ Inserted when a run starts (`status = 'running'`) and finalized when it ends.
 Inserted when a table starts (`status = 'running'`) and updated when it finishes. Tables that fail
 before any work (stage `plan` or `detect`) also get a `failed` event. CT tables that skip-no-change
 finds unchanged don't get an event: they're advanced in bulk, counted in `ingest_run.skipped`, and
-their `checkpoint.last_success_at` is still stamped. Cursor tables always get one, with no rows
+their `checkpoint.last_success_at` is still stamped (or, for a whole unchanged database, its
+`database_check` row). Cursor tables always get one, with no rows
 when the watermark hasn't moved.
 
 | Column | Meaning |
