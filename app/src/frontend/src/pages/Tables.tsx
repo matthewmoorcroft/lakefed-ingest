@@ -11,7 +11,7 @@ export default function Tables() {
   const [params, setParams] = useSearchParams();
   const collection = params.get("collection") ?? "";
   const [search, setSearch] = useState("");
-  const [status, setStatus] = useState("all");
+  const [status, setStatus] = useState(FILTERS.includes(params.get("status") ?? "") ? params.get("status")! : "all");
   const [limit, setLimit] = useState(1000);
   const [selected, setSelected] = useState<Row[]>([]);
   const [message, setMessage] = useState<string | null>(null);

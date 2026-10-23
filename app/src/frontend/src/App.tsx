@@ -11,15 +11,16 @@ import BulkImport from "./pages/BulkImport";
 import Changes from "./pages/Changes";
 import Schedules from "./pages/Schedules";
 import Timeline from "./pages/Timeline";
+import Collection from "./pages/Collection";
 
 interface Settings { config?: Config }
 const SettingsContext = createContext<Settings>({});
 export const useSettings = () => useContext(SettingsContext);
 
 const NAV = [
-  ["/overview", "Overview"], ["/runs", "Runs"], ["/timeline", "Timeline"], ["/schedules", "Schedules"],
-  ["/tables", "Tables"], ["/jobs", "Jobs"],
-  ["/add", "Add table"], ["/bulk", "Bulk import"], ["/changes", "Changes"],
+  ["Monitor", [["/overview", "Overview"], ["/runs", "Runs"], ["/timeline", "Timeline"]]],
+  ["Manage", [["/tables", "Tables"], ["/schedules", "Schedules"], ["/jobs", "Jobs"], ["/add", "Add table"],
+              ["/bulk", "Bulk import"], ["/changes", "Changes"]]],
 ] as const;
 
 export default function App() {
@@ -29,10 +30,15 @@ export default function App() {
     <SettingsContext.Provider value={{ config: config.data }}>
       <div className="layout">
         <aside className="sidebar">
-          <div className="brand">lakefed_ingest</div>
+          <div className="brand"><div>lakefed_ingest<small>Operations</small></div></div>
           <nav>
-            {NAV.map(([to, label]) => (
-              <NavLink key={to} to={to} className={({ isActive }) => (isActive ? "active" : "")}>{label}</NavLink>
+            {NAV.map(([group, links]) => (
+              <div key={group}>
+                <div className="nav-group">{group}</div>
+                {links.map(([to, label]) => (
+                  <NavLink key={to} to={to} className={({ isActive }) => (isActive ? "active" : "")}>{label}</NavLink>
+                ))}
+              </div>
             ))}
           </nav>
           <div className="sidebar-foot">
@@ -54,6 +60,7 @@ export default function App() {
             <Route path="/jobs" element={<Jobs />} />
             <Route path="/schedules" element={<Schedules />} />
             <Route path="/timeline" element={<Timeline />} />
+            <Route path="/collections/:name" element={<Collection />} />
             <Route path="/add" element={<AddTable />} />
             <Route path="/bulk" element={<BulkImport />} />
             <Route path="/changes" element={<Changes />} />

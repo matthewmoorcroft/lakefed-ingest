@@ -1,0 +1,120 @@
+import { useQuery } from "@tanstack/react-query";
+import { Link, useParams } from "react-router-dom";
+import { api, type Row } from "../api";
+import {
+  ErrorBox, PageHead, ProgressBar, ProgressKey, Section, Stamp, StateBar, StateKey, Tag,
+  fmtAgo, fmtClock, fmtDuration, fmtInt, progressOf, progressText, type Progress,
+} from "../components";
+
+interface CollectionData { collection: string; databases: Row[]; running: Row | null; batches: Row[]; read_at: string; cache_s: number }
+
+/** What a database's first loads wrote: per-table counts, a batched append's total, or "at least". */
+function firstLoadRows(d: Row) {
+  const counted = d.rows_first_loads === null || d.rows_first_loads === undefined ? null : Number(d.rows_first_loads);
+  const batched = (d.batches ?? []).reduce((a: number, b: Row) => a + Number(b.rows || 0), 0);
+  const uncounted = Number(d.first_loads_uncounted || 0);
+  if (!Number(d.first_loads)) return <span className="muted">no first load yet</span>;
+  if (batched) {
+    return <>{fmtInt((counted ?? 0) + batched)}<span className="sub">{counted ? `${fmtInt(counted)} per table + ` : ""}
+      {fmtInt(batched)} in batches (run {(d.batches as Row[]).map((b) => `#${b.run_id}`).join(", ")})</span></>;
+  }
+  if (uncounted) return <>{counted ? `at least ${fmtInt(counted)}` : "not recorded"}<span className="sub">{fmtInt(uncounted)} loads with no count</span></>;
+  return fmtInt(counted);
+}
+
+export default function CollectionPage() {
+  const { name = "" } = useParams();
+  const data = useQuery({
+    queryKey: ["collection", name],
+    queryFn: () => api.get<CollectionData>(`/collections/${encodeURIComponent(name)}/databases`),
+    refetchInterval: (q) => ((q.state.data as CollectionData | undefined)?.running ? 15_000 : 60_000),
+  });
+  const dbs = data.data?.databases ?? [];
+  const run = data.data?.running ?? null;
+  const p = run ? progressOf(run) : null;
+  const tables = dbs.reduce((a, d) => a + Number(d.tables || 0), 0);
+  const servers = [...new Set(dbs.map((d) => d.server).filter(Boolean))];
+  const totalFirst = dbs.reduce((a, d) => a + Number(d.rows_first_loads || 0)
+    + (d.batches ?? []).reduce((x: number, b: Row) => x + Number(b.rows || 0), 0), 0);
+  const unattributed = (data.data?.batches ?? []).filter((b) => (b.databases ?? []).length !== 1);
+  return (
+    <>
+      <PageHead crumb={<span className="eyebrow"><Link to="/overview">Overview</Link> · Collection · How far along is each database?</span>} title={name}
+        lead={<><strong>{fmtInt(dbs.length)}</strong> databases, <strong>{fmtInt(tables)}</strong> enabled tables
+          {servers.length ? <> on <strong>{servers.join(", ")}</strong></> : null}.{" "}
+          <Link to={`/tables?collection=${encodeURIComponent(name)}`}>Its tables</Link> ·{" "}
+          <Link to="/schedules">Schedules</Link> · <Link to="/runs">Runs</Link></>}
+        right={<Stamp at={data.data?.read_at} every={run ? 15 : 60} />} />
+      <ErrorBox error={data.error} />
+
+      {run && p && (
+        <Section title={<>Run #{run.run_id} <Tag tone="run">Running</Tag></>}
+          actions={<div className="kv"><span>Started <b>{fmtClock(run.started_at)}</b></span>
+            <span>Running <b>{fmtDuration(run.elapsed_s)}</b>{run.typical_s ? <> (typical <b>{fmtDuration(run.typical_s)}</b>)</> : null}</span>
+            <span>Last table activity <b>{fmtAgo(run.last_activity_at)}</b></span></div>}>
+          <div className="count">{progressText(p)}</div><ProgressBar p={p} big /><ProgressKey p={p} />
+        </Section>
+      )}
+
+      <Section title="Databases" actions={<button className="ghost" onClick={() => download(name, dbs)}>Download CSV</button>}
+        note={<>Rows in first loads are what each table's first load wrote, which is the source's row count at that moment, so the
+          total can be checked against a count taken at the source. Rows in changes are written since, in the last 24 hours.</>}>
+        <div className="table-wrap">
+          <table className="data">
+            <thead><tr><th>Database</th>{run && <th>This run</th>}{run && <th className="num">Checked</th>}{run && <th className="num">In flight</th>}
+              <th>State now</th><th className="num">Failing</th><th className="num">First load</th><th className="num">Oldest success</th>
+              <th className="num">Rows in first loads</th><th className="num">Rows in changes, 24 h</th></tr></thead>
+            <tbody>
+              {dbs.map((d) => {
+                const tablesHere = Number(d.tables || 0);
+                const checked = Number(d.checked_this_run || 0);
+                const loaded = Number(d.loaded_this_run || 0);
+                const dp: Progress = { total: tablesHere, unchanged: Math.max(0, checked - loaded), loaded,
+                                       inFlight: Number(d.in_flight || 0), failed: Number(d.failed_this_run || 0) };
+                return (
+                  <tr key={d.src_database}>
+                    <td><b>{d.src_database || "(none)"}</b></td>
+                    {run && <td><ProgressBar p={dp} /></td>}
+                    {run && <td className="num">{fmtInt(checked)} of {fmtInt(tablesHere)}</td>}
+                    {run && <td className="num">{fmtInt(d.in_flight || 0)}</td>}
+                    <td><StateBar row={d} /></td>
+                    <td className="num" style={{ color: Number(d.state_failing) ? "var(--bad)" : undefined }}>{fmtInt(d.state_failing)}</td>
+                    <td className="num">{fmtInt(d.state_first_load)}</td>
+                    <td className="num">{fmtAgo(d.oldest_success_at)}</td>
+                    <td className="num">{firstLoadRows(d)}</td>
+                    <td className="num">{fmtInt(d.rows_changes_24h || 0)}</td>
+                  </tr>
+                );
+              })}
+              {dbs.length > 1 && (
+                <tr className="total"><td>{fmtInt(dbs.length)} databases</td>{run && <td />}
+                  {run && <td className="num">{fmtInt(dbs.reduce((a, d) => a + Number(d.checked_this_run || 0), 0))} of {fmtInt(tables)}</td>}
+                  {run && <td className="num">{fmtInt(dbs.reduce((a, d) => a + Number(d.in_flight || 0), 0))}</td>}
+                  <td /><td className="num">{fmtInt(dbs.reduce((a, d) => a + Number(d.state_failing || 0), 0))}</td>
+                  <td className="num">{fmtInt(dbs.reduce((a, d) => a + Number(d.state_first_load || 0), 0))}</td><td />
+                  <td className="num">{fmtInt(totalFirst)}</td>
+                  <td className="num">{fmtInt(dbs.reduce((a, d) => a + Number(d.rows_changes_24h || 0), 0))}</td></tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+        {run ? <ProgressKey /> : <StateKey />}
+        {unattributed.length > 0 && <p className="small muted" style={{ marginTop: 8 }}>Batched appends over several databases wrote{" "}
+          {unattributed.map((b) => `${fmtInt(b.rows)} rows in run #${b.run_id}`).join(", ")}; batches record one total, so these
+          are not shown per database.</p>}
+      </Section>
+    </>
+  );
+}
+
+function download(name: string, rows: Row[]) {
+  const head = ["database", "tables", "current", "late", "first_load", "failing", "oldest_success_at", "rows_first_loads",
+                "first_loads_uncounted", "rows_in_batches", "rows_changes_24h"];
+  const lines = rows.map((d) => [d.src_database, d.tables, d.state_current, d.state_late, d.state_first_load, d.state_failing,
+    d.oldest_success_at ?? "", d.rows_first_loads ?? "", d.first_loads_uncounted ?? "",
+    (d.batches ?? []).reduce((a: number, b: Row) => a + Number(b.rows || 0), 0), d.rows_changes_24h ?? ""].join(","));
+  const url = URL.createObjectURL(new Blob([[head.join(","), ...lines].join("\n")], { type: "text/csv" }));
+  const a = document.createElement("a");
+  a.href = url; a.download = `${name}-databases.csv`; a.click();
+  URL.revokeObjectURL(url);
+}
