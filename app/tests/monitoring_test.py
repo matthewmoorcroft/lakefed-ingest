@@ -53,6 +53,13 @@ def test_batch_rows_reads_a_run_detail_safely(detail, expected):
     ("Invalid object name 'dbo.orders'.", "missing"),
     ("Something else entirely", "other"),
     (None, "other"),
+    # Near misses: a name that contains a cause word is not that cause.
+    ("Invalid column name 'network_id'.", "missing"),
+    ("Invalid column name 'timeout_ms'.", "missing"),
+    ("Invalid column name 'socket_count'.", "missing"),
+    ("A network-related or instance-specific error occurred while establishing a connection", "connection"),
+    ("java.net.SocketException: Connection reset", "connection"),
+    ("The TCP/IP connection to the host failed: network is unreachable", "connection"),
 ])
 def test_classify_error(error, expected):
     assert q.classify_error(error)[0] == expected
@@ -79,6 +86,28 @@ def test_group_errors_counts_tables_and_databases_per_cause():
     assert first["databases"][1]["tables"] == ["dbo.t0041", "dbo.t0838"]
 
 
+def test_group_errors_counts_a_table_failing_on_every_run_once():
+    rows = [dict(finished_at=f"2026-10-23T{h:02d}:00:00+00:00", task_collection="c1", control_id=7, src_database="db1",
+                 src_schema="dbo", src_table="orders", error="Read timed out after 30000 ms") for h in (9, 8, 7)]
+    g = q.group_errors(rows)[0]
+    assert (g["tables"], g["failures"]) == (1, 3)
+    assert g["databases"][0]["tables"] == ["dbo.orders"]
+    assert (g["first_at"], g["last_at"]) == ("2026-10-23T07:00:00+00:00", "2026-10-23T09:00:00+00:00")
+
+
+def test_error_groups_say_when_the_list_was_cut_short(monkeypatch):
+    pytest.importorskip("fastapi")
+    from fastapi.testclient import TestClient
+    import main
+    many = [dict(finished_at="2026-10-23T09:00:00+00:00", task_collection="c1", control_id=i, src_database="db1",
+                 src_schema="dbo", src_table=f"t{i}", error="Read timed out") for i in range(4)]
+    monkeypatch.setattr(main, "ERROR_TABLES_LIMIT", 3)
+    monkeypatch.setattr(main.db, "query", lambda sql, params=(): many[:params[1]])
+    body = TestClient(main.app).get("/api/errors/groups?hours=5").json()
+    assert body["truncated"] is True and body["tables_shown"] == 3
+    assert sum(g["tables"] for g in body["groups"]) == 3
+
+
 # ---- API (needs FastAPI and httpx, like api_test.py) --------------------------------------------
 
 @pytest.fixture
@@ -103,6 +132,8 @@ def api(monkeypatch):
                            dict(run_id=8, detail=json.dumps({"batch_rows": 50, "batch_rows_unknown": 0}),
                                 rows_written=None, uncounted=3)],
         q.recent_errors_sql(): [dict(finished_at="2026-10-23T07:40:00+00:00", task_collection="c1", src_database="db1",
+                                     src_schema="dbo", src_table="t", error="connection reset")],
+        q.failed_tables_sql(): [dict(finished_at="2026-10-23T07:40:00+00:00", task_collection="c1", src_database="db1",
                                      src_schema="dbo", src_table="t", error="connection reset")],
         q.connection_databases_sql(): [dict(src_database="db1", collections="c1, c2", tables=4,
                                             newest_success_at=None)],
@@ -152,8 +183,10 @@ def test_runs_report_rows_written_with_batches_and_say_when_partial(api):
 
 
 def test_error_groups_endpoint(api):
-    groups = api.get("/api/errors/groups?hours=24").json()
+    body = api.get("/api/errors/groups?hours=24").json()
+    groups = body["groups"]
     assert groups[0]["error_class"] == "connection" and groups[0]["tables"] == 1
+    assert (body["tables_shown"], body["truncated"]) == (1, False)
 
 
 def test_connections_list_sorted_with_tracked_counts_and_discoverable_flag(api):

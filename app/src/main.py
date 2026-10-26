@@ -140,11 +140,21 @@ def overview():
     return _shared("overview", compute)
 
 
+# The most failed tables the failure groups read; past it they say how many they show.
+ERROR_TABLES_LIMIT = 20000
+
+
 @app.get("/api/errors/groups")
 def error_groups(hours: int = 24):
-    """Failed tables in the last `hours`, grouped by cause (queries.group_errors)."""
+    """Failed tables in the last `hours`, grouped by cause (queries.group_errors). The newest
+    ERROR_TABLES_LIMIT tables at most; `truncated` says when more failed."""
     hours = max(1, min(int(hours), 168))
-    return _shared(("errors", hours), lambda: q.group_errors(db.query(q.recent_errors_sql(), (hours, 5000))))
+
+    def compute():
+        rows = db.query(q.failed_tables_sql(), (hours, ERROR_TABLES_LIMIT + 1, hours))
+        shown = rows[:ERROR_TABLES_LIMIT]
+        return {"groups": q.group_errors(shown), "tables_shown": len(shown), "truncated": len(rows) > len(shown)}
+    return _shared(("errors", hours), compute)
 
 
 @app.get("/api/collections/{name}/databases")

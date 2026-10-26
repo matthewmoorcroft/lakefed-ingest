@@ -5,7 +5,7 @@ import queries as q
 
 
 def test_every_statement_is_parameterized_and_schema_qualified():
-    for sql in (q.collections_overview_sql(), q.running_runs_sql(), q.run_events_sql(), q.recent_errors_sql(),
+    for sql in (q.collections_overview_sql(), q.running_runs_sql(), q.run_events_sql(), q.recent_errors_sql(), q.failed_tables_sql(),
                 q.collections_sql(), q.set_enabled_sql(), q.force_reseed_sql(), q.log_reseed_sql(),
                 q.insert_control_sql()):
         assert "lakefed_ingest." in sql

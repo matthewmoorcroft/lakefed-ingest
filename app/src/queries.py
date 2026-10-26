@@ -342,11 +342,17 @@ ERROR_CLASSES = (
 )
 
 
+# Each cause phrase matches only as a whole word or phrase, so a name that contains one (a column called
+# network_id or timeout_ms) is not read as that cause.
+_ERROR_PATTERNS = tuple((name, label, re.compile("|".join(rf"(?<![a-z0-9_]){re.escape(n)}(?![a-z0-9_])" for n in needles)))
+                        for name, label, needles in ERROR_CLASSES)
+
+
 def classify_error(error: Optional[str]) -> Tuple[str, str]:
     """(class, label) of an error message; ('other', 'Other errors') when nothing matches."""
     text = (error or "").lower()
-    for name, label, needles in ERROR_CLASSES:
-        if any(n in text for n in needles):
+    for name, label, pattern in _ERROR_PATTERNS:
+        if pattern.search(text):
             return name, label
     return "other", "Other errors"
 
@@ -360,25 +366,58 @@ def error_signature(error: Optional[str]) -> str:
     return first[:240]
 
 
+def failed_tables_sql() -> str:
+    """One row per table that failed in the last N hours, newest failure first: its newest failed event
+    (the error the groups classify), how many times it failed, and its first and last failure. Params:
+    hours, limit (tables), hours."""
+    return f"""
+with failing as (
+    select control_id, count(*) as failures, min(finished_at) as first_at, max(finished_at) as last_at,
+           max(started_at) as last_started_at
+    from {SCHEMA}.ingest_event
+    where status = 'failed' and started_at > now() - make_interval(hours => %s)
+    group by control_id
+    order by last_started_at desc
+    limit %s
+)
+select e.finished_at, e.task_collection, e.run_id, e.control_id, e.src_database, e.src_schema, e.src_table,
+       e.stage, e.error, f.failures, f.first_at, f.last_at
+from failing f
+join lateral (select * from {SCHEMA}.ingest_event e
+              where e.control_id = f.control_id and e.status = 'failed'
+                and e.started_at > now() - make_interval(hours => %s)
+              order by e.started_at desc limit 1) e on true
+order by f.last_started_at desc"""
+
+
 def group_errors(rows: List[dict]) -> List[dict]:
-    """Failed table events grouped by cause (class and signature), most tables first: tables, databases
-    (with collection and server), first and last time, and one raw example message."""
+    """Failed tables grouped by cause (class and signature), most tables first: tables (each counted
+    once, however often it failed), failures, databases (with collection), first and last time, and one
+    raw example message. Takes failed_tables_sql's rows (one per table, with its failures and times) or
+    plain failed events (one per failure), and counts a table once either way."""
     groups: dict = {}
     for r in rows:
         name, label = classify_error(r.get("error"))
         g = groups.setdefault((name, error_signature(r.get("error"))), {
             "error_class": name, "label": label, "signature": error_signature(r.get("error")),
-            "example": (r.get("error") or "")[:2000], "tables": 0, "databases": {}, "first_at": None, "last_at": None})
-        g["tables"] += 1
-        db = g["databases"].setdefault((r.get("task_collection"), r.get("src_database")), {
-            "task_collection": r.get("task_collection"), "src_database": r.get("src_database"), "tables": []})
-        db["tables"].append(f"{r.get('src_schema')}.{r.get('src_table')}")
-        at = r.get("finished_at")
-        if at:
-            g["first_at"] = min(g["first_at"] or at, at)
-            g["last_at"] = max(g["last_at"] or at, at)
+            "example": (r.get("error") or "")[:2000], "tables": 0, "failures": 0, "databases": {}, "seen": set(),
+            "first_at": None, "last_at": None})
+        g["failures"] += int(r.get("failures") or 1)
+        table = r.get("control_id") or (r.get("task_collection"), r.get("src_database"), r.get("src_schema"),
+                                        r.get("src_table"))
+        if table not in g["seen"]:
+            g["seen"].add(table)
+            g["tables"] += 1
+            db = g["databases"].setdefault((r.get("task_collection"), r.get("src_database")), {
+                "task_collection": r.get("task_collection"), "src_database": r.get("src_database"), "tables": []})
+            db["tables"].append(f"{r.get('src_schema')}.{r.get('src_table')}")
+        for at in (r.get("first_at") or r.get("finished_at"), r.get("last_at") or r.get("finished_at")):
+            if at:
+                g["first_at"] = min(g["first_at"] or at, at)
+                g["last_at"] = max(g["last_at"] or at, at)
     out = []
     for g in sorted(groups.values(), key=lambda g: -g["tables"]):
+        del g["seen"]
         g["databases"] = sorted(g["databases"].values(),
                                 key=lambda d: (str(d["task_collection"]), str(d["src_database"])))
         out.append(g)

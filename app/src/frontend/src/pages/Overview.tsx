@@ -16,7 +16,7 @@ const HEALTH_TONE: Record<string, Tone> = { healthy: "ok", failing: "bad", late:
 export default function OverviewPage() {
   const nav = useNavigate();
   const ov = useQuery({ queryKey: ["overview"], queryFn: () => api.get<Overview>("/overview"), refetchInterval: 30_000 });
-  const groups = useQuery({ queryKey: ["error-groups"], queryFn: () => api.get<Row[]>("/errors/groups?hours=24"),
+  const groups = useQuery({ queryKey: ["error-groups"], queryFn: () => api.get<{ groups: Row[]; tables_shown: number; truncated: boolean }>("/errors/groups?hours=24"),
                             refetchInterval: 60_000 });
   const cols = ov.data?.collections ?? [];
   const running = ov.data?.running ?? [];
@@ -144,12 +144,15 @@ export default function OverviewPage() {
       <Section title="Failures, last 24 hours" actions={<Link to="/tables?status=failing">Failing tables</Link>}
         note="Failures with the same cause are grouped. Connection and timeout failures usually clear on the next run; the others need a change at the source or in config.">
         <ErrorBox error={groups.error} />
-        {groups.data && groups.data.length === 0 && <Notice tone="ok">No failed tables in the last 24 hours.</Notice>}
-        {(groups.data ?? []).map((g) => (
+        {groups.data && groups.data.groups.length === 0 && <Notice tone="ok">No failed tables in the last 24 hours.</Notice>}
+        {groups.data?.truncated && <Notice tone="warn">Showing the {fmtInt(groups.data.tables_shown)} tables that failed most
+          recently; more failed in the last 24 hours. The Tables page's failing filter lists them all.</Notice>}
+        {(groups.data?.groups ?? []).map((g) => (
           <div className="err-group" key={`${g.error_class}:${g.signature}`}>
             <div><div className="what">{g.label}{" "}
               <Tag tone={g.error_class === "connection" || g.error_class === "timeout" ? "warn" : "bad"}>{g.error_class}</Tag></div>
-              <div className="where">{fmtInt(g.tables)} {g.tables === 1 ? "table" : "tables"} in {g.databases.length}{" "}
+              <div className="where">{fmtInt(g.tables)} {plural(g.tables, "table")}
+                {Number(g.failures) > Number(g.tables) ? <> ({fmtInt(g.failures)} failures)</> : null} in {g.databases.length}{" "}
                 {g.databases.length === 1 ? "database" : "databases"}:{" "}
                 {g.databases.slice(0, 6).map((d: Row) => `${d.src_database} (${d.task_collection}): ${d.tables.slice(0, 4).join(", ")}`
                   + (d.tables.length > 4 ? ` and ${d.tables.length - 4} more` : "")).join("; ")}

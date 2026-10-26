@@ -140,3 +140,10 @@ def test_a_runs_databases_and_rows(pg):
 def test_connection_databases_match_by_name_or_host_case_insensitively(pg):
     found = rows(pg, q.connection_databases_sql(), ("no_such_connection", "host-a"))
     assert [(d["src_database"], d["tables"], d["collections"]) for d in found] == [("db1", 10, "c1"), ("db2", 10, "c1")]
+
+
+def test_failed_tables_are_one_row_per_table_with_its_failures(pg):
+    found = rows(pg, q.failed_tables_sql(), (24, 10, 24))
+    assert [(r["src_database"], r["src_table"], r["failures"]) for r in found] == [("db2", "t9", 1)]
+    assert found[0]["error"].startswith("[FAILED_JDBC.CONNECTION]") and found[0]["first_at"] == found[0]["last_at"]
+    assert rows(pg, q.failed_tables_sql(), (24, 0, 24)) == []
