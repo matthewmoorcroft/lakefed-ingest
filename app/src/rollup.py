@@ -166,7 +166,7 @@ def sources(states: Iterable[dict], connections: Iterable[dict], not_ingested: I
         used_hosts |= all_hosts
         found = [d for d in not_ingested if (d.get("src_host") or "").lower() in all_hosts]
         job_rows, unscheduled = jobs(mine, schedules, members)
-        here = {s["task_collection"] for s in mine if _count(s, "tables")}
+        here = {s["task_collection"] for s in mine}
         instances.append({**row, "groups": row["collections"], "read_via": read_via, "nothing_registered": False,
                           "jobs": [dict(j, groups=[g for g in j["groups"] if g in here])
                                    for j in job_rows if j["groups"] and j["enabled_tables"]]
