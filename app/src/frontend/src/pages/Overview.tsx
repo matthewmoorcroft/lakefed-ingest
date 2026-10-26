@@ -88,7 +88,7 @@ export function RunningNow({ runs, total, notInJob }: { runs: Row[]; total: numb
         return (
           <div key={`${r.job_id}-${r.slot}`} className="run-row">
             <div><div className="title"><Link to={jobRunPath(r.job_id, r.slot)}>{jobRunName(r.job_name, r.slot)}</Link></div>
-              <div className="kv"><span>{fmtInt(r.ran - r.running_group_runs)} finished</span><span>{fmtInt(r.running_group_runs)} running</span>
+              <div className="kv"><span>{fmtInt(r.finished_group_runs)} finished</span><span>{fmtInt(r.running_group_runs)} running</span>
                 <span>{fmtInt(r.waiting)} waiting</span></div></div>
             <div><div className="count">{progressText(p)}</div><ProgressBar p={p} /></div>
             <div className="kv"><span>Speed now <b>{r.speed_now ? `${fmtSpeed(r.speed_now.tables_per_min)} tables/min` : "not yet"}</b></span>

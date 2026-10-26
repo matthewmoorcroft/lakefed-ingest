@@ -132,6 +132,7 @@ def summarize(job: dict, job_run: dict, running_by_run: dict, group_tables: Dict
             "typical_s": round(max(typical)) if typical else None,
             "waiting": sum(1 for m in members if m["state"] in ("waiting", "starting")),
             "running_group_runs": sum(1 for r in ran if r.get("status") == "running"),
+            "finished_group_runs": sum(1 for r in ran if r.get("status") != "running"),     # extra runs included
         })
     return out
 

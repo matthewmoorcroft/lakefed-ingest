@@ -135,7 +135,9 @@ def test_an_extra_run_counts_in_the_outcome_but_not_as_a_member():
     s = ij.summarize(SCHEDULES[0], jr, {}, {"c1": 10}, {}, NOW)
     assert (s["outcome"]["label"], s["ran"], s["members"], s["extra"]) == ("Completed with failures", 1, 1, 1)
     live = dict(jr, members=[dict(jr["members"][0], extra=[run(12, "c1", datetime(2026, 10, 26, 13, 40, tzinfo=UTC), status="running")])])
-    assert ij.summarize(SCHEDULES[0], live, {}, {"c1": 10}, {}, NOW)["outcome"]["label"] == "Running"
+    running = ij.summarize(SCHEDULES[0], live, {}, {"c1": 10}, {}, NOW)
+    assert running["outcome"]["label"] == "Running"
+    assert (running["finished_group_runs"], running["running_group_runs"]) == (1, 1)     # c1's own run finished
 
 
 def test_a_finished_group_runs_reseeds_queued_are_not_loaded_in_its_progress():
