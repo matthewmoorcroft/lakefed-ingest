@@ -120,7 +120,8 @@ secret). See `README.md`, `docs/deploy.md`, `docs/monitoring.md`, `docs/lakebase
   `database_catalogs.lakebase_catalog`, `secret_scopes.secret_scope`).
 
 ### Run flow (`ingest.ipynb`)
-1. Per-collection Lakebase advisory lock (duplicate run exits `skipped`).
+1. Per-collection Lakebase advisory lock (duplicate run exits `skipped`; a duplicate with a `work_id` fails,
+   since its databases would not be ingested).
 2. Plan (`planner.py`, pure): unsupported (`src_type`, `load_type`) pair → fail per table (stage
    `plan`); `full` → reload; `cursor` → `cursor_seed` / schema_reseed / `cursor` (per-table high
    watermark, `cursor_engine`); CT tables → seed / schema_reseed / detection candidate; group by

@@ -667,6 +667,11 @@ def test_a_work_list_that_matches_no_enabled_row_is_refused_not_ingested_as_noth
     assert planner.work_without_rows(cfgs, partly) == [("h9|1433|k-d9", "d9")]
 
 
+def test_a_run_for_a_work_list_that_finds_its_collection_locked_fails_instead_of_skipping():
+    assert planner.locked_run_status("") == "skipped"
+    assert planner.locked_run_status("launch-1:c1") == "failed"
+
+
 def test_the_sink_lookup_covers_the_incremental_rows_only():
     """The sweep and the check list the sinks of ct and cursor rows (the ones a missing sink reseeds);
     full reloads have no checkpoint to protect."""
