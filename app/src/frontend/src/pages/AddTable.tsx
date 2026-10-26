@@ -6,7 +6,7 @@ import { ErrorBox, Notice, Section } from "../components";
 type Field = { key: string; label: string; required?: boolean; help?: string; type?: "text" | "number" | "checkbox"; options?: string[]; initial?: any };
 
 const FIELDS: Field[] = [
-  { key: "task_collection", label: "task_collection", required: true },
+  { key: "task_collection", label: "Ingestion group (task_collection)", required: true },
   { key: "src_type", label: "src_type", options: ["sqlserver", "oracle", "postgresql", "mysql"], initial: "sqlserver" },
   { key: "load_type", label: "load_type", options: ["ct", "cursor", "full"], initial: "ct" },
   { key: "use_remote_query", label: "use_remote_query", type: "checkbox", initial: false,
@@ -54,7 +54,7 @@ export default function AddTable() {
     <>
       <h1>Add a table</h1>
       <Section title="New control row">
-        <p className="muted small">Adds one control row; the next run of its collection seeds it. For many tables use Bulk import.</p>
+        <p className="muted small">Adds one control row; the next run of its ingestion group seeds it. For many tables use Bulk import.</p>
         <form className="form-grid" onSubmit={(e) => { e.preventDefault(); add.mutate(); }}>
           {FIELDS.map((f) => { const required = f.required && !(row.use_remote_query && JDBC_ONLY.includes(f.key)); return (
             <label key={f.key} className={f.key === "select_list" ? "wide" : ""}>

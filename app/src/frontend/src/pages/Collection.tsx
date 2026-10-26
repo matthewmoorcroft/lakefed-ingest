@@ -3,7 +3,7 @@ import { Link, useParams } from "react-router-dom";
 import { api, type Row } from "../api";
 import {
   ErrorBox, FillBox, PageHead, ProgressBar, ProgressKey, Section, Stamp, StateBar, StateKey, Tag,
-  fmtAgo, fmtClock, fmtDuration, fmtInt, progressOf, progressText, type Progress,
+  fmtAgo, fmtClock, fmtDuration, fmtInt, progressOf, progressText, type Progress, plural
 } from "../components";
 
 interface CollectionData { collection: string; databases: Row[]; running: Row | null; batches: Row[]; read_at: string; cache_s: number }
@@ -39,8 +39,8 @@ export default function CollectionPage() {
   const unattributed = (data.data?.batches ?? []).filter((b) => (b.databases ?? []).length !== 1);
   return (
     <>
-      <PageHead crumb={<span className="eyebrow"><Link to="/overview">Overview</Link> · Collection · How far along is each database?</span>} title={name}
-        lead={<><strong>{fmtInt(dbs.length)}</strong> databases, <strong>{fmtInt(tables)}</strong> enabled tables
+      <PageHead crumb={<span className="eyebrow"><Link to="/overview">Overview</Link> · Ingestion group · How far along is each database?</span>} title={name}
+        lead={<><strong>{fmtInt(dbs.length)}</strong> {plural(dbs.length, "database")}, <strong>{fmtInt(tables)}</strong> enabled {plural(tables, "table")}
           {servers.length ? <> on <strong>{servers.join(", ")}</strong></> : null}.{" "}
           <Link to={`/tables?collection=${encodeURIComponent(name)}`}>Its tables</Link> ·{" "}
           <Link to="/schedules">Schedules</Link> · <Link to="/runs">Runs</Link></>}
@@ -87,7 +87,7 @@ export default function CollectionPage() {
                 );
               })}
               {dbs.length > 1 && (
-                <tr className="total"><td>{fmtInt(dbs.length)} databases</td>{run && <td />}
+                <tr className="total"><td>{fmtInt(dbs.length)} {plural(dbs.length, "database")}</td>{run && <td />}
                   {run && <td className="num">{fmtInt(dbs.reduce((a, d) => a + Number(d.checked_this_run || 0), 0))} of {fmtInt(tables)}</td>}
                   {run && <td className="num">{fmtInt(dbs.reduce((a, d) => a + Number(d.in_flight || 0), 0))}</td>}
                   <td /><td className="num">{fmtInt(dbs.reduce((a, d) => a + Number(d.state_failing || 0), 0))}</td>

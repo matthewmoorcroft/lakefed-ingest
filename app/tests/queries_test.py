@@ -170,7 +170,7 @@ def test_plan_edit_ignores_cosmetic_changes():
 
 def test_plan_edit_move_secret_and_select_list_notes():
     (p,) = q.plan_edit([ROW], {"task_collection": "c2", "secret_key": "k2"}, bulk=False)
-    assert p["reseed"] is None and any("moves to collection c2" in n for n in p["notes"])
+    assert p["reseed"] is None and any("moves to ingestion group c2" in n for n in p["notes"])
     (p,) = q.plan_edit([ROW], {"select_list": "id, w"}, bulk=False)
     assert any("new columns w" in n for n in p["notes"]) and any("removed columns v stay in the sink" in n for n in p["notes"])
 

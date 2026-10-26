@@ -83,12 +83,12 @@ def validate(body: dict, known_collections: Iterable[str], variants: Iterable[st
     members = body.get("members") or []
     known = set(known_collections)
     if not members:
-        errs.append("members: at least one collection")
+        errs.append("members: at least one ingestion group")
     if len(set(members)) != len(members):
-        errs.append("members: a collection is listed twice")
+        errs.append("members: an ingestion group is listed twice")
     unknown = [m for m in members if m not in known]
     if unknown:
-        errs.append(f"members: unknown collections {', '.join(sorted(unknown))}")
+        errs.append(f"members: unknown ingestion groups {', '.join(sorted(unknown))}")
     bad = [e for e in emails(body.get("notify_emails")) if not _EMAIL.fullmatch(e)]
     if bad:
         errs.append(f"notify_emails: invalid address {bad[0]}")
@@ -227,8 +227,8 @@ def warnings(cadence: int, p95_s: Optional[float], min_sla_minutes: Optional[flo
     if skipped:
         out.append(f"{skipped} trigger(s) skipped in the last 24 hours (the previous run was still going)")
     if min_sla_minutes is not None and p95_s is not None and cadence + p95_s / 60 > min_sla_minutes:
-        out.append(f"can't meet SLA: cadence + p95 run time ({round(cadence + p95_s / 60)} min) is longer than the "
-                   f"strictest table SLA ({int(min_sla_minutes)} min)")
+        out.append(f"can't meet the freshness target: cadence + p95 run time ({round(cadence + p95_s / 60)} min) is longer "
+                   f"than the strictest table's target ({int(min_sla_minutes)} min)")
     return out
 
 

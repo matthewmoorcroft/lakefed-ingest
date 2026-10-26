@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { api, qs, type Row } from "../api";
-import { ErrorBox, Notice, fmtTime, useWidth } from "../components";
+import { ErrorBox, Notice, fmtTime, useWidth, plural } from "../components";
 
 // Runs per collection over a window: planned triggers (ticks), runs (bars by outcome) and triggers
 // Databricks skipped because the previous run was still going (red markers).
@@ -41,17 +41,17 @@ export default function TimelinePage() {
         </label>
         <span className="legend">
           <i style={{ background: COLOR.completed }} /> completed <i style={{ background: COLOR.failed }} /> failed
-          <i style={{ background: COLOR.running }} /> running <i style={{ background: COLOR.skipped }} /> skipped (collection already running)
+          <i style={{ background: COLOR.running }} /> running <i style={{ background: COLOR.skipped }} /> skipped (ingestion group already running)
           <i className="tick" /> planned trigger (current schedule, since its last change) <b className="skipmark">▼</b> trigger skipped by Databricks
         </span>
       </div>
       <ErrorBox error={t.error} />
-      {d && <p className="muted small">{stats.runs} runs, {stats.failed} failed, {stats.skipped} skipped triggers, {fmtTime(d.start)} – {fmtTime(d.end)}.
+      {d && <p className="muted small">{stats.runs} {plural(stats.runs, "run")}, {stats.failed} failed, {stats.skipped} skipped {plural(stats.skipped, "trigger")}, {fmtTime(d.start)} – {fmtTime(d.end)}.
         Hover a bar for details.</p>}
       {d && rows.length === 0 && <Notice>No runs or schedules in this window.</Notice>}
       {d && rows.length > 0 && (
         <div className="card timeline" ref={box}>
-          <svg viewBox={`0 0 ${LABEL_W + CHART_W + 10} ${height}`} width={LABEL_W + CHART_W + 10} height={height} role="img" aria-label="Runs per collection over time">
+          <svg viewBox={`0 0 ${LABEL_W + CHART_W + 10} ${height}`} width={LABEL_W + CHART_W + 10} height={height} role="img" aria-label="Runs per ingestion group over time">
             {ticks.map((ms) => (
               <g key={ms}>
                 <line x1={x(ms)} x2={x(ms)} y1={AXIS_H - 4} y2={height} style={{ stroke: "var(--border)" }} />

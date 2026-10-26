@@ -57,9 +57,9 @@ def test_validate():
                job_variant="large", members=["c1", "c1", "zz"], notify_emails="nope")
     errs = " | ".join(sch.validate(bad, ["c1"], ["default"]))
     for part in ("name:", "cadence_minutes", "timezone", "parameters.parallelism", "'x' isn't", "job_variant",
-                 "listed twice", "unknown collections zz", "notify_emails"):
+                 "listed twice", "unknown ingestion groups zz", "notify_emails"):
         assert part in errs
-    assert "at least one collection" in " ".join(sch.validate(dict(ok, members=[]), [], ["default"]))
+    assert "at least one ingestion group" in " ".join(sch.validate(dict(ok, members=[]), [], ["default"]))
 
 
 def test_job_settings_and_drift():
@@ -87,7 +87,7 @@ def test_warnings():
     assert sch.warnings(15, 300, 60) == []
     assert "overrun" in sch.warnings(15, 960, None)[0]
     assert sch.warnings(15, 780, None)[0].startswith("near overrun")
-    assert "can't meet SLA" in sch.warnings(15, 600, 20)[-1]
+    assert "can't meet the freshness target" in sch.warnings(15, 600, 20)[-1]
     assert "2 trigger(s) skipped" in sch.warnings(15, None, None, skipped=2)[0]
 
 

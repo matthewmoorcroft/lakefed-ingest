@@ -4,6 +4,7 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, type Config } from "./api";
 import Overview from "./pages/Overview";
 import Runs from "./pages/Runs";
+import RunDetail from "./pages/RunDetail";
 import Tables from "./pages/Tables";
 import Jobs from "./pages/Jobs";
 import AddTable from "./pages/AddTable";
@@ -56,6 +57,7 @@ export default function App() {
             <Route path="/" element={<Navigate to="/overview" replace />} />
             <Route path="/overview" element={<Overview />} />
             <Route path="/runs" element={<Runs />} />
+            <Route path="/runs/:id" element={<RunDetail />} />
             <Route path="/tables" element={<Tables />} />
             <Route path="/jobs" element={<Jobs />} />
             <Route path="/schedules" element={<Schedules />} />

@@ -53,7 +53,7 @@ def _lock_collections(cur, collections):
     for c in sorted({c for c in collections if c}):
         cur.execute(q.collection_lock_sql(), (q.collection_lock_key(c),))
         if not cur.fetchone()[0]:
-            raise HTTPException(409, f"collection '{c}' is running; try again after the run finishes")
+            raise HTTPException(409, f"ingestion group '{c}' is running; try again after the run finishes")
 
 
 def _refuse_mixed_sinks(cur, rows):
@@ -190,7 +190,10 @@ def runs(collection: Optional[str] = None, limit: int = 200):
     """Recent runs, each with the rows it wrote: its table loads' counts plus its batched appends' total;
     rows_partial when some loads recorded no count."""
     sql, params = q.runs_sql(collection or None, limit=limit)
-    out = db.query(sql, params)
+    return _with_rows_written(db.query(sql, params))
+
+
+def _with_rows_written(out: List[dict]) -> List[dict]:
     if out:
         written = {r["run_id"]: r for r in db.query(q.run_rows_sql(), ([r["run_id"] for r in out],))}
         for r in out:
@@ -199,6 +202,18 @@ def runs(collection: Optional[str] = None, limit: int = 200):
             r["rows_written"] = int(w.get("rows_written") or 0) + batched
             r["rows_partial"] = bool(batched_unknown) if batched else bool(w.get("uncounted"))
     return out
+
+
+@app.get("/api/runs/{run_id}")
+def run_detail(run_id: int):
+    """One run: its row and rows written, and while it is running its live progress (the overview's counts)."""
+    found = _with_rows_written(db.query(q.run_sql(), (int(run_id),)))
+    if not found:
+        raise HTTPException(404, f"run {run_id} not found")
+    run = found[0]
+    if run["status"] == "running":
+        run["progress"] = next((r for r in db.query(q.running_runs_sql()) if r["run_id"] == run["run_id"]), None)
+    return run
 
 
 @app.get("/api/runs/{run_id}/databases")
@@ -805,14 +820,19 @@ def timeline(hours: int = 24):
 # ---- UC connections (bulk import) ----------------------------------------------------------------
 
 DISCOVERABLE_CONNECTION_TYPES = {"SQLSERVER"}
+# Connection types lakefed can read: its source adapters (queries.SRC_TYPES). HTTP and other connections are left out.
+READABLE_CONNECTION_TYPES = {t.upper() for t in q.SRC_TYPES}
 
 
 def _connections() -> List[dict]:
-    """The Unity Catalog connections this app's identity can see, with host and port from their options."""
+    """The database connections of a type lakefed can read that this app's identity can see, with host and port
+    from their options."""
     out = []
     for c in db.workspace().connections.list():
         options = c.options or {}
         kind = getattr(c.connection_type, "value", c.connection_type)
+        if str(kind or "").upper() not in READABLE_CONNECTION_TYPES:
+            continue
         out.append({"name": c.name, "connection_type": kind, "host": options.get("host"), "port": options.get("port"),
                     "owner": c.owner, "comment": c.comment, "discoverable": kind in DISCOVERABLE_CONNECTION_TYPES})
     return sorted(out, key=lambda c: c["name"])

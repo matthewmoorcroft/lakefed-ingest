@@ -129,7 +129,7 @@ def test_create_writes_rows_creates_one_job_per_member_and_logs(api):
 
 def test_validation_and_duplicate_name(api):
     r = api.post("/api/schedules", json=dict(BODY, cadence_minutes=7, members=["c1", "nope"]))
-    assert r.status_code == 422 and "cadence_minutes" in r.text and "unknown collections nope" in r.text
+    assert r.status_code == 422 and "cadence_minutes" in r.text and "unknown ingestion groups nope" in r.text
     api.store.unique = True
     assert api.post("/api/schedules", json=BODY).status_code == 409
 

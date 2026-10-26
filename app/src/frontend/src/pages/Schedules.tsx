@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, type Row } from "../api";
-import { Badge, ConfirmButton, ErrorBox, Grid, Notice, Section, fmtTime } from "../components";
+import { Badge, ConfirmButton, ErrorBox, Grid, Notice, Section, fmtTime, plural } from "../components";
 
 // A schedule runs one or more collections at a cadence. The app turns each (schedule, collection)
 // into a small Databricks job that starts the ingestion job; editing here keeps those jobs in sync.
@@ -76,8 +76,8 @@ function Editor({ initial, options, onDone }: { initial?: Row; options: Options;
         <label className="checkbox"><input type="checkbox" checked={f.paused} onChange={(e) => setF({ ...f, paused: e.target.checked })} />
           Paused</label>
         <div className="wide">
-          <div className="muted small">Collections * ({f.members.length} selected). Each gets its own job, so one slow
-            collection never delays the others.</div>
+          <div className="muted small">Ingestion groups * ({f.members.length} selected). Each gets its own job, so one slow
+            ingestion group never delays the others.</div>
           <div className="checklist">
             {options.collections.map((c) => {
               const elsewhere = (options.scheduled[c] ?? []).filter((n) => n !== initial?.name);
@@ -133,17 +133,17 @@ function ScheduleCard({ s, onEdit }: { s: Row; onEdit: () => void }) {
     </>}>
       <p className="muted small">Time zone {s.timezone}{paramsText(s.parameters) ? ` · ${paramsText(s.parameters)}` : ""}
         {s.notify_emails ? ` · failure emails to ${s.notify_emails}` : ""} · updated {fmtTime(s.updated_at)}{s.created_by ? ` · created by ${s.created_by}` : ""}</p>
-      {warned > 0 && <Notice tone="warn">{warned} collection(s) have warnings: see the warnings column.</Notice>}
+      {warned > 0 && <Notice tone="warn">{warned} {plural(warned, "ingestion group")} {warned === 1 ? "has" : "have"} warnings: see the warnings column.</Notice>}
       <ErrorBox error={act.error || check.error} />
       <SyncResult result={act.data} />
       <Grid rows={rows} fitRows columns={[
-        { field: "collection", headerName: "Collection", pinned: "left" }, { field: "starts", headerName: "Starts" },
+        { field: "collection", headerName: "Ingestion group", pinned: "left" }, { field: "starts", headerName: "Starts" },
         { field: "next_run", headerName: "Next run" },
         { field: "last_run", headerName: "Last run", cellRenderer: (p: any) => <Badge value={p.value} /> },
         { field: "last_started", headerName: "Last started" }, { field: "last_duration", headerName: "Last duration" },
         { field: "p95_7d", headerName: "p95 (7 days)" }, { field: "runs_24h", headerName: "Runs (24 h)" },
         { field: "failed_24h", headerName: "Failed (24 h)" }, { field: "skipped_24h", headerName: "Skipped triggers (24 h)" },
-        { field: "strictest_sla", headerName: "Strictest SLA" },
+        { field: "strictest_sla", headerName: "Strictest freshness target" },
         { field: "job", headerName: "Job", cellRenderer: (p: any) => (p.value ? <a href={p.value} target="_blank" rel="noreferrer">open</a> : null) },
         { field: "sync", headerName: "Sync", cellRenderer: (p: any) => <Badge value={p.value === "ok" ? "ok" : "failed"} /> },
         { field: "sync_drift", headerName: "Check", cellRenderer: (p: any) => (p.value ? <Badge value={p.value === "in_sync" ? "ok" : "failed"} /> : null) },
@@ -162,9 +162,9 @@ export default function Schedules() {
   return (
     <>
       <h1>Schedules</h1>
-      <p className="muted">Each collection in a schedule gets its own Databricks job that starts the ingestion job at the
+      <p className="muted">Each ingestion group in a schedule gets its own Databricks job that starts the ingestion job at the
         schedule's cadence. A run still going at the next trigger makes Databricks skip that trigger (shown as skipped), so a
-        slow collection never piles up runs. Edit schedules here: changes made in the Jobs UI are reported by "Check jobs" and
+        slow ingestion group never piles up runs. Edit schedules here: changes made in the Jobs UI are reported by "Check jobs" and
         undone by the next sync.</p>
       <ErrorBox error={list.error || options.error} />
       <div className="toolbar"><button className="primary" disabled={!options.data} onClick={() => setEditing("new")}>New schedule</button></div>

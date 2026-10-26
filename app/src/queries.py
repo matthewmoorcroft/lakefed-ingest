@@ -119,16 +119,23 @@ order by r.started_at desc"""
 
 # ---- runs / events ------------------------------------------------------------------------------
 
+_RUN_COLUMNS = ("run_id, task_collection, status, started_at, finished_at, "
+                "round(extract(epoch from (coalesce(finished_at, now()) - started_at))::numeric, 0) as duration_s, "
+                "total, ok, failed, skipped, reseeded, job_run_id, parallelism")
+
+
 def runs_sql(collection: Optional[str], limit: int = 100) -> Tuple[str, tuple]:
     """Recent runs, optionally for one collection. Returns (sql, params)."""
     where, params = "", ()
     if collection:
         where, params = "where task_collection = %s ", (collection,)
-    sql = (f"select run_id, task_collection, status, started_at, finished_at, "
-           f"round(extract(epoch from (coalesce(finished_at, now()) - started_at))::numeric, 0) as duration_s, "
-           f"total, ok, failed, skipped, reseeded, job_run_id, parallelism "
-           f"from {SCHEMA}.ingest_run {where}order by started_at desc limit %s")
+    sql = f"select {_RUN_COLUMNS} from {SCHEMA}.ingest_run {where}order by started_at desc limit %s"
     return sql, params + (int(limit),)
+
+
+def run_sql() -> str:
+    """One run, with the same columns as runs_sql. Param: run_id."""
+    return f"select {_RUN_COLUMNS} from {SCHEMA}.ingest_run where run_id = %s"
 
 
 def run_events_sql() -> str:
@@ -814,7 +821,7 @@ def plan_edit(rows: List[dict], changes: dict, bulk: bool) -> List[dict]:
         if "client_attrs" in p["changes"]:
             p["notes"].append("rows already written keep their client_attrs values; columns added now are NULL on them")
         if "task_collection" in p["changes"]:
-            p["notes"].append(f"moves to collection {merged['task_collection']}: that collection's runs and schedule apply")
+            p["notes"].append(f"moves to ingestion group {merged['task_collection']}: that group's runs and schedule apply")
         if p["reseed"]:
             p["notes"].insert(0, f"reseed required ({p['reseed']}): the table is copied again on its next run")
         plans.append(p)

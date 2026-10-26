@@ -34,12 +34,12 @@ export default function Jobs() {
           <div className="metrics">
             <Metric label="Schedule" value={j.schedule ?? "none"} />
             <Metric label="Schedule status" value={j.schedule_status ?? "–"} />
-            <Metric label="Scheduled collection" value={j.default_task_collection ?? "–"} />
+            <Metric label="Scheduled ingestion group" value={j.default_task_collection ?? "–"} />
           </div>
-          <p className="muted small">The job's own schedule only runs its default task_collection; the Schedules page
-            runs any collection on a cadence (runs it starts show their schedule).</p>
+          <p className="muted small">The job's own schedule only runs its default ingestion group; the Schedules page
+            runs any ingestion group on a cadence (runs it starts show their schedule).</p>
           <div className="toolbar">
-            <label>Collection
+            <label>Ingestion group
               <select value={coll} onChange={(e) => setCollection(e.target.value)}>
                 {collections.data?.map((c) => <option key={c}>{c}</option>)}
               </select>

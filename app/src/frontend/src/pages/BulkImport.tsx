@@ -4,7 +4,7 @@ import { AgGridReact } from "ag-grid-react";
 import { type ColDef } from "ag-grid-community";
 import { api, type Row } from "../api";
 import { useSettings } from "../App";
-import { Badge, ConfirmButton, ErrorBox, FillBox, Grid, Notice, PageHead, Section, Tag, autoColumns, fmtAgo, fmtInt, fmtTime, gridTheme } from "../components";
+import { Badge, ConfirmButton, ErrorBox, FillBox, Grid, Notice, PageHead, Section, Tag, autoColumns, fmtAgo, fmtInt, fmtTime, gridTheme, Host, plural } from "../components";
 
 const EDITABLE = ["include", "load_type", "primary_key", "cursor_column", "load_partitioned", "partition_col",
   "partition_size_mb", "sink_catalog", "sink_schema", "sink_table", "client_id", "freshness_sla_minutes"];
@@ -32,7 +32,7 @@ function Connections({ picked, onPick }: { picked: Connection | null; onPick: (c
   });
   const found = list.data?.connections ?? [];
   return (
-    <Section title="1. Source" note="Unity Catalog connections this app can use, with the databases, tables and collections lakefed already tracks on each (matched by connection name or host).">
+    <Section title="1. Source" note="Unity Catalog connections this app can use, with the databases, tables and ingestion groups lakefed already tracks on each (matched by connection name or host).">
       <ErrorBox error={list.error} />
       {list.data?.error && <Notice tone="warn">Could not list connections: {list.data.error}. Discovery by host and secret below still works.</Notice>}
       {list.data && !list.data.error && !found.length && <div className="empty">No Unity Catalog connections visible to this app.</div>}
@@ -40,12 +40,13 @@ function Connections({ picked, onPick }: { picked: Connection | null; onPick: (c
         {found.map((c) => (
           <div key={c.name} className={`server-card ${c.discoverable ? "selectable" : "disabled"} ${picked?.name === c.name ? "selected" : ""}`}
             onClick={() => c.discoverable && onPick(c)} role="button" aria-pressed={picked?.name === c.name}>
-            <div className="top"><div><h3>{c.name}</h3><div className="meta">{c.connection_type}{c.host ? ` · ${c.host}` : ""}{c.port ? `:${c.port}` : ""}</div></div>
+            <div className="top"><div className="name"><h3 title={c.name}>{c.name}</h3>
+              <div className="meta">{c.connection_type}{c.host && <> · <Host host={c.host} port={c.port} /></>}</div></div>
               {picked?.name === c.name ? <Tag tone="run">Selected</Tag> : c.tracked.tables ? <Tag tone="ok">Tracked</Tag> : <Tag>Not tracked</Tag>}</div>
             {c.discoverable ? (
               <div className="nums three"><div><b>{fmtInt(c.tracked.databases)}</b><span>databases tracked</span></div>
                 <div><b>{fmtInt(c.tracked.tables)}</b><span>tables tracked</span></div>
-                <div><b>{fmtInt(c.tracked.collections)}</b><span>collections</span></div></div>
+                <div><b>{fmtInt(c.tracked.collections)}</b><span>ingestion groups</span></div></div>
             ) : <div className="meta">Discovery is SQL Server only for now.</div>}
           </div>
         ))}
@@ -58,7 +59,7 @@ function Connections({ picked, onPick }: { picked: Connection | null; onPick: (c
           <ErrorBox error={tracked.error} />
           <FillBox min={200}>
             <table className="data">
-              <thead><tr><th>Database</th><th>Collections</th><th className="num">Tables</th><th className="num">Last success</th></tr></thead>
+              <thead><tr><th>Database</th><th>Ingestion groups</th><th className="num">Tables</th><th className="num">Last success</th></tr></thead>
               <tbody>
                 {(tracked.data ?? []).map((d) => (
                   <tr key={d.src_database}><td><b>{d.src_database}</b></td><td>{d.collections}</td><td className="num">{fmtInt(d.tables)}</td>
@@ -101,7 +102,7 @@ function DiscoverForm({ onStarted, prefill }: { onStarted: (id: string, runId: n
         <div className="wide"><button className="primary" disabled={start.isPending}>{start.isPending ? "Starting…" : "Discover"}</button></div>
       </form>
       <ErrorBox error={start.error} />
-      {start.data && <Notice tone="ok">Discovery {start.data.discovery_id} started for {start.data.databases} databases
+      {start.data && <Notice tone="ok">Discovery {start.data.discovery_id} started for {start.data.databases} {plural(start.data.databases, "database")}{" "}
         (job run {start.data.run_id}). It appears below; results arrive in a few minutes.</Notice>}
     </Section>
   );
@@ -224,7 +225,7 @@ export default function BulkImport() {
             <select value={did} onChange={(e) => setDiscoveryId(e.target.value)}>
               {discoveries.data?.map((d) => (
                 <option key={d.discovery_id} value={d.discovery_id}>
-                  {d.discovery_id}: {d.src_host}, {d.databases} databases, {d.tables} tables, {fmtTime(d.started_at)}
+                  {d.discovery_id}: {d.src_host}, {d.databases} {plural(d.databases, "database")}, {d.tables} {plural(d.tables, "table")}, {fmtTime(d.started_at)}
                   {Number(d.running) > 0 ? " (running)" : ""}{Number(d.failed) > 0 ? ` (${d.failed} failed)` : ""}
                 </option>
               ))}
@@ -251,7 +252,7 @@ export default function BulkImport() {
           <p className="muted small">Templates can use <code>{"{database}"}</code>, <code>{"{schema}"}</code> and
             <code>{" {table}"}</code>. Changing shared fields rebuilds the grid, so set them before editing rows.</p>
           <div className="form-grid">
-            <label>task_collection *<input value={collection} onChange={(e) => setCollection(e.target.value)} /></label>
+            <label>Ingestion group (task_collection) *<input value={collection} onChange={(e) => setCollection(e.target.value)} /></label>
             <label>sink_catalog *<input value={shared.sink_catalog} onChange={(e) => setShared({ ...shared, sink_catalog: e.target.value })} /></label>
             <label>sink_schema *<input value={shared.sink_schema} onChange={(e) => setShared({ ...shared, sink_schema: e.target.value })} /></label>
             <label>sink_table *<input value={shared.sink_table} onChange={(e) => setShared({ ...shared, sink_table: e.target.value })} /></label>
@@ -259,8 +260,8 @@ export default function BulkImport() {
               <input placeholder="e.g. {database}" value={shared.client_id} onChange={(e) => setShared({ ...shared, client_id: e.target.value })} />
               <span className="muted small">with a shared sink_schema, consolidates databases into one table each</span>
             </label>
-            <label>freshness_sla_minutes
-              <input type="number" min={1} placeholder="blank = no SLA" value={shared.freshness_sla_minutes ?? ""}
+            <label>Freshness target (freshness_sla_minutes)
+              <input type="number" min={1} placeholder="blank = no target" value={shared.freshness_sla_minutes ?? ""}
                 onChange={(e) => setShared({ ...shared, freshness_sla_minutes: Number(e.target.value) > 0 ? Number(e.target.value) : null })} />
               <span className="muted small">a table is late when its last success is older than this</span>
             </label>
@@ -302,7 +303,7 @@ export default function BulkImport() {
               onSelectionChanged={(e) => setSelected(e.api.getSelectedRows())}
               onCellValueChanged={(e) => update((r) => key(r) === key(e.data), () => ({ ...e.data }))} />
           </div>
-          <p className="muted small">{nIncluded} of {rows.length} tables included ({nPartitioned} partitioned).
+          <p className="muted small">{nIncluded} of {rows.length} {plural(rows.length, "table")} included ({nPartitioned} partitioned).
             {rows.length - shown.length > 0 && ` ${rows.length - shown.length} already registered are hidden.`}</p>
         </Section>
       )}
@@ -311,12 +312,12 @@ export default function BulkImport() {
         <Section title="5. Register">
           <div className="toolbar">
             <button className="ghost" disabled={!nIncluded || !collection || validate.isPending} onClick={() => { register.reset(); validate.mutate(); }}>
-              Validate {nIncluded} tables
+              Validate {nIncluded} {plural(nIncluded, "table")}
             </button>
-            <ConfirmButton label={`Register ${nIncluded} tables`} disabled={!nIncluded || !collection}
-              confirmLabel={`Confirm: register ${nIncluded} tables in '${collection}'`}
+            <ConfirmButton label={`Register ${nIncluded} ${plural(nIncluded, "table")}`} disabled={!nIncluded || !collection}
+              confirmLabel={`Confirm: register ${nIncluded} ${plural(nIncluded, "table")} in '${collection}'`}
               onConfirm={async () => { validate.reset(); await register.mutateAsync(); }} />
-            {!collection && <span className="muted">Set task_collection first.</span>}
+            {!collection && <span className="muted">Set the ingestion group first.</span>}
           </div>
           <ErrorBox error={validate.error || register.error} />
           {result && (

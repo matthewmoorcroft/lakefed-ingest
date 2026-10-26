@@ -169,7 +169,7 @@ def test_bulk_move_takes_both_collection_locks_and_does_not_reseed(client):
 def test_edit_refused_while_collection_runs(client):
     client.db.running = {"lakefed_ingest:c2"}
     r = _edit(client, [7], {"task_collection": "c2"})
-    assert r.status_code == 409 and "collection 'c2' is running" in r.json()["detail"]
+    assert r.status_code == 409 and "ingestion group 'c2' is running" in r.json()["detail"]
 
 
 def test_bulk_edit_rejects_single_row_fields_and_invalid_rows(client):
@@ -233,3 +233,35 @@ def test_discovery_run_state_only_for_discovery_runs(client, monkeypatch):
                                                               "state": "TERMINATED", "result": "FAILED", "message": "m", "url": "u"})
     assert client.get("/api/discoveries/runs/1").json()["result"] == "FAILED"
     assert client.get("/api/discoveries/runs/2").status_code == 404
+
+
+def test_connections_lists_only_database_connections_lakefed_can_read(monkeypatch):
+    from types import SimpleNamespace
+    kind = lambda v: SimpleNamespace(value=v)
+    listed = [SimpleNamespace(name=n, connection_type=k, options={"host": f"{n}.example", "port": "1"}, owner="o", comment=None)
+              for n, k in (("z_sql", kind("SQLSERVER")), ("mcp_slack", kind("HTTP")), ("pg", kind("POSTGRESQL")),
+                           ("ora", "ORACLE"), ("my", kind("MYSQL")), ("snow", kind("SNOWFLAKE")), ("gdrive", kind("HTTP")))]
+    monkeypatch.setattr(main.db, "workspace", lambda: SimpleNamespace(connections=SimpleNamespace(list=lambda: listed)))
+    found = main._connections()
+    assert [c["name"] for c in found] == ["my", "ora", "pg", "z_sql"]
+    assert {c["name"]: c["discoverable"] for c in found} == {"my": False, "ora": False, "pg": False, "z_sql": True}
+
+
+def test_run_detail_returns_the_run_its_rows_and_live_progress(monkeypatch):
+    run = dict(run_id=5, task_collection="c1", status="running", total=10, ok=4, failed=1, skipped=2)
+    calls = []
+
+    def query(sql, params=()):
+        calls.append(sql)
+        if sql == q.run_sql():
+            return [dict(run)] if params == (5,) else []
+        if sql == q.run_rows_sql():
+            return [dict(run_id=5, rows_written=120, uncounted=0, detail=None)]
+        if sql == q.running_runs_sql():
+            return [dict(run_id=4, tables_ok=9), dict(run_id=5, tables_ok=4, tables_running=3, enabled_tables=10)]
+        raise AssertionError(sql)
+    monkeypatch.setattr(main.db, "query", query)
+    client = TestClient(main.app)
+    body = client.get("/api/runs/5").json()
+    assert body["run_id"] == 5 and body["rows_written"] == 120 and body["progress"]["tables_running"] == 3
+    assert client.get("/api/runs/6").status_code == 404

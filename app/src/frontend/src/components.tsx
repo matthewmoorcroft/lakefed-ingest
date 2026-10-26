@@ -156,6 +156,30 @@ export function fmtInt(v: unknown): string {
   return v === null || v === undefined || v === "" ? "" : NUMBER.format(Number(v));
 }
 
+const COMPACT = new Intl.NumberFormat("en-US", { notation: "compact", maximumFractionDigits: 1 });
+
+/** A count for a metric tile: in full below a billion, else short ("296.3B") with the full count on hover, so it fits. */
+export function BigCount({ value }: { value: unknown }) {
+  if (value === null || value === undefined || value === "") return null;
+  const n = Number(value);
+  return Math.abs(n) < 1e9 ? <>{fmtInt(n)}</> : <span title={fmtInt(n)}>{COMPACT.format(n)}</span>;
+}
+
+/** A host name that wraps only after a dot, never inside a name or the port. */
+export function Host({ host, port }: { host: string; port?: unknown }) {
+  const parts = host.split(".");
+  return (
+    <span className="host" title={port ? `${host}:${port}` : host}>
+      {parts.map((part, i) => <span key={i}>{part}{i < parts.length - 1 ? <>.<wbr /></> : port ? `:${port}` : ""}</span>)}
+    </span>
+  );
+}
+
+/** "database" for one, "databases" for any other count. */
+export function plural(count: unknown, word: string): string {
+  return Number(count) === 1 ? word : `${word}s`;
+}
+
 /** Seconds -> "8m 12s", "1h 4m", "41s". */
 export function fmtDuration(seconds: unknown): string {
   const s = Math.max(0, Math.round(Number(seconds) || 0));

@@ -2,8 +2,8 @@ import { useQuery } from "@tanstack/react-query";
 import { Link, useNavigate } from "react-router-dom";
 import { api, type Row } from "../api";
 import {
-  ErrorBox, Notice, PageHead, ProgressBar, ProgressKey, RunStatus, Section, Stamp, StateBar, StateKey, Tag,
-  fmtAgo, fmtClock, fmtDuration, fmtInt, progressOf, progressText,
+  BigCount, ErrorBox, Notice, PageHead, ProgressBar, ProgressKey, RunStatus, Section, Stamp, StateBar, StateKey, Tag,
+  fmtAgo, fmtClock, fmtDuration, fmtInt, progressOf, progressText, plural
 } from "../components";
 
 interface Overview { collections: Row[]; running: Row[]; servers: Row[]; read_at: string; cache_s: number }
@@ -18,19 +18,21 @@ export default function OverviewPage() {
   const cols = ov.data?.collections ?? [];
   const running = ov.data?.running ?? [];
   const enabled = sum(cols, "enabled_tables");
+  const noTarget = sum(cols, "no_sla_tables");
   const current = sum(cols, "state_current");
   const databases = sum(cols, "databases");
   const servers = ov.data?.servers.length ?? 0;
   const pct = enabled ? ((100 * current) / enabled).toFixed(1) : "0.0";
   return (
     <>
-      <PageHead crumb={<span className="eyebrow">Overview · Is everything healthy now?</span>} title={ov.data ? `${pct}% of ${fmtInt(enabled)} enabled tables are current` : "Overview"}
+      <PageHead crumb={<span className="eyebrow">Overview · Is everything healthy now?</span>} title={!ov.data ? "Overview" : enabled ? `${pct}% of ${fmtInt(enabled)} enabled ${plural(enabled, "table")} ${enabled === 1 ? "is" : "are"} current` : "No enabled tables yet"}
         lead={ov.data && <>Now: <strong>{fmtInt(sum(cols, "state_first_load"))}</strong> waiting for a first load,{" "}
           <strong>{fmtInt(sum(cols, "state_failing"))}</strong> failing, <strong>{fmtInt(sum(cols, "state_late"))}</strong> late,
-          across <strong>{fmtInt(databases)}</strong> databases in <strong>{cols.length}</strong> collections
+          across <strong>{fmtInt(databases)}</strong> {plural(databases, "database")} in <strong>{cols.length}</strong> {plural(cols.length, "ingestion group")}{" "}
           on <strong>{servers}</strong> {servers === 1 ? "server" : "servers"}.</>}
         right={<Stamp at={ov.data?.read_at} every={30} />} />
       <ErrorBox error={ov.error} />
+      {ov.data && !cols.length && <Notice tone="info">No tables are set up yet. Add them with <Link to="/bulk">Bulk import</Link> or <Link to="/add">Add table</Link>.</Notice>}
       <div className="metrics">
         <div className="metric ok"><div className="metric-label">Current</div>
           <div className="metric-value">{fmtInt(current)}<small>tables</small></div><div className="metric-sub">{pct}% of enabled, now</div></div>
@@ -41,21 +43,23 @@ export default function OverviewPage() {
           <div className="metric-sub">latest attempt failed</div></div>
         <div className={`metric ${sum(cols, "state_late") ? "warn" : ""}`}><div className="metric-label">Late</div>
           <div className="metric-value">{fmtInt(sum(cols, "state_late"))}<small>tables</small></div>
-          <div className="metric-sub">past their freshness SLA</div></div>
+          <div className="metric-sub">past their freshness target</div></div>
         <div className="metric"><div className="metric-label">Running now</div>
           <div className="metric-value">{running.length}<small>{running.length === 1 ? "run" : "runs"}</small></div>
           <div className="metric-sub">{running.map((r) => <Link key={r.run_id} to={`/collections/${encodeURIComponent(r.task_collection)}`}
             style={{ marginRight: 8 }}>{r.task_collection}</Link>)}{!running.length && "none"}</div></div>
         <div className="metric"><div className="metric-label">Rows written</div>
-          <div className="metric-value">{fmtInt(sum(cols, "rows_24h"))}</div><div className="metric-sub">last 24 h</div></div>
+          <div className="metric-value"><BigCount value={sum(cols, "rows_24h")} /></div><div className="metric-sub">last 24 h</div></div>
       </div>
-      {sum(cols, "no_sla_tables") > 0 && (
-        <Notice tone="warn">{fmtInt(sum(cols, "no_sla_tables"))} enabled tables have no freshness SLA, so they are never
-          flagged as late. Set <code>freshness_sla_minutes</code> on the Tables page (bulk edit).</Notice>
+      {/* Only once freshness targets are in use: until then no table can be late, and there is nothing to warn about. */}
+      {noTarget > 0 && noTarget < enabled && (
+        <Notice tone="warn">{fmtInt(noTarget)} enabled {plural(noTarget, "table")} {noTarget === 1 ? "has" : "have"} no freshness
+          target, so {noTarget === 1 ? "it is" : "they are"} never flagged as late. To set one: Tables, select the tables, Bulk edit,
+          then Freshness target.</Notice>
       )}
 
       <Section title="Running now" actions={<Link to="/runs">All runs</Link>}
-        note="Checked counts the collection's tables this run has stamped: unchanged ones in bulk once change detection ends, loaded ones as each finishes.">
+        note="Checked counts the ingestion group's tables this run has stamped: unchanged ones in bulk once change detection ends, loaded ones as each finishes.">
         {!running.length && <div className="empty">Nothing is running. A run appears here as soon as it starts.</div>}
         {running.map((r) => {
           const p = progressOf(r);
@@ -85,7 +89,7 @@ export default function OverviewPage() {
           {(ov.data?.servers ?? []).map((s) => (
             <div className="server-card" key={s.server}>
               <div className="top"><div><h3>{s.server || "(no server)"}</h3>
-                <div className="meta">{fmtInt(s.databases)} databases · {fmtInt(s.tables)} tables · {s.collections} collections</div></div>
+                <div className="meta">{fmtInt(s.databases)} {plural(s.databases, "database")} · {fmtInt(s.tables)} {plural(s.tables, "table")} · {s.collections} {plural(s.collections, "ingestion group")}</div></div>
                 {Number(s.running_collections) > 0 ? <Tag tone="run">{s.running_collections} running</Tag>
                   : Number(s.state_failing) > 0 ? <Tag tone="bad">Failing</Tag> : <Tag tone="ok">Healthy</Tag>}</div>
               <StateBar row={s} />
@@ -101,10 +105,10 @@ export default function OverviewPage() {
         </div>
       </Section>
 
-      <Section title="Collections" note="Select a collection for its databases. Its tables and schedule stay on the Tables and Schedules pages.">
+      <Section title="Ingestion groups" note="Select an ingestion group for its databases. Its tables and schedule stay on the Tables and Schedules pages.">
         <div className="table-wrap">
           <table className="data">
-            <thead><tr><th>Collection</th><th>Server</th><th className="num">Databases</th><th className="num">Tables</th>
+            <thead><tr><th>Ingestion group</th><th>Server</th><th className="num">Databases</th><th className="num">Tables</th>
               <th>State now</th><th className="num">Failing</th><th className="num">First load</th><th className="num">Late</th>
               <th>Last run</th><th className="num">Rows, 24 h</th></tr></thead>
             <tbody>
