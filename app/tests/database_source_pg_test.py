@@ -1,6 +1,7 @@
-"""A database's check stamp key, built in SQL (the app's and the engine's ``database_source_sql``) and in
-Python, is the same text for every source type and port; and re-applying the schema drops the stamps
-the old blank-port key left behind. Run against a real Postgres.
+"""A database's check stamp key, built in SQL (the engine's and the app's ``database_source_sql``) and in
+Python (the engine's and the app's ``database_source``), is the same for every source type, port, host,
+connection and credential shape; and re-applying the schema leaves every check stamp alone. Run against a
+real Postgres.
 
 Skipped unless LAKEFED_APP_TEST_PG names a Postgres server (a libpq URI to any database there) where
 the test may create and drop its own database."""
@@ -15,11 +16,12 @@ import queries as q
 URI = os.environ.get("LAKEFED_APP_TEST_PG")
 pytestmark = pytest.mark.skipif(not URI, reason="LAKEFED_APP_TEST_PG not set")
 REPO = Path(__file__).resolve().parents[2]
-CASES = [{"src_type": t, "src_host": host, "src_connection": "conn", "src_port": port, "secret_key": secret}
+CASES = [{"src_type": t, "src_host": host, "src_connection": connection, "src_port": port, "secret_key": secret}
          for t in (None, "", "sqlserver", "oracle", "postgresql", "mysql", "db2", "\toracle", "oracle\n")
-         for host in ("Host-A", None)
+         for host in ("Host-A", None, "")
+         for connection in ("conn", None, "")
          for port in (None, 0, 1433, 1521, 5432, 3306, 3307)
-         for secret in (None, "k1")]
+         for secret in (None, "", "k1")]
 
 
 @pytest.fixture(scope="module")
@@ -48,6 +50,7 @@ def test_the_sql_stamp_key_is_the_python_one_for_every_source_type_and_port(pg):
            "as t(src_type, src_host, src_connection, src_port, secret_key)")
     in_sql = [row[0] for row in pg.execute(sql, params).fetchall()]
     assert in_sql == [engine.database_source(c) for c in CASES]
+    assert in_sql == [q.database_source(c) for c in CASES]
     blank = CASES.index({"src_type": "sqlserver", "src_host": "Host-A", "src_connection": "conn", "src_port": None,
                          "secret_key": "k1"})
     assert in_sql[blank] == "host-a|1433|k1"
