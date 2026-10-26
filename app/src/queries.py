@@ -12,15 +12,20 @@ from datetime import datetime, timedelta
 from typing import List, Optional, Tuple
 
 SCHEMA = "lakefed_ingest"
+# The default port of each source type (the engine's source_adapters); a test keeps them equal.
+DEFAULT_PORTS = {"sqlserver": 1433, "oracle": 1521, "postgresql": 5432, "mysql": 3306}
 
 
 # ---- freshness SLA ------------------------------------------------------------------------------
 
 def database_source_sql(alias: str) -> str:
     """The server, port and credential a control row reads its database through: the key of its
-    database's check stamp (the engine's ``state_store.database_source_sql``; a test keeps them equal)."""
+    database's check stamp (the engine's ``state_store.database_source_sql``; a test keeps them equal).
+    A blank port reads the source type's default port, as ``DEFAULT_PORTS`` lists it."""
+    whens = " ".join(f"when '{src_type}' then {port}" for src_type, port in DEFAULT_PORTS.items())
+    default_port = f"(case coalesce(nullif(lower(trim({alias}.src_type)), ''), 'sqlserver') {whens} else 0 end)"
     return (f"lower(coalesce(nullif({alias}.src_host, ''), nullif({alias}.src_connection, ''), '')) || '|' || "
-            f"coalesce({alias}.src_port, 0) || '|' || "
+            f"coalesce(nullif({alias}.src_port, 0), {default_port}) || '|' || "
             f"coalesce(nullif({alias}.secret_key, ''), nullif({alias}.src_connection, ''), '')")
 
 
@@ -1264,7 +1269,6 @@ RESEED_FIELDS = {
 INT_FIELDS = {"src_port", "priority", "partition_size_mb", "freshness_sla_minutes"}
 BOOL_FIELDS = {"task_enabled", "load_partitioned", "use_remote_query"}
 JSON_FIELDS = {"jdbc_options", "client_attrs"}
-DEFAULT_PORTS = {"sqlserver": 1433, "oracle": 1521, "postgresql": 5432, "mysql": 3306}
 CASE_INSENSITIVE = {"src_host", "src_database", "src_schema", "src_table", "sink_catalog", "sink_schema",
                     "sink_table", "primary_key", "src_connection", "write_mode"}
 SINK_FIELDS = ("sink_catalog", "sink_schema", "sink_table")
@@ -1414,7 +1418,8 @@ def database_source(row: dict) -> str:
     """``database_source_sql`` of a control-row dict (the engine's ``state_store.database_source``)."""
     host = str(row.get("src_host") or row.get("src_connection") or "").lower()
     credential = row.get("secret_key") or row.get("src_connection") or ""
-    return f"{host}|{int(row.get('src_port') or 0)}|{credential}"
+    default_port = DEFAULT_PORTS.get((str(row.get("src_type") or "").strip().lower()) or "sqlserver", 0)
+    return f"{host}|{int(row.get('src_port') or default_port)}|{credential}"
 
 
 def database_key(row: dict) -> str:

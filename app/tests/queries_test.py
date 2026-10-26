@@ -301,15 +301,34 @@ def test_tables_page_after_a_cursor_with_an_exact_database():
     assert sql.rstrip().endswith("order by t.task_collection, coalesce(t.src_database, ''), t.src_schema, t.src_table, t.id limit %s")
 
 
-def test_the_database_source_in_sql_is_the_engines():
+def _engine():
     import importlib.util
+    import sys
     from pathlib import Path
-    path = Path(__file__).resolve().parents[2] / "src" / "lakefed_ingest" / "state_store.py"
-    spec = importlib.util.spec_from_file_location("engine_state_store", path)
+    engine_dir = Path(__file__).resolve().parents[2] / "src" / "lakefed_ingest"
+    if str(engine_dir) not in sys.path:
+        sys.path.insert(0, str(engine_dir))
+    spec = importlib.util.spec_from_file_location("engine_state_store", engine_dir / "state_store.py")
     engine = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(engine)
+    return engine
+
+
+def test_the_database_source_in_sql_is_the_engines():
+    engine = _engine()
     assert q.database_source_sql("t") == engine.database_source_sql("t")
     for row in ({"src_host": "Srv", "src_port": 1433, "secret_key": "k"}, {"src_connection": "conn"},
                 {"src_host": "srv", "src_port": None, "secret_key": ""}):
         assert q.database_source(row) == engine.database_source(row)
+
+
+def test_the_database_source_copies_agree_for_every_source_type_and_port():
+    engine = _engine()
+    import source_adapters
+    assert q.DEFAULT_PORTS == {t: source_adapters.get_adapter(t).default_port for t in source_adapters.SRC_TYPES}
+    assert q.database_source({"src_type": "mysql", "src_host": "Srv", "src_port": None, "secret_key": "k"}) == "srv|3306|k"
+    for src_type in (None, "", "SQLServer", "oracle", "postgresql", "mysql", "db2"):
+        for port in (None, 0, 1433, 1521, 5432, 3306, 3307):
+            row = {"src_type": src_type, "src_host": "Srv", "src_port": port, "secret_key": "k"}
+            assert q.database_source(row) == engine.database_source(row), row
     assert "database_check dc" in q.DATABASE_CHECK_JOIN and "dc.source = " + q.database_source_sql("t") in q.DATABASE_CHECK_JOIN

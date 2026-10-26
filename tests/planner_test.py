@@ -631,13 +631,13 @@ def test_a_database_with_work_elsewhere_or_a_failure_is_never_stamped_as_a_whole
 
 
 def test_one_stamp_per_source_identity_in_a_detection_group():
-    a, b = _cfg(1, "d1", "a"), dict(_cfg(2, "d1", "b"), src_port=None)   # one group, two spellings of the port
+    a, b = _cfg(1, "d1", "a"), dict(_cfg(2, "d1", "b"), src_port=None)   # one group: a port and a blank port
     cps = {1: _stamped(100, 5), 2: _stamped(100, 5)}
     members = [(a, cps[1]), (b, cps[2])]
     assert len(planner.group_by_source(members)) == 1
     out = planner.detect_group(members, None, None, database_state=_state(100, [a, b]))
     assert sorted(planner.unchanged_writes([members], [out], cps, 0, now=_NOW)[1]) == [
-        ("h1|0|k-d1", "d1", 100, 1), ("h1|1433|k-d1", "d1", 100, 1)]
+        ("h1|1433|k-d1", "d1", 100, 2)]   # a blank port is the default port, so the two share one stamp
 
 
 def test_bulk_rows_to_write_reads_a_vouching_database_stamp_as_the_last_success():

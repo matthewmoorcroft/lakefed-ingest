@@ -88,7 +88,8 @@ WITH t AS (
   LEFT JOIN lakefed_ingest_lakebase.lakefed_ingest.database_check dc
     ON dc.task_collection = c.task_collection AND dc.src_database = c.src_database
    AND dc.source = concat_ws('|', lower(coalesce(nullif(c.src_host, ''), nullif(c.src_connection, ''), '')),
-                             coalesce(c.src_port, 0), coalesce(nullif(c.secret_key, ''), nullif(c.src_connection, ''), '')))
+                             coalesce(nullif(c.src_port, 0), <default port of c.src_type>),
+                             coalesce(nullif(c.secret_key, ''), nullif(c.src_connection, ''), '')))
 SELECT *, timestampdiff(MINUTE, last_success_at, current_timestamp()) AS lag_minutes
 FROM t ORDER BY last_success_at NULLS FIRST;
 ```

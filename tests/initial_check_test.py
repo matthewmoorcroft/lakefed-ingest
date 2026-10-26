@@ -8,7 +8,7 @@ import planner
 import state_store as ss
 
 NOW = datetime(2026, 10, 22, 12, 0, tzinfo=timezone.utc)
-SOURCE = "conn|0|conn"   # state_store.database_source of _cfg
+SOURCE = "conn|1433|conn"   # state_store.database_source of _cfg: a blank port reads sqlserver's 1433
 
 
 def _cfg(cid, db, table, collection="c1"):
