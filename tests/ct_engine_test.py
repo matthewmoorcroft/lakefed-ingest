@@ -1384,7 +1384,8 @@ def test_apply_session_conf_sets_each_setting_as_a_string():
 
 def test_apply_session_conf_refuses_a_null_or_a_container_before_setting_anything():
     spark = type("S", (), {"conf": _Conf()})()
-    for bad in ('{"x": null}', '{"y": [1]}', '{"z": {"a": 1}}', '{"n": NaN}', '{"n": Infinity}'):
+    for bad in ('{"x": null}', '{"y": [1]}', '{"z": {"a": 1}}', '{"n": NaN}', '{"n": Infinity}',
+                '{"n": 1e999}'):
         with pytest.raises(ValueError, match="spark_conf"):
             ce.apply_session_conf(spark, bad)
     with pytest.raises(ValueError, match="spark_conf"):
