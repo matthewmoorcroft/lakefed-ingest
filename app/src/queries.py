@@ -236,12 +236,29 @@ def run_sql() -> str:
     return f"select {_RUN_COLUMNS} from {SCHEMA}.ingest_run where run_id = %s"
 
 
+# The most table events the group run page lists.
+RUN_EVENTS_LIMIT = 500
+
+
 def run_events_sql() -> str:
-    """Per-table events of one run, failures first. Param: run_id."""
+    """Per-table events of one run, failures first, at most RUN_EVENTS_LIMIT. Param: run_id."""
     return (f"select control_id, src_database, src_schema, src_table, sink_fqn, action, stage, status, "
             f"duration_ms, rows_merged, position_from, position_to, error "
             f"from {SCHEMA}.ingest_event where run_id = %s "
-            f"order by (status = 'failed') desc, duration_ms desc nulls last")
+            f"order by (status = 'failed') desc, duration_ms desc nulls last limit {RUN_EVENTS_LIMIT}")
+
+
+def in_flight_sql() -> str:
+    """The tables a group run is loading now, longest first. Params: run_id, limit."""
+    return (f"select e.src_database, e.src_schema, e.src_table, e.action, e.stage, e.started_at, "
+            f"round(extract(epoch from (now() - e.started_at)))::int as running_s, e.retry_count "
+            f"from {SCHEMA}.ingest_event e where e.run_id = %s and e.status = 'running' "
+            f"order by e.started_at limit %s")
+
+
+def in_flight_count_sql() -> str:
+    """How many tables a group run is loading now. Param: run_id."""
+    return f"select count(*) as tables from {SCHEMA}.ingest_event where run_id = %s and status = 'running'"
 
 
 def recent_errors_sql() -> str:
@@ -428,6 +445,103 @@ def batch_rows(detail) -> tuple:
     if not isinstance(d, dict):
         return 0, 0
     return int(d.get("batch_rows") or 0), int(d.get("batch_rows_unknown") or 0)
+
+
+def _count(row: dict, key: str) -> int:
+    return int(row.get(key) or 0)
+
+
+def _detail(run: dict) -> dict:
+    """A run's detail as a dict: it is text that may not be JSON, so parse it here rather than cast it in SQL."""
+    detail = run.get("detail")
+    try:
+        d = json.loads(detail) if isinstance(detail, str) else (detail or {})
+    except ValueError:
+        return {}
+    return d if isinstance(d, dict) else {}
+
+
+def run_outcome(run: dict, progress: Optional[dict] = None) -> dict:
+    """What a group run's engine record means, as the pages show it: a label, a tone and an optional note.
+    The engine records a run that loaded with some table failures as failed, and a run another run closed
+    (it stopped without finishing) as failed with closed_by_run in its detail. A running run is detecting
+    changes until its first table is checked or loaded, then loading changed tables."""
+    status = run.get("status")
+    if status == "completed":
+        return {"label": "Completed", "tone": "ok", "note": None}
+    if status == "skipped":
+        return {"label": "Skipped: already running", "tone": "neutral", "note": None}
+    if status == "running":
+        if progress is None:
+            return {"label": "Running", "tone": "run", "note": None}
+        started = any(_count(progress, k) for k in ("tables_ok", "tables_failed", "tables_running", "tables_checked"))
+        return {"label": "Loading changed tables" if started else "Detecting changes", "tone": "run", "note": None}
+    closed_by = _detail(run).get("closed_by_run")
+    if closed_by is not None:
+        return {"label": "Ended without finishing", "tone": "bad", "note": f"closed by run {closed_by}"}
+    failed = _count(run, "failed")
+    if status == "failed" and failed:
+        return {"label": "Completed with failures", "tone": "warn", "note": f"{failed:,} {'table' if failed == 1 else 'tables'} failed"}
+    return {"label": "Failed", "tone": "bad", "note": None}
+
+
+def with_outcome(run: dict, progress: Optional[dict] = None) -> dict:
+    """The run with its outcome (run_outcome); a run another run closed has no duration, since its finish
+    is the closing time, not when its work stopped."""
+    run["outcome"] = run_outcome(run, progress)
+    if run["outcome"]["label"] == "Ended without finishing":
+        run["duration_s"] = None
+    return run
+
+
+def work_speed(run: dict) -> Optional[float]:
+    """Tables loaded a minute over the run's work span (first table start to last finish), which leaves
+    out planning and change detection. None before any table loaded."""
+    start, end, loaded = run.get("work_started_at"), run.get("work_finished_at"), _count(run, "loaded")
+    if not (start and end and loaded):
+        return None
+    minutes = max((end - start).total_seconds(), 1) / 60
+    return round(loaded / minutes, 1)
+
+
+# Live speed and a rate-based time left wait for this much loading, so the first few loads don't set the pace.
+LIVE_SPEED_AFTER_S = 180
+LIVE_WINDOW_S = 300
+
+
+def _live_window_minutes(progress: dict, now) -> Optional[float]:
+    start = progress.get("work_started_at")
+    if not start:
+        return None
+    loading_s = (now - start).total_seconds()
+    if loading_s < LIVE_SPEED_AFTER_S:
+        return None
+    return min(loading_s, LIVE_WINDOW_S) / 60
+
+
+def live_speed(progress: dict, now) -> Optional[dict]:
+    """A running group run's tables and rows a minute over its last 5 minutes of loading (fewer, when it
+    has loaded for less). None in its first 3 minutes of loading."""
+    minutes = _live_window_minutes(progress, now)
+    if minutes is None:
+        return None
+    return {"tables_per_min": round(_count(progress, "ok_last_5m") / minutes, 1),
+            "rows_per_min": round(_count(progress, "rows_last_5m") / minutes, 1)}
+
+
+def time_left(progress: dict, now) -> Optional[dict]:
+    """About how long a running group run has left. While loading (3 minutes on): the tables to go at the
+    last 5 minutes' rate. Before that, or with no recent loads: its group's typical (p50) run time less the
+    time so far. None with neither."""
+    minutes = _live_window_minutes(progress, now)
+    rate = _count(progress, "ok_last_5m") / minutes if minutes else 0
+    if rate:
+        to_go = max(_count(progress, "enabled_tables") - _count(progress, "tables_checked")
+                    - _count(progress, "tables_running") - _count(progress, "tables_failed"), 0)
+        return {"seconds": round(to_go / rate * 60), "basis": "rate"}
+    if progress.get("p50_s") is None:
+        return None
+    return {"seconds": max(int(progress["p50_s"]) - _count(progress, "elapsed_s"), 0), "basis": "typical"}
 
 
 # Failure causes, by the error text, most specific first. Connection and timeout failures usually clear

@@ -159,7 +159,8 @@ def overview():
         g, r = dict(groups[name]), last.get(name) or {}
         g.update({"last_run_id": r.get("run_id"), "last_run_status": r.get("status"),
                   "last_run_started": r.get("started_at"), "last_run_finished": r.get("finished_at"),
-                  "last_run_ok": r.get("ok"), "last_run_failed": r.get("failed")})
+                  "last_run_ok": r.get("ok"), "last_run_failed": r.get("failed"),
+                  "last_run_outcome": q.run_outcome(r) if r else None})
         collections.append(g)
     running = [dict(r, server=(groups.get(r["task_collection"]) or {}).get("server")) for r in running]
     servers = [dict(s, health=q.server_health(s))
@@ -245,18 +246,25 @@ def _with_rows_written(out: List[dict]) -> List[dict]:
             batched, batched_unknown = q.batch_rows(r.get("detail"))
             r["rows_written"] = int(w.get("rows_written") or 0) + batched
             r["rows_partial"] = bool(batched_unknown) if batched else bool(w.get("uncounted"))
+            q.with_outcome(r)
+            r["speed_tables_per_min"] = q.work_speed(r)
     return out
 
 
 @app.get("/api/runs/{run_id}")
 def run_detail(run_id: int):
-    """One run: its row and rows written, and while it is running its live progress (the overview's counts)."""
+    """One run: its row, outcome and rows written, and while it is running its live progress (the
+    overview's counts), speed over the last minutes and about how long it has left."""
     found = _with_rows_written(db.query(q.run_sql(), (int(run_id),)))
     if not found:
         raise HTTPException(404, f"run {run_id} not found")
     run = found[0]
     if run["status"] == "running":
-        run["progress"] = next((r for r in _running() if r["run_id"] == run["run_id"]), None)
+        progress = next((r for r in _running() if r["run_id"] == run["run_id"]), None)
+        now = datetime.now(timezone.utc)
+        run.update(progress=progress, live_speed=progress and q.live_speed(progress, now),
+                   time_left=progress and q.time_left(progress, now))
+        q.with_outcome(run, progress)
     return run
 
 
@@ -268,6 +276,18 @@ def run_databases(run_id: int):
 @app.get("/api/runs/{run_id}/events")
 def run_events(run_id: int):
     return db.query(q.run_events_sql(), (int(run_id),))
+
+
+# The most in-flight tables the group run page lists.
+IN_FLIGHT_LIMIT = 50
+
+
+@app.get("/api/runs/{run_id}/in-flight")
+def run_in_flight(run_id: int):
+    """The tables a group run is loading now, longest first (at most IN_FLIGHT_LIMIT), and how many there are."""
+    tables = db.query(q.in_flight_sql(), (int(run_id), IN_FLIGHT_LIMIT))
+    total = len(tables) if len(tables) < IN_FLIGHT_LIMIT else db.query(q.in_flight_count_sql(), (int(run_id),))[0]["tables"]
+    return {"tables": tables, "total": total, "limit": IN_FLIGHT_LIMIT}
 
 
 # ---- tables -------------------------------------------------------------------------------------

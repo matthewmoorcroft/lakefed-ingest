@@ -8,7 +8,7 @@ import queries as q
 
 MONITORING_SQL = (q.servers_sql(), q.collection_databases_sql(), q.collection_database_rows_sql(),
                   q.run_databases_sql(), q.run_rows_sql(), q.run_batch_rows_sql(), q.collection_batch_runs_sql(),
-                  q.connection_databases_sql())
+                  q.connection_databases_sql(), q.in_flight_sql(), q.in_flight_count_sql(), q.run_events_sql())
 
 
 def test_monitoring_statements_are_parameterized_and_schema_qualified():
@@ -20,6 +20,8 @@ def test_monitoring_statements_are_parameterized_and_schema_qualified():
     assert q.collection_batch_runs_sql().count("%s") == 2
     assert q.failed_tables_sql().count("%s") == 2
     assert q.connection_databases_sql().count("%s") == 2
+    assert (q.in_flight_sql().count("%s"), q.in_flight_count_sql().count("%s")) == (2, 1)
+    assert q.run_events_sql().endswith(f"limit {q.RUN_EVENTS_LIMIT}")
 
 
 def test_running_runs_report_progress_over_the_whole_collection():

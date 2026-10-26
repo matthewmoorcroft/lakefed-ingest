@@ -179,6 +179,14 @@ def test_the_running_pass_counts_what_the_old_running_query_counts(pg):
         assert "p95_s" in new[run_id] and new[run_id]["ok_last_5m"] == 1
 
 
+def test_the_in_flight_list_is_running_tables_longest_first(pg):
+    found = rows(pg, q.in_flight_sql(), (2, 50))
+    assert [(r["src_database"], r["src_table"]) for r in found] == [("db1", "t8")]
+    assert found[0]["running_s"] >= 60 and found[0]["retry_count"] == 0
+    assert rows(pg, q.in_flight_count_sql(), (2,))[0]["tables"] == 1
+    assert rows(pg, q.in_flight_sql(), (1, 50)) == []
+
+
 def test_a_connections_databases_from_the_shared_pass_equal_the_old_query_with_a_disabled_table(pg):
     import rollup
     with pg.transaction(force_rollback=True):

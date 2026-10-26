@@ -124,7 +124,7 @@ export default function OverviewPage() {
                     <td className="num">{fmtInt(c.state_first_load)}</td><td className="num">{fmtInt(c.state_late)}</td>
                     <td>{run ? <><Tag tone="run">Running</Tag><span className="sub">#{run.run_id} since {fmtClock(run.started_at)},{" "}
                       {Math.floor((100 * Number(run.tables_checked || 0)) / Math.max(1, Number(run.enabled_tables || 0)))}% checked</span></>
-                      : c.last_run_id ? <><RunStatus status={c.last_run_status} /><span className="sub">#{c.last_run_id} at {fmtClock(c.last_run_started)}
+                      : c.last_run_id ? <><RunStatus status={c.last_run_status} outcome={c.last_run_outcome} /><span className="sub">#{c.last_run_id} at {fmtClock(c.last_run_started)}
                         {c.last_run_finished && `, took ${fmtDuration((new Date(c.last_run_finished).getTime() - new Date(c.last_run_started).getTime()) / 1000)}`}
                         {Number(c.last_run_failed) > 0 && `, ${c.last_run_failed} failed`}</span></>
                       : <span className="muted">never run</span>}</td>

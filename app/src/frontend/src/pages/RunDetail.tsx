@@ -4,7 +4,7 @@ import { Link, useParams } from "react-router-dom";
 import { api, type Row } from "../api";
 import {
   Badge, BigCount, ErrorBox, FillBox, Grid, PageHead, ProgressBar, ProgressKey, RunStatus, Section, Stamp, autoColumns,
-  fmtDuration, fmtInt, progressOf, progressText, type Progress
+  fmtDuration, fmtInt, fmtLeft, fmtSpeed, plural, progressOf, progressText, type Progress
 } from "../components";
 
 /** A finished run's totals in the same shape as a live run's progress, so both read the same way. The run's "ok"
@@ -24,6 +24,54 @@ function Figure({ label, value, sub, tone }: { label: string; value: ReactNode; 
     </div>
   );
 }
+
+/** The run page's title: the group and run, and while running how far it is and about how long is left. */
+function title(id: string, r: Row | undefined, p: Progress | null, live: boolean): ReactNode {
+  if (!r) return <>Group run {id}</>;
+  const head = <>{r.task_collection}, group run {fmtInt(r.run_id)}</>;
+  if (!live) return <>{head} <RunStatus status={r.status} outcome={r.outcome} /></>;
+  const pct = p && p.total ? Math.floor((100 * (p.unchanged + p.loaded)) / p.total) : null;
+  const left = r.time_left ? `, ${fmtLeft(r.time_left.seconds)} left` : "";
+  return <>{head}{pct !== null ? `: ${pct}% checked${left}` : ""} <RunStatus status={r.status} outcome={r.outcome} /></>;
+}
+
+/** The tables the run is loading now, longest first: eight, or every one the server sent with "Show all". */
+function InFlight({ id }: { id: string }) {
+  const [all, setAll] = useState(false);
+  const found = useQuery({
+    queryKey: ["run-in-flight", id],
+    queryFn: () => api.get<{ tables: Row[]; total: number; limit: number }>(`/runs/${encodeURIComponent(id)}/in-flight`),
+    refetchInterval: 15_000,
+  });
+  const tables = found.data?.tables ?? [];
+  const shown = all ? tables : tables.slice(0, 8);
+  const total = found.data?.total ?? 0;
+  const note = total > tables.length ? `The ${fmtInt(tables.length)} running longest of ${fmtInt(total)}.` : undefined;
+  return (
+    <Section title={found.data ? `In flight now: ${shown.length ? `1 to ${fmtInt(shown.length)} of ` : ""}${fmtInt(total)}` : "In flight now"}
+      note={note}
+      actions={tables.length > 8 ? <button onClick={() => setAll(!all)}>{all ? "Show fewer" : "Show all"}</button> : undefined}>
+      <ErrorBox error={found.error} />
+      <FillBox min={120}>
+        <table className="data">
+          <thead><tr><th>Database</th><th>Table</th><th>Load</th><th>Step</th><th className="num">Running for</th>
+            <th className="num">Retries</th></tr></thead>
+          <tbody>
+            {shown.map((t) => (
+              <tr key={`${t.src_database}\u001f${t.src_schema}\u001f${t.src_table}`}><td>{t.src_database}</td>
+                <td><b>{t.src_schema}.{t.src_table}</b></td><td>{t.action}</td><td>{t.stage || ""}</td>
+                <td className="num">{fmtDuration(t.running_s)}</td><td className="num">{fmtInt(t.retry_count)}</td></tr>
+            ))}
+            {found.data && !tables.length && <tr><td colSpan={6} className="muted">No table is being loaded right now.</td></tr>}
+          </tbody>
+        </table>
+      </FillBox>
+    </Section>
+  );
+}
+
+/** queries.RUN_EVENTS_LIMIT: the most table events the server sends. */
+const EVENTS_LIMIT = 500;
 
 const fmtWhen = (v: unknown) => (v ? new Date(String(v)).toLocaleString([], { day: "numeric", month: "short", hour: "2-digit",
   minute: "2-digit", second: "2-digit" }) : "");
@@ -57,21 +105,39 @@ export default function RunDetail() {
   const rows = r ? <>{r.rows_partial ? "at least " : ""}<BigCount value={r.rows_written} /></> : "";
   return (
     <>
-      <PageHead crumb={<span className="eyebrow"><Link to="/runs">Runs</Link> · What did this run do?</span>}
-        title={<>Run #{id} {r && <RunStatus status={r.status} />}</>}
+      <PageHead crumb={<span className="eyebrow"><Link to="/runs">Runs</Link> · What did this group run do?</span>}
+        title={title(id, r, p, live)}
         lead={r && <>Ingestion group <Link to={`/collections/${encodeURIComponent(r.task_collection)}`}><strong>{r.task_collection}</strong></Link>
-          {r.parallelism ? <>, parallelism <strong>{fmtInt(r.parallelism)}</strong></> : null}
-          {r.job_run_id ? <>, job run <strong>{r.job_run_id}</strong></> : null}.</>}
+          {dbs.length ? <>, <strong>{fmtInt(dbs.length)}</strong> {plural(dbs.length, "database")}</> : null}
+          {p ? <>, <strong>{fmtInt(p.total)}</strong> {plural(p.total, "table")}</> : null}
+          , started {fmtWhen(r.started_at)}
+          {r.job_run_id ? <>, Databricks job run <strong>{r.job_run_id}</strong></> : null}
+          {r.cluster_id ? <>, cluster <strong>{r.cluster_id}</strong></> : null}
+          {r.parallelism ? <>, parallelism <strong>{fmtInt(r.parallelism)}</strong></> : null}.
+          {!live && r.outcome?.note ? <> {r.outcome.label}: {r.outcome.note}.</> : null}</>}
         right={live ? <Stamp at={new Date(run.dataUpdatedAt).toISOString()} every={15} /> : undefined} />
       <ErrorBox error={run.error} />
       {r && (
         <>
-          <div className="metrics">
-            <Figure label="Started" value={fmtWhen(r.started_at)} />
-            <Figure label="Ended" value={live ? "still running" : fmtWhen(r.finished_at)} />
-            <Figure label={live ? "Running for" : "Took"} value={fmtDuration(r.duration_s)} />
-            <Figure label="Rows written" value={rows} sub={live ? "so far" : undefined} />
-          </div>
+          {live ? (
+            <div className="metrics">
+              <Figure label="Speed now" value={r.live_speed ? `${fmtSpeed(r.live_speed.tables_per_min)} tables/min` : ""}
+                sub={r.live_speed ? "over the last 5 minutes of loading" : "shown after 3 minutes of loading"} />
+              <Figure label="Time left" value={r.time_left ? fmtLeft(r.time_left.seconds) : ""}
+                sub={r.time_left?.basis === "typical" ? "from its typical run" : r.time_left ? "at the speed now" : "no typical run yet"} />
+              <Figure label="Running for" value={fmtDuration(r.duration_s)}
+                sub={r.progress?.p50_s != null ? `typical ${fmtDuration(r.progress.p50_s)}, slowest 5% over ${fmtDuration(r.progress.p95_s)}` : undefined} />
+              <Figure label="Rows written" value={rows} sub="so far" />
+            </div>
+          ) : (
+            <div className="metrics">
+              <Figure label="Took" value={r.duration_s === null ? "" : fmtDuration(r.duration_s)}
+                sub={r.duration_s === null ? "it ended without finishing" : `ended ${fmtWhen(r.finished_at)}`} />
+              <Figure label="Speed" value={r.speed_tables_per_min != null ? `${fmtSpeed(r.speed_tables_per_min)} tables/min` : ""}
+                sub={r.speed_tables_per_min != null ? "while loading tables" : "no table was loaded"} />
+              <Figure label="Rows written" value={rows} />
+            </div>
+          )}
           {p && (
             <Section title={live ? "Progress now" : "What the run did"}
               note={live ? "Refreshes every 15 s while the run is going." : undefined}>
@@ -87,6 +153,7 @@ export default function RunDetail() {
             </Section>
           )}
           {live && !p && <p className="muted">Progress is not available yet.</p>}
+          {live && <InFlight id={id} />}
           <Section title="By database" note="Each database of the run: tables loaded, in flight and failed, and the rows its loads wrote.">
             <ErrorBox error={databases.error} />
             <FillBox min={160}>
@@ -111,7 +178,8 @@ export default function RunDetail() {
           </Section>
           <Section title={showEvents && events.data ? `Table events: ${fmtInt(events.data.length)}, ${fmtInt(failedEvents)} failed` : "Table events"}
             actions={<button onClick={() => setShowEvents(!showEvents)}>{showEvents ? "Hide" : "Show"} table events</button>}
-            note={'Tables found unchanged by change detection are counted in "Unchanged" without an event.'}>
+            note={<>Tables found unchanged by change detection are counted in "Unchanged" without an event.
+              {events.data && events.data.length >= EVENTS_LIMIT ? ` The first ${fmtInt(EVENTS_LIMIT)}, failures first.` : ""}</>}>
             {showEvents && (
               <>
                 <ErrorBox error={events.error} />

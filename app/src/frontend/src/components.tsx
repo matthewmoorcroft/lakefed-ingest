@@ -211,12 +211,32 @@ export function Tag({ tone = "", children }: { tone?: Tone; children: ReactNode 
   return <span className={`tag ${tone}`}><span className="dot" />{children}</span>;
 }
 
-/** A run's status as a tag. */
-export function RunStatus({ status }: { status: unknown }) {
+export interface Outcome { label: string; tone: string; note?: string | null }
+
+/** A run's status as a tag: its outcome (queries.run_outcome) when the server sent one, else its engine status. */
+export function RunStatus({ status, outcome }: { status: unknown; outcome?: Outcome | null }) {
+  if (outcome) {
+    const tone = (["ok", "warn", "bad", "run"].includes(outcome.tone) ? outcome.tone : "") as Tone;
+    return <span title={outcome.note ?? undefined}><Tag tone={tone}>{outcome.label}</Tag></span>;
+  }
   const v = String(status ?? "");
   const tone: Tone = v === "completed" ? "ok" : v === "running" ? "run" : v === "failed" || v === "abandoned" ? "bad"
     : v === "skipped" ? "warn" : "";
   return <Tag tone={tone}>{v ? v[0].toUpperCase() + v.slice(1) : "Unknown"}</Tag>;
+}
+
+/** Tables a minute -> "12", "2.5", "0.4". */
+export function fmtSpeed(perMinute: unknown): string {
+  const v = Number(perMinute) || 0;
+  return v >= 10 ? fmtInt(Math.round(v)) : v.toFixed(1);
+}
+
+/** Seconds left -> "about 7 min", "under a minute", "about 2.5 h". */
+export function fmtLeft(seconds: unknown): string {
+  const s = Math.max(0, Number(seconds) || 0);
+  if (s < 60) return "under a minute";
+  if (s < 5400) return `about ${Math.round(s / 60)} min`;
+  return `about ${(s / 3600).toFixed(1)} h`;
 }
 
 export interface StateCounts { state_current?: unknown; state_late?: unknown; state_first_load?: unknown; state_failing?: unknown }

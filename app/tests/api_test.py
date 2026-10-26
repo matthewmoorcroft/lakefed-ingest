@@ -2,6 +2,9 @@
 
 Skipped when FastAPI isn't installed (the repo's base test environment needs only pytest);
 run with the app's requirements installed: `pip install -r app/src/requirements.txt httpx pytest`."""
+import json
+from datetime import datetime, timedelta, timezone
+
 import pytest
 
 pytest.importorskip("fastapi")
@@ -328,3 +331,53 @@ def test_the_overview_says_when_its_table_states_were_read(monkeypatch):
     clock[0] += 30
     again = client.get("/api/overview").json()
     assert again["read_at"] == first["read_at"] and again["states_cache_s"] == 60
+
+
+def test_runs_carry_their_outcome_and_speed_and_a_closed_run_has_no_duration(monkeypatch):
+    start = datetime(2026, 10, 26, 13, 0, tzinfo=timezone.utc)
+    listed = [dict(run_id=8, task_collection="c1", status="failed", failed=0, duration_s=5000,
+                   detail=json.dumps({"closed_by_run": 9, "reason": "x"})),
+              dict(run_id=7, task_collection="c1", status="failed", failed=2, duration_s=600, detail=None)]
+
+    def query(sql, params=()):
+        if sql.startswith("select run_id, task_collection, status, started_at"):
+            return [dict(r) for r in listed]
+        if sql == q.run_work_sql():
+            return [dict(run_id=7, loaded=30, work_started_at=start, work_finished_at=start + timedelta(minutes=3))]
+        return []
+    monkeypatch.setattr(main.db, "query", query)
+    got = {r["run_id"]: r for r in TestClient(main.app).get("/api/runs").json()}
+    assert got[8]["outcome"]["label"] == "Ended without finishing" and got[8]["duration_s"] is None
+    assert got[7]["outcome"]["label"] == "Completed with failures" and got[7]["duration_s"] == 600
+    assert got[7]["speed_tables_per_min"] == 10.0 and got[8]["speed_tables_per_min"] is None
+
+
+def test_a_running_run_shows_what_it_is_doing_and_about_how_long_is_left(monkeypatch):
+    def query(sql, params=()):
+        if sql == q.run_sql():
+            return [dict(run_id=5, task_collection="c1", status="running", detail=None)]
+        if sql == q.running_progress_sql():
+            return [dict(run_id=5, enabled_tables=10, elapsed_s=60, p50_s=600, work_started_at=None)]
+        return []
+    monkeypatch.setattr(main.db, "query", query)
+    body = TestClient(main.app).get("/api/runs/5").json()
+    assert body["outcome"]["label"] == "Detecting changes"
+    assert body["time_left"] == {"seconds": 540, "basis": "typical"} and body["live_speed"] is None
+
+
+def test_the_in_flight_list_says_how_many_it_shows(monkeypatch):
+    page = [dict(src_table=f"t{i}", running_s=90) for i in range(main.IN_FLIGHT_LIMIT)]
+    answers = {5: (page, 64), 6: (page[:3], None)}
+
+    def query(sql, params=()):
+        listed, total = answers[params[0]]
+        if sql == q.in_flight_sql():
+            assert params[1] == main.IN_FLIGHT_LIMIT
+            return listed
+        if sql == q.in_flight_count_sql() and total is not None:
+            return [dict(tables=total)]
+        raise AssertionError(sql)
+    monkeypatch.setattr(main.db, "query", query)
+    client = TestClient(main.app)
+    assert client.get("/api/runs/5/in-flight").json() == {"tables": page, "total": 64, "limit": main.IN_FLIGHT_LIMIT}
+    assert client.get("/api/runs/6/in-flight").json()["total"] == 3
