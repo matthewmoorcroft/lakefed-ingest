@@ -141,6 +141,7 @@ class _Store:
         self.configs, self.checkpoints, self.held = configs, checkpoints, set(held)
         self.runs, self.finished, self.advanced, self.stamped, self.unlocked = [], {}, [], {}, []
         self.closed = []
+        self.alive = True
 
     def mixed_sinks(self):
         return set()
@@ -176,6 +177,9 @@ class _Store:
     def close_abandoned_runs(self, collection, run_id):
         self.closed.append((collection, run_id))
         return (0, 0)
+
+    def is_alive(self):
+        return self.alive
 
 
 def test_the_check_stamps_the_quiet_databases_and_lists_each_collections_work():
@@ -222,6 +226,40 @@ def test_a_check_closes_the_runs_a_dead_sweep_left_open_once_it_holds_the_lock()
     store = _Store(configs, _recorded(configs, {1: _cp(10)}))
     summary = ic.run_check(store, store, ["c1"], _detector({"quiet": 10}), existing_sinks_of=_sinks)
     assert store.closed == [("c1", 1)] and summary["per_collection"][0]["run_id"] == 1
+
+
+def test_a_check_whose_lock_connection_dropped_writes_nothing_and_fails():
+    configs = [_cfg(1, "quiet", "a", "c1")]
+    store = _Store(configs, _recorded(configs, {1: _cp(10)}))
+    store.alive = False                       # the session lock went with the dropped connection
+    try:
+        ic.run_check(store, store, ["c1"], _detector({"quiet": 10}), existing_sinks_of=_sinks)
+        raise AssertionError("a check that lost its lock must fail")
+    except RuntimeError as e:
+        assert "lock" in str(e)
+    assert store.advanced == [] and store.stamped == {}
+    assert store.finished[1]["status"] == "failed" and store.unlocked == ["c1"]
+
+
+def test_a_failed_unlock_is_reported_and_does_not_hide_the_check_result():
+    configs = [_cfg(1, "quiet", "a", "c1")]
+    store = _Store(configs, _recorded(configs, {1: _cp(10)}))
+
+    def dead_unlock(collection):
+        raise RuntimeError("connection closed")
+
+    store.unlock_collection = dead_unlock
+    summary = ic.run_check(store, store, ["c1"], _detector({"quiet": 10}), existing_sinks_of=_sinks)
+    assert summary["per_collection"][0]["work"] == [] and store.finished[1]["status"] == "completed"
+
+    def broken(members):
+        raise RuntimeError("source unreachable")
+
+    try:
+        ic.run_check(store, store, ["c1"], broken, existing_sinks_of=_sinks)
+        raise AssertionError("the check should fail")
+    except RuntimeError as e:
+        assert "source unreachable" in str(e)
 
 
 def test_a_failing_close_of_abandoned_runs_does_not_stop_the_check():
