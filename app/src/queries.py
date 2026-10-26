@@ -506,27 +506,29 @@ def _database_rows() -> str:
 def database_tables_sql() -> str:
     """One database's tables in one ingestion group, with their state now and their part in a group run
     (its latest event for the table, and whether it is still to go): failing first, then in flight, then to
-    go, then by name. Params: group, server, database, run_id (or None), schema.table pattern, limit, offset."""
+    go, then by name. A table's last success counts its database's check stamp (LAST_SUCCESS). Params: group,
+    server, database, run_id (or None), schema.table pattern, limit, offset."""
     return f"""
 with t as ({_database_rows()}),
 r as (select run_id, started_at from {SCHEMA}.ingest_run where run_id = %s)
-select t.id, t.src_schema, t.src_table, t.load_type, t.task_enabled, cp.phase, cp.status, cp.last_success_at,
-       round(extract(epoch from (now() - cp.last_success_at)) / 60)::int as lag_min,
+select t.id, t.src_schema, t.src_table, t.load_type, t.task_enabled, cp.phase, cp.status, {LAST_SUCCESS} as last_success_at,
+       round(extract(epoch from (now() - {LAST_SUCCESS})) / 60)::int as lag_min,
        t.freshness_sla_minutes as sla_min, {SLA_BREACHED} as sla_breached,
        case when not t.task_enabled then 'disabled' when {_FAILING} then 'failing' when {_FIRST_LOAD} then 'first load'
             when {SLA_BREACHED} then 'late' else 'current' end as state,
        e.status as run_status, e.stage as run_stage, e.started_at as run_started_at, e.rows_merged as run_rows,
        round(extract(epoch from (now() - e.started_at)))::int as run_running_s,
        (r.run_id is not null and e.status is null and t.task_enabled
-        and (cp.last_success_at is null or cp.last_success_at < r.started_at)) as run_to_go
+        and ({LAST_SUCCESS} is null or {LAST_SUCCESS} < r.started_at)) as run_to_go
 from t
 left join {SCHEMA}.checkpoint cp on cp.control_id = t.id
+{DATABASE_CHECK_JOIN}
 left join r on true
 left join lateral (select ev.status, ev.stage, ev.started_at, ev.rows_merged from {SCHEMA}.ingest_event ev
                    where ev.run_id = r.run_id and ev.control_id = t.id order by ev.started_at desc limit 1) e on true
 where (t.src_schema || '.' || t.src_table) ilike %s
 order by coalesce({_FAILING}, false) desc, (e.status = 'running') is true desc,
-         (r.run_id is not null and e.status is null and (cp.last_success_at is null or cp.last_success_at < r.started_at)) desc,
+         (r.run_id is not null and e.status is null and ({LAST_SUCCESS} is null or {LAST_SUCCESS} < r.started_at)) desc,
          t.src_schema, t.src_table
 limit %s offset %s"""
 
