@@ -41,7 +41,7 @@ export default function Database() {
           {d.jobs.length ? <> ({d.jobs.map((j: Row) => j.name).join(", ")})</> : <> (in no job)</>}: <strong>{fmtInt(d.tables)}</strong> enabled{" "}
           {plural(d.tables, "table")}{running && <>; <Link to={`/runs/${d.running.run_id}`}>group run {fmtInt(d.running.run_id)}</Link> is going now</>}.{" "}
           <Link to={`/tables${qs({ collection: name, database })}`}>Edit these tables</Link></>}
-        right={<Stamp at={d?.read_at} every={running ? 15 : 60} />} />
+        right={<Stamp at={d?.read_at} every={running ? 15 : 60} error={found.error} />} />
       <ErrorBox error={found.error} />
       {d && (
         <div className="metrics">

@@ -252,3 +252,14 @@ def test_a_databases_tables_come_failing_first_with_their_part_in_the_running_ru
     assert rows(pg, q.database_tables_sql(), ("c1", "srv1", "db1", 2, "%t8%", 100, 0))[0]["run_status"] == "running"
     assert [r["src_table"] for r in rows(pg, q.database_tables_sql(), ("c1", "srv1", "db1", None, "%t1%", 100, 0))] == ["t1", "t10"]
     assert rows(pg, q.database_tables_count_sql(), ("c1", "srv1", "db1", "%"))[0]["tables"] == 10
+
+
+def test_tables_page_by_keyset_and_filter_one_database_exactly(pg):
+    sql, params = q.tables_sql("c1", None, "all", 4, database="db2")
+    first = rows(pg, sql, params)
+    cursor = [first[-1][k] for k in ("task_collection", "src_database", "src_schema", "src_table", "id")]
+    sql, params = q.tables_sql("c1", None, "all", 4, database="db2", after=cursor)
+    second = rows(pg, sql, params)
+    assert {r["src_database"] for r in first + second} == {"db2"} and len(first) == len(second) == 4
+    assert not {r["id"] for r in first} & {r["id"] for r in second}
+    assert [r["src_table"] for r in first + second] == sorted(r["src_table"] for r in first + second)

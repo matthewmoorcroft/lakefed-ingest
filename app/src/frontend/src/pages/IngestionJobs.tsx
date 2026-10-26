@@ -27,7 +27,7 @@ export default function IngestionJobs() {
     <>
       <PageHead crumb={<span className="eyebrow">Ingestion jobs · Which jobs need me?</span>} title="Ingestion jobs"
         lead="Each ingestion job is a schedule: a cadence and its ingestion groups. Failing first, then late, then by name."
-        right={<Stamp at={jobs.data?.read_at} every={30} />} />
+        right={<Stamp at={jobs.data?.read_at} every={30} error={jobs.error} />} />
       <ErrorBox error={jobs.error} />
       <div className="toolbar">
         <span className="chips">

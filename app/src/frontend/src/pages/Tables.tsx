@@ -22,15 +22,17 @@ export default function Tables() {
   const collection = params.get("collection") ?? "";
   const [search, setSearch] = useState("");
   const [status, setStatus] = useState(FILTERS.includes(params.get("status") ?? "") ? params.get("status")! : "all");
-  const [limit, setLimit] = useState(1000);
+  const database = params.get("database") ?? undefined;
+  const [pages, setPages] = useState<string[]>([]);
+  const after = pages[pages.length - 1];
   const [selected, setSelected] = useState<Row[]>([]);
   const [message, setMessage] = useState<string | null>(null);
   const [editing, setEditing] = useState<"one" | "bulk" | null>(null);
   const qc = useQueryClient();
   const collections = useQuery({ queryKey: ["collections"], queryFn: () => api.get<string[]>("/collections") });
   const tables = useQuery({
-    queryKey: ["tables", collection, search, status, limit],
-    queryFn: () => api.get(`/tables${qs({ collection, search, status, limit })}`),
+    queryKey: ["tables", collection, database, search, status, after],
+    queryFn: () => api.get<{ tables: Row[]; limit: number; next_after: unknown[] | null }>(`/tables${qs({ collection, database, search, status, after })}`),
   });
   const act = useMutation({
     mutationFn: ({ path, body }: { path: string; body: Row }) => api.post<{ updated: number }>(path, body),
@@ -45,25 +47,27 @@ export default function Tables() {
       <h1>Tables</h1>
       <div className="toolbar">
         <label>Ingestion group
-          <select value={collection} onChange={(e) => setParams(e.target.value ? { collection: e.target.value } : {})}>
+          <select value={collection} onChange={(e) => { setPages([]); setParams(e.target.value ? { collection: e.target.value } : {}); }}>
             <option value="">(all)</option>
             {collections.data?.map((c) => <option key={c}>{c}</option>)}
           </select>
         </label>
         <label className="grow">Search
-          <input placeholder="database, table, sink or client_id" value={search} onChange={(e) => setSearch(e.target.value)} />
+          <input placeholder="database, table, sink or client_id" value={search} onChange={(e) => { setPages([]); setSearch(e.target.value); }} />
         </label>
         <label>Show
-          <select value={status} onChange={(e) => setStatus(e.target.value)}>{FILTERS.map((f) => <option key={f}>{f}</option>)}</select>
+          <select value={status} onChange={(e) => { setPages([]); setStatus(e.target.value); }}>{FILTERS.map((f) => <option key={f}>{f}</option>)}</select>
         </label>
-        <label>Max rows
-          <input type="number" min={50} max={20000} step={50} value={limit} onChange={(e) => setLimit(Number(e.target.value) || 1000)} />
-        </label>
+        {database !== undefined && <span className="tag">database {database || "(none)"}
+          <button className="ghost" onClick={() => { setPages([]); setParams(collection ? { collection } : {}); }}>clear</button></span>}
       </div>
       <ErrorBox error={tables.error || act.error} />
       {message && <Notice tone="ok">{message}</Notice>}
-      <Section title={`${tables.data?.length ?? "…"} ${plural(tables.data?.length, "table")}`} actions={ids.length > 0 && (
-        <>
+      <Section title={tables.data ? `Page ${pages.length + 1}: ${tables.data.tables.length} ${plural(tables.data.tables.length, "table")}` : "Tables"}
+        actions={<>
+          <button className="ghost" disabled={!pages.length} onClick={() => setPages(pages.slice(0, -1))}>Previous</button>
+          <button className="ghost" disabled={!tables.data?.next_after} onClick={() => setPages([...pages, JSON.stringify(tables.data!.next_after)])}>Next</button>
+          {ids.length > 0 && <>
           <span className="muted">{ids.length} selected</span>
           <button className="primary" onClick={() => setEditing(ids.length === 1 ? "one" : "bulk")}>
             {ids.length === 1 ? "Edit" : "Bulk edit"}
@@ -72,12 +76,13 @@ export default function Tables() {
           <ConfirmButton label="Disable" onConfirm={() => act.mutateAsync({ path: "/tables/enable", body: { ids, enabled: false } })} />
           <ConfirmButton label="Force reseed" danger
             onConfirm={() => act.mutateAsync({ path: "/tables/reseed", body: { ids } })} />
-        </>
-      )}>
+          </>}
+        </>}>
         <p className="muted small">Select one row to edit it, or several to bulk edit, enable, disable, or force a reseed
-          (the next run copies them again). Changes are refused while the table's ingestion group is running.</p>
-        <Grid rows={tables.data} selection="multiple" onSelect={setSelected} getRowId={(r) => String(r.id)}
-          columns={targetAfterEnabled(autoColumns(tables.data ?? [], {
+          (the next run copies them again). Changes are refused while the table's ingestion group is running. 100 tables a page,
+          by ingestion group, database and table; selections are per page.</p>
+        <Grid rows={tables.data?.tables} selection="multiple" onSelect={setSelected} getRowId={(r) => String(r.id)}
+          columns={targetAfterEnabled(autoColumns(tables.data?.tables ?? [], {
             task_collection: { headerName: "Ingestion group" },
             sla_min: { headerName: "Freshness target (min)", minWidth: 180, type: "rightAligned", valueFormatter: (p) => fmtInt(p.value) },
             sla_breached: { headerName: "Past target", cellRenderer: (p: any) => p.value ? <Badge value="breached" /> : null },

@@ -25,7 +25,7 @@ export default function Sources() {
         title={d ? `${fmtInt(d.ingested)} ${plural(d.ingested, "instance")} ingested, ${fmtInt(d.nothing_registered)} with nothing registered` : "Sources"}
         lead={d && <>{fmtInt(d.not_registered)} {plural(d.not_registered, "table")} discovered and not registered yet. An instance is a source
           server: the tables' instance group, else their UC connection or host.</>}
-        right={<Stamp at={d?.read_at} every={60} />} />
+        right={<Stamp at={d?.read_at} every={60} error={found.error} />} />
       <ErrorBox error={found.error} />
       {d?.connections_error && <Notice tone="warn">UC connections could not be listed, so connections with nothing registered are missing: {d.connections_error}</Notice>}
       <Section title={`Instances: ${fmtInt(instances.length)}`} actions={<StateKey />}>

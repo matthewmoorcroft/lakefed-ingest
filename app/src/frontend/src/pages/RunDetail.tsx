@@ -129,7 +129,7 @@ export default function RunDetail() {
           {r.cluster_id ? <>, cluster <strong>{r.cluster_id}</strong></> : null}
           {r.parallelism ? <>, parallelism <strong>{fmtInt(r.parallelism)}</strong></> : null}.
           {!live && r.outcome?.note ? <> {r.outcome.label}: {r.outcome.note}.</> : null}</>}
-        right={live ? <Stamp at={new Date(run.dataUpdatedAt).toISOString()} every={15} /> : undefined} />
+        right={live || run.error ? <Stamp at={run.dataUpdatedAt ? new Date(run.dataUpdatedAt).toISOString() : undefined} every={15} error={run.error} /> : undefined} />
       <ErrorBox error={run.error} />
       {r && (
         <>

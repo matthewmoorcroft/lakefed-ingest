@@ -39,7 +39,7 @@ export default function JobRun() {
           <RunStatus status={null} outcome={r.outcome} /></> : "Job run"}
         lead={r && <>{r.outcome?.note ?? `${fmtInt(r.ran)} of ${fmtInt(r.members)} group ${plural(r.members, "run")}`}
           {live && <>; {fmtInt(r.running_group_runs)} running, {fmtInt(r.waiting)} waiting to start</>}. Placed by the job's current schedule.</>}
-        right={live ? <Stamp at={r?.read_at} every={15} /> : undefined} />
+        right={live || run.error ? <Stamp at={r?.read_at} every={15} error={run.error} /> : undefined} />
       <ErrorBox error={run.error} />
       {r && (
         <>

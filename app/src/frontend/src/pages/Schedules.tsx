@@ -4,7 +4,7 @@ import { api, type Row } from "../api";
 import { Badge, ConfirmButton, ErrorBox, Grid, Notice, Section, fmtTime, plural } from "../components";
 
 // A schedule runs one or more collections at a cadence. The app turns each (schedule, collection)
-// into a small Databricks job that starts the ingestion job; editing here keeps those jobs in sync.
+// into a small Databricks job that starts the Databricks ingestion job; editing here keeps those jobs in sync.
 
 interface Options { cadences: number[]; parameters: string[]; flags: string[]; defaults: Record<string, string>;
   variants: string[]; collections: string[]; scheduled: Record<string, string[]>; view_group: string | null }
@@ -63,7 +63,7 @@ function Editor({ initial, options, onDone }: { initial?: Row; options: Options;
             )}</label>
         ))}
         {options.variants.length > 1 && (
-          <label>Ingestion job
+          <label>Databricks job
             <select value={f.job_variant} onChange={(e) => setF({ ...f, job_variant: e.target.value })}>
               {options.variants.map((v) => <option key={v}>{v}</option>)}
             </select>
@@ -162,7 +162,8 @@ export default function Schedules() {
   return (
     <>
       <h1>Schedules</h1>
-      <p className="muted">Each ingestion group in a schedule gets its own Databricks job that starts the ingestion job at the
+      <p className="muted">Each schedule is an ingestion job: a cadence and its ingestion groups, named on the Overview by the
+        schedule's name. Each ingestion group in it gets its own small wrapper job that starts the Databricks job at the
         schedule's cadence. A run still going at the next trigger makes Databricks skip that trigger (shown as skipped), so a
         slow ingestion group never piles up runs. Edit schedules here: changes made in the Jobs UI are reported by "Check jobs" and
         undone by the next sync.</p>

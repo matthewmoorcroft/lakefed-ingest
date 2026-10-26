@@ -293,3 +293,9 @@ def test_a_server_is_healthy_only_when_every_enabled_table_is_current():
     assert health(tables=10, state_current=5, state_late=2, state_first_load=3) == "late"
     assert health(tables=0) == "no tables"
     assert health(tables=None, state_current=None) == "no tables"
+
+
+def test_tables_page_after_a_cursor_with_an_exact_database():
+    sql, params = q.tables_sql("c1", None, "all", 100, database="db1", after=["c1", "db1", "dbo", "t5", 42])
+    assert "coalesce(t.src_database, '') = %s" in sql and params == ("c1", "db1", "c1", "db1", "dbo", "t5", 42, 100)
+    assert sql.rstrip().endswith("order by t.task_collection, coalesce(t.src_database, ''), t.src_schema, t.src_table, t.id limit %s")

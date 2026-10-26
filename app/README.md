@@ -7,12 +7,14 @@ root doesn't depend on it, and everything the app does can also be done with SQL
 
 | Page | What it does |
 |---|---|
-| **Overview** | Per-collection health: enabled, failing, seeding and SLA-breached tables, and a warning for enabled tables with no freshness SLA; the last run; runs in progress (elapsed against the collection's typical run time, tables done and failed); failed tables in the last 24 hours |
-| **Runs** | Recent runs (filter by collection); select one to see its per-table events and errors |
+| **Overview** | Ingestion jobs (a schedule and its ingestion groups) with their tables by state, last job run and Status (running, failing, late, paused); groups in no job; job runs going now (progress over all the job's tables, speed, expected end); jobs needing attention, with their failures grouped by cause |
+| **Ingestion jobs** | Every ingestion job, filtered (running, failing, late, paused) and searched; one job's details with its job runs (one per trigger: outcome, took, speed, parallelism, clusters) and its groups; one job run with its group runs, databases and failures |
+| **Runs** | Job runs of every ingestion job, running first; group runs of groups in no job. A group run's page shows its outcome, speed, time left, tables in flight, databases and table events |
+| **Sources** | Each source instance: how it is read (UC connection or JDBC host), its ingestion jobs, its tables by state, and tables discovered and not registered yet; UC connections with nothing registered |
 | **Timeline** | Runs per collection over a window (6 hours to 7 days): planned triggers, runs colored by outcome, and triggers Databricks skipped because the previous run was still going |
 | **Schedules** | Run collections at a cadence (see [Schedules](#schedules)): create, edit, pause, resume and delete schedules; each member's next run, wrapper job, last run, p95 run time, skipped triggers, and warnings for overruns and SLAs a schedule can't meet |
 | **Tables** | Browse control rows with their checkpoint (phase, status, freshness lag, SLA). Filter by collection, text, or failing / SLA breached / no SLA / seeding / disabled. Select one row to **edit** it (every field, plus its change history), or several to **bulk edit** (e.g. move to another collection, or switch to reads through a UC connection), **enable**, **disable** or **force a reseed**. Changing `write_mode` needs a new sink in the same edit (an append sink and a merge sink can't share a table) |
-| **Jobs** | The ingestion job's schedule; active and recent runs (with the schedule that started each); **start a run** for a collection; **cancel** a run; run the schema setup job |
+| **Databricks jobs** | The Databricks ingestion job's own schedule; active and recent runs (with the schedule that started each); **start a run** for a collection; **cancel** a run; run the schema setup job |
 | **Changes** | The change log: every add, register, edit, enable / disable and reseed made in the app, with who, what and when |
 | **Add table** | A form that adds one control row, checked before insert (the database constraints are the backstop): a JDBC source (host and secret) or a UC connection (`use_remote_query`), `write_mode`, `client_attrs` and `jdbc_options` |
 | **Bulk import** | Discover a server's tables (the `lakefed_ingest_discover` job, catalog metadata only), review the recommended settings in an editable grid, set shared fields once (collection, sink catalog / schema / table templates, `client_id` template, freshness SLA), and register the selection. Tables at or above a size threshold (default 1 GB) get a partitioned seed; tables already registered start unticked; duplicates are skipped |
@@ -23,17 +25,17 @@ see [Removing tables and old history](../docs/lakebase_schema.md#removing-tables
 
 ## Schedules
 
-A Databricks job schedule can't pass parameters, so the ingestion job's own schedule can only run its
-default collection. Schedules in the app fill that gap:
+A Databricks job schedule can't pass parameters, so the Databricks ingestion job's own schedule can only run its
+default collection. Schedules in the app fill that gap; the app shows each schedule as an ingestion job:
 
 - **A schedule** has a cadence (every 5 minutes to daily; each cadence divides a day), a time zone,
-  ingestion job parameters (any of the job's tuning parameters, such as `parallelism`, `table_retries` or
+  Databricks job parameters (any of the job's tuning parameters, such as `parallelism`, `table_retries` or
   `max_queries_per_source`; the rest keep the job's defaults), optional failure e-mails, and one or more member
   collections. A collection can be in more than one schedule.
 - **One wrapper job per member.** The app creates a small Databricks job for each (schedule,
-  collection): a cron schedule and one `run_job` task that starts the ingestion job with
+  collection): a cron schedule and one `run_job` task that starts the Databricks ingestion job with
   `task_collection` set. Wrapper jobs need no compute of their own, and every run still happens in the
-  one bundle-deployed ingestion job, so a redeploy upgrades every schedule. They're named
+  one bundle-deployed Databricks ingestion job, so a redeploy upgrades every schedule. They're named
   `lakefed_ingest schedule: <schedule> / <collection>` and tagged `lakefed_ingest_schedule`,
   `lakefed_ingest_collection` and `lakefed_ingest_app` (the app's Lakebase `<instance>/<database>`, so
   apps of other deployments in the workspace leave them alone). Skipped triggers send no failure e-mail.

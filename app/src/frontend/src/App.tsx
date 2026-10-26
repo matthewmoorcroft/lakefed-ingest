@@ -25,7 +25,7 @@ export const useSettings = () => useContext(SettingsContext);
 
 const NAV = [
   ["Monitor", [["/overview", "Overview"], ["/ingestion-jobs", "Ingestion jobs"], ["/runs", "Runs"], ["/sources", "Sources"], ["/timeline", "Timeline"]]],
-  ["Manage", [["/tables", "Tables"], ["/schedules", "Schedules"], ["/jobs", "Jobs"], ["/add", "Add table"],
+  ["Manage", [["/tables", "Tables"], ["/schedules", "Schedules"], ["/jobs", "Databricks jobs"], ["/add", "Add table"],
               ["/bulk", "Bulk import"], ["/changes", "Changes"]]],
 ] as const;
 

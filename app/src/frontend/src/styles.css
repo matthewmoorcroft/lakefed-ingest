@@ -227,3 +227,4 @@ table.data td.name, table.data td.name b, table.data td.name a { white-space: no
 .attention-row .title { font-weight: var(--db-font-weight-semibold); }
 .attention-row .example { display: block; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .metric-value.small-value { font-size: var(--db-font-size-md); }
+.stamp.stale { color: var(--bad); font-weight: var(--db-font-weight-semibold); max-width: 420px; display: inline-block; }

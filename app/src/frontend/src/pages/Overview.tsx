@@ -157,7 +157,7 @@ export default function OverviewPage() {
           in <strong>{fmtInt(t.groups)}</strong> {plural(t.groups, "ingestion group")} and <strong>{fmtInt(t.databases)}</strong>{" "}
           {plural(t.databases, "database")} on <strong>{fmtInt(t.servers)}</strong> {plural(t.servers, "server")}
           {unscheduled > 0 && <>; {fmtInt(unscheduled)} {plural(unscheduled, "group")} in no job</>}.</> : "No enabled tables yet.")}
-        right={<Stamp at={d?.read_at} every={30} />} />
+        right={<Stamp at={d?.read_at} every={30} error={ov.error} />} />
       <ErrorBox error={ov.error} />
       {d && !enabled && <Notice tone="info">No tables are set up yet. Add them with <Link to="/bulk">Bulk import</Link> or <Link to="/add">Add table</Link>.</Notice>}
       {/* Only once freshness targets are in use: until then no table can be late, and there is nothing to warn about. */}

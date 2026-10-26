@@ -560,13 +560,26 @@ def run_in_flight(run_id: int):
 
 # ---- tables -------------------------------------------------------------------------------------
 
+TABLES_PAGE = 100
+
+
 @app.get("/api/tables")
 def tables(collection: Optional[str] = None, search: Optional[str] = None, status: str = "all",
-           limit: int = 1000):
+           database: Optional[str] = None, after: Optional[str] = None, limit: int = 0):
+    """Control rows with their checkpoint, TABLES_PAGE at a time (queries.TABLES_ORDER). `after` is the
+    previous page's `next_after` (JSON); `database` filters on one database exactly."""
     if status not in q.TABLE_FILTERS:
         raise HTTPException(400, f"status must be one of {q.TABLE_FILTERS}")
-    sql, params = q.tables_sql(collection or None, search or None, status, limit)
-    return db.query(sql, params)
+    limit = max(1, min(int(limit or TABLES_PAGE), 500))
+    cursor = json.loads(after) if after else None
+    if cursor is not None and (not isinstance(cursor, list) or len(cursor) != 5):
+        raise HTTPException(400, "after must be the previous page's next_after")
+    sql, params = q.tables_sql(collection or None, search or None, status, limit, database=database, after=cursor)
+    rows = db.query(sql, params)
+    last = rows[-1] if len(rows) == limit else None
+    return {"tables": rows, "limit": limit,
+            "next_after": [last["task_collection"], last.get("src_database") or "", last["src_schema"], last["src_table"],
+                           last["id"]] if last else None}
 
 
 class Ids(BaseModel):
@@ -864,7 +877,7 @@ def _ingest_job_id(variant: str) -> Optional[int]:
 def _variant_job_id(variant: str) -> int:
     jid = _ingest_job_id(variant)
     if jid is None:
-        raise HTTPException(503, f"no ingestion job configured for variant '{variant}'")
+        raise HTTPException(503, f"no Databricks ingestion job configured for variant '{variant}'")
     return jid
 
 

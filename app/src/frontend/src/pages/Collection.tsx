@@ -46,7 +46,7 @@ export default function CollectionPage() {
           {servers.length ? <> on <strong>{servers.join(", ")}</strong></> : null}.{" "}
           <Link to={`/tables?collection=${encodeURIComponent(name)}`}>Its tables</Link> ·{" "}
           <Link to="/schedules">Schedules</Link></>}
-        right={<Stamp at={data.data?.read_at} every={run ? 15 : 60} />} />
+        right={<Stamp at={data.data?.read_at} every={run ? 15 : 60} error={data.error} />} />
       <ErrorBox error={data.error} />
 
       {run && p && (

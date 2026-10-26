@@ -46,3 +46,31 @@ def test_schedule_messages_say_ingestion_group():
     errors = " ".join(sch.validate(dict(name="s", cadence_minutes=60, timezone="UTC", members=["a", "a", "zz"]),
                                    ["a"], ["default"]))
     assert "ingestion group" in errors and not OLD_WORD.search(errors.replace("members:", ""))
+
+
+# "Ingestion job" means a schedule now; the bundle-deployed job is "the Databricks job".
+DATABRICKS_JOB_AS_INGESTION_JOB = re.compile(r"\bthe ingestion job\b", re.IGNORECASE)
+
+
+def test_no_page_calls_the_databricks_job_an_ingestion_job():
+    offenders = []
+    for path in sorted(FRONTEND.rglob("*.tsx")):
+        for text in visible_text(path.read_text()):
+            if DATABRICKS_JOB_AS_INGESTION_JOB.search(text):
+                offenders.append(f"{path.name}: {text.strip()[:80]}")
+    schedules = (FRONTEND / "pages" / "Schedules.tsx").read_text()
+    if re.search(r"<label>Ingestion job\b", schedules):
+        offenders.append("Schedules.tsx: the variant select is labelled Ingestion job")
+    assert not offenders, "say 'the Databricks job' for the bundle-deployed job:\n" + "\n".join(offenders)
+
+
+def test_the_nav_says_databricks_jobs_and_its_page_has_no_jobs_heading():
+    app = (FRONTEND / "App.tsx").read_text()
+    assert '["/jobs", "Databricks jobs"]' in app and '["/jobs", "Jobs"]' not in app
+    page = (FRONTEND / "pages" / "Jobs.tsx").read_text()
+    assert "<h1>Jobs</h1>" not in page and re.search(r"Databricks jobs", page)
+
+
+def test_the_backend_names_the_databricks_job():
+    main_py = (FRONTEND.parent.parent / "main.py").read_text()
+    assert "no ingestion job configured" not in main_py and "no Databricks ingestion job configured" in main_py

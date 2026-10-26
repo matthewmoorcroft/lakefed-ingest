@@ -395,3 +395,18 @@ def test_a_running_run_in_the_list_says_what_it_is_doing(monkeypatch):
         return []
     monkeypatch.setattr(main.db, "query", query)
     assert TestClient(main.app).get("/api/runs").json()[0]["outcome"]["label"] == "Loading changed tables"
+
+
+def test_tables_come_a_page_at_a_time_with_the_cursor_of_the_next(monkeypatch):
+    seen = []
+
+    def query(sql, params=()):
+        seen.append(params)
+        limit = params[-1]
+        return [dict(id=i, task_collection="c1", src_database="db1", src_schema="dbo", src_table=f"t{i}") for i in range(limit)]
+    monkeypatch.setattr(main.db, "query", query)
+    client = TestClient(main.app)
+    body = client.get("/api/tables?collection=c1&database=db1").json()
+    assert len(body["tables"]) == main.TABLES_PAGE and body["next_after"] == ["c1", "db1", "dbo", f"t{main.TABLES_PAGE - 1}", main.TABLES_PAGE - 1]
+    client.get("/api/tables", params={"after": json.dumps(body["next_after"])})
+    assert seen[-1][:-1] == tuple(body["next_after"])

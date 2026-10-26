@@ -26,7 +26,8 @@ export default function Jobs() {
   const par = parallelism === "" ? Number(j?.parameters?.parallelism || 32) : parallelism;
   return (
     <>
-      <h1>Jobs</h1>
+      <h1>Databricks jobs</h1>
+      <p className="muted">The bundle-deployed Databricks job that ingests one ingestion group a run, and the schema setup job. Ingestion jobs (schedules and their groups) are on the Overview and Ingestion jobs.</p>
       <ErrorBox error={job.error || post.error} />
       {message && <Notice tone="ok">{message}</Notice>}
       {j && (
@@ -36,7 +37,7 @@ export default function Jobs() {
             <Metric label="Schedule status" value={j.schedule_status ?? "–"} />
             <Metric label="Scheduled ingestion group" value={j.default_task_collection ?? "–"} />
           </div>
-          <p className="muted small">The job's own schedule only runs its default ingestion group; the Schedules page
+          <p className="muted small">The Databricks job's own schedule only runs its default ingestion group; the Schedules page
             runs any ingestion group on a cadence (runs it starts show their schedule).</p>
           <div className="toolbar">
             <label>Ingestion group

@@ -836,15 +836,24 @@ def connection_databases_sql() -> str:
 TABLE_FILTERS = ("all", "failing", "sla_breached", "no_sla", "seeding", "disabled")
 
 
+# The order Tables pages in, and the cursor it pages after: one value per column, the row's id last.
+TABLES_ORDER = "t.task_collection, coalesce(t.src_database, ''), t.src_schema, t.src_table, t.id"
+
+
 def tables_sql(collection: Optional[str], search: Optional[str], status_filter: str,
-               limit: int) -> Tuple[str, tuple]:
-    """Control rows joined with their checkpoint. Returns (sql, params)."""
+               limit: int, database: Optional[str] = None, after: Optional[list] = None) -> Tuple[str, tuple]:
+    """Control rows joined with their checkpoint, a page of `limit` in TABLES_ORDER after the cursor `after`
+    (the last row's group, database, schema, table and id). `database` filters on one database exactly.
+    Returns (sql, params)."""
     if status_filter not in TABLE_FILTERS:
         raise ValueError(f"status_filter must be one of {TABLE_FILTERS}")
     conds, params = [], []
     if collection:
         conds.append("t.task_collection = %s")
         params.append(collection)
+    if database is not None:
+        conds.append("coalesce(t.src_database, '') = %s")
+        params.append(database)
     if search:
         conds.append("(t.src_database || '.' || t.src_schema || '.' || t.src_table || ' ' || "
                      "t.sink_catalog || '.' || t.sink_schema || '.' || t.sink_table || ' ' || "
@@ -860,6 +869,9 @@ def tables_sql(collection: Optional[str], search: Optional[str], status_filter: 
         conds.append("(cp.control_id is null or cp.phase = 'seeding')")
     elif status_filter == "disabled":
         conds.append("not t.task_enabled")
+    if after:
+        conds.append(f"({TABLES_ORDER}) > (%s, %s, %s, %s, %s)")
+        params.extend(after)
     where = ("where " + " and ".join(conds) + " ") if conds else ""
     sql = (f"select t.id, t.task_collection, t.task_enabled, t.src_type, t.load_type, "
            f"t.src_database, t.src_schema, t.src_table, "
@@ -869,7 +881,7 @@ def tables_sql(collection: Optional[str], search: Optional[str], status_filter: 
            f"t.freshness_sla_minutes as sla_min, {SLA_BREACHED} as sla_breached, "
            f"cp.position, cp.detail "
            f"from {SCHEMA}.control t left join {SCHEMA}.checkpoint cp on cp.control_id = t.id "
-           f"{where}order by t.task_collection, t.src_database, t.src_schema, t.src_table limit %s")
+           f"{where}order by {TABLES_ORDER} limit %s")
     return sql, tuple(params) + (int(limit),)
 
 

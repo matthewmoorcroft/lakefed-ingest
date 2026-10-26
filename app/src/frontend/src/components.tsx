@@ -313,8 +313,11 @@ export function progressText(p: Progress): string {
   return `${fmtInt(checked)} of ${fmtInt(p.total)} tables checked (${pct}%), ${fmtInt(p.inFlight)} in flight, ${fmtInt(left)} to go`;
 }
 
-/** When the shown data was read, and how often it refreshes. */
-export function Stamp({ at, every }: { at?: string; every?: number }) {
+/** When the shown data was read, and how often it refreshes. When the latest refresh failed, it says the page
+ * shows older data and why, so a broken read never looks calm. */
+export function Stamp({ at, every, error }: { at?: string; every?: number; error?: unknown }) {
+  if (error && at) return <span className="stamp stale" title={(error as ApiError).message ?? String(error)}>
+    Not updated since {fmtClock(at)}: {(error as ApiError).message ?? String(error)}</span>;
   if (!at) return null;
   return <span className="stamp">Updated {fmtAgo(at)}{every ? `, every ${every} s` : ""}</span>;
 }
