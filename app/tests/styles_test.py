@@ -28,3 +28,8 @@ def test_names_wrap_between_words():
     name = re.search(r"export function Name\b.*?\n}\n", COMPONENTS, re.S).group(0)
     word = re.search(r'<span[^>]*className="word"[^>]*>(.*?)</span>', name, re.S).group(1)
     assert '" "' not in word
+
+
+def test_ids_stay_on_one_line():
+    """A cluster id such as 1026-204044-7mghi0m4 never breaks at its hyphens."""
+    assert "white-space: nowrap" in rule("td.mono")

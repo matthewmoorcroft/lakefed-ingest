@@ -172,7 +172,8 @@ export default function OverviewPage() {
           <div className="metric-sub">{unscheduled ? `and ${fmtInt(unscheduled)} ${plural(unscheduled, "group")} in no job` : "every group is in one"}</div></div>
         <div className="metric run"><div className="metric-label">Running now</div>
           <div className="metric-value">{fmtInt(d?.running_total)}<small>{plural(d?.running_total, "job run")}</small></div>
-          <div className="metric-sub">{d?.running_not_in_job.length ? `and ${fmtInt(d.running_not_in_job.length)} group runs in no job` : "now"}</div></div>
+          <div className="metric-sub">in {fmtInt(t.running_jobs)} of {fmtInt(t.jobs)} {plural(t.jobs, "job")}
+            {d?.running_not_in_job.length ? `, and ${fmtInt(d.running_not_in_job.length)} group runs in no job` : ""}</div></div>
         <div className={`metric ${Number(t.failing_jobs) ? "bad" : ""}`}><div className="metric-label">Failing</div>
           <div className="metric-value">{fmtInt(t.failing_jobs)}<small>{plural(t.failing_jobs, "job")}</small></div>
           <div className="metric-sub">{fmtInt(t.state_failing)} {plural(t.state_failing, "table")} failing now</div></div>

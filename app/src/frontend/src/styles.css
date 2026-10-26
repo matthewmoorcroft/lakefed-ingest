@@ -218,6 +218,7 @@ label.changed input, label.changed select { border-color: var(--accent); }
 .status-cell .sub { font-size: var(--db-font-size-sm); color: var(--muted); }
 .word { white-space: nowrap; }
 table.data td.name { min-width: 140px; }
+table.data td.mono { white-space: nowrap; }
 .pager { display: flex; align-items: center; justify-content: space-between; gap: var(--db-space-3); flex-wrap: wrap; margin: var(--db-space-2) 0; }
 .pager-buttons { display: inline-flex; gap: var(--db-space-2); }
 .chips { display: inline-flex; flex-wrap: wrap; gap: var(--db-space-2); }
