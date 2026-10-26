@@ -1158,6 +1158,7 @@ def test_seed_prep_asks_every_database_in_one_job_then_one_by_one_on_failure(mon
     sql = ce.seed_prep_sql(cfgs[0])
     assert sql.startswith("SELECT CAST(1 AS BIGINT) AS control_id, CAST(CHANGE_TRACKING_CURRENT_VERSION() AS BIGINT)")
     assert "CHANGE_TRACKING_MIN_VALID_VERSION(OBJECT_ID(N'[dbo].[t]'))" in sql and "begin_version" in sql
+    assert "CAST(OBJECT_ID(N'[dbo].[t]') AS BIGINT) AS oid" in sql
 
 
 def test_prepare_seed_asks_the_version_ct_state_and_begin_version_in_one_query(monkeypatch):
@@ -1165,14 +1166,18 @@ def test_prepare_seed_asks_the_version_ct_state_and_begin_version_in_one_query(m
     # seed, ct_begin_version), each a statement the driver plans. One query answers all three, and
     # the begin_version is then the one CT had BEFORE the read, as a batched seed records it.
     import pytest
-    seen = _fake_read(monkeypatch, [{"control_id": 1, "v": 500, "mv": 7, "bv": 3}])
+    seen = _fake_read(monkeypatch, [{"control_id": 1, "v": 500, "mv": 7, "bv": 3, "oid": 901}])
     assert ce.prepare_seed(None, _APP) == (500, 3)
     assert seen == [ce.seed_prep_sql(_APP)]
     _fake_read(monkeypatch, [{"control_id": 1, "v": None, "mv": None, "bv": None}])
     with pytest.raises(RuntimeError, match="not enabled on this source database"):
         ce.prepare_seed(None, _APP)
-    _fake_read(monkeypatch, [{"control_id": 1, "v": 500, "mv": None, "bv": None}])
+    _fake_read(monkeypatch, [{"control_id": 1, "v": 500, "mv": None, "bv": None, "oid": 901}])
     with pytest.raises(RuntimeError, match="not enabled on this source table"):
+        ce.prepare_seed(None, _APP)
+    # A table that is not there has no Change Tracking either: say it is missing, not that CT is off.
+    _fake_read(monkeypatch, [{"control_id": 1, "v": 500, "mv": None, "bv": None, "oid": None}])
+    with pytest.raises(RuntimeError, match=r"source table not found: \[dbo\]\.\[t\]"):
         ce.prepare_seed(None, _APP)
 
 

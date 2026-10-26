@@ -50,7 +50,7 @@ _NEVER = (
 _PERMANENT = (
     "Login failed for user", "Cannot open database", "Invalid object name", "Invalid column name",
     "permission was denied", "VIEW CHANGE TRACKING permission",
-    ct_engine.CT_NOT_ENABLED_MSG, ct_engine.CT_TABLE_NOT_ENABLED_MSG,
+    ct_engine.CT_NOT_ENABLED_MSG, ct_engine.CT_TABLE_NOT_ENABLED_MSG, "source table not found",
     "TABLE_OR_VIEW_NOT_FOUND", "UNRESOLVED_COLUMN", "DELTA_FAILED_TO_MERGE_FIELDS", "CAST_INVALID_INPUT",
     "DATATYPE_MISMATCH", "PKIX path building failed", "UnknownHostException",
     # Oracle, PostgreSQL, MySQL: a refused login, a missing object, a missing privilege.

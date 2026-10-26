@@ -181,6 +181,7 @@ def _policy(retries=2, budget=20, per_source=5):
     (RuntimeError("Invalid object name 'dbo.orders'."), tr.PERMANENT),
     (RuntimeError("The SELECT permission was denied on the object 'orders'"), tr.PERMANENT),
     (RuntimeError(ce.CT_TABLE_NOT_ENABLED_MSG), tr.PERMANENT),
+    (RuntimeError(ce.SOURCE_TABLE_NOT_FOUND_MSG.format(table="[dbo].[t]")), tr.PERMANENT),
     (RuntimeError("collection lock lost; table deferred to the next sweep"), tr.PERMANENT),
     (RuntimeError(f"{ce.RETENTION_LAPSED_MARKER}: Connection reset"), tr.PERMANENT),   # never wins over transient
     (ValueError("control row 3: Connection reset"), tr.PERMANENT),            # a configuration error
