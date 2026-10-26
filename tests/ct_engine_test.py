@@ -1382,6 +1382,21 @@ def test_apply_session_conf_sets_each_setting_as_a_string():
     assert applied == spark.conf.values
 
 
+def test_apply_session_conf_refuses_a_null_or_a_container_before_setting_anything():
+    spark = type("S", (), {"conf": _Conf()})()
+    for bad in ('{"x": null}', '{"y": [1]}', '{"z": {"a": 1}}', '{"n": NaN}', '{"n": Infinity}'):
+        with pytest.raises(ValueError, match="spark_conf"):
+            ce.apply_session_conf(spark, bad)
+    with pytest.raises(ValueError, match="spark_conf"):
+        ce.apply_session_conf(spark, '{"ok.setting": "1", "y": [1]}')
+    assert spark.conf.values == {}
+
+
+def test_spark_conf_settings_writes_booleans_as_true_and_false_and_keeps_strings_and_numbers():
+    assert ce.spark_conf_settings('{"a": true, "b": false, "c": 1.5, "d": 7, "e": "x"}') == {
+        "a": "true", "b": "false", "c": "1.5", "d": "7", "e": "x"}
+
+
 def test_apply_session_conf_ignores_blank_and_refuses_anything_but_an_object():
     spark = type("S", (), {"conf": _Conf()})()
     assert ce.apply_session_conf(spark, "") == {} and ce.apply_session_conf(spark, "  ") == {}
