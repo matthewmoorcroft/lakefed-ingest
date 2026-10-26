@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { Fragment, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { AgGridReact } from "ag-grid-react";
 import { themeQuartz, type ColDef, type GridApi, type GridOptions } from "ag-grid-community";
 import { ApiError, type Row } from "./api";
@@ -450,5 +450,5 @@ export const databasePath = (group: unknown, server: unknown, database: unknown)
 /** A name that wraps only between words, so a hyphenated or underscored name never breaks mid-word. */
 export function Name({ children }: { children: unknown }) {
   const words = String(children ?? "").split(" ");
-  return <>{words.map((w, i) => <span key={i} className="word">{w}{i < words.length - 1 ? " " : ""}</span>)}</>;
+  return <>{words.map((w, i) => <Fragment key={i}>{i > 0 && " "}<span className="word">{w}</span></Fragment>)}</>;
 }
