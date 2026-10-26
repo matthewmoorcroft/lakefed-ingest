@@ -137,9 +137,10 @@ def launch(jobs, job_id: int, requests: List[dict], *, launch_id: str = "", max_
       started from an earlier work list), the collection is ``deferred``: those databases wait for the next cycle.
     - At most ``room`` runs are started (None: no limit; see ``capacity``); the rest are ``not_started``.
     - One run failing does not stop the others: each collection's run is independent and safe to finish.
-    - Without ``wait`` (the default) every run is started, then the started runs are polled every few
-      seconds for ``confirm_s``: one that ends in that time (skipped by Databricks, or failed at once)
-      is reported with its outcome; the rest are ``started`` and report their own results.
+    - Without ``wait`` (the default) every run is started, then the started runs are polled (at once, then
+      every few seconds) for ``confirm_s``: one that ends in that time (skipped by Databricks, or failed at
+      once) is reported with its outcome; one still going after a successful poll is ``started`` and reports
+      its own result; one no poll of which succeeded is ``unconfirmed``, a failure: nothing says it started.
     - With ``wait``, at most ``max_running`` runs go at once (0: all at once), the next starting as one
       ends; each run is polled every ``poll_s`` seconds (a failed poll is tried again on the next
       one); after ``timeout_s`` (0: no limit) the runs still going are cancelled and reported as timed
@@ -169,6 +170,7 @@ def launch(jobs, job_id: int, requests: List[dict], *, launch_id: str = "", max_
         else:
             pending.append(entry)
     going: Dict[int, dict] = {}
+    polled = set()          # run ids whose state a poll has read
 
     def start(entry):
         try:
@@ -187,6 +189,7 @@ def launch(jobs, job_id: int, requests: List[dict], *, launch_id: str = "", max_
                 entry["poll_errors"] += 1
                 entry["state_message"] = f"poll failed: {str(e)[:200]}"
                 continue
+            polled.add(run_id)
             entry["url"] = state.get("run_page_url") or entry["url"]
             result = outcome(state)
             if result:
@@ -207,11 +210,13 @@ def launch(jobs, job_id: int, requests: List[dict], *, launch_id: str = "", max_
             start(entry)
         pending = []
         confirm_until = clock() + max(0.0, confirm_s)
+        poll()
         while going and clock() < confirm_until:
             sleep(min(5.0, confirm_s))
             poll()
-        for entry in going.values():
-            entry["outcome"] = "started"
+        for run_id, entry in going.items():
+            entry["outcome"] = "started" if run_id in polled else "unconfirmed"
+            entry["state_message"] = entry["state_message"] or "no poll of this run succeeded in the confirm window"
         going.clear()
     try:
         while pending or going:
