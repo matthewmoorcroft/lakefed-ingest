@@ -1048,6 +1048,8 @@ def test_database_source_reads_a_blank_port_as_the_source_types_default():
     # SQL trim() removes spaces only, so a tab is not part of the type name: an unknown type in both copies
     tab = {"src_type": "\toracle", "src_host": "Srv", "src_port": None, "secret_key": "k"}
     assert ss.database_source(tab) == "srv|0|k"
+    padded = {"src_type": " oracle ", "src_host": "Srv", "src_port": None, "secret_key": "k"}
+    assert ss.database_source(padded) == "srv|1521|k"
 
 
 def test_a_connection_backed_row_keeps_a_blank_port_as_zero():

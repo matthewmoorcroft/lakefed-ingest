@@ -17,7 +17,7 @@ URI = os.environ.get("LAKEFED_APP_TEST_PG")
 pytestmark = pytest.mark.skipif(not URI, reason="LAKEFED_APP_TEST_PG not set")
 REPO = Path(__file__).resolve().parents[2]
 CASES = [{"src_type": t, "src_host": host, "src_connection": connection, "src_port": port, "secret_key": secret}
-         for t in (None, "", "sqlserver", "oracle", "postgresql", "mysql", "db2", "\toracle", "oracle\n")
+         for t in (None, "", "sqlserver", "oracle", "postgresql", "mysql", "db2", "\toracle", "oracle\n", " oracle ")
          for host in ("Host-A", None, "")
          for connection in ("conn", None, "")
          for port in (None, 0, 1433, 1521, 5432, 3306, 3307)
