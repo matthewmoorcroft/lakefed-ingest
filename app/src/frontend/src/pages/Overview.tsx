@@ -2,7 +2,7 @@ import { useQuery } from "@tanstack/react-query";
 import { Link, useNavigate } from "react-router-dom";
 import { api, type Row } from "../api";
 import {
-  BigCount, ErrorBox, Notice, PageHead, ProgressBar, ProgressKey, RunStatus, Section, Stamp, StateBar, StateKey, Tag,
+  ErrorBox, Notice, PageHead, ProgressBar, ProgressKey, RunStatus, Section, Stamp, StateBar, StateKey, Tag,
   fmtAgo, fmtClock, fmtDuration, fmtInt, progressOf, progressText, plural, type Tone
 } from "../components";
 
@@ -51,8 +51,6 @@ export default function OverviewPage() {
           <div className="metric-value">{running.length}<small>{running.length === 1 ? "run" : "runs"}</small></div>
           <div className="metric-sub">{running.map((r) => <Link key={r.run_id} to={`/collections/${encodeURIComponent(r.task_collection)}`}
             style={{ marginRight: 8 }}>{r.task_collection}</Link>)}{!running.length && "none"}</div></div>
-        <div className="metric"><div className="metric-label">Rows written</div>
-          <div className="metric-value"><BigCount value={sum(cols, "rows_24h")} /></div><div className="metric-sub">last 24 h</div></div>
       </div>
       {/* Only once freshness targets are in use: until then no table can be late, and there is nothing to warn about. */}
       {noTarget > 0 && noTarget < enabled && (
@@ -66,7 +64,7 @@ export default function OverviewPage() {
         {!running.length && <div className="empty">Nothing is running. A run appears here as soon as it starts.</div>}
         {running.map((r) => {
           const p = progressOf(r);
-          const slow = r.typical_s && r.elapsed_s > 2 * Math.max(r.typical_s, 60);
+          const slow = r.p95_s && r.elapsed_s > Math.max(Number(r.p95_s), 60);
           return (
             <div className="run-row" key={r.run_id}>
               <div>
@@ -77,8 +75,7 @@ export default function OverviewPage() {
               </div>
               <div><div className="count">{progressText(p)}</div><ProgressBar p={p} big /><ProgressKey p={p} /></div>
               <div className="kv stack">
-                <span>Running <b>{fmtDuration(r.elapsed_s)}</b>{r.typical_s ? <> (typical <b>{fmtDuration(r.typical_s)}</b>)</> : null}</span>
-                <span>Last table activity <b>{fmtAgo(r.last_activity_at)}</b></span>
+                <span>Running <b>{fmtDuration(r.elapsed_s)}</b>{r.p50_s ? <> (typical <b>{fmtDuration(r.p50_s)}</b>)</> : null}</span>
                 <span>Started <b>{fmtClock(r.started_at)}</b></span>
               </div>
             </div>
@@ -113,7 +110,7 @@ export default function OverviewPage() {
           <table className="data">
             <thead><tr><th>Ingestion group</th><th>Server</th><th className="num">Databases</th><th className="num">Tables</th>
               <th>State now</th><th className="num">Failing</th><th className="num">First load</th><th className="num">Late</th>
-              <th>Last run</th><th className="num">Rows, 24 h</th></tr></thead>
+              <th>Last run</th></tr></thead>
             <tbody>
               {cols.map((c) => {
                 const run = running.find((r) => r.task_collection === c.task_collection);
@@ -131,7 +128,6 @@ export default function OverviewPage() {
                         {c.last_run_finished && `, took ${fmtDuration((new Date(c.last_run_finished).getTime() - new Date(c.last_run_started).getTime()) / 1000)}`}
                         {Number(c.last_run_failed) > 0 && `, ${c.last_run_failed} failed`}</span></>
                       : <span className="muted">never run</span>}</td>
-                    <td className="num">{fmtInt(c.rows_24h)}</td>
                   </tr>
                 );
               })}

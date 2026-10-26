@@ -255,9 +255,9 @@ def test_run_detail_returns_the_run_its_rows_and_live_progress(monkeypatch):
         calls.append(sql)
         if sql == q.run_sql():
             return [dict(run)] if params == (5,) else []
-        if sql == q.run_rows_sql():
-            return [dict(run_id=5, rows_written=120, uncounted=0, detail=None)]
-        if sql == q.running_runs_sql():
+        if sql == q.run_work_sql():
+            return [dict(run_id=5, rows_written=120, uncounted=0)]
+        if sql == q.running_progress_sql():
             return [dict(run_id=4, tables_ok=9), dict(run_id=5, tables_ok=4, tables_running=3, enabled_tables=10)]
         raise AssertionError(sql)
     monkeypatch.setattr(main.db, "query", query)
@@ -274,9 +274,27 @@ def test_a_collections_databases_keep_two_servers_databases_of_one_name_apart(mo
     batches = [dict(run_id=9, detail='{"batch_rows": 70}', databases=["Sales"], keys=[q.server_database_key("srvY", "Sales")])]
 
     def query(sql, params=()):
-        return {q.collection_database_rows_sql(): written, q.running_runs_sql(): [], q.collection_batch_runs_sql(): batches,
+        return {q.collection_database_rows_sql(): written, q.running_progress_sql(): [], q.collection_batch_runs_sql(): batches,
                 q.collection_databases_sql(): states}[sql]
     monkeypatch.setattr(main.db, "query", query)
     body = TestClient(main.app).get("/api/collections/two_servers_one_name/databases").json()
     got = {(d["server"], d["src_database"]): (d["rows_first_loads"], d["batches"]) for d in body["databases"]}
     assert got == {("srvX", "Sales"): (450, []), ("srvY", "Sales"): (600, [{"run_id": 9, "rows": 70}])}
+
+
+def test_run_pages_share_one_read_of_running_progress(monkeypatch):
+    reads = []
+
+    def query(sql, params=()):
+        if sql == q.run_sql():
+            return [dict(run_id=5, task_collection="c1", status="running", detail=None)]
+        if sql == q.running_progress_sql():
+            reads.append(sql)
+            return [dict(run_id=5, tables_ok=4, enabled_tables=10)]
+        return []
+    monkeypatch.setattr(main.db, "query", query)
+    monkeypatch.setattr(main, "MONITOR_CACHE_S", 15)
+    client = TestClient(main.app)
+    assert client.get("/api/runs/5").json()["progress"]["tables_ok"] == 4
+    assert client.get("/api/runs/5").json()["progress"]["tables_ok"] == 4
+    assert len(reads) == 1

@@ -150,9 +150,15 @@ def api(monkeypatch):
     from fastapi.testclient import TestClient
 
     answers = {
-        q.collections_overview_sql(): [dict(task_collection="c1", rows_24h=100)],
-        q.running_runs_sql(): [dict(run_id=9, task_collection="c1", enabled_tables=10, tables_checked=4)],
-        q.servers_sql(): [dict(server="s1", databases=2, tables=10)],
+        q.database_states_sql(): [
+            dict(server="s1", src_connection="sql_b", src_host=None, task_collection="c1", src_database="db1", tables=2,
+                 state_current=2, state_late=0, state_first_load=0, state_failing=0, no_sla_tables=0),
+            dict(server="s1", src_connection="sql_b", src_host=None, task_collection="c2", src_database="db1", tables=2,
+                 state_current=2, state_late=0, state_first_load=0, state_failing=0, no_sla_tables=0),
+            dict(server="s1", src_connection=None, src_host="other", task_collection="c1", src_database="db2", tables=6,
+                 state_current=6, state_late=0, state_first_load=0, state_failing=0, no_sla_tables=0)],
+        q.last_runs_sql(): [dict(task_collection="c1", run_id=9, status="running")],
+        q.running_progress_sql(): [dict(run_id=9, task_collection="c1", enabled_tables=10, tables_checked=4)],
         q.run_batch_rows_sql(): [dict(run_id=8, task_collection="c1", detail=json.dumps({"batch_rows": 50}))],
         q.collection_databases_sql(): [dict(server="s1", src_database="db1", tables=5), dict(server="s1", src_database="db2", tables=5)],
         q.collection_database_rows_sql(): [dict(server="s1", src_database="db1", rows_first_loads=1000, first_loads=5,
@@ -160,21 +166,18 @@ def api(monkeypatch):
                                                 failed_this_run=0)],
         q.collection_batch_runs_sql(): [dict(run_id=7, detail=json.dumps({"batch_rows": 400, "batch_rows_unknown": 0}),
                                              databases=["db2"], keys=[q.server_database_key("s1", "db2")])],
-        q.run_rows_sql(): [dict(run_id=9, detail=None, rows_written=12, uncounted=1),
-                           dict(run_id=8, detail=json.dumps({"batch_rows": 50, "batch_rows_unknown": 0}),
-                                rows_written=None, uncounted=3)],
+        q.run_work_sql(): [dict(run_id=9, rows_written=12, uncounted=1), dict(run_id=8, rows_written=None, uncounted=3)],
         q.recent_errors_sql(): [dict(finished_at="2026-10-23T07:40:00+00:00", task_collection="c1", src_database="db1",
                                      src_schema="dbo", src_table="t", error="connection reset")],
         q.failed_tables_sql(): [dict(finished_at="2026-10-23T07:40:00+00:00", task_collection="c1", control_id=1, src_database="db1",
                                      src_schema="dbo", src_table="t", error="connection reset")],
-        q.connection_databases_sql(): [dict(src_database="db1", collections="c1, c2", tables=4,
-                                            newest_success_at=None)],
     }
 
     def query(sql, params=()):
         if sql.startswith("select run_id, task_collection, status, started_at"):      # runs_sql
-            return [dict(run_id=9, task_collection="c1", status="running"), dict(run_id=8, task_collection="c1",
-                                                                                 status="completed")]
+            return [dict(run_id=9, task_collection="c1", status="running", detail=None),
+                    dict(run_id=8, task_collection="c1", status="completed",
+                         detail=json.dumps({"batch_rows": 50, "batch_rows_unknown": 0}))]
         return answers.get(sql, [])
 
     class Connection:
@@ -194,10 +197,12 @@ def api(monkeypatch):
     return TestClient(main.app)
 
 
-def test_overview_adds_batched_rows_servers_and_progress(api):
+def test_overview_sums_the_shared_reads_into_groups_servers_and_progress(api):
     data = api.get("/api/overview").json()
-    assert data["collections"][0]["rows_24h"] == 150
-    assert data["running"][0]["tables_checked"] == 4 and data["servers"][0]["server"] == "s1"
+    c1 = data["collections"][0]
+    assert (c1["task_collection"], c1["enabled_tables"], c1["databases"], c1["last_run_id"]) == ("c1", 8, 2, 9)
+    assert data["running"][0]["tables_checked"] == 4 and data["running"][0]["server"] == "s1"
+    assert data["servers"][0]["server"] == "s1" and data["servers"][0]["running_collections"] == 1
 
 
 def test_collection_databases_merge_rows_and_place_a_batch_on_its_one_database(api):

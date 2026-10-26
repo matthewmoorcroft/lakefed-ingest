@@ -50,8 +50,7 @@ export default function CollectionPage() {
       {run && p && (
         <Section title={<>Run #{run.run_id} <Tag tone="run">Running</Tag></>}
           actions={<div className="kv"><span>Started <b>{fmtClock(run.started_at)}</b></span>
-            <span>Running <b>{fmtDuration(run.elapsed_s)}</b>{run.typical_s ? <> (typical <b>{fmtDuration(run.typical_s)}</b>)</> : null}</span>
-            <span>Last table activity <b>{fmtAgo(run.last_activity_at)}</b></span></div>}>
+            <span>Running <b>{fmtDuration(run.elapsed_s)}</b>{run.p50_s ? <> (typical <b>{fmtDuration(run.p50_s)}</b>)</> : null}</span></div>}>
           <div className="count">{progressText(p)}</div><ProgressBar p={p} big /><ProgressKey p={p} />
         </Section>
       )}

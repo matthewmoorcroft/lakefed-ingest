@@ -45,6 +45,99 @@ STATE_COUNTS = (
 
 # ---- overview -----------------------------------------------------------------------------------
 
+def database_states_sql() -> str:
+    """One row per (server, connection, host, ingestion group, database): enabled tables by state
+    (STATE_COUNTS), tables without a freshness target, and the oldest and newest success. The one scan
+    the monitoring views share: rollup.py sums it into groups, servers and connections."""
+    return f"""
+select {SERVER} as server, t.src_connection, lower(t.src_host) as src_host, t.task_collection,
+       coalesce(t.src_database, '') as src_database,
+       count(*) filter (where t.task_enabled) as tables,
+       count(*) filter (where t.task_enabled and t.freshness_sla_minutes is null) as no_sla_tables,
+       {STATE_COUNTS},
+       min(cp.last_success_at) filter (where t.task_enabled) as oldest_success_at,
+       max(cp.last_success_at) filter (where t.task_enabled) as newest_success_at
+from {SCHEMA}.control t
+left join {SCHEMA}.checkpoint cp on cp.control_id = t.id
+group by 1, 2, 3, 4, 5"""
+
+
+def last_runs_sql() -> str:
+    """Each ingestion group's latest run."""
+    return f"""
+select distinct on (task_collection) task_collection, run_id, status, started_at, finished_at,
+       total, ok, failed, skipped, detail
+from {SCHEMA}.ingest_run
+order by task_collection, started_at desc"""
+
+
+def running_progress_sql() -> str:
+    """Every running group run's progress in one pass: its group's enabled tables and how many it has
+    checked (stamped since it started, on the database's clock like started_at), its table events so far
+    (unchanged tables are stamped in bulk without events), the loads that finished in the last 5 minutes
+    (live speed and time left), and its group's 7-day median and p95 run time."""
+    return f"""
+with r as (
+    select run_id, task_collection, job_run_id, cluster_id, parallelism, started_at
+    from {SCHEMA}.ingest_run where status = 'running'
+),
+tables as (
+    select r.run_id,
+           count(*) filter (where t.task_enabled) as enabled_tables,
+           count(*) filter (where t.task_enabled and cp.last_success_at >= r.started_at) as tables_checked
+    from r join {SCHEMA}.control t on t.task_collection = r.task_collection
+    left join {SCHEMA}.checkpoint cp on cp.control_id = t.id
+    group by r.run_id
+),
+events as (
+    select e.run_id,
+           count(*) filter (where e.status = 'ok')      as tables_ok,
+           count(*) filter (where e.status = 'failed')  as tables_failed,
+           count(*) filter (where e.status = 'running') as tables_running,
+           min(e.started_at)                            as work_started_at,
+           count(*) filter (where e.status = 'ok' and e.finished_at > now() - interval '5 minutes') as ok_last_5m,
+           sum(e.rows_merged) filter (where e.status = 'ok' and e.finished_at > now() - interval '5 minutes') as rows_last_5m
+    from {SCHEMA}.ingest_event e join r on r.run_id = e.run_id
+    group by e.run_id
+)
+select r.run_id, r.task_collection, r.job_run_id, r.cluster_id, r.parallelism, r.started_at,
+       round(extract(epoch from (now() - r.started_at)))::int as elapsed_s,
+       coalesce(tb.enabled_tables, 0) as enabled_tables, coalesce(tb.tables_checked, 0) as tables_checked,
+       coalesce(ev.tables_ok, 0) as tables_ok, coalesce(ev.tables_failed, 0) as tables_failed,
+       coalesce(ev.tables_running, 0) as tables_running, ev.work_started_at,
+       coalesce(ev.ok_last_5m, 0) as ok_last_5m, ev.rows_last_5m, p.p50_s, p.p95_s
+from r
+left join tables tb on tb.run_id = r.run_id
+left join events ev on ev.run_id = r.run_id
+left join lateral (
+    select round(percentile_cont(0.5) within group (order by extract(epoch from (x.finished_at - x.started_at)))::numeric) as p50_s,
+           round(percentile_cont(0.95) within group (order by extract(epoch from (x.finished_at - x.started_at)))::numeric) as p95_s
+    from {SCHEMA}.ingest_run x
+    where x.task_collection = r.task_collection and x.finished_at is not null and x.status <> 'skipped'
+      and x.started_at > now() - interval '7 days') p on true
+order by r.started_at desc"""
+
+
+def group_runs_sql() -> str:
+    """The runs of some ingestion groups that started in a window, oldest first (the group runs the app
+    places into job runs). Params: groups, window start, window end."""
+    return (f"select run_id, task_collection, status, started_at, finished_at, total, ok, failed, skipped, "
+            f"reseeded, job_run_id, cluster_id, parallelism, detail "
+            f"from {SCHEMA}.ingest_run where task_collection = any(%s) and started_at >= %s and started_at < %s "
+            f"order by started_at")
+
+
+def run_work_sql() -> str:
+    """Per group run: its work span (first table start to last table finish), tables loaded and failed,
+    and rows written (uncounted: loads with no count). Param: array of run ids."""
+    return (f"select e.run_id, min(e.started_at) as work_started_at, max(e.finished_at) as work_finished_at, "
+            f"count(*) filter (where e.status = 'ok') as loaded, "
+            f"count(*) filter (where e.status = 'failed') as failed_tables, "
+            f"sum(e.rows_merged) as rows_written, "
+            f"count(*) filter (where e.status = 'ok' and e.rows_merged is null) as uncounted "
+            f"from {SCHEMA}.ingest_event e where e.run_id = any(%s) group by e.run_id")
+
+
 def collections_overview_sql() -> str:
     """One row per task_collection: table counts, the latest run, and current health. The state_* counts
     put each enabled table in exactly one state (STATE_COUNTS) for the state bar; rows_24h is the rows
@@ -124,7 +217,7 @@ order by r.started_at desc"""
 
 _RUN_COLUMNS = ("run_id, task_collection, status, started_at, finished_at, "
                 "round(extract(epoch from (coalesce(finished_at, now()) - started_at))::numeric, 0) as duration_s, "
-                "total, ok, failed, skipped, reseeded, job_run_id, parallelism")
+                "total, ok, failed, skipped, reseeded, job_run_id, cluster_id, parallelism, detail")
 
 
 def runs_sql(collection: Optional[str], limit: int = 100) -> Tuple[str, tuple]:

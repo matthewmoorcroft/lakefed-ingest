@@ -147,3 +147,33 @@ def test_failed_tables_are_one_row_per_table_with_its_failures(pg):
     assert [(r["src_database"], r["src_table"], r["failures"]) for r in found] == [("db2", "t9", 1)]
     assert found[0]["error"].startswith("[FAILED_JDBC.CONNECTION]") and found[0]["first_at"] == found[0]["last_at"]
     assert rows(pg, q.failed_tables_sql(), (24, 0)) == []
+
+
+def test_the_shared_per_database_pass_adds_up_to_the_overview_and_servers(pg):
+    import rollup
+    with pg.transaction():
+        states = rows(pg, q.database_states_sql())
+        old_groups = {r["task_collection"]: r for r in rows(pg, q.collections_overview_sql())}
+        old_servers = rows(pg, q.servers_sql())
+    new_groups = rollup.groups(states)
+    assert set(new_groups) == set(old_groups)
+    for name, old in old_groups.items():
+        new = new_groups[name]
+        for k in ("enabled_tables", "no_sla_tables", "databases", "servers", "server") + rollup.STATES:
+            assert new[k] == old[k], (name, k)
+    new_servers = rollup.servers(states)
+    assert [s["server"] for s in new_servers] == [s["server"] for s in old_servers]
+    for new, old in zip(new_servers, old_servers):
+        for k in ("databases", "tables", "collections", "oldest_success_at", "newest_success_at") + rollup.STATES:
+            assert new[k] == old[k], (old["server"], k)
+
+
+def test_the_running_pass_counts_what_the_old_running_query_counts(pg):
+    with pg.transaction():
+        new = {r["run_id"]: r for r in rows(pg, q.running_progress_sql())}
+        old = {r["run_id"]: r for r in rows(pg, q.running_runs_sql())}
+    assert set(new) == set(old) and new
+    for run_id, o in old.items():
+        for k in ("enabled_tables", "tables_checked", "tables_ok", "tables_failed", "tables_running"):
+            assert new[run_id][k] == o[k], (run_id, k)
+        assert "p95_s" in new[run_id] and new[run_id]["ok_last_5m"] == 1
