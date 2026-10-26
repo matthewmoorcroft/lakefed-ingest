@@ -162,6 +162,13 @@ def _when(value) -> Optional[datetime]:
     return datetime.fromisoformat(value) if isinstance(value, str) else value
 
 
+def launch_of(run: dict) -> Optional[str]:
+    """The check job's launch a group run belongs to: the launch id in its work_id ("<launch_id>:<collection>"),
+    or None for a run started otherwise."""
+    work_id = run.get("work_id")
+    return str(work_id).split(":", 1)[0] if work_id else None
+
+
 def slot_of(fire: datetime, offset: int, tz: str) -> datetime:
     """The job run a member's trigger belongs to: its fire time less the member's offset, on the wall clock
     of the schedule's time zone, so every member of one trigger shares it across a daylight saving change."""
@@ -178,7 +185,8 @@ def job_runs(cadence: int, tz: str, members: List[dict], runs: List[dict], start
     """A schedule's job runs whose triggers fall in [start, end), newest first, each with one entry per
     member then: its trigger time, its group run and any extra runs, and its state.
 
-    A group run belongs to its member's latest trigger at or before its start; the first in a slot is the
+    A group run belongs to its member's latest trigger at or before its start, or with a launch id to its
+    launch's job run (launch_of); the first in a slot is the
     slot's run and later ones are extra (started by hand, most likely). A member with no run is waiting when
     its trigger is still ahead, skipped when its group's previous run was still going at the trigger (wrapper
     jobs allow one run and don't queue), starting for STARTING_MINUTES after its trigger (its cluster may still
@@ -187,6 +195,20 @@ def job_runs(cadence: int, tz: str, members: List[dict], runs: List[dict], start
     by_group: Dict[str, List[dict]] = {}
     for r in sorted(runs, key=lambda r: _when(r["started_at"])):
         by_group.setdefault(r["task_collection"], []).append(r)
+    # Group runs the check job started together share a launch id: they are one job run, the slot of the
+    # earliest of them, however late the others start.
+    launch_slot: Dict[str, datetime] = {}
+    for m in members:
+        offset = int(m["offset_minutes"])
+        for r in by_group.get(m["task_collection"], []):
+            launch = launch_of(r)
+            if launch is None:
+                continue
+            started = _when(r["started_at"])
+            before = fire_times(cadence, offset, tz, started - timedelta(minutes=cadence + 1), started + timedelta(seconds=1))
+            if before:
+                slot = slot_of(before[-1], offset, tz)
+                launch_slot[launch] = min(launch_slot.get(launch, slot), slot)
     slots: Dict[datetime, List[dict]] = {}
     for m in members:
         group, offset = m["task_collection"], int(m["offset_minutes"])
@@ -201,7 +223,10 @@ def job_runs(cadence: int, tz: str, members: List[dict], runs: List[dict], start
         for fire, following in zip(fires, fires[1:]):
             if (added is not None and fire < added) or (removed is not None and fire >= removed):
                 continue
-            in_slot = [r for r in member_runs if fire <= _when(r["started_at"]) < following]
+            slot = slot_of(fire, offset, tz)
+            in_slot = [r for r in member_runs
+                       if (launch_slot.get(launch_of(r)) == slot if launch_of(r) in launch_slot
+                           else fire <= _when(r["started_at"]) < following)]
             if in_slot:
                 state = "run"
             elif fire > now:
@@ -213,7 +238,7 @@ def job_runs(cadence: int, tz: str, members: List[dict], runs: List[dict], start
                 state = "starting"
             else:
                 state = "no run"
-            slots.setdefault(slot_of(fire, offset, tz), []).append(
+            slots.setdefault(slot, []).append(
                 {"task_collection": group, "offset_minutes": offset, "fire_at": fire, "state": state,
                  "run": in_slot[0] if in_slot else None, "extra": in_slot[1:]})
     return [{"slot": slot, "members": sorted(entries, key=lambda e: (e["offset_minutes"], e["task_collection"]))}

@@ -81,7 +81,7 @@ export default function IngestionJob() {
             <div className="metric-sub">p95 over 7 days</div></div>
         </div>
       )}
-      <Section title="Runs of this job" note="One row per trigger, newest first. Group runs are placed by the job's current schedule; a run started by hand inside a slot is an extra run. Exact once each group run records its launch."
+      <Section title="Runs of this job" note="One row per trigger, newest first. Group runs the check job started together are one job run; other group runs are placed by the job's current schedule, and one started by hand inside a slot is an extra run."
         actions={<span className="pager-buttons">
           <button className="ghost" disabled={!pages.length} onClick={() => setPages(pages.slice(0, -1))}>Newer</button>
           <button className="ghost" disabled={!runs.data?.next_before} onClick={() => setPages([...pages, runs.data!.next_before])}>Older</button>

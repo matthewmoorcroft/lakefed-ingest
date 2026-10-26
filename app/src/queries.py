@@ -258,7 +258,7 @@ order by r.started_at desc"""
 
 _RUN_COLUMNS = ("run_id, task_collection, status, started_at, finished_at, "
                 "round(extract(epoch from (coalesce(finished_at, now()) - started_at))::numeric, 0) as duration_s, "
-                "total, ok, failed, skipped, reseeded, job_run_id, cluster_id, parallelism, detail")
+                "total, ok, failed, skipped, reseeded, job_run_id, cluster_id, parallelism, detail, work_id")
 
 
 def runs_sql(collection: Optional[str], limit: int = 100) -> Tuple[str, tuple]:

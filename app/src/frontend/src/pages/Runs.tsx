@@ -59,7 +59,7 @@ export default function Runs() {
       <PageHead crumb={<span className="eyebrow">Runs · What ran, and how fast?</span>}
         title={job === "none" ? "Runs: groups in no job"
           : d ? `Runs: ${fmtInt(running.length)} running; ${fmtInt(withFailed.length)} finished with failed tables${oldest ? ` since ${fmtWhen(oldest)}` : ""}` : "Runs"}
-        lead="A job run is one trigger of an ingestion job, with one group run per ingestion group. Group runs are placed by each job's current schedule."
+        lead="A job run is one trigger of an ingestion job, with one group run per ingestion group. Group runs the check job started together are one job run; others are placed by each job's current schedule."
         right={<label className="toolbar" style={{ margin: 0 }}>Ingestion job
           <select value={job} onChange={(e) => choose(e.target.value)}>
             <option value="">(all jobs)</option>

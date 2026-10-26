@@ -39,7 +39,7 @@ export default function JobRun() {
         title={r ? <>{jobRunName(r.job_name, r.slot)}{live ? `: ${checkedPct}% checked${r.expected_end ? `, ends about ${fmtClock(r.expected_end)}` : ""}` : ""}{" "}
           <RunStatus status={null} outcome={r.outcome} /></> : "Job run"}
         lead={r && <>{r.outcome?.note ?? `${fmtInt(r.ran)} of ${fmtInt(r.members)} group ${plural(r.members, "run")}`}
-          {live && <>; {fmtInt(r.running_group_runs)} running, {fmtInt(r.waiting)} waiting to start</>}. Placed by the job's current schedule.</>}
+          {live && <>; {fmtInt(r.running_group_runs)} running, {fmtInt(r.waiting)} waiting to start</>}. Group runs the check job started together are one job run; others are placed by the job's current schedule.</>}
         right={live || run.error ? <Stamp at={r?.read_at} every={15} error={run.error} /> : undefined} />
       <ErrorBox error={run.error} />
       {r && (

@@ -372,3 +372,14 @@ def test_the_check_variant_is_valid_only_when_the_check_job_is_configured():
     body = dict(name="Group", cadence_minutes=15, timezone="UTC", parameters={}, members=["c1"], job_variant="check")
     assert sch.validate(body, ["c1"], {"default": "1", "check": "2"}) == []
     assert sch.validate(body, ["c1"], {"default": "1"}) == ["job_variant must be one of default"]
+
+
+def test_group_runs_of_one_launch_are_one_job_run_however_late_they_start():
+    late = _run("b", datetime(2026, 10, 26, 15, 40, tzinfo=UTC), run_id=2)      # after b's 15:30 trigger
+    late["work_id"] = "900:b"
+    first = _run("a", datetime(2026, 10, 26, 14, 1, tzinfo=UTC), run_id=1)
+    first["work_id"] = "900:a"
+    found = sch.job_runs(60, "UTC", _members(("a", 0), ("b", 30)), [first, late], datetime(2026, 10, 26, 14, tzinfo=UTC),
+                         datetime(2026, 10, 26, 16, tzinfo=UTC), now=datetime(2026, 10, 26, 17, tzinfo=UTC))
+    by_hour = {j["slot"].hour: [(m["task_collection"], (m["run"] or {}).get("run_id")) for m in j["members"]] for j in found}
+    assert by_hour == {14: [("a", 1), ("b", 2)], 15: [("a", None), ("b", None)]}
