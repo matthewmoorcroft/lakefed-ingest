@@ -287,14 +287,44 @@ def test_run_pages_share_one_read_of_running_progress(monkeypatch):
 
     def query(sql, params=()):
         if sql == q.run_sql():
-            return [dict(run_id=5, task_collection="c1", status="running", detail=None)]
+            return [dict(run_id=params[0], task_collection="c1", status="running", detail=None)]
         if sql == q.running_progress_sql():
             reads.append(sql)
-            return [dict(run_id=5, tables_ok=4, enabled_tables=10)]
+            return [dict(run_id=5, tables_ok=4, enabled_tables=10), dict(run_id=6, tables_ok=7, enabled_tables=10)]
         return []
     monkeypatch.setattr(main.db, "query", query)
     monkeypatch.setattr(main, "MONITOR_CACHE_S", 15)
     client = TestClient(main.app)
     assert client.get("/api/runs/5").json()["progress"]["tables_ok"] == 4
-    assert client.get("/api/runs/5").json()["progress"]["tables_ok"] == 4
+    assert client.get("/api/runs/6").json()["progress"]["tables_ok"] == 7
     assert len(reads) == 1
+
+
+def test_the_overviews_last_runs_are_read_as_often_as_the_running_runs(monkeypatch):
+    reads, clock = [], [1000.0]
+
+    def query(sql, params=()):
+        reads.append(sql)
+        return []
+    monkeypatch.setattr(main.db, "query", query)
+    monkeypatch.setattr(main.time, "time", lambda: clock[0])
+    monkeypatch.setattr(main, "MONITOR_CACHE_S", 15)
+    monkeypatch.setattr(main, "STATES_CACHE_S", 60)
+    client = TestClient(main.app)
+    client.get("/api/overview")
+    clock[0] += 20
+    client.get("/api/overview")
+    assert reads.count(q.running_progress_sql()) == reads.count(q.last_runs_sql()) == 2
+    assert reads.count(q.database_states_sql()) == 1
+
+
+def test_the_overview_says_when_its_table_states_were_read(monkeypatch):
+    clock = [1_800_000_000.0]
+    monkeypatch.setattr(main.db, "query", lambda sql, params=(): [])
+    monkeypatch.setattr(main.time, "time", lambda: clock[0])
+    monkeypatch.setattr(main, "STATES_CACHE_S", 60)
+    client = TestClient(main.app)
+    first = client.get("/api/overview").json()
+    clock[0] += 30
+    again = client.get("/api/overview").json()
+    assert again["read_at"] == first["read_at"] and again["states_cache_s"] == 60

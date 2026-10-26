@@ -177,3 +177,15 @@ def test_the_running_pass_counts_what_the_old_running_query_counts(pg):
         for k in ("enabled_tables", "tables_checked", "tables_ok", "tables_failed", "tables_running"):
             assert new[run_id][k] == o[k], (run_id, k)
         assert "p95_s" in new[run_id] and new[run_id]["ok_last_5m"] == 1
+
+
+def test_a_connections_databases_from_the_shared_pass_equal_the_old_query_with_a_disabled_table(pg):
+    import rollup
+    with pg.transaction(force_rollback=True):
+        pg.execute("update lakefed_ingest.control set task_enabled = false where src_database = 'db1' and src_table = 't1'")
+        pg.execute("update lakefed_ingest.checkpoint set last_success_at = now() + interval '1 hour' "
+                   "where src_database = 'db1' and src_table = 't1'")
+        old = rows(pg, q.connection_databases_sql(), ("no_such_connection", "HOST-A"))
+        new = rollup.connection_databases(rows(pg, q.database_states_sql()), "no_such_connection", "HOST-A")
+    keys = ("src_database", "collections", "tables", "newest_success_at")
+    assert [tuple(d[k] for k in keys) for d in new] == [tuple(d[k] for k in keys) for d in old]

@@ -120,8 +120,8 @@ def _shared(key, compute, ttl=None):
     return value
 
 
-# Table states change at run cadence, so the one per-database scan they come from (and each group's
-# last run) is shared for longer than running progress is.
+# Table states change at run cadence, so the one per-database scan they come from is shared for longer
+# than running progress is.
 STATES_CACHE_S = max(0, int(os.environ.get("STATES_CACHE_S", "60")))
 
 
@@ -131,9 +131,15 @@ def _states() -> List[dict]:
 
 
 def _last_runs() -> dict:
-    """Each ingestion group's latest run, by group, shared like _states."""
-    return _shared("last_runs", lambda: {r["task_collection"]: r for r in db.query(q.last_runs_sql())},
-                   ttl=STATES_CACHE_S)
+    """Each ingestion group's latest run, by group, shared as often as _running, so a run that has finished
+    is not still shown running beside an empty running list."""
+    return _shared("last_runs", lambda: {r["task_collection"]: r for r in db.query(q.last_runs_sql())})
+
+
+def _read_at(key) -> str:
+    """When the shared read under key was made: now, when it is not cached."""
+    hit = _shared_reads.get(key)
+    return datetime.fromtimestamp(hit[1] if hit else time.time(), timezone.utc).isoformat()
 
 
 def _running() -> List[dict]:
@@ -159,7 +165,7 @@ def overview():
     servers = [dict(s, health=q.server_health(s))
                for s in rollup.servers(states, running_groups={r["task_collection"] for r in running})]
     return {"collections": collections, "running": running, "servers": servers,
-            "read_at": datetime.now(timezone.utc).isoformat(), "cache_s": MONITOR_CACHE_S}
+            "read_at": _read_at("database_states"), "cache_s": MONITOR_CACHE_S, "states_cache_s": STATES_CACHE_S}
 
 
 # The most failed tables the failure groups read; past it they say how many they show.

@@ -81,7 +81,8 @@ def _on_connection(s: dict, name: str, host: str) -> bool:
 
 def connection_databases(states: Iterable[dict], name: str, host: Optional[str]) -> List[dict]:
     """The databases lakefed tracks on one UC connection, by name: control rows naming the connection or
-    its host (case-insensitively). Each with its ingestion groups, enabled tables and newest success."""
+    its host (case-insensitively). Each with its ingestion groups, enabled tables and newest success of any
+    of its tables, enabled or not."""
     out: Dict[str, dict] = {}
     for s in states:
         if not _on_connection(s, name, host or ""):
@@ -90,7 +91,7 @@ def connection_databases(states: Iterable[dict], name: str, host: Optional[str])
                                                "newest_success_at": None})
         d["_groups"].add(s["task_collection"])
         d["tables"] += _count(s, "tables")
-        d["newest_success_at"] = _later(d["newest_success_at"], s.get("newest_success_at"))
+        d["newest_success_at"] = _later(d["newest_success_at"], s.get("newest_any_success_at"))
     rows = []
     for d in sorted(out.values(), key=lambda d: str(d["src_database"])):
         d["collections"] = ", ".join(sorted(d.pop("_groups")))

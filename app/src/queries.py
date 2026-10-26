@@ -47,7 +47,8 @@ STATE_COUNTS = (
 
 def database_states_sql() -> str:
     """One row per (server, connection, host, ingestion group, database): enabled tables by state
-    (STATE_COUNTS), tables without a freshness target, and the oldest and newest success. The one scan
+    (STATE_COUNTS), tables without a freshness target, the oldest and newest success of its enabled tables,
+    and the newest of any table (what a UC connection's databases show). The one scan
     the monitoring views share: rollup.py sums it into groups, servers and connections."""
     return f"""
 select {SERVER} as server, t.src_connection, lower(t.src_host) as src_host, t.task_collection,
@@ -56,7 +57,8 @@ select {SERVER} as server, t.src_connection, lower(t.src_host) as src_host, t.ta
        count(*) filter (where t.task_enabled and t.freshness_sla_minutes is null) as no_sla_tables,
        {STATE_COUNTS},
        min(cp.last_success_at) filter (where t.task_enabled) as oldest_success_at,
-       max(cp.last_success_at) filter (where t.task_enabled) as newest_success_at
+       max(cp.last_success_at) filter (where t.task_enabled) as newest_success_at,
+       max(cp.last_success_at) as newest_any_success_at
 from {SCHEMA}.control t
 left join {SCHEMA}.checkpoint cp on cp.control_id = t.id
 group by 1, 2, 3, 4, 5"""
