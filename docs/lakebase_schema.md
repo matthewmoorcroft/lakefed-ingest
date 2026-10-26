@@ -126,11 +126,11 @@ for the run's `task_collection`). See "Control rows" in the [README](../README.m
 | `freshness_sla_minutes` | Optional freshness SLA: an enabled table breaches it when its `checkpoint.last_success_at` (or, if it has never succeeded, `created_at`) is older than this many minutes. NULL = no SLA, never flagged. Monitoring only (the operations app and DBSQL alerts); the ingestion job doesn't read it. Set it to the collection's schedule plus run time plus slack, e.g. 45 for a 15-minute schedule |
 | `created_at` | When the row was added (rows that predate this column show the migration time) |
 | `src_type` | Source adapter: `sqlserver` \| `oracle` \| `postgresql` \| `mysql` |
-| `src_host`, `src_port` | Source server; NULL port = the engine's default |
+| `src_host`, `src_port` | Source server; NULL port = the engine's default (no `src_host`: the connection's port) |
 | `src_database`, `src_schema`, `src_table` | Source table (Oracle: `src_database` is the service name) |
 | `secret_key` | Secret (in the job's secret scope) holding JSON `{"user", "password"}` for this database |
 | `use_remote_query` | `true`: read through the Unity Catalog connection in `src_connection` (`remote_query`) instead of Spark JDBC; `src_host`, `src_port` and `secret_key` aren't used then. Default `false` |
-| `src_connection` | The connection read through when `use_remote_query` is `true`. Otherwise only a fallback for the host when `src_host` is NULL |
+| `src_connection` | Connection read through when `use_remote_query` is `true`. Otherwise, with `src_host` NULL, the host and a NULL `src_port` come from its options |
 | `jdbc_options` | Optional JSON object of extra Spark JDBC read options |
 | `select_list` | Explicit, comma-separated columns to copy (`*` isn't supported). Adding a column reseeds the table |
 | `primary_key` | Comma-separated; required for `ct`, `cursor` and `cdc` (MERGE key) |
