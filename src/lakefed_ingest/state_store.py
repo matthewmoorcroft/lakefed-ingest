@@ -127,7 +127,7 @@ def split_sql_statements(ddl: str) -> List[str]:
 # DDL's fingerprint to it, so a schema change can't ship without a bump.
 #   0 = no version recorded (deployed before versions existed)   1 = first recorded version
 #   2 = discovery, control_change, checkpoint identities, freshness SLA, schedules (operations app)
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 # Advisory lock that serializes migrations (the setup job and ingestion runs of any collection): two
 # int keys, so it can't collide with a collection's one-key lock whatever the collection is named,
 # and a class of its own (not SOURCE_LOCK_CLASS).
@@ -424,11 +424,12 @@ def enqueue_reseed_sql() -> str:
 def start_run_sql() -> str:
     """Open an ingest_run row (status 'running'); returns the new run_id. total starts as the tables the
     run plans to take (a run on a work list takes fewer than its collection has), until finish_run sets the
-    final count."""
+    final count. work_id: the work list the check job started it for ("<launch_id>:<collection>"), so the
+    group runs of one launch can be told apart; None for a run started otherwise."""
     return (
         f"insert into {RUN_TABLE} "
-        "(task_collection, job_run_id, cluster_id, parallelism, total, status) "
-        "values (%s, %s, %s, %s, %s, 'running') returning run_id"
+        "(task_collection, job_run_id, cluster_id, parallelism, total, work_id, status) "
+        "values (%s, %s, %s, %s, %s, %s, 'running') returning run_id"
     )
 
 
@@ -966,12 +967,13 @@ class StateStore:
                          *identity_values(cfg)))
 
     # ---- Observability / telemetry -----------------------------------------------------
-    def start_run(self, task_collection, job_run_id, cluster_id, parallelism, planned=None) -> int:
-        """Open an ingest_run row; returns its run_id. planned: the tables the run will take, if known."""
+    def start_run(self, task_collection, job_run_id, cluster_id, parallelism, planned=None, work_id=None) -> int:
+        """Open an ingest_run row; returns its run_id. planned: the tables the run will take, if known;
+        work_id: the check job's work list it runs, if any."""
         with self._cursor() as cur:
             cur.execute(start_run_sql(),
                         (task_collection, job_run_id, cluster_id, int(parallelism),
-                         None if planned is None else int(planned)))
+                         None if planned is None else int(planned), work_id or None))
             return int(cur.fetchone()[0])
 
     def record_event_start(self, run_id, cfg, action, phase, pool) -> int:

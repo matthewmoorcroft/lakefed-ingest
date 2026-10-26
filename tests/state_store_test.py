@@ -200,7 +200,17 @@ def test_start_run_sql_inserts_running_and_returns_id():
     assert ss.RUN_TABLE == "lakefed_ingest.ingest_run" and ss.RUN_TABLE in sql
     assert "'running'" in sql
     assert "returning run_id" in sql
-    assert sql.count("%s") == 5  # task_collection, job_run_id, cluster_id, parallelism, total (planned)
+    assert sql.count("%s") == 6  # task_collection, job_run_id, cluster_id, parallelism, total (planned), work_id
+    assert "work_id" in sql
+
+
+def test_a_run_records_the_work_list_it_was_started_for():
+    assert "alter table lakefed_ingest.ingest_run add column if not exists work_id text" in _DDL
+    assert "ingest_run_work_idx" in _DDL
+    import json as _json
+    notebook = _json.loads((Path(ss.__file__).parent / "ingest.ipynb").read_text())
+    source = "\n".join("".join(c["source"]) for c in notebook["cells"])
+    assert "planned=len(configs), work_id=work_id or None)" in source
 
 
 def test_record_event_start_sql_inserts_running_and_returns_id():
@@ -584,6 +594,7 @@ SCHEMA_FINGERPRINTS = {
     1: "c035b85032e0df245775f4858dcc2e450ae737e885f326071c7b8546527a96e1",
     2: "8e514a425a7684f353c288677bff216cfe32421980263c197ba453bc10ac989f",
     3: "b748cce2a28ea27b16807b344ebc891908bfed92658f67b6cf4ed360af3d1551",
+    4: "f105421638e334fbf50e4f7ee40469d129a03b4e22e7074f751b3dbad21b6d73",
 }
 
 

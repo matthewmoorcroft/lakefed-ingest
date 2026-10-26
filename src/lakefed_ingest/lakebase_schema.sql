@@ -345,6 +345,11 @@ create table if not exists lakefed_ingest.ingest_run (
 create index if not exists ingest_run_collection_idx
     on lakefed_ingest.ingest_run (task_collection, started_at);
 
+-- The check job's work list a run was started for ("<launch_id>:<collection>"): the group runs of one
+-- launch share its launch id, so the app shows them as one job run. Null for runs started otherwise.
+alter table lakefed_ingest.ingest_run add column if not exists work_id text;
+create index if not exists ingest_run_work_idx on lakefed_ingest.ingest_run (work_id);
+
 -- One row per (run, table): per-table telemetry for a run.
 create table if not exists lakefed_ingest.ingest_event (
     id              bigserial   primary key,
