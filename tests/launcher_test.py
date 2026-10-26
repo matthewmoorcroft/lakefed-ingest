@@ -245,6 +245,22 @@ def test_a_timeout_cancels_what_is_still_going_and_fails_the_step():
     assert [f["collection"] for f in launcher.failures(summary)] == ["c2"]
 
 
+def test_a_run_no_poll_of_which_succeeds_in_the_confirm_window_is_unconfirmed_and_fails_the_step():
+    jobs, clock = _Jobs({"c1": ["RUNNING"]}, poll_errors={"c1": 1000}), _Clock()
+    summary = launcher.launch(jobs, 7, launcher.run_requests(_per_collection(c1=["a"])), confirm_s=30,
+                              sleep=clock.sleep, clock=clock)
+    run = summary["runs"][0]
+    assert run["outcome"] == "unconfirmed" and run["run_id"] == 100 and run["poll_errors"] > 0
+    assert "poll failed" in run["state_message"] and launcher.failures(summary) == [run]
+
+
+def test_a_run_polled_once_still_going_is_started_even_with_no_confirm_window():
+    jobs, clock = _Jobs({"c1": ["RUNNING"]}), _Clock()
+    summary = launcher.launch(jobs, 7, launcher.run_requests(_per_collection(c1=["a"])), confirm_s=0,
+                              sleep=clock.sleep, clock=clock)
+    assert summary["runs"][0]["outcome"] == "started" and launcher.failures(summary) == []
+
+
 def test_a_failed_poll_is_tried_again_on_the_next_one():
     jobs, clock = _Jobs({"c1": ["RUNNING", "SUCCESS"]}, poll_errors={"c1": 2}), _Clock()
     summary = launcher.launch(jobs, 7, launcher.run_requests(_per_collection(c1=["a"])), wait=True, sleep=clock.sleep,
