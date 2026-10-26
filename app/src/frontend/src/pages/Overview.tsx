@@ -91,7 +91,7 @@ export default function OverviewPage() {
         <div className="server-cards">
           {(ov.data?.servers ?? []).map((s) => (
             <div className="server-card" key={s.server}>
-              <div className="top"><div><h3>{s.server || "(no server)"}</h3>
+              <div className="top"><div><h3 title={s.server || undefined}>{s.server || "(no server)"}</h3>
                 <div className="meta">{fmtInt(s.databases)} {plural(s.databases, "database")} · {fmtInt(s.tables)} {plural(s.tables, "table")} · {s.collections} {plural(s.collections, "ingestion group")}</div></div>
                 {Number(s.running_collections) > 0 ? <Tag tone="run">{s.running_collections} running</Tag>
                   : <Tag tone={HEALTH_TONE[s.health] ?? ""}>{s.health ? s.health[0].toUpperCase() + s.health.slice(1) : "Unknown"}</Tag>}</div>

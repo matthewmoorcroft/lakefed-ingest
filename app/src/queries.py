@@ -340,7 +340,7 @@ def batch_rows(detail) -> tuple:
 ERROR_CLASSES = (
     ("connection", "Could not connect to the source database",
      ("failed_jdbc.connection", "connection reset", "connection refused", "could not connect", "network",
-      "login timeout", "socket")),
+      "login timeout", "socket", "tcp/ip connection to the host")),
     ("timeout", "Timed out", ("timeout", "timed out")),
     ("permission", "Permission denied at the source or sink",
      ("permission", "denied", "not authorized", "login failed")),
@@ -356,11 +356,17 @@ _ERROR_PATTERNS = tuple((name, label, re.compile("|".join(rf"(?<![a-z0-9_]){re.e
                         for name, label, needles in ERROR_CLASSES)
 
 
+# Quoted names in an error: anything in single quotes, one word in double quotes, or a bracketed name
+# that is not an upper-case error tag.
+_QUOTED_NAMES = re.compile(r"'[^'\n]{1,256}'|\"[\w.$#@-]{1,128}\"|\[(?![A-Z0-9_.]+\])[^\]\n]{1,256}\]")
+
+
 def classify_error(error: Optional[str]) -> Tuple[str, str]:
-    """(class, label) of an error message; ('other', 'Other errors') when nothing matches. Quoted names
-    (a column or table the message names, such as 'network') are left out, so a name is never read as a
-    cause."""
-    text = re.sub(r"'[^'\s]{1,256}'", "''", (error or "").lower())
+    """(class, label) of an error message; ('other', 'Other errors') when nothing matches. Names the
+    message quotes (a column or table such as 'network', "network" or [network]) are left out, so a name
+    is never read as a cause; a double-quoted phrase (a driver's quoted cause) and an upper-case error
+    tag such as [FAILED_JDBC.CONNECTION] are kept."""
+    text = _QUOTED_NAMES.sub("''", error or "").lower()
     for name, label, pattern in _ERROR_PATTERNS:
         if pattern.search(text):
             return name, label
