@@ -57,6 +57,7 @@ import contextlib
 import datetime
 import hashlib
 import json
+import math
 import os
 import random
 import re
@@ -792,8 +793,8 @@ def existing_sinks(spark, configs) -> Optional[set]:
 def spark_conf_settings(text) -> dict:
     """The Spark session settings of the job parameter ``spark_conf``: a JSON object of setting -> value
     (blank: none), as strings. A string or number is used as written; a boolean becomes "true" or "false".
-    Anything else (null, a list, an object, NaN) is refused: its text would be a value nobody wrote ("None",
-    "[1]"). Raises ValueError, naming the setting."""
+    Anything else (null, a list, an object, NaN, or a number too large to be finite such as 1e999) is refused:
+    its text would be a value nobody wrote ("None", "[1]", "inf"). Raises ValueError, naming the setting."""
     if text is None or not str(text).strip():
         return {}
     try:
@@ -806,6 +807,8 @@ def spark_conf_settings(text) -> dict:
     for key, value in settings.items():
         if isinstance(value, bool):
             out[str(key)] = "true" if value else "false"
+        elif isinstance(value, float) and not math.isfinite(value):
+            raise ValueError(f"spark_conf setting {key!r} must be a finite number")
         elif isinstance(value, (str, int, float)):
             out[str(key)] = str(value)
         else:
