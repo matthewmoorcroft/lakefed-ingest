@@ -261,11 +261,14 @@ def _schedule(job_id: int) -> dict:
 
 def _job_runs_of(job: dict, start: datetime, end: datetime, now: datetime) -> List[dict]:
     """A job's job runs whose slot started in [start, end), newest first, as ij.summarize shows them, with
-    their placed members. Runs are read from one cadence before `start`, for skipped triggers."""
+    their placed members. Runs are read from two slots before `start`: ij.place starts a slot early, and an
+    earlier run still going at a trigger makes it skipped."""
     _, members = _schedules()
     mine = [m for m in members if m["schedule_id"] == job["id"]]
     cadence = int(job["cadence_minutes"])
-    runs = _group_runs([m["task_collection"] for m in mine], start - timedelta(minutes=cadence), end + timedelta(minutes=cadence))
+    # A slot's group runs start up to two cadences after it: its member's offset, then up to its next trigger.
+    runs = _group_runs([m["task_collection"] for m in mine], start - timedelta(minutes=2 * max(cadence, 60)),
+                       end + timedelta(minutes=2 * cadence))
     placed = [jr for jr in ij.place(job, mine, runs, start, end + timedelta(minutes=cadence), now)
               if start <= jr["slot"] < end and jr["slot"] <= now]
     running = {r["run_id"]: r for r in _running()}
@@ -282,7 +285,8 @@ def _jobs_view() -> dict:
         schedules, members = _schedules()
         states, running, stats = _states(), _running(), _group_stats()
         groups = sorted({m["task_collection"] for m in members})
-        start = min((ij.window(int(s["cadence_minutes"]), ij.RECENT_JOB_RUNS + 1, now) for s in schedules), default=now)
+        start = min([ij.window(int(s["cadence_minutes"]), ij.RECENT_JOB_RUNS + 1, now) for s in schedules]
+                    + [q._when(r["started_at"]) - timedelta(days=1) for r in running if r.get("started_at")], default=now)
         runs = _group_runs(groups, start, now + timedelta(seconds=1))
         view = ij.jobs_view(schedules, members, states, running, runs, stats, now)
         causes = {}
@@ -307,7 +311,7 @@ def _job_filter(job: dict, name: str) -> bool:
 @app.get("/api/ingestion-jobs")
 def ingestion_jobs(filter: str = "all", search: str = "", offset: int = 0, limit: int = 25):
     """Every ingestion job, as on the Overview, filtered (each filter with its count) and searched on job and
-    group names, a page at a time. "Not in any job" is listed last, under All."""
+    group names, a page at a time; "Not in any job" comes apart, under All."""
     if filter not in JOB_FILTERS:
         raise HTTPException(400, f"filter must be one of {', '.join(JOB_FILTERS)}")
     view = _jobs_view()
@@ -317,11 +321,11 @@ def ingestion_jobs(filter: str = "all", search: str = "", offset: int = 0, limit
     counts = {f: sum(1 for j in found if _job_filter(j, f)) for f in JOB_FILTERS}
     rows = [j for j in found if _job_filter(j, filter)]
     not_in_job = view["not_in_job"]
-    if filter == "all" and not_in_job and (not needle or any(needle in g.lower() for g in not_in_job["groups"])):
-        rows = rows + [dict(not_in_job, status={"label": "Not in any job", "tone": "neutral", "detail": [], "cause": None})]
+    shown_apart = filter == "all" and not_in_job and (not needle or any(needle in g.lower() for g in not_in_job["groups"]))
     offset, limit = max(0, int(offset)), max(1, min(int(limit), 100))
     return {"jobs": rows[offset:offset + limit], "total": len(rows), "offset": offset, "limit": limit,
-            "counts": counts, "read_at": _read_at("jobs_view"), "cache_s": MONITOR_CACHE_S}
+            "not_in_job": not_in_job if shown_apart else None, "counts": counts, "read_at": _read_at("jobs_view"),
+            "cache_s": MONITOR_CACHE_S}
 
 
 @app.get("/api/ingestion-jobs/{job_id}")
@@ -427,7 +431,9 @@ def job_runs_across(job: Optional[str] = None, outcome: Optional[str] = None, be
         counts[r["outcome"]["label"]] = counts.get(r["outcome"]["label"], 0) + 1
     if outcome:
         found = [r for r in found if r["outcome"]["label"] == outcome]
-    running = [r for r in found if r["outcome"]["label"] == "Running"]
+    # Running job runs come from the Overview's read, so one overrunning its window is still listed.
+    running = [r for r in _jobs_view()["running_job_runs"] if (job is None or str(r["job_id"]) == str(job))
+               and (not outcome or outcome == "Running")] if not before else []
     rest = [r for r in found if r["outcome"]["label"] != "Running"][:limit]
     return {"job_runs": [{k: v for k, v in r.items() if k != "placed"} for r in running + rest],
             "counts": counts, "next_before": rest[-1]["slot"] if len(rest) >= limit else None,

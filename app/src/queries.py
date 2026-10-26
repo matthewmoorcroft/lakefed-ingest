@@ -591,7 +591,7 @@ def job_run_expected_end(members: List[dict], progress_by_run: dict, p50_by_grou
         run = m.get("run")
         if run and run.get("status") == "running":
             left = time_left(progress_by_run.get(run.get("run_id")) or {}, now)
-            if left:
+            if left and not (left["basis"] == "typical" and left["seconds"] == 0):     # past its typical run: no estimate
                 ends.append(now + timedelta(seconds=left["seconds"]))
         elif m["state"] == "waiting" and p50_by_group.get(m["task_collection"]) is not None:
             ends.append(_when(m["fire_at"]) + timedelta(seconds=int(p50_by_group[m["task_collection"]])))

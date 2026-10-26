@@ -1,9 +1,10 @@
 import { useState } from "react";
-import { Link } from "react-router-dom";
+import { Link, useSearchParams } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
 import { type ColDef } from "ag-grid-community";
 import { api, qs, type Row } from "../api";
-import { ErrorBox, Grid, PageHead, RunStatus, Section, fmtDuration, fmtInt, fmtSpeed, plural } from "../components";
+import { ErrorBox, Grid, PageHead, RunStatus, Section, fmtDuration, fmtInt, fmtSpeed } from "../components";
+import { JobRunsTable } from "./IngestionJob";
 
 /** Tables that needed a read: the run's total less those found unchanged. */
 const worked = (r: Row) => (r.total === null || r.total === undefined ? null : Number(r.total) - Number(r.skipped || 0));
@@ -28,33 +29,74 @@ const COLUMNS: ColDef[] = [
   { field: "parallelism", headerName: "Parallelism", type: "rightAligned", minWidth: 100 },
 ];
 
+const PAGE = 25;
+
+const fmtWhen = (v: unknown) => new Date(String(v)).toLocaleString([], { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" });
+
+/** Job runs of every job (or one), running first, then newest first, with outcome counts. "Not in any job" lists
+ * those groups' group runs with the run columns. */
 export default function Runs() {
-  const [collection, setCollection] = useState("");
-  const collections = useQuery({ queryKey: ["collections"], queryFn: () => api.get<string[]>("/collections") });
+  const [params, setParams] = useSearchParams();
+  const job = params.get("job") || "";
+  const [outcome, setOutcome] = useState("");
+  const [pages, setPages] = useState<string[]>([]);
+  const before = pages[pages.length - 1];
   const runs = useQuery({
-    queryKey: ["runs", collection],
-    queryFn: () => api.get(`/runs${qs({ collection, limit: 200 })}`),
-    refetchInterval: 30_000,
+    queryKey: ["job-runs", job, outcome, before],
+    queryFn: () => api.get<Row>(`/job-runs${qs({ job, outcome, before, limit: PAGE })}`),
+    refetchInterval: before ? false : 30_000,
   });
-  const running = (runs.data ?? []).filter((r) => r.status === "running").length;
+  const jobs = useQuery({ queryKey: ["job-runs-jobs"], queryFn: () => api.get<Row>(`/job-runs${qs({ limit: 1 })}`) });
+  const d = runs.data;
+  const list: Row[] = d?.job_runs ?? [];
+  const running = list.filter((r) => r.outcome?.label === "Running");
+  const finished = list.filter((r) => r.outcome?.label !== "Running");
+  const withFailed = finished.filter((r) => Number(r.failed_tables) > 0);
+  const oldest = finished.length ? finished[finished.length - 1].slot : null;
+  const choose = (value: string) => { setPages([]); setOutcome(""); setParams(value ? { job: value } : {}); };
   return (
     <>
-      <PageHead crumb={<span className="eyebrow">Runs · What ran, and how fast?</span>} title="Runs" lead={<><strong>{running}</strong> running; the last {fmtInt(runs.data?.length ?? 0)} {plural(runs.data?.length ?? 0, "run")}
-        {collection ? <> of <strong>{collection}</strong></> : " of every ingestion group"}.</>}
-        right={<label className="toolbar" style={{ margin: 0 }}>Ingestion group
-          <select value={collection} onChange={(e) => setCollection(e.target.value)}>
-            <option value="">(all)</option>
-            {collections.data?.map((c) => <option key={c}>{c}</option>)}
+      <PageHead crumb={<span className="eyebrow">Runs · What ran, and how fast?</span>}
+        title={job === "none" ? "Runs: groups in no job"
+          : d ? `Runs: ${fmtInt(running.length)} running; ${fmtInt(withFailed.length)} finished with failed tables${oldest ? ` since ${fmtWhen(oldest)}` : ""}` : "Runs"}
+        lead="A job run is one trigger of an ingestion job, with one group run per ingestion group. Group runs are placed by each job's current schedule."
+        right={<label className="toolbar" style={{ margin: 0 }}>Ingestion job
+          <select value={job} onChange={(e) => choose(e.target.value)}>
+            <option value="">(all jobs)</option>
+            {(jobs.data?.jobs ?? []).map((j: Row) => <option key={j.id} value={String(j.id)}>{j.name}</option>)}
+            <option value="none">Not in any job</option>
           </select>
         </label>} />
       <ErrorBox error={runs.error} />
-      <Section title="Recent runs" note={<>Worked: tables that needed a read (unchanged tables are advanced in bulk). Tables/min: tables loaded a
-        minute, from the first table's start to the last one's finish, so planning and change detection are left out. Took is
-        blank for a run another run closed: it ended without finishing. Rows written: the run's own, per-table counts plus its batches' total, "at least" when some
-        loads recorded none. Open a run by its number for its databases and table events.</>}>
-        <Grid rows={runs.data}
-          columns={COLUMNS} getRowId={(r) => String(r.run_id)} options={{ autoSizeStrategy: { type: "fitGridWidth" } }} />
-      </Section>
+      {job === "none" ? (
+        <Section title="Group runs of groups in no job" note={<>Started by Run now on Databricks jobs, or by the Databricks job's own schedule.
+          Speed: tables loaded a minute, from the first table's start to the last one's finish. Took is blank for a run another
+          run closed: it ended without finishing. Rows written: "at least" when some loads recorded none.</>}>
+          <Grid rows={d?.group_runs} columns={COLUMNS} getRowId={(r) => String(r.run_id)} options={{ autoSizeStrategy: { type: "fitGridWidth" } }} />
+        </Section>
+      ) : (
+        <>
+          <div className="toolbar"><span className="chips">
+            <button className={`chip${!outcome ? " active" : ""}`} onClick={() => { setPages([]); setOutcome(""); }}>All</button>
+            {Object.entries(d?.counts ?? {}).map(([label, count]) => (
+              <button key={label} className={`chip${outcome === label ? " active" : ""}`} onClick={() => { setPages([]); setOutcome(label); }}>
+                {label} <b>{fmtInt(count)}</b></button>
+            ))}
+          </span></div>
+          {running.length > 0 && (
+            <Section title={`Running now: ${fmtInt(running.length)}`}>
+              <JobRunsTable runs={running} showJob />
+            </Section>
+          )}
+          <Section title="Finished, newest first" note="Tables/min: tables loaded a minute over the job run's work span, so planning and change detection are left out."
+            actions={<span className="pager-buttons">
+              <button className="ghost" disabled={!pages.length} onClick={() => setPages(pages.slice(0, -1))}>Newer</button>
+              <button className="ghost" disabled={!d?.next_before} onClick={() => setPages([...pages, d!.next_before])}>Older</button>
+            </span>}>
+            {d && <JobRunsTable runs={finished} showJob />}
+          </Section>
+        </>
+      )}
     </>
   );
 }

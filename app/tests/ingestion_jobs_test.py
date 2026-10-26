@@ -89,3 +89,28 @@ def test_a_group_run_knows_its_job_runs():
     found = ij.job_runs_of_run(dict(task_collection="c2", started_at="2026-10-26T13:31:00+00:00"), SCHEDULES, MEMBERS)
     assert found == [{"job_id": 1, "job_name": "East hourly", "slot": "2026-10-26T13:00:00+00:00"}]
     assert ij.job_runs_of_run(dict(task_collection="c4", started_at="2026-10-26T13:31:00+00:00"), SCHEDULES, MEMBERS) == []
+
+
+def test_a_group_run_running_longer_than_the_window_still_shows_as_running():
+    old_start = NOW - timedelta(days=2)
+    running = [dict(RUNNING[0], run_id=20, elapsed_s=2 * 86400, started_at=old_start.isoformat())]
+    runs = RUNS[:2] + [run(20, "c1", old_start, status="running")]
+    v = ij.jobs_view(SCHEDULES, MEMBERS, STATES, running, runs, STATS, NOW)
+    assert [r["run_ids"] for r in v["running_job_runs"]] == [[20], []]     # the 14:00 one waits for c2
+
+
+def test_a_paused_job_with_failing_tables_shows_failing_and_says_it_is_paused():
+    paused_since = datetime(2026, 10, 26, 9, 2, tzinfo=UTC)
+    got = ij.status(dict(state_failing=3, state_late=9, paused=True, updated_at=paused_since), None, None, "Timed out", [])
+    assert (got["label"], got["detail"], got["paused_since"], got["cause"]) == ("Failing: 3 tables", ["paused"], paused_since, "Timed out")
+    late = ij.status(dict(state_failing=0, state_late=9, paused=True, updated_at=paused_since), None, None, None, [])
+    assert (late["label"], late["detail"]) == ("Late: 9 tables", ["paused"])
+
+
+def test_a_window_starting_mid_slot_never_cuts_a_job_run_short():
+    start = datetime(2026, 10, 26, 13, 10, tzinfo=UTC)     # after c1's 13:00 trigger, before c2's 13:30
+    end = datetime(2026, 10, 26, 15, 0, tzinfo=UTC)
+    placed = ij.place(SCHEDULES[0], MEMBERS, RUNS, start, end, NOW)
+    assert [(jr["slot"].hour, len(jr["members"])) for jr in placed] == [(14, 2)]
+    whole = ij.place(SCHEDULES[0], MEMBERS, RUNS, datetime(2026, 10, 26, 13, 0, tzinfo=UTC), end, NOW)
+    assert [(jr["slot"].hour, len(jr["members"])) for jr in whole] == [(14, 2), (13, 2)]

@@ -1,163 +1,192 @@
+import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { Link, useNavigate } from "react-router-dom";
-import { api, type Row } from "../api";
+import { Link } from "react-router-dom";
+import { api, qs, type Row } from "../api";
 import {
-  ErrorBox, Notice, PageHead, ProgressBar, ProgressKey, RunStatus, Section, Stamp, StateBar, StateKey, Tag,
-  fmtAgo, fmtClock, fmtDuration, fmtInt, progressOf, progressText, plural, type Tone
+  ErrorBox, FillBox, JobStatus, Notice, PageHead, Pager, ProgressBar, RunStatus, Section, Stamp, StateBar, StateKey,
+  fmtClock, fmtDuration, fmtInt, fmtSpeed, jobRunName, jobRunPath, plural, progressFrom, progressText
 } from "../components";
 
-interface Overview { collections: Row[]; running: Row[]; servers: Row[]; read_at: string; cache_s: number }
+interface Overview {
+  jobs: Row[]; jobs_total: number; offset: number; limit: number; not_in_job: Row | null;
+  running_job_runs: Row[]; running_total: number; running_not_in_job: Row[];
+  attention: Row[]; attention_total: number; totals: Row; read_at: string; cache_s: number;
+}
 
-const sum = (rows: Row[], k: string) => rows.reduce((a, r) => a + Number(r[k] || 0), 0);
+const jobPath = (id: unknown) => `/ingestion-jobs/${encodeURIComponent(String(id))}`;
 
-/** The tone of a server's health tag (queries.server_health). */
-const HEALTH_TONE: Record<string, Tone> = { healthy: "ok", failing: "bad", late: "warn", "first load": "first", "no tables": "" };
-
-export default function OverviewPage() {
-  const nav = useNavigate();
-  const ov = useQuery({ queryKey: ["overview"], queryFn: () => api.get<Overview>("/overview"), refetchInterval: 30_000 });
-  const groups = useQuery({ queryKey: ["error-groups"], queryFn: () => api.get<{ groups: Row[]; tables_shown: number; truncated: boolean }>("/errors/groups?hours=24"),
-                            refetchInterval: 60_000 });
-  const cols = ov.data?.collections ?? [];
-  const running = ov.data?.running ?? [];
-  const enabled = sum(cols, "enabled_tables");
-  const noTarget = sum(cols, "no_sla_tables");
-  const current = sum(cols, "state_current");
-  const databases = sum(cols, "databases");
-  const servers = ov.data?.servers.length ?? 0;
-  const pct = enabled ? ((100 * current) / enabled).toFixed(1) : "0.0";
+/** A job's last finished job run: its outcome, failed tables and how long it took. */
+function LastJobRun({ job }: { job: Row }) {
+  const last = job.last_job_run;
+  if (!last) return <span className="muted">none yet</span>;
   return (
     <>
-      <PageHead crumb={<span className="eyebrow">Overview · Is everything healthy now?</span>} title={!ov.data ? "Overview" : enabled ? `${pct}% of ${fmtInt(enabled)} enabled ${plural(enabled, "table")} ${enabled === 1 ? "is" : "are"} current` : "No enabled tables yet"}
-        lead={ov.data && <>Now: <strong>{fmtInt(sum(cols, "state_first_load"))}</strong> waiting for a first load,{" "}
-          <strong>{fmtInt(sum(cols, "state_failing"))}</strong> failing, <strong>{fmtInt(sum(cols, "state_late"))}</strong> late,
-          across <strong>{fmtInt(databases)}</strong> {plural(databases, "database")} in <strong>{cols.length}</strong> {plural(cols.length, "ingestion group")}{" "}
-          on <strong>{servers}</strong> {servers === 1 ? "server" : "servers"}.</>}
-        right={<Stamp at={ov.data?.read_at} every={30} />} />
-      <ErrorBox error={ov.error} />
-      {ov.data && !cols.length && <Notice tone="info">No tables are set up yet. Add them with <Link to="/bulk">Bulk import</Link> or <Link to="/add">Add table</Link>.</Notice>}
-      <div className="metrics">
-        <div className="metric ok"><div className="metric-label">Current</div>
-          <div className="metric-value">{fmtInt(current)}<small>tables</small></div><div className="metric-sub">{pct}% of enabled, now</div></div>
-        <div className="metric first"><div className="metric-label">Waiting for a first load</div>
-          <div className="metric-value">{fmtInt(sum(cols, "state_first_load"))}<small>tables</small></div><div className="metric-sub">now</div></div>
-        <div className={`metric ${sum(cols, "state_failing") ? "bad" : ""}`}><div className="metric-label">Failing</div>
-          <div className="metric-value">{fmtInt(sum(cols, "state_failing"))}<small>tables</small></div>
-          <div className="metric-sub">latest attempt failed</div></div>
-        <div className={`metric ${sum(cols, "state_late") ? "warn" : ""}`}><div className="metric-label">Late</div>
-          <div className="metric-value">{fmtInt(sum(cols, "state_late"))}<small>tables</small></div>
-          <div className="metric-sub">past their freshness target</div></div>
-        <div className="metric"><div className="metric-label">Running now</div>
-          <div className="metric-value">{running.length}<small>{running.length === 1 ? "run" : "runs"}</small></div>
-          <div className="metric-sub">{running.map((r) => <Link key={r.run_id} to={`/collections/${encodeURIComponent(r.task_collection)}`}
-            style={{ marginRight: 8 }}>{r.task_collection}</Link>)}{!running.length && "none"}</div></div>
-      </div>
-      {/* Only once freshness targets are in use: until then no table can be late, and there is nothing to warn about. */}
-      {noTarget > 0 && noTarget < enabled && (
-        <Notice tone="warn">{fmtInt(noTarget)} enabled {plural(noTarget, "table")} {noTarget === 1 ? "has" : "have"} no freshness
-          target, so {noTarget === 1 ? "it is" : "they are"} never flagged as late. To set one: Tables, select the tables, Bulk edit,
-          then Freshness target.</Notice>
-      )}
+      <Link to={jobRunPath(job.id, last.slot)}><RunStatus status={null} outcome={last.outcome} /></Link>
+      <span className="sub">{fmtClock(last.slot)}{last.took_s != null && `, took ${fmtDuration(last.took_s)}`}
+        {Number(last.failed_tables) > 0 && `, ${fmtInt(last.failed_tables)} failed`}</span>
+    </>
+  );
+}
 
-      <Section title="Running now" actions={<Link to="/runs">All runs</Link>}
-        note="Checked counts the ingestion group's tables this run has stamped: unchanged ones in bulk once change detection ends, loaded ones as each finishes.">
-        {!running.length && <div className="empty">Nothing is running. A run appears here as soon as it starts.</div>}
-        {running.map((r) => {
-          const p = progressOf(r);
-          const slow = r.p95_s && r.elapsed_s > Math.max(Number(r.p95_s), 60);
-          return (
-            <div className="run-row" key={r.run_id}>
-              <div>
-                <div className="title"><Link to={`/collections/${encodeURIComponent(r.task_collection)}`}>{r.task_collection}</Link></div>
-                <div className="kv"><span>Run <b>#{r.run_id}</b></span>{r.server && <span>{r.server}</span>}
-                  {r.parallelism && <span>Parallelism <b>{r.parallelism}</b></span>}</div>
-                <div style={{ marginTop: 6 }}>{slow ? <Tag tone="warn">Longer than usual</Tag> : <Tag tone="run">Running</Tag>}</div>
-              </div>
-              <div><div className="count">{progressText(p)}</div><ProgressBar p={p} big /><ProgressKey p={p} /></div>
-              <div className="kv stack">
-                <span>Running <b>{fmtDuration(r.elapsed_s)}</b>{r.p50_s ? <> (typical <b>{fmtDuration(r.p50_s)}</b>)</> : null}</span>
-                <span>Started <b>{fmtClock(r.started_at)}</b></span>
-              </div>
-            </div>
-          );
-        })}
-      </Section>
-
-      <Section title="Servers" actions={<StateKey />}
-        note="Each source server (the tables' instance group, else their connection or host) with its enabled tables by state.">
-        <div className="server-cards">
-          {(ov.data?.servers ?? []).map((s) => (
-            <div className="server-card" key={s.server}>
-              <div className="top"><div><h3 title={s.server || undefined}>{s.server || "(no server)"}</h3>
-                <div className="meta">{fmtInt(s.databases)} {plural(s.databases, "database")} · {fmtInt(s.tables)} {plural(s.tables, "table")} · {s.collections} {plural(s.collections, "ingestion group")}</div></div>
-                {Number(s.running_collections) > 0 ? <Tag tone="run">{s.running_collections} running</Tag>
-                  : <Tag tone={HEALTH_TONE[s.health] ?? ""}>{s.health ? s.health[0].toUpperCase() + s.health.slice(1) : "Unknown"}</Tag>}</div>
-              <StateBar row={s} />
-              <div className="nums">
-                <div><b>{Number(s.tables) ? Math.floor((100 * Number(s.state_current)) / Number(s.tables)) : 0}%</b><span>current</span></div>
-                <div><b>{fmtInt(s.state_first_load)}</b><span>first load</span></div>
-                <div><b>{fmtInt(s.state_failing)}</b><span>failing</span></div>
-                <div><b>{fmtInt(s.state_late)}</b><span>late</span></div>
-              </div>
-              <div className="meta">Last success {fmtAgo(s.newest_success_at)} · oldest {fmtAgo(s.oldest_success_at)}</div>
-            </div>
+/** Every ingestion job, failing first, with its tables by state and its Status; "Not in any job" last. */
+export function JobsTable({ jobs, notInJob, total, offset, limit, onPage, link, fill }: {
+  jobs: Row[]; notInJob?: Row | null; total: number; offset: number; limit: number; onPage: (offset: number) => void;
+  link?: boolean; fill?: boolean }) {
+  const table = (
+      <table className="data">
+        <thead><tr><th>Ingestion job</th><th className="num">Groups</th><th className="num">Databases</th>
+          <th className="num">Tables</th><th>State now</th><th className="num">Failing</th><th className="num">Late</th>
+          <th>Last job run</th><th>Status</th></tr></thead>
+        <tbody>
+          {jobs.map((j) => (
+            <tr key={j.id ?? "none"}>
+              <td className="name">{j.id != null ? <Link to={jobPath(j.id)}><b>{j.name}</b></Link> : <b>{j.name}</b>}
+                <span className="sub">{j.id != null ? j.description : `${fmtInt(j.groups?.length)} ${plural(j.groups?.length, "group")}`}</span></td>
+              <td className="num">{fmtInt(j.groups?.length)}</td><td className="num">{fmtInt(j.databases)}</td>
+              <td className="num">{fmtInt(j.enabled_tables)}</td><td><StateBar row={j} /></td>
+              <td className="num" style={{ color: Number(j.state_failing) ? "var(--bad)" : undefined }}>{fmtInt(j.state_failing)}</td>
+              <td className="num">{fmtInt(j.state_late)}</td>
+              <td>{j.id != null ? <LastJobRun job={j} /> : <Link to="/runs?job=none">its group runs</Link>}</td>
+              <td><JobStatus status={j.status} /></td>
+            </tr>
           ))}
-        </div>
-      </Section>
+          {notInJob && (
+            <tr className="total">
+              <td className="name"><b>Not in any job</b><span className="sub">{notInJob.groups.join(", ")}</span></td>
+              <td className="num">{fmtInt(notInJob.groups.length)}</td><td className="num">{fmtInt(notInJob.databases)}</td>
+              <td className="num">{fmtInt(notInJob.enabled_tables)}</td><td><StateBar row={notInJob} /></td>
+              <td className="num" style={{ color: Number(notInJob.state_failing) ? "var(--bad)" : undefined }}>{fmtInt(notInJob.state_failing)}</td>
+              <td className="num">{fmtInt(notInJob.state_late)}</td>
+              <td><Link to="/runs?job=none">its group runs</Link></td><td><span className="muted">run by hand or by the Databricks job</span></td>
+            </tr>
+          )}
+          {!jobs.length && !notInJob && <tr><td colSpan={9} className="muted">No ingestion jobs here.</td></tr>}
+        </tbody>
+      </table>
+  );
+  const pager = <Pager offset={offset} limit={limit} total={total} noun="ingestion job" onPage={onPage} />;
+  if (fill) return <>{pager}<FillBox min={240}>{table}</FillBox></>;
+  return (
+    <>
+      {table}
+      {pager}
+      {link && <p className="muted small"><Link to="/ingestion-jobs">All ingestion jobs</Link>, with filters.</p>}
+    </>
+  );
+}
 
-      <Section title="Ingestion groups" note="Select an ingestion group for its databases. Its tables and schedule stay on the Tables and Schedules pages.">
-        <div className="table-wrap">
-          <table className="data">
-            <thead><tr><th>Ingestion group</th><th>Server</th><th className="num">Databases</th><th className="num">Tables</th>
-              <th>State now</th><th className="num">Failing</th><th className="num">First load</th><th className="num">Late</th>
-              <th>Last run</th></tr></thead>
-            <tbody>
-              {cols.map((c) => {
-                const run = running.find((r) => r.task_collection === c.task_collection);
-                return (
-                  <tr key={c.task_collection} className="link" onClick={() => nav(`/collections/${encodeURIComponent(c.task_collection)}`)}>
-                    <td><Link to={`/collections/${encodeURIComponent(c.task_collection)}`}><b>{c.task_collection}</b></Link></td>
-                    <td>{Number(c.servers) > 1 ? `${c.servers} servers` : c.server}</td>
-                    <td className="num">{fmtInt(c.databases)}</td><td className="num">{fmtInt(c.enabled_tables)}</td>
-                    <td><StateBar row={c} /></td>
-                    <td className="num" style={{ color: Number(c.state_failing) ? "var(--bad)" : undefined }}>{fmtInt(c.state_failing)}</td>
-                    <td className="num">{fmtInt(c.state_first_load)}</td><td className="num">{fmtInt(c.state_late)}</td>
-                    <td>{run ? <><Tag tone="run">Running</Tag><span className="sub">#{run.run_id} since {fmtClock(run.started_at)},{" "}
-                      {Math.floor((100 * Number(run.tables_checked || 0)) / Math.max(1, Number(run.enabled_tables || 0)))}% checked</span></>
-                      : c.last_run_id ? <><RunStatus status={c.last_run_status} outcome={c.last_run_outcome} /><span className="sub">#{c.last_run_id} at {fmtClock(c.last_run_started)}
-                        {c.last_run_finished && c.last_run_outcome?.label !== "Ended without finishing" && `, took ${fmtDuration((new Date(c.last_run_finished).getTime() - new Date(c.last_run_started).getTime()) / 1000)}`}
-                        {Number(c.last_run_failed) > 0 && `, ${c.last_run_failed} failed`}</span></>
-                      : <span className="muted">never run</span>}</td>
-                  </tr>
-                );
-              })}
-            </tbody>
-          </table>
-        </div>
-        <StateKey />
-      </Section>
-
-      <Section title="Failures, last 24 hours" actions={<Link to="/tables?status=failing">Failing tables</Link>}
-        note="Failures with the same cause are grouped. Connection and timeout failures usually clear on the next run; the others need a change at the source or in config.">
-        <ErrorBox error={groups.error} />
-        {groups.data && groups.data.groups.length === 0 && <Notice tone="ok">No failed tables in the last 24 hours.</Notice>}
-        {groups.data?.truncated && <Notice tone="warn">Showing the {fmtInt(groups.data.tables_shown)} tables that failed most
-          recently; more failed in the last 24 hours. The Tables page's failing filter lists every table failing now.</Notice>}
-        {(groups.data?.groups ?? []).map((g) => (
-          <div className="err-group" key={`${g.error_class}:${g.signature}`}>
-            <div><div className="what">{g.label}{" "}
-              <Tag tone={g.error_class === "connection" || g.error_class === "timeout" ? "warn" : "bad"}>{g.error_class}</Tag></div>
-              <div className="where">{fmtInt(g.tables)} {plural(g.tables, "table")}
-                {Number(g.failures) > Number(g.tables) ? <> ({fmtInt(g.failures)} failures)</> : null} in {g.databases.length}{" "}
-                {g.databases.length === 1 ? "database" : "databases"}:{" "}
-                {g.databases.slice(0, 6).map((d: Row) => `${d.src_database}${d.server ? ` on ${d.server}` : ""} (${d.task_collection}): ${d.tables.slice(0, 4).join(", ")}`
-                  + (d.tables.length > 4 ? ` and ${d.tables.length - 4} more` : "")).join("; ")}
-                {g.databases.length > 6 && `; and ${g.databases.length - 6} more databases`}</div></div>
-            <div className="where" style={{ textAlign: "right" }}>first {fmtClock(g.first_at)}<br />last {fmtClock(g.last_at)}</div>
-            <div className="raw">{g.example}</div>
+/** The job runs going now, longest running first: group runs, one bar over all the job's tables, speed now,
+ * expected end, and running for against typical. Groups in no job list their group runs apart. */
+export function RunningNow({ runs, total, notInJob }: { runs: Row[]; total: number; notInJob: Row[] }) {
+  return (
+    <Section title={`Running now: ${fmtInt(total)} ${plural(total, "job run")}`}
+      note="Each bar covers all of the job's tables, its groups that have not started yet included."
+      actions={<Link to="/runs">All runs</Link>}>
+      {!runs.length && !notInJob.length && <p className="muted">Nothing is running.</p>}
+      {runs.map((r) => {
+        const p = progressFrom(r.progress);
+        return (
+          <div key={`${r.job_id}-${r.slot}`} className="run-row">
+            <div><div className="title"><Link to={jobRunPath(r.job_id, r.slot)}>{jobRunName(r.job_name, r.slot)}</Link></div>
+              <div className="kv"><span>{fmtInt(r.ran - r.running_group_runs)} finished</span><span>{fmtInt(r.running_group_runs)} running</span>
+                <span>{fmtInt(r.waiting)} waiting</span></div></div>
+            <div><div className="count">{progressText(p)}</div><ProgressBar p={p} /></div>
+            <div className="kv"><span>Speed now <b>{r.speed_now ? `${fmtSpeed(r.speed_now.tables_per_min)} tables/min` : "not yet"}</b></span>
+              <span>Ends about <b>{r.expected_end ? fmtClock(r.expected_end) : "unknown"}</b></span>
+              <span>{r.running_s != null ? <>Running for <b>{fmtDuration(r.running_s)}</b></> : "No group run has started yet"}
+                {r.typical_s != null && <> (typical {fmtDuration(r.typical_s)})</>}</span></div>
           </div>
-        ))}
+        );
+      })}
+      {runs.length < total && <p className="muted small">{fmtInt(runs.length)} of {fmtInt(total)} running; <Link to="/runs">All runs</Link>.</p>}
+      {notInJob.map((r) => (
+        <div key={r.run_id} className="run-row">
+          <div><div className="title"><Link to={`/runs/${r.run_id}`}>{r.task_collection}, group run {fmtInt(r.run_id)}</Link></div>
+            <div className="kv"><span>Not in any job</span></div></div>
+          <div><div className="count">{progressText(progressFrom({ total: r.enabled_tables, loaded: r.tables_ok,
+            unchanged: Math.max(0, Number(r.tables_checked || 0) - Number(r.tables_ok || 0)), in_flight: r.tables_running, failed: r.tables_failed }))}</div></div>
+          <div className="kv"><span>Running for <b>{fmtDuration(r.elapsed_s)}</b></span></div>
+        </div>
+      ))}
+    </Section>
+  );
+}
+
+/** Jobs with tables failing now, or whose last job run ended without finishing, worst first, with their causes.
+ * Late data is not listed here: it is a count on the job, with its reason. */
+export function NeedsAttention({ jobs, total }: { jobs: Row[]; total: number }) {
+  return (
+    <Section title={`Needs attention: ${fmtInt(total)} ${plural(total, "job")}`}
+      note="Jobs with tables failing now, or whose last job run ended without finishing. Late data is counted on each job instead."
+      actions={total > jobs.length ? <Link to="/ingestion-jobs?filter=failing">All {fmtInt(total)}</Link> : undefined}>
+      {!jobs.length && <Notice tone="ok">No job has failing tables.</Notice>}
+      {jobs.map((j) => (
+        <div key={j.id} className="attention-row">
+          <div className="title"><Link to={jobPath(j.id)}>{j.name}</Link>{" "}
+            <span className="muted">{fmtInt(j.state_failing)} {plural(j.state_failing, "table")} failing
+              {Number(j.failed_in_a_row) > 1 && `, in each of the last ${fmtInt(j.failed_in_a_row)} job runs`}</span></div>
+          {(j.causes ?? []).map((c: Row) => (
+            <div key={c.signature ?? c.label} className="kv"><span><b>{c.label}</b>: {fmtInt(c.tables)} {plural(c.tables, "table")}</span>
+              {c.first_at && <span>first {fmtClock(c.first_at)}</span>}</div>
+          ))}
+          {j.last_job_run && j.last_job_run.outcome.label === "Ended without finishing" && <div className="kv">
+            <span>Its last job run ended without finishing: <Link to={jobRunPath(j.id, j.last_job_run.slot)}>{jobRunName(j.name, j.last_job_run.slot)}</Link></span></div>}
+        </div>
+      ))}
+    </Section>
+  );
+}
+
+export default function OverviewPage() {
+  const [offset, setOffset] = useState(0);
+  const ov = useQuery({ queryKey: ["overview", offset], queryFn: () => api.get<Overview>(`/overview${qs({ offset })}`),
+                        refetchInterval: 30_000 });
+  const d = ov.data;
+  const t = d?.totals ?? {};
+  const enabled = Number(t.enabled_tables || 0);
+  const pct = enabled ? ((100 * Number(t.state_current || 0)) / enabled).toFixed(1) : "0.0";
+  const jobs = Number(t.jobs || 0);
+  const title = !d ? "Overview"
+    : `${fmtInt(jobs)} ${plural(jobs, "ingestion job")}: ${fmtInt(t.running_jobs)} running, ${fmtInt(t.failing_jobs)} with failing tables, `
+      + `${fmtInt(t.late_jobs)} with late data`;
+  const unscheduled = d?.not_in_job?.groups?.length ?? 0;
+  return (
+    <>
+      <PageHead crumb={<span className="eyebrow">Overview · Is everything healthy now?</span>} title={title}
+        lead={d && (enabled ? <>{pct}% of <strong>{fmtInt(enabled)}</strong> enabled {plural(enabled, "table")} {enabled === 1 ? "is" : "are"} current,
+          in <strong>{fmtInt(t.groups)}</strong> {plural(t.groups, "ingestion group")} and <strong>{fmtInt(t.databases)}</strong>{" "}
+          {plural(t.databases, "database")} on <strong>{fmtInt(t.servers)}</strong> {plural(t.servers, "server")}
+          {unscheduled > 0 && <>; {fmtInt(unscheduled)} {plural(unscheduled, "group")} in no job</>}.</> : "No enabled tables yet.")}
+        right={<Stamp at={d?.read_at} every={30} />} />
+      <ErrorBox error={ov.error} />
+      {d && !enabled && <Notice tone="info">No tables are set up yet. Add them with <Link to="/bulk">Bulk import</Link> or <Link to="/add">Add table</Link>.</Notice>}
+      {/* Only once freshness targets are in use: until then no table can be late, and there is nothing to warn about. */}
+      {Number(t.no_sla_tables) > 0 && Number(t.no_sla_tables) < enabled && (
+        <Notice tone="warn">{fmtInt(t.no_sla_tables)} enabled {plural(t.no_sla_tables, "table")} {Number(t.no_sla_tables) === 1 ? "has" : "have"} no
+          freshness target, so {Number(t.no_sla_tables) === 1 ? "it is" : "they are"} never flagged as late. To set one: Tables, select the
+          tables, Bulk edit, then Freshness target.</Notice>
+      )}
+      <div className="metrics">
+        <div className="metric"><div className="metric-label">Ingestion jobs</div>
+          <div className="metric-value">{fmtInt(jobs)}<small>{plural(jobs, "job")}</small></div>
+          <div className="metric-sub">{unscheduled ? `and ${fmtInt(unscheduled)} ${plural(unscheduled, "group")} in no job` : "every group is in one"}</div></div>
+        <div className="metric run"><div className="metric-label">Running now</div>
+          <div className="metric-value">{fmtInt(d?.running_total)}<small>{plural(d?.running_total, "job run")}</small></div>
+          <div className="metric-sub">{d?.running_not_in_job.length ? `and ${fmtInt(d.running_not_in_job.length)} group runs in no job` : "now"}</div></div>
+        <div className={`metric ${Number(t.failing_jobs) ? "bad" : ""}`}><div className="metric-label">Failing</div>
+          <div className="metric-value">{fmtInt(t.failing_jobs)}<small>{plural(t.failing_jobs, "job")}</small></div>
+          <div className="metric-sub">{fmtInt(t.state_failing)} {plural(t.state_failing, "table")} failing now</div></div>
+        <div className={`metric ${Number(t.late_jobs) ? "warn" : ""}`}><div className="metric-label">Late data</div>
+          <div className="metric-value">{fmtInt(t.late_jobs)}<small>{plural(t.late_jobs, "job")}</small></div>
+          <div className="metric-sub">{fmtInt(t.state_late)} {plural(t.state_late, "table")} past their freshness target</div></div>
+      </div>
+      <Section title="Ingestion jobs" note="Each job is a schedule and its ingestion groups. Failing first, then late, then by name."
+        actions={<StateKey />}>
+        {d && <JobsTable jobs={d.jobs} notInJob={offset + d.limit >= d.jobs_total ? d.not_in_job : null} total={d.jobs_total}
+          offset={offset} limit={d.limit} onPage={setOffset} link />}
       </Section>
+      {d && <RunningNow runs={d.running_job_runs} total={d.running_total} notInJob={d.running_not_in_job} />}
+      {d && <NeedsAttention jobs={d.attention} total={d.attention_total} />}
     </>
   );
 }

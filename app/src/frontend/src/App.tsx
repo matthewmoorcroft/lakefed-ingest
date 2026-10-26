@@ -13,13 +13,16 @@ import Changes from "./pages/Changes";
 import Schedules from "./pages/Schedules";
 import Timeline from "./pages/Timeline";
 import Collection from "./pages/Collection";
+import IngestionJobs from "./pages/IngestionJobs";
+import IngestionJob from "./pages/IngestionJob";
+import JobRun from "./pages/JobRun";
 
 interface Settings { config?: Config }
 const SettingsContext = createContext<Settings>({});
 export const useSettings = () => useContext(SettingsContext);
 
 const NAV = [
-  ["Monitor", [["/overview", "Overview"], ["/runs", "Runs"], ["/timeline", "Timeline"]]],
+  ["Monitor", [["/overview", "Overview"], ["/ingestion-jobs", "Ingestion jobs"], ["/runs", "Runs"], ["/timeline", "Timeline"]]],
   ["Manage", [["/tables", "Tables"], ["/schedules", "Schedules"], ["/jobs", "Jobs"], ["/add", "Add table"],
               ["/bulk", "Bulk import"], ["/changes", "Changes"]]],
 ] as const;
@@ -56,6 +59,9 @@ export default function App() {
           <Routes>
             <Route path="/" element={<Navigate to="/overview" replace />} />
             <Route path="/overview" element={<Overview />} />
+            <Route path="/ingestion-jobs" element={<IngestionJobs />} />
+            <Route path="/ingestion-jobs/:id" element={<IngestionJob />} />
+            <Route path="/ingestion-jobs/:id/runs/:slot" element={<JobRun />} />
             <Route path="/runs" element={<Runs />} />
             <Route path="/runs/:id" element={<RunDetail />} />
             <Route path="/tables" element={<Tables />} />

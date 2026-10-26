@@ -4,7 +4,7 @@ import { Link, useParams } from "react-router-dom";
 import { api, type Row } from "../api";
 import {
   Badge, BigCount, ErrorBox, FillBox, Grid, PageHead, ProgressBar, ProgressKey, RunStatus, Section, Stamp, autoColumns,
-  fmtDuration, fmtInt, fmtLeft, fmtSpeed, plural, progressOf, progressText, type Progress
+  fmtDuration, fmtInt, fmtLeft, fmtSpeed, jobRunName, jobRunPath, plural, progressOf, progressText, type Progress
 } from "../components";
 
 /** A finished run's totals in the same shape as a live run's progress, so both read the same way. The run's "ok"
@@ -109,7 +109,10 @@ export default function RunDetail() {
   const rows = r ? <>{r.rows_partial ? "at least " : ""}<BigCount value={r.rows_written} /></> : "";
   return (
     <>
-      <PageHead crumb={<span className="eyebrow"><Link to="/runs">Runs</Link> · What did this group run do?</span>}
+      <PageHead crumb={<span className="eyebrow"><Link to="/overview">Overview</Link> ·{" "}
+        {r?.job_runs?.length ? r.job_runs.map((j: Row, i: number) => <span key={j.job_id}>{i > 0 && ", "}
+          <Link to={`/ingestion-jobs/${j.job_id}`}>{j.job_name}</Link> · <Link to={jobRunPath(j.job_id, j.slot)}>{jobRunName(j.job_name, j.slot)}</Link></span>)
+          : <Link to="/runs?job=none">Runs</Link>} · Group run</span>}
         title={title(id, r, p, live)}
         lead={r && <>Ingestion group <Link to={`/collections/${encodeURIComponent(r.task_collection)}`}><strong>{r.task_collection}</strong></Link>
           {dbs.length ? <>, <strong>{fmtInt(dbs.length)}</strong> {plural(dbs.length, "database")}</> : null}

@@ -102,3 +102,9 @@ def test_a_job_runs_expected_end_is_its_latest_members():
     assert q.job_run_expected_end([running, waiting], progress, {"b": 600}, NOW) == NOW + timedelta(minutes=40)
     assert q.job_run_expected_end([running], progress, {}, NOW) == NOW + timedelta(minutes=5)
     assert q.job_run_expected_end([_member("run", dict(status="completed"))], {}, {}, NOW) is None
+
+
+def test_a_running_group_run_past_its_typical_time_gives_no_expected_end():
+    running = _member("run", dict(status="running", run_id=7), group="a")
+    overdue = {7: dict(enabled_tables=100, tables_checked=50, ok_last_5m=0, work_started_at=None, elapsed_s=5000, p50_s=900)}
+    assert q.job_run_expected_end([running], overdue, {}, NOW) is None

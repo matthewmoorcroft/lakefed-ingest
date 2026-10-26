@@ -388,3 +388,54 @@ export function Section({ title, actions, note, children }: { title: ReactNode; 
     </section>
   );
 }
+
+/** The server's progress shape (ingestion_jobs._progress) as the progress bar's. */
+export function progressFrom(p?: Row | null): Progress {
+  return { total: Number(p?.total || 0), unchanged: Number(p?.unchanged || 0), loaded: Number(p?.loaded || 0),
+           inFlight: Number(p?.in_flight || 0), failed: Number(p?.failed || 0) };
+}
+
+/** A job run's name: its job and its slot's start, "East hourly, 14:00 job run" (with the day when not today). */
+export function jobRunName(jobName: unknown, slot: unknown): string {
+  const at = new Date(String(slot));
+  const today = new Date().toDateString() === at.toDateString();
+  const when = at.toLocaleString([], today ? { hour: "2-digit", minute: "2-digit" }
+    : { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" });
+  return `${jobName}, ${when} job run`;
+}
+
+export const jobRunPath = (jobId: unknown, slot: unknown) =>
+  `/ingestion-jobs/${encodeURIComponent(String(jobId))}/runs/${encodeURIComponent(String(slot))}`;
+
+/** A job's Status cell (ingestion_jobs.status): its state and issues together, never color alone. */
+export function JobStatus({ status }: { status?: Row | null }) {
+  if (!status) return null;
+  const tone = (["ok", "warn", "bad", "run"].includes(status.tone) ? status.tone : "") as Tone;
+  const detail: string[] = [...(status.detail ?? [])];
+  if (status.paused_since) detail[detail.length - 1] = `paused since ${fmtClock(status.paused_since)}`;
+  if (status.expected_end) detail.push(`ends about ${fmtClock(status.expected_end)}`);
+  return (
+    <div className="status-cell">
+      <Tag tone={tone}>{status.label}</Tag>
+      {detail.length > 0 && <span className="sub">{detail.join(" · ")}</span>}
+      {status.cause && <span className="sub">{status.cause}</span>}
+    </div>
+  );
+}
+
+/** "1 to 25 of 40 ingestion jobs", with previous and next. */
+export function Pager({ offset, limit, total, noun, onPage }: { offset: number; limit: number; total: number; noun: string;
+                        onPage: (offset: number) => void }) {
+  const last = Math.min(offset + limit, total);
+  return (
+    <div className="pager">
+      <span className="muted">{total ? `${fmtInt(offset + 1)} to ${fmtInt(last)} of ${fmtInt(total)}` : "0"} {plural(total, noun)}</span>
+      {total > limit && (
+        <span className="pager-buttons">
+          <button className="ghost" disabled={offset === 0} onClick={() => onPage(Math.max(0, offset - limit))}>Previous</button>
+          <button className="ghost" disabled={last >= total} onClick={() => onPage(offset + limit)}>Next</button>
+        </span>
+      )}
+    </div>
+  );
+}

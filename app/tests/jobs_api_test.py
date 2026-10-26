@@ -108,7 +108,26 @@ def test_a_job_run_lists_its_waiting_members_with_their_start(client):
 
 def test_the_ingestion_jobs_list_filters_with_counts_and_ends_with_not_in_any_job(client):
     body = client.get("/api/ingestion-jobs").json()
-    assert [j["name"] for j in body["jobs"]] == ["East hourly", "Nightly", "Not in any job"]
+    assert [j["name"] for j in body["jobs"]] == ["East hourly", "Nightly"] and body["total"] == 2
+    assert body["not_in_job"]["groups"] == ["c4"]
     assert body["counts"] == {"all": 2, "running": 1, "failing": 1, "late": 1, "paused": 1}
     assert [j["name"] for j in client.get("/api/ingestion-jobs?filter=late").json()["jobs"]] == ["Nightly"]
     assert [j["name"] for j in client.get("/api/ingestion-jobs?search=c3").json()["jobs"]] == ["Nightly"]
+
+
+def test_a_job_run_finds_a_group_run_that_started_near_the_end_of_its_slot(client):
+    RUNS.append(group_run(11, "c2", datetime(2026, 10, 26, 12, 10, tzinfo=UTC)))     # late, after c2's 11:30 trigger
+    try:
+        body = client.get("/api/ingestion-jobs/1/runs/2026-10-26T11:00:00+00:00").json()
+    finally:
+        RUNS.pop()
+    assert [g["run_id"] for g in body["group_runs"] if g["task_collection"] == "c2"] == [11]
+
+
+def test_runs_across_jobs_pin_the_running_job_runs_and_count_outcomes(client):
+    body = client.get("/api/job-runs").json()
+    labels = [(r["job_name"], r["slot"][11:16], r["outcome"]["label"]) for r in body["job_runs"]][:3]
+    assert labels[0] == ("East hourly", "14:00", "Running") and ("East hourly", "13:00", "Completed with failures") in labels
+    assert body["counts"]["Completed with failures"] == 1
+    none = client.get("/api/job-runs?job=none").json()
+    assert none["job_runs"] == [] and "group_runs" in none

@@ -26,11 +26,15 @@ def window(cadence: int, slots: int, end: datetime) -> datetime:
 
 
 def place(job: dict, members: List[dict], runs: List[dict], start: datetime, end: datetime, now: datetime):
-    """The job's job runs in [start, end), newest first (schedules.job_runs), with their members' runs."""
+    """The job's job runs whose slot starts in [start, end), newest first (schedules.job_runs), with their
+    members' runs. Triggers are placed from one slot earlier, so a window starting mid-slot keeps every
+    member of its first job run (a member's offset is under a cadence, and under an hour past hourly)."""
     mine = [m for m in members if m["schedule_id"] == job["id"]]
     groups = {m["task_collection"] for m in mine}
-    return sch.job_runs(int(job["cadence_minutes"]), job.get("timezone") or "UTC", mine,
-                        [r for r in runs if r["task_collection"] in groups], start, end, now)
+    cadence = int(job["cadence_minutes"])
+    placed = sch.job_runs(cadence, job.get("timezone") or "UTC", mine, [r for r in runs if r["task_collection"] in groups],
+                          start - timedelta(minutes=max(cadence, 60)), end, now)
+    return [jr for jr in placed if jr["slot"] >= start]
 
 
 def current_and_past(job: dict, members: List[dict], runs: List[dict], start: datetime, now: datetime) -> List[dict]:
@@ -162,7 +166,8 @@ def member_views(job_run: dict, running_by_run: dict, group_tables: Dict[str, in
 def status(job: dict, running: Optional[dict], last: Optional[dict], top_cause: Optional[str],
            warnings: List[str]) -> dict:
     """A job's Status cell: its running state and its issues together. Running (with failing tables, the
-    progress, expected end and top cause), else late while paused, failing, late, paused or current."""
+    progress, expected end and top cause), else failing (paused or not), late while paused, late, paused,
+    ended without finishing, or current. A paused job whose tables are only late shows late, not failing."""
     failing, late = q._count(job, "state_failing"), q._count(job, "state_late")
     if running:
         p = running["progress"]
@@ -172,12 +177,12 @@ def status(job: dict, running: Optional[dict], last: Optional[dict], top_cause: 
             parts.append(f"{failing:,} {'table' if failing == 1 else 'tables'} failing")
         return {"label": "Running", "tone": "run", "detail": parts, "expected_end": running.get("expected_end"),
                 "cause": top_cause if failing else None}
-    if job.get("paused") and late:
-        return {"label": f"Late: {late:,} {'table' if late == 1 else 'tables'}", "tone": "warn",
-                "detail": ["paused"], "paused_since": job.get("updated_at"), "cause": None}
+    paused = {"detail": ["paused"], "paused_since": job.get("updated_at")} if job.get("paused") else {"detail": []}
     if failing:
-        return {"label": f"Failing: {failing:,} {'table' if failing == 1 else 'tables'}", "tone": "bad", "detail": [],
+        return {"label": f"Failing: {failing:,} {'table' if failing == 1 else 'tables'}", "tone": "bad", **paused,
                 "cause": top_cause}
+    if job.get("paused") and late:
+        return {"label": f"Late: {late:,} {'table' if late == 1 else 'tables'}", "tone": "warn", **paused, "cause": None}
     if late:
         return {"label": f"Late: {late:,} {'table' if late == 1 else 'tables'}", "tone": "warn",
                 "detail": warnings[:1], "cause": None}
@@ -219,7 +224,12 @@ def jobs_view(schedules: List[dict], members: List[dict], states: List[dict], ru
     rows, running_job_runs = [], []
     for s, sums in zip(schedules, job_sums):
         cadence = int(s["cadence_minutes"])
-        placed = current_and_past(s, active, runs, window(cadence, RECENT_JOB_RUNS, now), now)
+        start = window(cadence, RECENT_JOB_RUNS, now)
+        member_groups = {m["task_collection"] for m in active if m["schedule_id"] == s["id"]}
+        oldest_running = [_when(r["started_at"]) for r in running if r["task_collection"] in member_groups and r.get("started_at")]
+        if oldest_running:     # a group run overrunning the window still belongs to its job run
+            start = min(start, min(oldest_running) - timedelta(minutes=cadence))
+        placed = current_and_past(s, active, runs, start, now)
         summaries = [summarize(s, jr, running_by_run, group_tables, p50_by_group, now) for jr in placed]
         current = next((x for x in summaries if x["outcome"]["label"] == "Running"), None)
         last = next((x for x in summaries if x["outcome"]["label"] != "Running"), None)
@@ -234,19 +244,18 @@ def jobs_view(schedules: List[dict], members: List[dict], states: List[dict], ru
                "failed_in_a_row": consecutive_failed(summaries), "causes": causes[:3]}
         row["status"] = status(row, current, last, causes[0]["label"] if causes else None, warnings)
         rows.append(row)
-        if current:
-            running_job_runs.append(current)
+        running_job_runs += [x for x in summaries if x["outcome"]["label"] == "Running"]
     rows.sort(key=lambda j: (-1 if j["running_job_run"] and j["state_failing"] else 0 if j["state_failing"] else
                              1 if j["state_late"] else 2, str(j["name"]).lower()))
     attention = [j for j in rows if j["state_failing"]
                  or (j["last_job_run"] and j["last_job_run"]["outcome"]["label"] == "Ended without finishing")]
     attention.sort(key=lambda j: (-q._count(j, "state_failing"), str(j["name"]).lower()))
-    running_job_runs.sort(key=lambda r: r.get("started_at") or "")
-    totals = {**{k: sum(q._count(g, k) for g in groups.values()) for k in ("enabled_tables",) + rollup.STATES},
+    running_job_runs.sort(key=lambda r: r.get("started_at") or r["slot"])
+    totals = {**{k: sum(q._count(g, k) for g in groups.values()) for k in ("enabled_tables", "no_sla_tables") + rollup.STATES},
               "groups": len(groups), "databases": len({(s["server"], s["src_database"]) for s in states
                                                         if q._count(s, "tables")}),
               "servers": len({s["server"] for s in states if q._count(s, "tables")}),
-              "jobs": len(rows), "running_jobs": len(running_job_runs),
+              "jobs": len(rows), "running_jobs": sum(1 for j in rows if j["running_job_run"]),
               "failing_jobs": sum(1 for j in rows if j["state_failing"]),
               "late_jobs": sum(1 for j in rows if j["state_late"])}
     unscheduled = set((not_in_job or {}).get("groups") or [])

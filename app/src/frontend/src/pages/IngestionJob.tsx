@@ -1,0 +1,117 @@
+import { useState } from "react";
+import { useQuery } from "@tanstack/react-query";
+import { Link, useParams } from "react-router-dom";
+import { api, qs, type Row } from "../api";
+import {
+  ErrorBox, PageHead, RunStatus, Section, StateBar, StateKey, fmtClock, fmtDuration, fmtInt, fmtSpeed, jobRunPath, plural
+} from "../components";
+
+const PAGE = 25;
+
+/** A job run's rows written: "at least" when some loads recorded no count. */
+export const rowsText = (r: Row) => (r.rows_partial ? `at least ${fmtInt(r.rows_written)}` : fmtInt(r.rows_written));
+
+/** One row per job run: outcome, group runs, took, tables loaded, speed, rows written, parallelism, clusters, failed. */
+export function JobRunsTable({ runs, showJob }: { runs: Row[]; showJob?: boolean }) {
+  return (
+    <table className="data">
+      <thead><tr><th>Job run</th>{showJob && <th>Ingestion job</th>}<th>Outcome</th><th className="num">Group runs</th>
+        <th className="num">Took</th><th className="num">Tables loaded</th><th className="num">Tables/min</th>
+        <th className="num">Rows written</th><th className="num">Parallelism</th><th className="num">Clusters</th>
+        <th className="num">Failed</th></tr></thead>
+      <tbody>
+        {runs.map((r) => (
+          <tr key={`${r.job_id}-${r.slot}`}>
+            <td className="name"><Link to={jobRunPath(r.job_id, r.slot)}>{new Date(r.slot).toLocaleString([], { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" })}</Link></td>
+            {showJob && <td className="name"><Link to={`/ingestion-jobs/${r.job_id}`}>{r.job_name}</Link></td>}
+            <td><RunStatus status={null} outcome={r.outcome} />{r.outcome?.note && <span className="sub">{r.outcome.note}</span>}</td>
+            <td className="num">{fmtInt(r.ran)} of {fmtInt(r.members)}{Number(r.extra) > 0 && <span className="sub">{fmtInt(r.extra)} extra</span>}</td>
+            <td className="num">{r.took_s != null ? fmtDuration(r.took_s) : r.running_s != null ? `${fmtDuration(r.running_s)} so far` : ""}</td>
+            <td className="num">{fmtInt(r.loaded)}</td>
+            <td className="num">{r.speed_tables_per_min != null ? fmtSpeed(r.speed_tables_per_min) : ""}</td>
+            <td className="num">{rowsText(r)}</td>
+            <td className="num">{(r.parallelism ?? []).join(", ")}</td><td className="num">{fmtInt(r.clusters)}</td>
+            <td className="num" style={{ color: Number(r.failed_tables) ? "var(--bad)" : undefined }}>{fmtInt(r.failed_tables)}</td>
+          </tr>
+        ))}
+        {!runs.length && <tr><td colSpan={showJob ? 11 : 10} className="muted">No job runs in this window.</td></tr>}
+      </tbody>
+    </table>
+  );
+}
+
+export default function IngestionJob() {
+  const { id = "" } = useParams();
+  const [pages, setPages] = useState<string[]>([]);
+  const before = pages[pages.length - 1];
+  const job = useQuery({ queryKey: ["ingestion-job", id], queryFn: () => api.get<Row>(`/ingestion-jobs/${encodeURIComponent(id)}`),
+                         refetchInterval: 60_000 });
+  const runs = useQuery({
+    queryKey: ["ingestion-job-runs", id, before],
+    queryFn: () => api.get<Row>(`/ingestion-jobs/${encodeURIComponent(id)}/runs${qs({ before, limit: PAGE })}`),
+    refetchInterval: before ? false : 30_000,
+  });
+  const j = job.data;
+  const last = j?.last_job_run;
+  return (
+    <>
+      <PageHead crumb={<span className="eyebrow"><Link to="/overview">Overview</Link> · <Link to="/ingestion-jobs">Ingestion jobs</Link></span>}
+        title={j ? j.name : "Ingestion job"}
+        lead={j && <>{j.description}{j.stagger_to ? `, starts from :${String(j.stagger_from).padStart(2, "0")} to :${String(j.stagger_to).padStart(2, "0")}` : ""};{" "}
+          <strong>{fmtInt(j.groups?.length)}</strong> {plural(j.groups?.length, "ingestion group")}, <strong>{fmtInt(j.databases)}</strong>{" "}
+          {plural(j.databases, "database")}, <strong>{fmtInt(j.enabled_tables)}</strong> {plural(j.enabled_tables, "table")} on{" "}
+          <strong>{fmtInt(j.servers)}</strong> {plural(j.servers, "server")}
+          {j.parameters?.parallelism && <>, parallelism <strong>{j.parameters.parallelism}</strong></>}
+          {j.job_variant && j.job_variant !== "default" && <>, Databricks job variant <strong>{j.job_variant}</strong></>}
+          {j.paused && <>; <strong>paused</strong></>}. <Link to="/schedules">Edit on Schedules</Link>.</>} />
+      <ErrorBox error={job.error} />
+      {j && (
+        <div className="metrics">
+          <div className="metric"><div className="metric-label">Tables now</div><StateBar row={j} />
+            <div className="metric-sub">{fmtInt(j.state_current)} current, {fmtInt(j.state_late)} late, {fmtInt(j.state_first_load)} waiting, {fmtInt(j.state_failing)} failing</div></div>
+          <div className="metric"><div className="metric-label">Last finished job run</div>
+            <div className="metric-value small-value">{last ? <Link to={jobRunPath(j.id, last.slot)}><RunStatus status={null} outcome={last.outcome} /></Link> : "none yet"}</div>
+            <div className="metric-sub">{last ? `${fmtClock(last.slot)}${last.took_s != null ? `, took ${fmtDuration(last.took_s)}` : ""}` : ""}</div></div>
+          <div className="metric"><div className="metric-label">Speed</div>
+            <div className="metric-value">{j.median_speed_tables_per_min != null ? fmtSpeed(j.median_speed_tables_per_min) : "–"}<small>tables/min</small></div>
+            <div className="metric-sub">{Number(j.speed_job_runs) ? `median of the last ${fmtInt(j.speed_job_runs)} job ${plural(j.speed_job_runs, "run")} that loaded tables`
+              : "no job run loaded tables in 7 days"}</div></div>
+          <div className="metric"><div className="metric-label">Job run time</div>
+            <div className="metric-value">{j.p95_took_s != null ? fmtDuration(j.p95_took_s) : "–"}</div>
+            <div className="metric-sub">p95 over 7 days</div></div>
+        </div>
+      )}
+      <Section title="Runs of this job" note="One row per trigger, newest first. Group runs are placed by the job's current schedule; a run started by hand inside a slot is an extra run. Exact once each group run records its launch."
+        actions={<span className="pager-buttons">
+          <button className="ghost" disabled={!pages.length} onClick={() => setPages(pages.slice(0, -1))}>Newer</button>
+          <button className="ghost" disabled={!runs.data?.next_before} onClick={() => setPages([...pages, runs.data!.next_before])}>Older</button>
+        </span>}>
+        <ErrorBox error={runs.error} />
+        {runs.data && <JobRunsTable runs={runs.data.job_runs} />}
+      </Section>
+      {j && (
+        <Section title={`Ingestion groups: ${fmtInt(j.groups_detail.length)}`} actions={<StateKey />}>
+          <table className="data">
+            <thead><tr><th>Ingestion group</th><th className="num">Starts at</th><th className="num">Databases</th><th className="num">Tables</th>
+              <th>State now</th><th className="num">Failing</th><th>Last group run</th><th className="num">p95 run time</th><th>Wrapper job</th></tr></thead>
+            <tbody>
+              {j.groups_detail.map((g: Row) => (
+                <tr key={g.task_collection}>
+                  <td className="name"><Link to={`/collections/${encodeURIComponent(g.task_collection)}`}><b>{g.task_collection}</b></Link></td>
+                  <td className="num">:{String(g.offset_minutes % 60).padStart(2, "0")}</td>
+                  <td className="num">{fmtInt(g.databases)}</td><td className="num">{fmtInt(g.enabled_tables)}</td><td><StateBar row={g} /></td>
+                  <td className="num" style={{ color: Number(g.state_failing) ? "var(--bad)" : undefined }}>{fmtInt(g.state_failing)}</td>
+                  <td>{g.last_run ? <><Link to={`/runs/${g.last_run.run_id}`}><RunStatus status={g.last_run.status} outcome={g.last_run.outcome} /></Link>
+                    <span className="sub">group run {fmtInt(g.last_run.run_id)} at {fmtClock(g.last_run.started_at)}</span></> : <span className="muted">never run</span>}</td>
+                  <td className="num">{g.p95_s != null ? fmtDuration(g.p95_s) : ""}</td>
+                  <td>{g.job_url ? <a href={g.job_url} target="_blank" rel="noreferrer">open</a> : <span className="muted">not synced</span>}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </Section>
+      )}
+    </>
+  );
+}
+
