@@ -2,6 +2,7 @@
 import json
 from datetime import datetime, timedelta, timezone
 
+import ct_engine
 import initial_check as ic
 import planner
 import state_store as ss
@@ -13,7 +14,13 @@ SOURCE = "conn|0|conn"   # state_store.database_source of _cfg
 def _cfg(cid, db, table, collection="c1"):
     return {"id": cid, "task_collection": collection, "src_connection": "conn", "use_remote_query": True,
             "src_database": db, "src_schema": "dbo", "src_table": table, "select_list": "id, v",
-            "primary_key": "id", "src_type": "sqlserver", "load_type": "ct"}
+            "primary_key": "id", "src_type": "sqlserver", "load_type": "ct",
+            "sink_catalog": "main", "sink_schema": "bronze", "sink_table": f"{db}_{table}"}
+
+
+def _sinks(configs):
+    """The sink tables that exist for these rows: every one of them, unless a test drops one."""
+    return {ct_engine.sink_lookup_key(c) for c in configs}
 
 
 def _cp(v, phase=ss.INCREMENTAL, **kw):
@@ -50,7 +57,7 @@ def test_only_databases_that_changed_or_were_never_loaded_need_an_ingest():
     cps = _recorded(configs, {1: _cp(10), 2: _cp(10), 3: _cp(20), 4: _cp(20), 5: _cp(30), 7: _cp(40), 8: _cp(50)})
     calls = []
     detect = _detector({"quiet": 10, "busy": 21, "moved": 41, "down": None}, changed={3}, calls=calls)
-    out = ic.check_collection(configs, cps, detect, now=NOW)
+    out = ic.check_collection(configs, cps, detect, existing_sinks=_sinks(configs), now=NOW)
     # quiet: fast exit. busy: table 3 changed. new: table 6 was never loaded (no detection asked).
     # moved: the version moved but none of our tables changed. down: no CT version, the ingest reports it.
     assert out["work"] == [[SOURCE, "busy"], [SOURCE, "down"], [SOURCE, "new"]]
@@ -67,16 +74,50 @@ def test_forced_databases_skip_the_check_and_go_to_the_ingest():
     calls = []
     out = ic.check_collection(configs, _recorded(configs, {1: _cp(10), 2: _cp(10)}),
                               _detector({"quiet": 10, "other": 10}, calls=calls),
-                              force={"quiet"}, now=NOW)
+                              existing_sinks=_sinks(configs), force={"quiet"}, now=NOW)
     assert out["work"] == [[SOURCE, "quiet"]] and calls == ["other"]
     assert [s[1] for s in out["database_stamps"]] == ["other"]
+
+
+def test_a_dropped_sink_sends_its_database_to_the_ingest_not_the_stamp():
+    configs = [_cfg(1, "quiet", "a"), _cfg(2, "quiet", "b")]
+    calls = []
+    present = _sinks(configs) - {ct_engine.sink_lookup_key(configs[0])}     # quiet.a's sink was dropped
+    out = ic.check_collection(configs, _recorded(configs, {1: _cp(10), 2: _cp(10)}), _detector({"quiet": 10}, calls=calls),
+                              existing_sinks=present, now=NOW)
+    assert out["work"] == [[SOURCE, "quiet"]] and calls == []
+    assert out["rows"] == [] and out["database_stamps"] == [] and out["unchanged_databases"] == 0
+
+
+def test_unknown_sinks_send_every_database_with_a_candidate_to_the_ingest():
+    configs = [_cfg(1, "quiet", "a")]
+    out = ic.check_collection(configs, _recorded(configs, {1: _cp(10)}), _detector({"quiet": 10}),
+                              existing_sinks=None, now=NOW)
+    assert out["work"] == [[SOURCE, "quiet"]] and out["database_stamps"] == []
+
+
+def test_the_check_needs_the_existing_sinks_it_is_given():
+    configs = [_cfg(1, "quiet", "a")]
+    try:
+        ic.check_collection(configs, _recorded(configs, {1: _cp(10)}), _detector({"quiet": 10}), now=NOW)
+        raise AssertionError("a check without sink information must not stamp anything")
+    except TypeError:
+        pass
+
+
+def test_a_run_check_sends_a_database_with_a_dropped_sink_to_the_ingest():
+    configs = [_cfg(1, "quiet", "a", "c1")]
+    store = _Store(configs, _recorded(configs, {1: _cp(10)}))
+    summary = ic.run_check(store, store, ["c1"], _detector({"quiet": 10}), existing_sinks_of=lambda cfgs: set())
+    assert summary["per_collection"][0]["work"] == [[SOURCE, "quiet"]]
+    assert store.stamped == {"c1": []}
 
 
 def test_freshness_skips_a_fresh_database_stamp():
     configs = [_cfg(1, "quiet", "a")]
     stamps = {(ss.database_source(configs[0]), "quiet"): {"version": 10, "checked_at": NOW - timedelta(minutes=5)}}
-    out = ic.check_collection(configs, _recorded(configs, {1: _cp(10)}), _detector({"quiet": 10}), stamps=stamps,
-                              interval_s=3600, now=NOW)
+    out = ic.check_collection(configs, _recorded(configs, {1: _cp(10)}), _detector({"quiet": 10}),
+                              existing_sinks=_sinks(configs), stamps=stamps, interval_s=3600, now=NOW)
     assert out["work"] == [] and out["rows"] == [] and out["database_stamps"] == []
     assert out["unchanged_databases"] == 1
 
@@ -137,7 +178,7 @@ def test_the_check_stamps_the_quiet_databases_and_lists_each_collections_work():
                _cfg(3, "new", "a", "c2"), _cfg(4, "old", "a", "c2")]
     store = _Store(configs, _recorded(configs, {1: _cp(10), 2: _cp(10), 4: _cp(10)}))
     summary = ic.run_check(store, store, ["c1", "c2"], _detector({"quiet": 10, "old": 10}),
-                           job_run_id="77", cluster_id="serverless", parallelism=4)
+                           existing_sinks_of=_sinks, job_run_id="77", cluster_id="serverless", parallelism=4)
     assert [(r["collection"], r["work"]) for r in summary["per_collection"]] == [("c1", []), ("c2", [[SOURCE, "new"]])]
     assert store.stamped == {"c1": ["quiet"], "c2": ["old"]}
     assert sorted(store.unlocked) == ["c1", "c2"]
@@ -151,7 +192,7 @@ def test_the_check_stamps_the_quiet_databases_and_lists_each_collections_work():
 def test_the_check_leaves_a_collection_being_swept_to_that_sweep():
     configs = [_cfg(1, "new", "a", "c1")]
     store = _Store(configs, {}, held={"c1"})
-    summary = ic.run_check(store, store, ["c1"], _detector({}))
+    summary = ic.run_check(store, store, ["c1"], _detector({}), existing_sinks_of=_sinks)
     assert summary["busy"] == ["c1"] and summary["per_collection"] == [] and store.runs == [] and store.unlocked == []
 
 
@@ -162,7 +203,7 @@ def test_the_check_releases_a_collections_lock_when_its_check_fails():
     configs = [_cfg(1, "quiet", "a", "c1")]
     store = _Store(configs, _recorded(configs, {1: _cp(10)}))
     try:
-        ic.run_check(store, store, ["c1"], broken)
+        ic.run_check(store, store, ["c1"], broken, existing_sinks_of=_sinks)
         raise AssertionError("the check should fail")
     except RuntimeError as e:
         assert "source unreachable" in str(e)
