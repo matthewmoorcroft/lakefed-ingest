@@ -439,3 +439,7 @@ export function Pager({ offset, limit, total, noun, onPage }: { offset: number; 
     </div>
   );
 }
+
+/** One database's page: its group, server ("-" when blank) and name. */
+export const databasePath = (group: unknown, server: unknown, database: unknown) =>
+  `/collections/${encodeURIComponent(String(group))}/databases/${encodeURIComponent(String(server || "-"))}/${encodeURIComponent(String(database ?? ""))}`;

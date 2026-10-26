@@ -428,6 +428,72 @@ def run_failures_sql() -> str:
             f"where e.run_id = any(%s) and e.status = 'failed' order by e.finished_at desc")
 
 
+def not_ingested_sql() -> str:
+    """Per discovered (host, database), from its latest successful discovery: tables found, how many have no
+    control row yet (matched as discovered_tables_sql's registered_id is, in any group), and the largest of
+    those."""
+    return f"""
+with latest as (
+    select distinct on (lower(src_host), lower(src_database)) discovery_id, src_host, src_database, finished_at
+    from {SCHEMA}.discovery where status = 'ok'
+    order by lower(src_host), lower(src_database), finished_at desc
+),
+found as (
+    select l.src_host, l.src_database, l.finished_at, dt.src_schema, dt.src_table, dt.size_mb,
+           exists (select 1 from {SCHEMA}.control c where lower(c.src_host) = lower(l.src_host)
+                   and lower(c.src_database) = lower(dt.src_database) and lower(c.src_schema) = lower(dt.src_schema)
+                   and lower(c.src_table) = lower(dt.src_table)) as registered
+    from latest l
+    join {SCHEMA}.discovered_table dt on dt.discovery_id = l.discovery_id and dt.src_database = l.src_database
+)
+select src_host, src_database, finished_at as discovered_at, count(*) as discovered,
+       count(*) filter (where not registered) as not_registered,
+       (array_agg(src_schema || '.' || src_table order by size_mb desc nulls last)
+          filter (where not registered))[1] as largest_not_registered
+from found
+group by 1, 2, 3
+order by 1, 2"""
+
+
+def _database_rows() -> str:
+    return (f"select t.* from {SCHEMA}.control t where t.task_collection = %s and {SERVER} = %s "
+            f"and coalesce(t.src_database, '') = %s")
+
+
+def database_tables_sql() -> str:
+    """One database's tables in one ingestion group, with their state now and their part in a group run
+    (its latest event for the table, and whether it is still to go): failing first, then in flight, then to
+    go, then by name. Params: group, server, database, run_id (or None), schema.table pattern, limit, offset."""
+    return f"""
+with t as ({_database_rows()}),
+r as (select run_id, started_at from {SCHEMA}.ingest_run where run_id = %s)
+select t.id, t.src_schema, t.src_table, t.load_type, t.task_enabled, cp.phase, cp.status, cp.last_success_at,
+       round(extract(epoch from (now() - cp.last_success_at)) / 60)::int as lag_min,
+       t.freshness_sla_minutes as sla_min, {SLA_BREACHED} as sla_breached,
+       case when not t.task_enabled then 'disabled' when {_FAILING} then 'failing' when {_FIRST_LOAD} then 'first load'
+            when {SLA_BREACHED} then 'late' else 'current' end as state,
+       e.status as run_status, e.stage as run_stage, e.started_at as run_started_at, e.rows_merged as run_rows,
+       round(extract(epoch from (now() - e.started_at)))::int as run_running_s,
+       (r.run_id is not null and e.status is null and t.task_enabled
+        and (cp.last_success_at is null or cp.last_success_at < r.started_at)) as run_to_go
+from t
+left join {SCHEMA}.checkpoint cp on cp.control_id = t.id
+left join r on true
+left join lateral (select ev.status, ev.stage, ev.started_at, ev.rows_merged from {SCHEMA}.ingest_event ev
+                   where ev.run_id = r.run_id and ev.control_id = t.id order by ev.started_at desc limit 1) e on true
+where (t.src_schema || '.' || t.src_table) ilike %s
+order by coalesce({_FAILING}, false) desc, (e.status = 'running') is true desc,
+         (r.run_id is not null and e.status is null and (cp.last_success_at is null or cp.last_success_at < r.started_at)) desc,
+         t.src_schema, t.src_table
+limit %s offset %s"""
+
+
+def database_tables_count_sql() -> str:
+    """How many tables database_tables_sql pages through. Params: group, server, database, schema.table pattern."""
+    return (f"with t as ({_database_rows()}) select count(*) as tables from t "
+            f"where (t.src_schema || '.' || t.src_table) ilike %s")
+
+
 def run_rows_sql() -> str:
     """Per run: rows its table loads wrote, how many loads recorded no count, and its detail (which
     holds a batched append's total). Param: array of run ids."""

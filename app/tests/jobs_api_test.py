@@ -131,3 +131,38 @@ def test_runs_across_jobs_pin_the_running_job_runs_and_count_outcomes(client):
     assert body["counts"]["Completed with failures"] == 1
     none = client.get("/api/job-runs?job=none").json()
     assert none["job_runs"] == [] and "group_runs" in none
+
+
+def test_sources_list_a_uc_connection_with_nothing_registered(client, monkeypatch):
+    class Connection:
+        def __init__(self, name, host):
+            self.name, self.connection_type, self.options, self.owner, self.comment = name, "SQLSERVER", {"host": host}, "o", None
+
+    class Workspace:
+        class connections:
+            @staticmethod
+            def list():
+                return [Connection("unused_conn", "nobody.example.com")]
+    monkeypatch.setattr(main.db, "workspace", lambda: Workspace())
+    body = client.get("/api/sources").json()
+    empty = [i for i in body["instances"] if i["nothing_registered"]]
+    assert [i["server"] for i in empty] == ["unused_conn"] and body["nothing_registered"] == 1
+    assert {i["server"] for i in body["instances"] if not i["nothing_registered"]} == {"srv1"}
+
+
+def test_one_database_lists_its_tables_with_the_group_and_its_job(client, monkeypatch):
+    calls = []
+    real = main.db.query
+
+    def query(sql, params=()):
+        if sql == q.database_tables_sql():
+            calls.append(params)
+            return [dict(id=1, src_schema="dbo", src_table="t1", state="failing")]
+        if sql == q.database_tables_count_sql():
+            return [dict(tables=1)]
+        return real(sql, params)
+    monkeypatch.setattr(main.db, "query", query)
+    body = client.get("/api/collections/c1/databases/srv1/c1_db?search=t1").json()
+    assert (body["tables"][0]["state"], body["total"], body["jobs"]) == ("failing", 1, [{"id": 1, "name": "East hourly"}])
+    assert calls[0][:5] == ("c1", "srv1", "c1_db", None, "%t1%")
+    assert client.get("/api/collections/c1/databases/srv9/c1_db").status_code == 404

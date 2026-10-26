@@ -4,7 +4,7 @@ import { Link, useParams } from "react-router-dom";
 import { api, type Row } from "../api";
 import {
   Badge, BigCount, ErrorBox, FillBox, Grid, PageHead, ProgressBar, ProgressKey, RunStatus, Section, Stamp, autoColumns,
-  fmtDuration, fmtInt, fmtLeft, fmtSpeed, jobRunName, jobRunPath, plural, progressOf, progressText, type Progress
+  databasePath, fmtDuration, fmtInt, fmtLeft, fmtSpeed, jobRunName, jobRunPath, plural, progressOf, progressText, type Progress
 } from "../components";
 
 /** A finished run's totals in the same shape as a live run's progress, so both read the same way. The run's "ok"
@@ -95,6 +95,12 @@ export default function RunDetail() {
     enabled: !!run.data,
     refetchInterval: live ? 15_000 : false,
   });
+  const groupDatabases = useQuery({
+    queryKey: ["collection-databases", run.data?.task_collection],
+    queryFn: () => api.get<Row>(`/collections/${encodeURIComponent(run.data!.task_collection)}/databases`),
+    enabled: !!run.data && live,
+    refetchInterval: live ? 15_000 : false,
+  });
   const events = useQuery({
     queryKey: ["events", id],
     queryFn: () => api.get(`/runs/${encodeURIComponent(id)}/events`),
@@ -102,7 +108,8 @@ export default function RunDetail() {
   });
   const r = run.data;
   const p = r ? (live ? (r.progress ? progressOf(r.progress) : null) : finishedProgress(r)) : null;
-  const dbs = databases.data ?? [];
+  const checkedBy = new Map<string, Row>((groupDatabases.data?.databases ?? []).map((d: Row) => [`${d.server}\u001f${d.src_database}`, d]));
+  const dbs = [...(databases.data ?? [])].sort((a, b) => Number(b.in_flight || 0) - Number(a.in_flight || 0));
   const total = (k: string) => dbs.reduce((a, d) => a + Number(d[k] || 0), 0);
   const manyServers = new Set(dbs.map((d) => d.server)).size > 1;
   const failedEvents = (events.data ?? []).filter((e) => e.status === "failed").length;
@@ -162,24 +169,34 @@ export default function RunDetail() {
           )}
           {live && !p && <p className="muted">Progress is not available yet.</p>}
           {live && <InFlight id={id} />}
-          <Section title="By database" note="Each database of the run: tables loaded, in flight and failed, and the rows its loads wrote.">
+          <Section title="By database" note="Each database of the run, in progress first: tables loaded, in flight and failed, and the rows its loads wrote. Checked counts its tables stamped since the run started.">
             <ErrorBox error={databases.error} />
             <FillBox min={160}>
               <table className="data">
-                <thead><tr><th>Database</th><th className="num">Loaded</th><th className="num">In flight</th><th className="num">Failed</th>
-                  <th className="num">Rows written</th></tr></thead>
+                <thead><tr><th>Database</th>{live && <th>Progress</th>}{live && <th className="num">Checked</th>}<th className="num">Loaded</th>
+                  <th className="num">In flight</th><th className="num">Failed</th><th className="num">Rows written</th></tr></thead>
                 <tbody>
-                  {dbs.map((d) => (
-                    <tr key={`${d.server}\u001f${d.src_database}`}><td><b>{d.src_database || "(none)"}</b>
-                      {manyServers && <span className="sub">{d.server || "(no server)"}</span>}</td><td className="num">{fmtInt(d.loaded)}</td>
+                  {dbs.map((d) => {
+                    const g = checkedBy.get(`${d.server}\u001f${d.src_database}`);
+                    const tables = Number(g?.tables || 0), checked = Number(g?.checked_this_run || 0);
+                    const dp: Progress = { total: tables, loaded: Number(d.loaded || 0), unchanged: Math.max(0, checked - Number(d.loaded || 0)),
+                                           inFlight: Number(d.in_flight || 0), failed: Number(d.failed || 0) };
+                    return (
+                    <tr key={`${d.server}\u001f${d.src_database}`}><td className="name">
+                      <Link to={databasePath(r!.task_collection, d.server, d.src_database)}><b>{d.src_database || "(none)"}</b></Link>
+                      {manyServers && <span className="sub">{d.server || "(no server)"}</span>}</td>
+                      {live && <td style={{ minWidth: 140 }}>{g ? <ProgressBar p={dp} /> : null}</td>}
+                      {live && <td className="num">{g ? `${fmtInt(checked)} of ${fmtInt(tables)}` : ""}</td>}
+                      <td className="num">{fmtInt(d.loaded)}</td>
                       <td className="num">{fmtInt(d.in_flight)}</td>
                       <td className="num" style={{ color: Number(d.failed) ? "var(--bad)" : undefined }}>{fmtInt(d.failed)}</td>
                       <td className="num">{Number(d.uncounted) ? `at least ${fmtInt(d.rows_written || 0)}` : fmtInt(d.rows_written || 0)}</td></tr>
-                  ))}
-                  {dbs.length > 1 && <tr className="total"><td>All databases</td><td className="num">{fmtInt(total("loaded"))}</td>
+                    );
+                  })}
+                  {dbs.length > 1 && <tr className="total"><td>All databases</td>{live && <td />}{live && <td />}<td className="num">{fmtInt(total("loaded"))}</td>
                     <td className="num">{fmtInt(total("in_flight"))}</td><td className="num">{fmtInt(total("failed"))}</td>
                     <td className="num">{total("uncounted") ? `at least ${fmtInt(total("rows_written"))}` : fmtInt(total("rows_written"))}</td></tr>}
-                  {databases.data && !dbs.length && <tr><td colSpan={5} className="muted">No table events: every table was unchanged.</td></tr>}
+                  {databases.data && !dbs.length && <tr><td colSpan={live ? 7 : 5} className="muted">No table events: every table was unchanged.</td></tr>}
                 </tbody>
               </table>
             </FillBox>

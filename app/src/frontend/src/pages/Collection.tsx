@@ -2,11 +2,11 @@ import { useQuery } from "@tanstack/react-query";
 import { Link, useParams } from "react-router-dom";
 import { api, type Row } from "../api";
 import {
-  ErrorBox, FillBox, PageHead, ProgressBar, ProgressKey, Section, Stamp, StateBar, StateKey, Tag,
+  ErrorBox, FillBox, PageHead, ProgressBar, ProgressKey, Section, Stamp, StateBar, StateKey, Tag, databasePath,
   fmtAgo, fmtClock, fmtDuration, fmtInt, progressOf, progressText, type Progress, plural
 } from "../components";
 
-interface CollectionData { collection: string; databases: Row[]; running: Row | null; batches: Row[]; read_at: string; cache_s: number }
+interface CollectionData { collection: string; databases: Row[]; running: Row | null; batches: Row[]; jobs: Row[]; read_at: string; cache_s: number }
 
 /** What a database's first loads wrote: per-table counts, a batched append's total, or "at least". */
 function firstLoadRows(d: Row) {
@@ -39,16 +39,18 @@ export default function CollectionPage() {
   const unattributed = (data.data?.batches ?? []).filter((b) => (b.keys ?? []).length !== 1);
   return (
     <>
-      <PageHead crumb={<span className="eyebrow"><Link to="/overview">Overview</Link> · Ingestion group · How far along is each database?</span>} title={name}
+      <PageHead crumb={<span className="eyebrow"><Link to="/overview">Overview</Link> ·{" "}
+        {(data.data?.jobs ?? []).map((j) => <span key={j.id}><Link to={`/ingestion-jobs/${j.id}`}>{j.name}</Link> · </span>)}
+        {data.data && !data.data.jobs?.length && <><Link to="/ingestion-jobs">Not in any job</Link> · </>}Ingestion group · How far along is each database?</span>} title={name}
         lead={<><strong>{fmtInt(dbs.length)}</strong> {plural(dbs.length, "database")}, <strong>{fmtInt(tables)}</strong> enabled {plural(tables, "table")}
           {servers.length ? <> on <strong>{servers.join(", ")}</strong></> : null}.{" "}
           <Link to={`/tables?collection=${encodeURIComponent(name)}`}>Its tables</Link> ·{" "}
-          <Link to="/schedules">Schedules</Link> · <Link to="/runs">Runs</Link></>}
+          <Link to="/schedules">Schedules</Link></>}
         right={<Stamp at={data.data?.read_at} every={run ? 15 : 60} />} />
       <ErrorBox error={data.error} />
 
       {run && p && (
-        <Section title={<>Run #{run.run_id} <Tag tone="run">Running</Tag></>}
+        <Section title={<><Link to={`/runs/${run.run_id}`}>Group run {fmtInt(run.run_id)}</Link> <Tag tone="run">Running</Tag></>}
           actions={<div className="kv"><span>Started <b>{fmtClock(run.started_at)}</b></span>
             <span>Running <b>{fmtDuration(run.elapsed_s)}</b>{run.p50_s ? <> (typical <b>{fmtDuration(run.p50_s)}</b>)</> : null}</span></div>}>
           <div className="count">{progressText(p)}</div><ProgressBar p={p} big /><ProgressKey p={p} />
@@ -72,7 +74,8 @@ export default function CollectionPage() {
                                        inFlight: Number(d.in_flight || 0), failed: Number(d.failed_this_run || 0) };
                 return (
                   <tr key={`${d.server}\u001f${d.src_database}`}>
-                    <td><b>{d.src_database || "(none)"}</b>{servers.length > 1 && <span className="sub">{d.server || "(no server)"}</span>}</td>
+                    <td className="name"><Link to={databasePath(name, d.server, d.src_database)}><b>{d.src_database || "(none)"}</b></Link>
+                      {servers.length > 1 && <span className="sub">{d.server || "(no server)"}</span>}</td>
                     {run && <td><ProgressBar p={dp} /></td>}
                     {run && <td className="num">{fmtInt(checked)} of {fmtInt(tablesHere)}</td>}
                     {run && <td className="num">{fmtInt(d.in_flight || 0)}</td>}

@@ -140,3 +140,43 @@ def jobs(states: Iterable[dict], schedules: Iterable[dict], members: Iterable[di
     scheduled = set().union(*(active.get(s["id"], set()) for s in schedules)) if schedules else set()
     unscheduled = {s["task_collection"] for s in states} - scheduled
     return out, (_job_sums({"id": None, "name": "Not in any job"}, unscheduled, states) if unscheduled else None)
+
+
+def sources(states: Iterable[dict], connections: Iterable[dict], not_ingested: Iterable[dict],
+            schedules: Iterable[dict], members: Iterable[dict]) -> dict:
+    """Per source instance (server), by name: how it is read (the UC connections its rows name, else their
+    JDBC hosts), its ingestion jobs only (jobs(), over its own rows; groups stay on their job's page), its
+    groups, databases, tables by state, and the tables discovered on its hosts with no control row yet. Then
+    every readable UC connection that no row names, by name or host, as "nothing registered". Totals: instances
+    with tables, connections with nothing registered, and tables discovered and not registered."""
+    states, connections, schedules = list(states), list(connections), list(schedules)
+    members, not_ingested = list(members), list(not_ingested)
+    by_name = {c["name"]: c for c in connections}
+    used_connections, used_hosts = set(), set()
+    instances = []
+    for row in servers(states):
+        mine = [s for s in states if s["server"] == row["server"]]
+        names = sorted({s["src_connection"] for s in mine if s.get("src_connection")})
+        hosts = sorted({(s.get("src_host") or "").lower() for s in mine if s.get("src_host")})
+        read_via = [{"kind": "uc", "name": n, "connection_type": (by_name.get(n) or {}).get("connection_type"),
+                     "host": (by_name.get(n) or {}).get("host")} for n in names]
+        read_via += [{"kind": "jdbc", "host": h} for h in hosts if not any((v.get("host") or "").lower() == h for v in read_via)]
+        all_hosts = set(hosts) | {(v.get("host") or "").lower() for v in read_via if v.get("host")}
+        used_connections |= set(names)
+        used_hosts |= all_hosts
+        found = [d for d in not_ingested if (d.get("src_host") or "").lower() in all_hosts]
+        job_rows, unscheduled = jobs(mine, schedules, members)
+        instances.append({**row, "groups": row["collections"], "read_via": read_via, "nothing_registered": False,
+                          "jobs": [j for j in job_rows if j["groups"] and j["enabled_tables"]]
+                          + ([unscheduled] if unscheduled else []),
+                          "not_ingested": found, "not_registered": sum(_count(d, "not_registered") for d in found)})
+    empty = [c for c in connections
+             if c["name"] not in used_connections and (c.get("host") or "").lower() not in used_hosts]
+    for c in empty:
+        found = [d for d in not_ingested if (d.get("src_host") or "").lower() == (c.get("host") or "").lower()]
+        instances.append({"server": c["name"], "tables": 0, "databases": 0, "groups": 0, **{k: 0 for k in STATES},
+                          "read_via": [{"kind": "uc", "name": c["name"], "connection_type": c.get("connection_type"),
+                                        "host": c.get("host")}], "nothing_registered": True, "jobs": [],
+                          "not_ingested": found, "not_registered": sum(_count(d, "not_registered") for d in found)})
+    return {"instances": instances, "ingested": sum(1 for i in instances if i["tables"]),
+            "nothing_registered": len(empty), "not_registered": sum(i["not_registered"] for i in instances)}

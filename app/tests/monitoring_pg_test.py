@@ -231,3 +231,24 @@ def test_group_runs_in_a_window_oldest_first(pg):
     found = rows(pg, q.group_runs_sql(), (["c1"], datetime.now(timezone.utc) - timedelta(days=4),
                                           datetime.now(timezone.utc)))
     assert [r["run_id"] for r in found] == [1, 2] and "cluster_id" in found[0]
+
+
+def test_not_ingested_counts_discovered_tables_with_no_control_row_from_the_latest_discovery(pg):
+    with pg.transaction(force_rollback=True):
+        pg.execute("insert into lakefed_ingest.discovery (discovery_id, src_host, src_database, status, started_at, finished_at) "
+                   "values ('d0', 'HOST-A', 'db1', 'ok', now() - interval '2 days', now() - interval '2 days'), "
+                   "('d1', 'HOST-A', 'db1', 'ok', now() - interval '1 hour', now() - interval '1 hour')")
+        pg.execute("insert into lakefed_ingest.discovered_table (discovery_id, src_database, src_schema, src_table, size_mb) "
+                   "values ('d0', 'db1', 'dbo', 'only_in_the_old_one', 1), ('d1', 'db1', 'DBO', 'T1', 5), "
+                   "('d1', 'db1', 'dbo', 'new_a', 7), ('d1', 'db1', 'dbo', 'new_b', 3)")
+        found = rows(pg, q.not_ingested_sql())
+    assert [(r["src_host"], r["src_database"], r["discovered"], r["not_registered"], r["largest_not_registered"])
+            for r in found] == [("HOST-A", "db1", 3, 2, "dbo.new_a")]
+
+
+def test_a_databases_tables_come_failing_first_with_their_part_in_the_running_run(pg):
+    found = rows(pg, q.database_tables_sql(), ("c1", "srv1", "db2", 2, "%", 100, 0))
+    assert len(found) == 10 and (found[0]["src_table"], found[0]["run_status"]) == ("t9", "failed")
+    assert rows(pg, q.database_tables_sql(), ("c1", "srv1", "db1", 2, "%t8%", 100, 0))[0]["run_status"] == "running"
+    assert [r["src_table"] for r in rows(pg, q.database_tables_sql(), ("c1", "srv1", "db1", None, "%t1%", 100, 0))] == ["t1", "t10"]
+    assert rows(pg, q.database_tables_count_sql(), ("c1", "srv1", "db1", "%"))[0]["tables"] == 10

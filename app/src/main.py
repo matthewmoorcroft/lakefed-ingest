@@ -211,7 +211,10 @@ def collection_databases(name: str):
             d["batches"] = [{"run_id": b["run_id"], "rows": b["rows"]} for b in batches
                             if b["keys"] == [key]]
             databases.append(d)
-        return {"collection": name, "databases": databases, "running": running[0] if running else None,
+        schedules, members = _schedules()
+        job_names = [{"id": sc["id"], "name": sc["name"]} for sc in schedules
+                     if any(m["schedule_id"] == sc["id"] and m["task_collection"] == name for m in members)]
+        return {"collection": name, "databases": databases, "running": running[0] if running else None, "jobs": job_names,
                 "batches": batches, "read_at": datetime.now(timezone.utc).isoformat(), "cache_s": MONITOR_CACHE_S}
     return _shared(("collection", name), compute)
 
@@ -438,6 +441,53 @@ def job_runs_across(job: Optional[str] = None, outcome: Optional[str] = None, be
     return {"job_runs": [{k: v for k, v in r.items() if k != "placed"} for r in running + rest],
             "counts": counts, "next_before": rest[-1]["slot"] if len(rest) >= limit else None,
             "jobs": [{"id": s["id"], "name": s["name"]} for s in schedules]}
+
+
+# ---- sources and one database -------------------------------------------------------------------
+
+@app.get("/api/sources")
+def sources():
+    """Source instances (rollup.sources): how each is read, its ingestion jobs, its tables by state and the
+    tables discovered on it with no control row yet, plus readable UC connections with nothing registered.
+    Shared like _states; a failure to list UC connections only drops the "nothing registered" rows."""
+    def compute():
+        schedules, members = _schedules()
+        try:
+            listed, listed_error = _connections(), None
+        except Exception as e:
+            listed, listed_error = [], str(e)
+        view = rollup.sources(_states(), listed, db.query(q.not_ingested_sql()), schedules, members)
+        return {**view, "connections_error": listed_error, "read_at": datetime.now(timezone.utc).isoformat(),
+                "cache_s": STATES_CACHE_S}
+    return _shared("sources", compute, ttl=STATES_CACHE_S)
+
+
+DATABASE_TABLES_PAGE = 100
+
+
+@app.get("/api/collections/{name}/databases/{server}/{database}")
+def one_database(name: str, server: str, database: str, search: str = "", offset: int = 0):
+    """One database of an ingestion group: its tables by state now, the group's jobs and its running group
+    run, and its tables (DATABASE_TABLES_PAGE a page, failing first, then in flight, then to go) with their
+    part in that run. The server "-" stands for a blank one."""
+    server = "" if server == "-" else server
+    states = [s for s in _states() if s["task_collection"] == name and s["server"] == server
+              and s["src_database"] == database]
+    if not states:
+        raise HTTPException(404, f"no database {database} on {server or '(no server)'} in ingestion group {name}")
+    sums = {k: sum(q._count(s, k) for s in states) for k in ("tables", "no_sla_tables") + rollup.STATES}
+    running = next((r for r in _running() if r["task_collection"] == name), None)
+    schedules, members = _schedules()
+    job_names = [{"id": s["id"], "name": s["name"]} for s in schedules
+                 if any(m["schedule_id"] == s["id"] and m["task_collection"] == name for m in members)]
+    pattern = f"%{search.strip()}%" if search.strip() else "%"
+    offset = max(0, int(offset))
+    rows = db.query(q.database_tables_sql(), (name, server, database, running["run_id"] if running else None, pattern,
+                                              DATABASE_TABLES_PAGE, offset))
+    total = db.query(q.database_tables_count_sql(), (name, server, database, pattern))[0]["tables"]
+    return {"task_collection": name, "server": server, "src_database": database, **sums, "jobs": job_names,
+            "running": running, "tables": rows, "total": total, "offset": offset, "limit": DATABASE_TABLES_PAGE,
+            "read_at": datetime.now(timezone.utc).isoformat()}
 
 
 # ---- runs ---------------------------------------------------------------------------------------

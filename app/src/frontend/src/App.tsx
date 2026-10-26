@@ -16,13 +16,15 @@ import Collection from "./pages/Collection";
 import IngestionJobs from "./pages/IngestionJobs";
 import IngestionJob from "./pages/IngestionJob";
 import JobRun from "./pages/JobRun";
+import Sources from "./pages/Sources";
+import Database from "./pages/Database";
 
 interface Settings { config?: Config }
 const SettingsContext = createContext<Settings>({});
 export const useSettings = () => useContext(SettingsContext);
 
 const NAV = [
-  ["Monitor", [["/overview", "Overview"], ["/ingestion-jobs", "Ingestion jobs"], ["/runs", "Runs"], ["/timeline", "Timeline"]]],
+  ["Monitor", [["/overview", "Overview"], ["/ingestion-jobs", "Ingestion jobs"], ["/runs", "Runs"], ["/sources", "Sources"], ["/timeline", "Timeline"]]],
   ["Manage", [["/tables", "Tables"], ["/schedules", "Schedules"], ["/jobs", "Jobs"], ["/add", "Add table"],
               ["/bulk", "Bulk import"], ["/changes", "Changes"]]],
 ] as const;
@@ -69,6 +71,8 @@ export default function App() {
             <Route path="/schedules" element={<Schedules />} />
             <Route path="/timeline" element={<Timeline />} />
             <Route path="/collections/:name" element={<Collection />} />
+            <Route path="/collections/:name/databases/:server/:database" element={<Database />} />
+            <Route path="/sources" element={<Sources />} />
             <Route path="/add" element={<AddTable />} />
             <Route path="/bulk" element={<BulkImport />} />
             <Route path="/changes" element={<Changes />} />
