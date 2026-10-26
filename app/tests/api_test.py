@@ -262,6 +262,8 @@ def test_run_detail_returns_the_run_its_rows_and_live_progress(monkeypatch):
             return [dict(run_id=5, rows_written=120, uncounted=0)]
         if sql == q.running_progress_sql():
             return [dict(run_id=4, tables_ok=9), dict(run_id=5, tables_ok=4, tables_running=3, enabled_tables=10)]
+        if sql == q.schedules_sql():
+            return []
         raise AssertionError(sql)
     monkeypatch.setattr(main.db, "query", query)
     client = TestClient(main.app)
@@ -303,7 +305,7 @@ def test_run_pages_share_one_read_of_running_progress(monkeypatch):
     assert len(reads) == 1
 
 
-def test_the_overviews_last_runs_are_read_as_often_as_the_running_runs(monkeypatch):
+def test_the_overviews_job_reads_refresh_as_often_as_the_running_runs(monkeypatch):
     reads, clock = [], [1000.0]
 
     def query(sql, params=()):
@@ -317,7 +319,7 @@ def test_the_overviews_last_runs_are_read_as_often_as_the_running_runs(monkeypat
     client.get("/api/overview")
     clock[0] += 20
     client.get("/api/overview")
-    assert reads.count(q.running_progress_sql()) == reads.count(q.last_runs_sql()) == 2
+    assert reads.count(q.running_progress_sql()) == reads.count(q.schedules_sql()) == 2
     assert reads.count(q.database_states_sql()) == 1
 
 

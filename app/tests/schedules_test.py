@@ -1,5 +1,5 @@
 """Schedules: cron and offsets, next runs, wrapper job settings, drift, warnings, and sync with a fake client."""
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -232,3 +232,68 @@ def test_new_job_parameters_validate_like_the_notebook_parses_them():
                  ("snapshot_isolation", "yes")):
         assert f"parameters.{k}: invalid value" in " ".join(sch.validate(dict(ok, parameters={k: v}), ["c1"], ["default"]))
     assert set(sch.FLAGS) == {"trust_server_certificate", "snapshot_isolation", "reseed_on_new_columns"}
+
+
+# ---- job runs: group runs placed by cadence slot ------------------------------------------------
+
+def _run(group, started, minutes=10, run_id=None, status="completed"):
+    return dict(run_id=run_id, task_collection=group, status=status, started_at=started.isoformat(),
+                finished_at=None if status == "running" else (started + timedelta(minutes=minutes)).isoformat())
+
+
+def _members(*pairs, added=datetime(2026, 1, 1, tzinfo=UTC)):
+    return [dict(task_collection=g, offset_minutes=o, added_at=added, removed_at=None) for g, o in pairs]
+
+
+def test_staggered_members_of_one_hourly_trigger_share_one_job_run():
+    runs = [_run("a", datetime(2026, 10, 26, 14, 0, 30, tzinfo=UTC), run_id=1),
+            _run("b", datetime(2026, 10, 26, 14, 30, 20, tzinfo=UTC), run_id=2)]
+    found = sch.job_runs(60, "UTC", _members(("a", 0), ("b", 30)), runs, datetime(2026, 10, 26, 14, tzinfo=UTC),
+                         datetime(2026, 10, 26, 15, tzinfo=UTC), now=datetime(2026, 10, 26, 16, tzinfo=UTC))
+    assert len(found) == 1 and found[0]["slot"] == datetime(2026, 10, 26, 14, tzinfo=UTC)
+    assert [(m["task_collection"], m["state"], m["run"]["run_id"]) for m in found[0]["members"]] == [("a", "run", 1), ("b", "run", 2)]
+
+
+def test_a_run_two_minutes_late_belongs_to_its_trigger_and_a_second_one_is_extra():
+    runs = [_run("a", datetime(2026, 10, 26, 14, 2, tzinfo=UTC), run_id=1),
+            _run("a", datetime(2026, 10, 26, 14, 40, tzinfo=UTC), run_id=2)]
+    found = sch.job_runs(60, "UTC", _members(("a", 0)), runs, datetime(2026, 10, 26, 13, tzinfo=UTC),
+                         datetime(2026, 10, 26, 15, tzinfo=UTC), now=datetime(2026, 10, 26, 16, tzinfo=UTC))
+    by_slot = {j["slot"].hour: j["members"][0] for j in found}
+    assert by_slot[14]["run"]["run_id"] == 1 and [r["run_id"] for r in by_slot[14]["extra"]] == [2]
+    assert by_slot[13]["state"] == "no run" and [j["slot"].hour for j in found] == [14, 13]
+
+
+def test_a_trigger_missed_while_the_previous_run_was_going_is_skipped():
+    runs = [_run("a", datetime(2026, 10, 26, 13, 0, tzinfo=UTC), minutes=75, run_id=1)]
+    found = sch.job_runs(60, "UTC", _members(("a", 0)), runs, datetime(2026, 10, 26, 14, tzinfo=UTC),
+                         datetime(2026, 10, 26, 15, tzinfo=UTC), now=datetime(2026, 10, 26, 16, tzinfo=UTC))
+    assert found[0]["members"][0]["state"] == "skipped"
+
+
+def test_runs_and_triggers_before_a_member_was_added_are_left_out():
+    runs = [_run("a", datetime(2026, 10, 26, 13, 0, tzinfo=UTC), run_id=1),
+            _run("a", datetime(2026, 10, 26, 14, 0, tzinfo=UTC), run_id=2)]
+    members = _members(("a", 0), added=datetime(2026, 10, 26, 13, 30, tzinfo=UTC))
+    found = sch.job_runs(60, "UTC", members, runs, datetime(2026, 10, 26, 13, tzinfo=UTC),
+                         datetime(2026, 10, 26, 15, tzinfo=UTC), now=datetime(2026, 10, 26, 16, tzinfo=UTC))
+    assert [(j["slot"].hour, j["members"][0]["run"]["run_id"]) for j in found] == [(14, 2)]
+
+
+def test_a_daily_trigger_keeps_its_slot_across_a_daylight_saving_change():
+    zone = "Europe/London"     # clocks went back at 02:00 BST on 25 Oct 2026
+    runs = [_run("a", datetime(2026, 10, 24, 1, 5, tzinfo=UTC), run_id=1),     # 02:05 BST
+            _run("a", datetime(2026, 10, 25, 2, 5, tzinfo=UTC), run_id=2),     # 02:05 GMT
+            _run("b", datetime(2026, 10, 25, 2, 35, tzinfo=UTC), run_id=3)]
+    found = sch.job_runs(1440, zone, _members(("a", 120), ("b", 150)), runs, datetime(2026, 10, 23, 23, tzinfo=UTC),
+                         datetime(2026, 10, 25, 23, tzinfo=UTC), now=datetime(2026, 10, 26, 12, tzinfo=UTC))
+    assert [[(m["run"] or {}).get("run_id") for m in j["members"]] for j in found] == [[2, 3], [1, None]]
+    assert found[1]["members"][1]["state"] == "no run"
+
+
+def test_a_member_whose_start_is_still_ahead_is_waiting():
+    runs = [_run("a", datetime(2026, 10, 26, 14, 0, 30, tzinfo=UTC), run_id=1, status="running")]
+    found = sch.job_runs(60, "UTC", _members(("a", 0), ("b", 30)), runs, datetime(2026, 10, 26, 14, tzinfo=UTC),
+                         datetime(2026, 10, 26, 15, tzinfo=UTC), now=datetime(2026, 10, 26, 14, 10, tzinfo=UTC))
+    waiting = found[0]["members"][1]
+    assert waiting["state"] == "waiting" and waiting["fire_at"] == datetime(2026, 10, 26, 14, 30, tzinfo=UTC)

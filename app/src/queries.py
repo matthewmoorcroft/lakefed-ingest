@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import json
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import List, Optional, Tuple
 
 SCHEMA = "lakefed_ingest"
@@ -395,6 +395,39 @@ group by 1, 2
 order by 2, 1"""
 
 
+def group_runs_sql() -> str:
+    """The runs of some ingestion groups that started in a window, oldest first: the group runs placed into
+    job runs (schedules.job_runs). Params: groups, window start, window end."""
+    return (f"select {_RUN_COLUMNS} from {SCHEMA}.ingest_run "
+            f"where task_collection = any(%s) and started_at >= %s and started_at < %s order by started_at")
+
+
+def job_run_databases_sql() -> str:
+    """run_databases_sql over the group runs of one job run, with each database's ingestion group: failing
+    first, then in flight, then by name. Param: run ids."""
+    return f"""
+select e.task_collection, {SERVER} as server, coalesce(e.src_database, '') as src_database,
+       count(*) filter (where e.status = 'ok')      as loaded,
+       count(*) filter (where e.status = 'running') as in_flight,
+       count(*) filter (where e.status = 'failed')  as failed,
+       sum(e.rows_merged)                           as rows_written,
+       count(*) filter (where e.status = 'ok' and e.rows_merged is null) as uncounted
+from {SCHEMA}.ingest_event e
+left join {SCHEMA}.control t on t.id = e.control_id
+where e.run_id = any(%s)
+group by 1, 2, 3
+order by (count(*) filter (where e.status = 'failed')) desc, (count(*) filter (where e.status = 'running')) desc, 3, 2, 1"""
+
+
+def run_failures_sql() -> str:
+    """The failed table events of some group runs, newest first, with each table's server: what
+    group_errors groups by cause. Param: run ids."""
+    return (f"select e.finished_at, e.task_collection, e.run_id, e.control_id, {SERVER} as server, e.src_database, "
+            f"e.src_schema, e.src_table, e.stage, e.error from {SCHEMA}.ingest_event e "
+            f"left join {SCHEMA}.control t on t.id = e.control_id "
+            f"where e.run_id = any(%s) and e.status = 'failed' order by e.finished_at desc")
+
+
 def run_rows_sql() -> str:
     """Per run: rows its table loads wrote, how many loads recorded no count, and its detail (which
     holds a batched append's total). Param: array of run ids."""
@@ -504,18 +537,65 @@ def _when(value):
     return datetime.fromisoformat(value) if isinstance(value, str) else value
 
 
+def loaded_tables(run: dict) -> int:
+    """Tables a group run loaded: a finished run's ok less its unchanged tables and reseeds queued (both
+    count as ok), else its ok events."""
+    if run.get("ok") is not None:
+        return max(_count(run, "ok") - _count(run, "skipped") - _count(run, "reseeded"), 0)
+    return _count(run, "loaded")
+
+
 def work_speed(run: dict) -> Optional[float]:
     """Tables loaded a minute over the run's work span (first table start to last finish), which leaves
     out planning and change detection. A finished run's ok counts its unchanged tables (cursor tables whose
     watermark didn't move record ok events too) and its reseeds queued, so loaded is ok less both; a run
     with no totals yet counts its ok events. None before any table loaded."""
-    start, end = _when(run.get("work_started_at")), _when(run.get("work_finished_at"))
-    loaded = (max(_count(run, "ok") - _count(run, "skipped") - _count(run, "reseeded"), 0)
-              if run.get("ok") is not None else _count(run, "loaded"))
+    start, end, loaded = _when(run.get("work_started_at")), _when(run.get("work_finished_at")), loaded_tables(run)
     if not (start and end and loaded):
         return None
     minutes = max((end - start).total_seconds(), 1) / 60
     return round(loaded / minutes, 1)
+
+
+# A finished job run's outcome is the worst of its group runs', in this order.
+JOB_RUN_ORDER = ("Ended without finishing", "Failed", "Completed with failures", "Completed")
+
+
+def job_run_outcome(members: List[dict]) -> dict:
+    """A job run's outcome from its members (schedules.job_runs): running while any group run is running or
+    any member's start is still ahead; otherwise the worst of its group runs' outcomes, or "Not run" when
+    none ran. The note counts the members that did not run, as "17 of 18 group runs, 1 skipped"."""
+    runs = [m["run"] for m in members if m.get("run")]
+    ran = [r for r in runs if r.get("status") != "skipped"]
+    skipped = sum(1 for m in members if m["state"] == "skipped") + (len(runs) - len(ran))
+    no_run = sum(1 for m in members if m["state"] == "no run")
+    note = None
+    if len(ran) < len(members):
+        note = ", ".join([f"{len(ran)} of {len(members)} group runs"] + ([f"{skipped} skipped"] if skipped else [])
+                         + ([f"{no_run} no run"] if no_run else []))
+    if any(m["state"] == "waiting" for m in members) or any(r.get("status") == "running" for r in runs):
+        return {"label": "Running", "tone": "run", "note": note}
+    if not ran:
+        return {"label": "Not run", "tone": "neutral", "note": note}
+    worst = min((run_outcome(r)["label"] for r in ran), key=lambda label: JOB_RUN_ORDER.index(label)
+                if label in JOB_RUN_ORDER else len(JOB_RUN_ORDER))
+    tone = {"Completed": "ok", "Completed with failures": "warn"}.get(worst, "bad")
+    return {"label": worst, "tone": tone, "note": note}
+
+
+def job_run_expected_end(members: List[dict], progress_by_run: dict, p50_by_group: dict, now):
+    """When a running job run should end: the latest of each running group run's time left (time_left) and
+    each waiting member's start plus its group's typical run. None when there is nothing to go on."""
+    ends = []
+    for m in members:
+        run = m.get("run")
+        if run and run.get("status") == "running":
+            left = time_left(progress_by_run.get(run.get("run_id")) or {}, now)
+            if left:
+                ends.append(now + timedelta(seconds=left["seconds"]))
+        elif m["state"] == "waiting" and p50_by_group.get(m["task_collection"]) is not None:
+            ends.append(_when(m["fire_at"]) + timedelta(seconds=int(p50_by_group[m["task_collection"]])))
+    return max(ends) if ends else None
 
 
 # Live speed and a rate-based time left wait for this much loading, so the first few loads don't set the pace.

@@ -25,6 +25,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
 
+import ingestion_jobs as ij
 import jobs
 import lakebase as db
 import queries as q
@@ -148,25 +149,25 @@ def _running() -> List[dict]:
     return _shared("running", lambda: db.query(q.running_progress_sql()))
 
 
+# The most running job runs, and jobs needing attention, the Overview lists; Runs and Ingestion jobs list all.
+OVERVIEW_LIST = 5
+OVERVIEW_JOBS_PAGE = 25
+
+
 @app.get("/api/overview")
-def overview():
-    """Every ingestion group's tables by state and its last run, the running group runs, and the servers,
-    from the shared reads (_states, _last_runs, _running)."""
-    states, last, running = _states(), _last_runs(), _running()
-    groups = rollup.groups(states)
-    collections = []
-    for name in sorted(groups):
-        g, r = dict(groups[name]), last.get(name) or {}
-        g.update({"last_run_id": r.get("run_id"), "last_run_status": r.get("status"),
-                  "last_run_started": r.get("started_at"), "last_run_finished": r.get("finished_at"),
-                  "last_run_ok": r.get("ok"), "last_run_failed": r.get("failed"),
-                  "last_run_outcome": q.run_outcome(r) if r else None})
-        collections.append(g)
-    running = [dict(r, server=(groups.get(r["task_collection"]) or {}).get("server")) for r in running]
-    servers = [dict(s, health=q.server_health(s))
-               for s in rollup.servers(states, running_groups={r["task_collection"] for r in running})]
-    return {"collections": collections, "running": running, "servers": servers,
-            "read_at": _read_at("database_states"), "cache_s": MONITOR_CACHE_S, "states_cache_s": STATES_CACHE_S}
+def overview(offset: int = 0):
+    """The ingestion jobs (a page of OVERVIEW_JOBS_PAGE, failing first) with their Status, "Not in any job",
+    the running job runs and the jobs needing attention (OVERVIEW_LIST of each, with their totals), and the
+    totals over every enabled table, from the shared reads (_jobs_view)."""
+    view = _jobs_view()
+    offset = max(0, int(offset))
+    return {"jobs": view["jobs"][offset:offset + OVERVIEW_JOBS_PAGE], "jobs_total": len(view["jobs"]),
+            "offset": offset, "limit": OVERVIEW_JOBS_PAGE, "not_in_job": view["not_in_job"],
+            "running_job_runs": view["running_job_runs"][:OVERVIEW_LIST], "running_total": len(view["running_job_runs"]),
+            "running_not_in_job": view["running_not_in_job"],
+            "attention": view["attention"][:OVERVIEW_LIST], "attention_total": len(view["attention"]),
+            "totals": view["totals"], "read_at": _read_at("database_states"), "cache_s": MONITOR_CACHE_S,
+            "states_cache_s": STATES_CACHE_S}
 
 
 # The most failed tables the failure groups read; past it they say how many they show.
@@ -225,6 +226,214 @@ def collections():
     return [r["task_collection"] for r in db.query(q.collections_sql())]
 
 
+# ---- ingestion jobs and job runs ----------------------------------------------------------------
+
+def _schedules():
+    """Active schedules and their active members, shared like _running."""
+    def compute():
+        rows = db.query(q.schedules_sql())
+        members = db.query(q.schedule_members_sql(), ([r["id"] for r in rows],)) if rows else []
+        return rows, [m for m in members if m["removed_at"] is None]
+    return _shared("schedules", compute)
+
+
+def _group_stats() -> dict:
+    """Each ingestion group's run-time percentiles and strictest freshness target, shared like _states."""
+    def compute():
+        names = sorted({s["task_collection"] for s in _states()})
+        rows = db.query(q.collection_run_stats_sql(), (names, names, names, names)) if names else []
+        return {r["task_collection"]: r for r in rows}
+    return _shared("group_stats", compute, ttl=STATES_CACHE_S)
+
+
+def _group_runs(groups: List[str], start: datetime, end: datetime) -> List[dict]:
+    """The group runs of some groups that started in [start, end), with their work and outcome."""
+    return _with_rows_written(db.query(q.group_runs_sql(), (sorted(groups), start, end))) if groups else []
+
+
+def _schedule(job_id: int) -> dict:
+    schedules, _ = _schedules()
+    found = next((s for s in schedules if s["id"] == int(job_id)), None)
+    if not found:
+        raise HTTPException(404, f"ingestion job {job_id} not found")
+    return found
+
+
+def _job_runs_of(job: dict, start: datetime, end: datetime, now: datetime) -> List[dict]:
+    """A job's job runs whose slot started in [start, end), newest first, as ij.summarize shows them, with
+    their placed members. Runs are read from one cadence before `start`, for skipped triggers."""
+    _, members = _schedules()
+    mine = [m for m in members if m["schedule_id"] == job["id"]]
+    cadence = int(job["cadence_minutes"])
+    runs = _group_runs([m["task_collection"] for m in mine], start - timedelta(minutes=cadence), end + timedelta(minutes=cadence))
+    placed = [jr for jr in ij.place(job, mine, runs, start, end + timedelta(minutes=cadence), now)
+              if start <= jr["slot"] < end and jr["slot"] <= now]
+    running = {r["run_id"]: r for r in _running()}
+    tables = {name: g["enabled_tables"] for name, g in rollup.groups(_states()).items()}
+    p50 = {g: st.get("p50_s") for g, st in _group_stats().items()}
+    return [dict(ij.summarize(job, jr, running, tables, p50, now), placed=jr) for jr in placed]
+
+
+def _jobs_view() -> dict:
+    """ingestion_jobs.jobs_view over the shared reads, with each failing job's causes from its latest job run
+    with failed tables; shared like _running."""
+    def compute():
+        now = datetime.now(timezone.utc)
+        schedules, members = _schedules()
+        states, running, stats = _states(), _running(), _group_stats()
+        groups = sorted({m["task_collection"] for m in members})
+        start = min((ij.window(int(s["cadence_minutes"]), ij.RECENT_JOB_RUNS + 1, now) for s in schedules), default=now)
+        runs = _group_runs(groups, start, now + timedelta(seconds=1))
+        view = ij.jobs_view(schedules, members, states, running, runs, stats, now)
+        causes = {}
+        for job in view["jobs"]:
+            latest = next((jr for jr in (job["running_job_run"], job["last_job_run"]) if jr and jr["failed_tables"]), None)
+            if job["state_failing"] and latest and latest["run_ids"]:
+                causes[job["id"]] = q.group_errors(db.query(q.run_failures_sql(), (latest["run_ids"],)))
+        if causes:
+            view = ij.jobs_view(schedules, members, states, running, runs, stats, now, causes_by_job=causes)
+        return view
+    return _shared("jobs_view", compute)
+
+
+JOB_FILTERS = ("all", "running", "failing", "late", "paused")
+
+
+def _job_filter(job: dict, name: str) -> bool:
+    return {"all": True, "running": bool(job.get("running_job_run")), "failing": bool(job["state_failing"]),
+            "late": bool(job["state_late"]), "paused": bool(job.get("paused"))}[name]
+
+
+@app.get("/api/ingestion-jobs")
+def ingestion_jobs(filter: str = "all", search: str = "", offset: int = 0, limit: int = 25):
+    """Every ingestion job, as on the Overview, filtered (each filter with its count) and searched on job and
+    group names, a page at a time. "Not in any job" is listed last, under All."""
+    if filter not in JOB_FILTERS:
+        raise HTTPException(400, f"filter must be one of {', '.join(JOB_FILTERS)}")
+    view = _jobs_view()
+    needle = search.strip().lower()
+    found = [j for j in view["jobs"]
+             if not needle or needle in str(j["name"]).lower() or any(needle in g.lower() for g in j["groups"])]
+    counts = {f: sum(1 for j in found if _job_filter(j, f)) for f in JOB_FILTERS}
+    rows = [j for j in found if _job_filter(j, filter)]
+    not_in_job = view["not_in_job"]
+    if filter == "all" and not_in_job and (not needle or any(needle in g.lower() for g in not_in_job["groups"])):
+        rows = rows + [dict(not_in_job, status={"label": "Not in any job", "tone": "neutral", "detail": [], "cause": None})]
+    offset, limit = max(0, int(offset)), max(1, min(int(limit), 100))
+    return {"jobs": rows[offset:offset + limit], "total": len(rows), "offset": offset, "limit": limit,
+            "counts": counts, "read_at": _read_at("jobs_view"), "cache_s": MONITOR_CACHE_S}
+
+
+@app.get("/api/ingestion-jobs/{job_id}")
+def ingestion_job(job_id: int):
+    """One ingestion job's details: its schedule and members (wrapper jobs, next starts), its tables by
+    state, its last finished job run, the median speed over its last 24 job runs, its p95 job run time over
+    7 days, and its groups with their last group run and p95 run time. Job runs are placed once over 7 days;
+    the speed is over the newest 24 finished ones."""
+    job = _schedule(job_id)
+    now = datetime.now(timezone.utc)
+    _, members = _schedules()
+    mine = [m for m in members if m["schedule_id"] == job["id"]]
+    sums = next(j for j in rollup.jobs(_states(), [job], members)[0])
+    stats, last_runs = _group_stats(), _last_runs()
+    cadence = int(job["cadence_minutes"])
+    finished = [r for r in _job_runs_of(job, now - timedelta(days=7), now + timedelta(seconds=1), now)
+                if r["outcome"]["label"] != "Running"]
+    week = [r["took_s"] for r in finished if r["took_s"] is not None]
+    groups = rollup.groups(_states())
+    group_rows = []
+    for m in sorted(mine, key=lambda m: (m["offset_minutes"], m["task_collection"])):
+        g, st, last = groups.get(m["task_collection"]) or {}, stats.get(m["task_collection"]) or {}, last_runs.get(m["task_collection"])
+        group_rows.append({"task_collection": m["task_collection"], "offset_minutes": m["offset_minutes"],
+                           **{k: g.get(k) for k in ("databases", "enabled_tables") + rollup.STATES},
+                           "last_run": dict(last, outcome=q.run_outcome(last)) if last else None,
+                           "p95_s": st.get("p95_s"), "p50_s": st.get("p50_s"),
+                           "job_url": (f"{db.workspace().config.host.rstrip('/')}/jobs/{m['job_id']}"
+                                       if m.get("job_id") else None)})
+    speeds = sorted(r["speed_tables_per_min"] for r in finished[:24] if r["speed_tables_per_min"] is not None)
+    offsets = [m["offset_minutes"] for m in mine]
+    return {**{k: v for k, v in sums.items()}, "description": sch.describe(cadence, 0, job.get("timezone") or "UTC"),
+            "stagger_from": min(offsets) if offsets else None, "stagger_to": max(offsets) if offsets else None,
+            "parameters": job.get("parameters"), "job_variant": job.get("job_variant"), "paused": job.get("paused"),
+            "last_job_run": {k: v for k, v in finished[0].items() if k != "placed"} if finished else None,
+            "median_speed_tables_per_min": speeds[len(speeds) // 2] if speeds else None, "speed_job_runs": len(speeds),
+            "p95_took_s": sorted(week)[min(len(week) - 1, int(0.95 * len(week)))] if week else None,
+            "groups_detail": group_rows, "read_at": now.isoformat()}
+
+
+@app.get("/api/ingestion-jobs/{job_id}/runs")
+def ingestion_job_runs(job_id: int, before: Optional[str] = None, limit: int = 25):
+    """A job's job runs, newest first, `limit` slots before `before` (now when not given); `next_before` is
+    the oldest slot shown, for the next page. Placed by the job's current schedule."""
+    job = _schedule(job_id)
+    now = datetime.now(timezone.utc)
+    end = datetime.fromisoformat(before) if before else now + timedelta(seconds=1)
+    limit = max(1, min(int(limit), 100))
+    runs = _job_runs_of(job, end - timedelta(minutes=int(job["cadence_minutes"]) * limit), end, now)
+    return {"job_runs": [{k: v for k, v in r.items() if k != "placed"} for r in runs[:limit]],
+            "next_before": runs[-1]["slot"] if len(runs) >= limit else None, "job_id": job["id"], "job_name": job["name"]}
+
+
+@app.get("/api/ingestion-jobs/{job_id}/runs/{slot}")
+def ingestion_job_run(job_id: int, slot: str):
+    """One job run: its summary (progress over all the job's tables, speed, expected end), its group runs
+    (members, waiting ones with their start), its databases (failing first) and its failures by cause, with
+    how many job runs before it also had failed tables."""
+    job = _schedule(job_id)
+    now = datetime.now(timezone.utc)
+    at = datetime.fromisoformat(slot)
+    cadence = int(job["cadence_minutes"])
+    runs = _job_runs_of(job, at - timedelta(minutes=cadence * ij.RECENT_JOB_RUNS), at + timedelta(seconds=1), now)
+    found = next((r for r in runs if r["slot"] == at.isoformat()), None)
+    if not found:
+        raise HTTPException(404, f"no job run of {job['name']} at {slot}")
+    earlier = [r for r in runs if r["slot"] < found["slot"]]
+    running = {r["run_id"]: r for r in _running()}
+    tables = {name: g["enabled_tables"] for name, g in rollup.groups(_states()).items()}
+    ids = found["run_ids"]
+    return {**{k: v for k, v in found.items() if k != "placed"},
+            "group_runs": ij.member_views(found["placed"], running, tables, now),
+            "databases": db.query(q.job_run_databases_sql(), (ids,)) if ids else [],
+            "failures": q.group_errors(db.query(q.run_failures_sql(), (ids,))) if ids and found["failed_tables"] else [],
+            "failed_before": ij.consecutive_failed(earlier), "cadence_minutes": cadence, "paused": job.get("paused"),
+            "read_at": now.isoformat(), "cache_s": MONITOR_CACHE_S}
+
+
+@app.get("/api/job-runs")
+def job_runs_across(job: Optional[str] = None, outcome: Optional[str] = None, before: Optional[str] = None,
+                    limit: int = 25):
+    """Job runs of every job (or one, by id), running first, then newest first, `limit` a page before
+    `before`, with outcome counts over the page's window. job=none lists the group runs of the groups in no
+    job instead, with today's run columns."""
+    now = datetime.now(timezone.utc)
+    end = datetime.fromisoformat(before) if before else now + timedelta(seconds=1)
+    limit = max(1, min(int(limit), 100))
+    schedules, members = _schedules()
+    if job == "none":
+        scheduled = {m["task_collection"] for m in members}
+        unscheduled = sorted({s["task_collection"] for s in _states()} - scheduled)
+        sql, params = q.runs_sql(None, limit=500)
+        rows = [r for r in _with_rows_written(db.query(sql, params))
+                if r["task_collection"] in unscheduled and (not before or str(r["started_at"]) < before)][:limit]
+        return {"group_runs": rows, "job_runs": [], "counts": {}, "next_before": rows[-1]["started_at"] if len(rows) >= limit else None}
+    chosen = [s for s in schedules if job is None or str(s["id"]) == str(job)]
+    found = []
+    for s in chosen:
+        found += _job_runs_of(s, end - timedelta(minutes=int(s["cadence_minutes"]) * limit), end, now)
+    found.sort(key=lambda r: r["slot"], reverse=True)
+    window_rows = found
+    counts = {}
+    for r in window_rows:
+        counts[r["outcome"]["label"]] = counts.get(r["outcome"]["label"], 0) + 1
+    if outcome:
+        found = [r for r in found if r["outcome"]["label"] == outcome]
+    running = [r for r in found if r["outcome"]["label"] == "Running"]
+    rest = [r for r in found if r["outcome"]["label"] != "Running"][:limit]
+    return {"job_runs": [{k: v for k, v in r.items() if k != "placed"} for r in running + rest],
+            "counts": counts, "next_before": rest[-1]["slot"] if len(rest) >= limit else None,
+            "jobs": [{"id": s["id"], "name": s["name"]} for s in schedules]}
+
+
 # ---- runs ---------------------------------------------------------------------------------------
 
 @app.get("/api/runs")
@@ -260,6 +469,8 @@ def run_detail(run_id: int):
     if not found:
         raise HTTPException(404, f"run {run_id} not found")
     run = found[0]
+    schedules, members = _schedules()
+    run["job_runs"] = ij.job_runs_of_run(run, schedules, members)
     if run["status"] == "running":
         progress = next((r for r in _running() if r["run_id"] == run["run_id"]), None)
         now = datetime.now(timezone.utc)

@@ -104,3 +104,39 @@ def tracked(states: Iterable[dict], name: str, host: Optional[str]) -> dict:
     dbs = connection_databases(states, name, host)
     group_names = {g.strip() for d in dbs for g in d["collections"].split(",") if g.strip()}
     return {"databases": len(dbs), "tables": sum(d["tables"] for d in dbs), "collections": len(group_names)}
+
+
+def _job_sums(name_fields: dict, group_names, states: List[dict]) -> dict:
+    rows = [s for s in states if s["task_collection"] in group_names]
+    out = {**name_fields, "groups": sorted(group_names), "enabled_tables": 0, "no_sla_tables": 0,
+           **{k: 0 for k in STATES}, "newest_success_at": None}
+    databases, server_names = set(), set()
+    for s in rows:
+        out["enabled_tables"] += _count(s, "tables")
+        out["no_sla_tables"] += _count(s, "no_sla_tables")
+        for k in STATES:
+            out[k] += _count(s, k)
+        if _count(s, "tables"):
+            databases.add((s["server"], s["src_database"]))
+            server_names.add(s["server"])
+        out["newest_success_at"] = _later(out["newest_success_at"], s.get("newest_success_at"))
+    out["databases"], out["servers"] = len(databases), len(server_names)
+    return out
+
+
+def jobs(states: Iterable[dict], schedules: Iterable[dict], members: Iterable[dict]):
+    """Per ingestion job (a schedule), in the schedules' order: its member groups (active members only) and
+    their enabled tables, tables by state, databases and servers. A group in two jobs adds to both. Then
+    the groups in no job, summed the same way as "Not in any job", or None when every group is in one."""
+    states = list(states)
+    schedules = list(schedules)
+    active: Dict[int, set] = {}
+    for m in members:
+        if m.get("removed_at") is None:
+            active.setdefault(m["schedule_id"], set()).add(m["task_collection"])
+    out = [_job_sums({k: s.get(k) for k in ("id", "name", "cadence_minutes", "timezone", "paused", "updated_at",
+                                             "parameters", "job_variant", "stagger")},
+                     active.get(s["id"], set()), states) for s in schedules]
+    scheduled = set().union(*(active.get(s["id"], set()) for s in schedules)) if schedules else set()
+    unscheduled = {s["task_collection"] for s in states} - scheduled
+    return out, (_job_sums({"id": None, "name": "Not in any job"}, unscheduled, states) if unscheduled else None)

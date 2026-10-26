@@ -75,3 +75,30 @@ def test_reseeds_already_queued_are_not_left_to_go():
     progress = dict(enabled_tables=100, tables_checked=90, tables_skipped=10, tables_running=0, tables_failed=0,
                     ok_last_5m=5, work_started_at=NOW - timedelta(minutes=10), elapsed_s=600, p50_s=900)
     assert q.time_left(progress, NOW) == {"seconds": 0, "basis": "rate"}
+
+
+def _member(state, run=None, fire=NOW, group="g"):
+    return dict(task_collection=group, state=state, run=run, fire_at=fire, extra=[])
+
+
+def test_a_job_run_is_the_worst_of_its_group_runs_and_running_while_a_member_waits():
+    done = _member("run", dict(status="completed", failed=0))
+    with_failures = _member("run", dict(status="failed", failed=2))
+    closed = _member("run", dict(status="failed", failed=0, detail=json.dumps({"closed_by_run": 5})))
+    assert q.job_run_outcome([done, with_failures])["label"] == "Completed with failures"
+    assert q.job_run_outcome([done, with_failures, closed])["label"] == "Ended without finishing"
+    assert q.job_run_outcome([done, _member("waiting")])["label"] == "Running"
+    assert q.job_run_outcome([done, _member("run", dict(status="running"))])["label"] == "Running"
+    counted = q.job_run_outcome([done, _member("skipped"), _member("run", dict(status="skipped")), _member("no run")])
+    assert (counted["label"], counted["note"]) == ("Completed", "1 of 4 group runs, 2 skipped, 1 no run")
+    assert q.job_run_outcome([_member("no run"), _member("no run")])["label"] == "Not run"
+
+
+def test_a_job_runs_expected_end_is_its_latest_members():
+    running = _member("run", dict(status="running", run_id=7), group="a")
+    waiting = _member("waiting", fire=NOW + timedelta(minutes=30), group="b")
+    progress = {7: dict(enabled_tables=100, tables_checked=50, ok_last_5m=50, work_started_at=NOW - timedelta(minutes=10),
+                        elapsed_s=700, p50_s=900)}
+    assert q.job_run_expected_end([running, waiting], progress, {"b": 600}, NOW) == NOW + timedelta(minutes=40)
+    assert q.job_run_expected_end([running], progress, {}, NOW) == NOW + timedelta(minutes=5)
+    assert q.job_run_expected_end([_member("run", dict(status="completed"))], {}, {}, NOW) is None

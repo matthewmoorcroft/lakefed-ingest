@@ -149,6 +149,64 @@ def next_run(cadence: int, offset: int, tz: str, after: datetime) -> datetime:
     return fire_times(cadence, offset, tz, after, after + timedelta(days=2))[0]
 
 
+# ---- job runs: a schedule's group runs, placed by cadence slot ------------------------------------
+
+def _when(value) -> Optional[datetime]:
+    """A timestamp as an aware datetime: lakebase.query sends them as ISO text."""
+    return datetime.fromisoformat(value) if isinstance(value, str) else value
+
+
+def slot_of(fire: datetime, offset: int, tz: str) -> datetime:
+    """The job run a member's trigger belongs to: its fire time less the member's offset, on the wall clock
+    of the schedule's time zone, so every member of one trigger shares it across a daylight saving change."""
+    local = fire.astimezone(ZoneInfo(tz or "UTC"))
+    return (local - timedelta(minutes=offset)).astimezone(timezone.utc)
+
+
+def job_runs(cadence: int, tz: str, members: List[dict], runs: List[dict], start: datetime, end: datetime,
+             now: datetime) -> List[dict]:
+    """A schedule's job runs whose triggers fall in [start, end), newest first, each with one entry per
+    member then: its trigger time, its group run and any extra runs, and its state.
+
+    A group run belongs to its member's latest trigger at or before its start; the first in a slot is the
+    slot's run and later ones are extra (started by hand, most likely). A member with no run is waiting when
+    its trigger is still ahead, skipped when its group's previous run was still going at the trigger (wrapper
+    jobs allow one run and don't queue), else "no run". Only triggers and runs while the member belonged to
+    the schedule count. `runs` may start before `start`: earlier runs are only read for skipped triggers."""
+    by_group: Dict[str, List[dict]] = {}
+    for r in sorted(runs, key=lambda r: _when(r["started_at"])):
+        by_group.setdefault(r["task_collection"], []).append(r)
+    slots: Dict[datetime, List[dict]] = {}
+    for m in members:
+        group, offset = m["task_collection"], int(m["offset_minutes"])
+        added, removed = _when(m.get("added_at")), _when(m.get("removed_at"))
+        fires = fire_times(cadence, offset, tz, start, end)
+        if not fires:
+            continue
+        fires.append(next_run(cadence, offset, tz, fires[-1] + timedelta(seconds=1)))
+        history = by_group.get(group, [])
+        member_runs = [r for r in history if (added is None or _when(r["started_at"]) >= added)
+                       and (removed is None or _when(r["started_at"]) < removed)]
+        for fire, following in zip(fires, fires[1:]):
+            if (added is not None and fire < added) or (removed is not None and fire >= removed):
+                continue
+            in_slot = [r for r in member_runs if fire <= _when(r["started_at"]) < following]
+            if in_slot:
+                state = "run"
+            elif fire > now:
+                state = "waiting"
+            elif any(_when(r["started_at"]) < fire and r.get("status") != "skipped"
+                     and (r.get("finished_at") is None or _when(r["finished_at"]) > fire) for r in history):
+                state = "skipped"
+            else:
+                state = "no run"
+            slots.setdefault(slot_of(fire, offset, tz), []).append(
+                {"task_collection": group, "offset_minutes": offset, "fire_at": fire, "state": state,
+                 "run": in_slot[0] if in_slot else None, "extra": in_slot[1:]})
+    return [{"slot": slot, "members": sorted(entries, key=lambda e: (e["offset_minutes"], e["task_collection"]))}
+            for slot, entries in sorted(slots.items(), reverse=True)]
+
+
 # ---- wrapper job settings and drift -------------------------------------------------------------
 
 def job_name(schedule_name: str, collection: str) -> str:

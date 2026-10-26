@@ -46,3 +46,23 @@ def test_a_connection_matches_by_name_or_host_case_insensitively():
     assert [d["src_database"] for d in rollup.connection_databases(rows, "other", "SQL-W.example.com")] == ["Ops"]
     assert rollup.tracked(rows, "hr_conn", "") == {"databases": 1, "tables": 4, "collections": 1}
     assert rollup.connection_databases(rows, "nothing", "") == []
+
+
+SCHEDULES = [dict(id=1, name="East hourly", cadence_minutes=60, timezone="UTC", paused=False),
+             dict(id=2, name="Nightly", cadence_minutes=1440, timezone="UTC", paused=True)]
+MEMBERS = [dict(schedule_id=1, task_collection="c1", offset_minutes=0, removed_at=None),
+           dict(schedule_id=2, task_collection="c1", offset_minutes=0, removed_at=None),
+           dict(schedule_id=2, task_collection="c2", offset_minutes=30, removed_at="2026-10-01T00:00:00+00:00"),
+           dict(schedule_id=2, task_collection="c3", offset_minutes=10, removed_at=None)]
+
+
+def test_a_group_in_two_jobs_adds_to_both_and_one_in_no_job_is_not_in_any_job():
+    states = STATES + [state("srvZ", "c3", "Ops", tables=5, current=5)]
+    jobs, not_in_job = rollup.jobs(states, SCHEDULES, MEMBERS)
+    by_name = {j["name"]: j for j in jobs}
+    assert (by_name["East hourly"]["enabled_tables"], by_name["East hourly"]["databases"]) == (5, 2)
+    assert (by_name["Nightly"]["enabled_tables"], by_name["Nightly"]["databases"], by_name["Nightly"]["servers"]) == (10, 3, 3)
+    assert by_name["Nightly"]["groups"] == ["c1", "c3"] and by_name["Nightly"]["state_late"] == 1
+    assert not_in_job["groups"] == ["c2"] and (not_in_job["enabled_tables"], not_in_job["state_failing"]) == (4, 2)
+    assert rollup.jobs(STATES, SCHEDULES, MEMBERS + [dict(schedule_id=1, task_collection="c2", offset_minutes=30,
+                                                          removed_at=None)])[1] is None

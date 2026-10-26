@@ -8,7 +8,8 @@ import queries as q
 
 MONITORING_SQL = (q.servers_sql(), q.collection_databases_sql(), q.collection_database_rows_sql(),
                   q.run_databases_sql(), q.run_rows_sql(), q.run_batch_rows_sql(), q.collection_batch_runs_sql(),
-                  q.connection_databases_sql(), q.in_flight_sql(), q.in_flight_count_sql(), q.run_events_sql())
+                  q.connection_databases_sql(), q.in_flight_sql(), q.in_flight_count_sql(), q.run_events_sql(),
+                  q.group_runs_sql(), q.job_run_databases_sql(), q.run_failures_sql())
 
 
 def test_monitoring_statements_are_parameterized_and_schema_qualified():
@@ -21,6 +22,7 @@ def test_monitoring_statements_are_parameterized_and_schema_qualified():
     assert q.failed_tables_sql().count("%s") == 2
     assert q.connection_databases_sql().count("%s") == 2
     assert (q.in_flight_sql().count("%s"), q.in_flight_count_sql().count("%s")) == (2, 1)
+    assert (q.group_runs_sql().count("%s"), q.job_run_databases_sql().count("%s"), q.run_failures_sql().count("%s")) == (3, 1, 1)
     assert q.run_events_sql().endswith(f"limit {q.RUN_EVENTS_LIMIT}")
 
 
@@ -199,12 +201,12 @@ def api(monkeypatch):
     return TestClient(main.app)
 
 
-def test_overview_sums_the_shared_reads_into_groups_servers_and_progress(api):
+def test_overview_sums_the_shared_reads_into_jobs_and_groups_in_no_job(api):
     data = api.get("/api/overview").json()
-    c1 = data["collections"][0]
-    assert (c1["task_collection"], c1["enabled_tables"], c1["databases"], c1["last_run_id"]) == ("c1", 8, 2, 9)
-    assert data["running"][0]["tables_checked"] == 4 and data["running"][0]["server"] == "s1"
-    assert data["servers"][0]["server"] == "s1" and data["servers"][0]["running_collections"] == 1
+    assert data["jobs"] == [] and data["not_in_job"]["groups"] == ["c1", "c2"]
+    assert (data["not_in_job"]["enabled_tables"], data["not_in_job"]["databases"]) == (10, 2)
+    assert [r["run_id"] for r in data["running_not_in_job"]] == [9]
+    assert data["totals"]["enabled_tables"] == 10 and data["totals"]["servers"] == 1
 
 
 def test_collection_databases_merge_rows_and_place_a_batch_on_its_one_database(api):

@@ -6,6 +6,7 @@ Skipped unless LAKEFED_APP_TEST_PG names a Postgres server (a libpq URI to any d
 the test may create and drop its own database, for example a local pgserver."""
 import json
 import os
+from datetime import datetime, timedelta, timezone
 import sys
 import uuid
 from pathlib import Path
@@ -209,3 +210,24 @@ def test_the_typical_run_leaves_out_runs_another_run_closed_and_reseeds_queued_a
                    "from lakefed_ingest.control where src_database = 'db2' and src_table = 't10'")
         found = {r["run_id"]: r for r in rows(pg, q.running_progress_sql())}[2]
     assert found["p50_s"] == 0 and found["tables_skipped"] == 1
+
+
+def test_a_job_runs_databases_list_failing_first_and_keep_two_servers_apart(pg):
+    with pg.transaction(force_rollback=True):
+        pg.execute("update lakefed_ingest.control set source_instance_group = 'srv2' where src_database = 'db1' "
+                   "and src_table = 't1'")
+        pg.execute("insert into lakefed_ingest.ingest_event (run_id, task_collection, control_id, src_database, "
+                   "src_schema, src_table, action, status, started_at, finished_at, rows_merged) select 1, 'c1', id, "
+                   "src_database, src_schema, src_table, 'increment', 'ok', now(), now(), 3 "
+                   "from lakefed_ingest.control where src_database = 'db1' and src_table = 't1'")
+        found = rows(pg, q.job_run_databases_sql(), ([1, 2],))
+        failures = rows(pg, q.run_failures_sql(), ([1, 2],))
+    assert (found[0]["src_database"], found[0]["failed"]) == ("db2", 1)
+    assert sorted((d["server"], d["task_collection"]) for d in found if d["src_database"] == "db1") == [("srv1", "c1"), ("srv2", "c1")]
+    assert [(f["src_table"], f["server"]) for f in failures] == [("t9", "srv1")]
+
+
+def test_group_runs_in_a_window_oldest_first(pg):
+    found = rows(pg, q.group_runs_sql(), (["c1"], datetime.now(timezone.utc) - timedelta(days=4),
+                                          datetime.now(timezone.utc)))
+    assert [r["run_id"] for r in found] == [1, 2] and "cluster_id" in found[0]
