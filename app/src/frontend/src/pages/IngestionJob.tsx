@@ -3,7 +3,7 @@ import { useQuery } from "@tanstack/react-query";
 import { Link, useParams } from "react-router-dom";
 import { api, qs, type Row } from "../api";
 import {
-  ErrorBox, PageHead, RunStatus, Section, StateBar, StateKey, fmtClock, fmtDuration, fmtInt, fmtSpeed, jobRunPath, plural
+  ErrorBox, Name, PageHead, RunStatus, Section, StateBar, StateKey, fmtClock, fmtDuration, fmtInt, fmtSpeed, jobRunPath, plural
 } from "../components";
 
 const PAGE = 25;
@@ -14,7 +14,7 @@ export const rowsText = (r: Row) => (r.rows_partial ? `at least ${fmtInt(r.rows_
 /** One row per job run: outcome, group runs, took, tables loaded, speed, rows written, parallelism, clusters, failed. */
 export function JobRunsTable({ runs, showJob }: { runs: Row[]; showJob?: boolean }) {
   return (
-    <table className="data">
+    <div className="table-wrap"><table className="data dense">
       <thead><tr><th>Job run</th>{showJob && <th>Ingestion job</th>}<th>Outcome</th><th className="num">Group runs</th>
         <th className="num">Took</th><th className="num">Tables loaded</th><th className="num">Tables/min</th>
         <th className="num">Rows written</th><th className="num">Parallelism</th><th className="num">Clusters</th>
@@ -23,7 +23,7 @@ export function JobRunsTable({ runs, showJob }: { runs: Row[]; showJob?: boolean
         {runs.map((r) => (
           <tr key={`${r.job_id}-${r.slot}`}>
             <td className="name"><Link to={jobRunPath(r.job_id, r.slot)}>{new Date(r.slot).toLocaleString([], { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" })}</Link></td>
-            {showJob && <td className="name"><Link to={`/ingestion-jobs/${r.job_id}`}>{r.job_name}</Link></td>}
+            {showJob && <td className="name"><Link to={`/ingestion-jobs/${r.job_id}`}><Name>{r.job_name}</Name></Link></td>}
             <td><RunStatus status={null} outcome={r.outcome} />{r.outcome?.note && <span className="sub">{r.outcome.note}</span>}</td>
             <td className="num">{fmtInt(r.ran)} of {fmtInt(r.members)}{Number(r.extra) > 0 && <span className="sub">{fmtInt(r.extra)} extra</span>}</td>
             <td className="num">{r.took_s != null ? fmtDuration(r.took_s) : r.running_s != null ? `${fmtDuration(r.running_s)} so far` : ""}</td>
@@ -36,7 +36,7 @@ export function JobRunsTable({ runs, showJob }: { runs: Row[]; showJob?: boolean
         ))}
         {!runs.length && <tr><td colSpan={showJob ? 11 : 10} className="muted">No job runs in this window.</td></tr>}
       </tbody>
-    </table>
+    </table></div>
   );
 }
 
@@ -91,7 +91,7 @@ export default function IngestionJob() {
       </Section>
       {j && (
         <Section title={`Ingestion groups: ${fmtInt(j.groups_detail.length)}`} actions={<StateKey />}>
-          <table className="data">
+          <div className="table-wrap"><table className="data">
             <thead><tr><th>Ingestion group</th><th className="num">Starts at</th><th className="num">Databases</th><th className="num">Tables</th>
               <th>State now</th><th className="num">Failing</th><th>Last group run</th><th className="num">p95 run time</th><th>Wrapper job</th></tr></thead>
             <tbody>
@@ -108,7 +108,7 @@ export default function IngestionJob() {
                 </tr>
               ))}
             </tbody>
-          </table>
+          </table></div>
         </Section>
       )}
     </>

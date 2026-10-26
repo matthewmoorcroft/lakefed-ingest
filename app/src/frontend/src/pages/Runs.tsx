@@ -18,15 +18,15 @@ const COLUMNS: ColDef[] = [
     valueFormatter: (p) => (p.value ? new Date(p.value).toLocaleString([], { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" }) : "") },
   { field: "duration_s", headerName: "Took", type: "rightAligned", minWidth: 80,
     valueFormatter: (p) => (p.value === null || p.value === undefined ? "" : fmtDuration(p.value)) },
-  { colId: "worked", headerName: "Worked", type: "rightAligned", valueGetter: (p) => worked(p.data), valueFormatter: (p) => fmtInt(p.value) },
-  { field: "skipped", headerName: "Unchanged", minWidth: 100, type: "rightAligned", valueFormatter: (p) => fmtInt(p.value) },
+  { colId: "worked", headerName: "Worked", type: "rightAligned", minWidth: 90, valueGetter: (p) => worked(p.data), valueFormatter: (p) => fmtInt(p.value) },
+  { field: "skipped", headerName: "Unchanged", minWidth: 110, type: "rightAligned", valueFormatter: (p) => fmtInt(p.value) },
   { field: "failed", headerName: "Failed", type: "rightAligned", minWidth: 80, valueFormatter: (p) => fmtInt(p.value),
     cellStyle: (p) => (Number(p.value) ? { color: "var(--bad)", fontWeight: 600 } : null) },
-  { field: "rows_written", headerName: "Rows written", type: "rightAligned", minWidth: 110,
+  { field: "rows_written", headerName: "Rows written", type: "rightAligned", minWidth: 120,
     valueFormatter: (p) => (p.data?.rows_partial ? `at least ${fmtInt(p.value)}` : fmtInt(p.value)) },
-  { field: "speed_tables_per_min", headerName: "Tables/min", type: "rightAligned", minWidth: 95,
+  { field: "speed_tables_per_min", headerName: "Tables/min", type: "rightAligned", minWidth: 105,
     valueFormatter: (p) => (p.value === null || p.value === undefined ? "" : fmtSpeed(p.value)) },
-  { field: "parallelism", headerName: "Parallelism", type: "rightAligned", minWidth: 100 },
+  { field: "parallelism", headerName: "Parallelism", type: "rightAligned", minWidth: 110 },
 ];
 
 const PAGE = 25;
@@ -72,7 +72,7 @@ export default function Runs() {
         <Section title="Group runs of groups in no job" note={<>Started by Run now on Databricks jobs, or by the Databricks job's own schedule.
           Speed: tables loaded a minute, from the first table's start to the last one's finish. Took is blank for a run another
           run closed: it ended without finishing. Rows written: "at least" when some loads recorded none.</>}>
-          <Grid rows={d?.group_runs} columns={COLUMNS} getRowId={(r) => String(r.run_id)} options={{ autoSizeStrategy: { type: "fitGridWidth" } }} />
+          <Grid rows={d?.group_runs} columns={COLUMNS.map((c) => ({ ...c, filter: false }))} getRowId={(r) => String(r.run_id)} options={{ autoSizeStrategy: { type: "fitGridWidth" } }} />
         </Section>
       ) : (
         <>

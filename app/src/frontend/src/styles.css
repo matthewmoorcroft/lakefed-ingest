@@ -216,7 +216,8 @@ label.changed input, label.changed select { border-color: var(--accent); }
 /* Ingestion jobs: status cells, pagers, filter chips, attention rows */
 .status-cell { display: flex; flex-direction: column; align-items: flex-start; gap: 2px; min-width: 150px; }
 .status-cell .sub { font-size: var(--db-font-size-sm); color: var(--muted); }
-table.data td.name, table.data td.name b, table.data td.name a { white-space: nowrap; }
+.word { white-space: nowrap; }
+table.data td.name { min-width: 140px; }
 .pager { display: flex; align-items: center; justify-content: space-between; gap: var(--db-space-3); flex-wrap: wrap; margin: var(--db-space-2) 0; }
 .pager-buttons { display: inline-flex; gap: var(--db-space-2); }
 .chips { display: inline-flex; flex-wrap: wrap; gap: var(--db-space-2); }
@@ -228,3 +229,4 @@ table.data td.name, table.data td.name b, table.data td.name a { white-space: no
 .attention-row .example { display: block; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .metric-value.small-value { font-size: var(--db-font-size-md); }
 .stamp.stale { color: var(--bad); font-weight: var(--db-font-weight-semibold); max-width: 420px; display: inline-block; }
+table.data.dense th, table.data.dense td { padding-left: var(--db-space-2); padding-right: var(--db-space-2); }

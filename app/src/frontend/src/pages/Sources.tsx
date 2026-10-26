@@ -2,7 +2,7 @@ import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { Link } from "react-router-dom";
 import { api, type Row } from "../api";
-import { ErrorBox, Host, Notice, PageHead, Section, Stamp, StateBar, StateKey, fmtAgo, fmtInt, plural } from "../components";
+import { ErrorBox, Host, Name, Notice, PageHead, Section, Stamp, StateBar, StateKey, fmtAgo, fmtInt, plural } from "../components";
 
 /** How an instance is read: its UC connections (name, type, host) or its JDBC hosts. */
 function ReadVia({ via }: { via: Row[] }) {
@@ -29,7 +29,7 @@ export default function Sources() {
       <ErrorBox error={found.error} />
       {d?.connections_error && <Notice tone="warn">UC connections could not be listed, so connections with nothing registered are missing: {d.connections_error}</Notice>}
       <Section title={`Instances: ${fmtInt(instances.length)}`} actions={<StateKey />}>
-        <table className="data">
+        <div className="table-wrap"><table className="data">
           <thead><tr><th>Instance</th><th className="num">Jobs</th><th className="num">Groups</th><th className="num">Databases</th>
             <th className="num">Tables</th><th>State now</th><th className="num">Failing</th><th className="num">Not ingested yet</th></tr></thead>
           <tbody>
@@ -45,18 +45,18 @@ export default function Sources() {
             ))}
             {d && !instances.length && <tr><td colSpan={8} className="muted">No instances: nothing is registered and no UC connection is readable.</td></tr>}
           </tbody>
-        </table>
+        </table></div>
       </Section>
       {pick && (
         <>
           <Section title={`${pick.server || "(no server)"}: its ingestion jobs`} note="Jobs only: a job's groups and their databases are on the job's own page.">
-            <table className="data">
+            <div className="table-wrap"><table className="data">
               <thead><tr><th>Ingestion job</th><th className="num">Groups</th><th className="num">Databases</th><th className="num">Tables</th>
                 <th>State now</th><th>Now</th></tr></thead>
               <tbody>
                 {pick.jobs.map((j: Row) => (
                   <tr key={j.id ?? "none"}>
-                    <td className="name">{j.id != null ? <Link to={`/ingestion-jobs/${j.id}`}><b>{j.name}</b></Link> : <b>Not in any job</b>}</td>
+                    <td className="name">{j.id != null ? <Link to={`/ingestion-jobs/${j.id}`}><b><Name>{j.name}</Name></b></Link> : <b>Not in any job</b>}</td>
                     <td className="num">{fmtInt(j.groups.length)}</td><td className="num">{fmtInt(j.databases)}</td><td className="num">{fmtInt(j.enabled_tables)}</td>
                     <td><StateBar row={j} /></td>
                     <td>{j.paused ? `paused${Number(j.state_late) ? `, ${fmtInt(j.state_late)} late` : ""}` : j.id == null ? "run by hand or by the Databricks job" : j.description ?? ""}</td>
@@ -64,11 +64,11 @@ export default function Sources() {
                 ))}
                 {!pick.jobs.length && <tr><td colSpan={6} className="muted">No ingestion job reads this instance.</td></tr>}
               </tbody>
-            </table>
+            </table></div>
           </Section>
           <Section title="Not ingested yet" note="Per database discovered on this instance's hosts: tables found by its latest discovery that have no control row. Databases never discovered can't be listed without querying the server."
             actions={<Link to="/bulk">Review on Bulk import</Link>}>
-            <table className="data">
+            <div className="table-wrap"><table className="data">
               <thead><tr><th>Database</th><th className="num">Discovered</th><th className="num">Not registered</th><th>Largest not registered</th><th>Discovered</th></tr></thead>
               <tbody>
                 {pick.not_ingested.map((n: Row) => (
@@ -78,7 +78,7 @@ export default function Sources() {
                 ))}
                 {!pick.not_ingested.length && <tr><td colSpan={5} className="muted">No discovery on this instance's hosts.</td></tr>}
               </tbody>
-            </table>
+            </table></div>
           </Section>
         </>
       )}

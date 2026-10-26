@@ -8,10 +8,11 @@ import {
 } from "../components";
 
 /** A finished run's totals in the same shape as a live run's progress, so both read the same way. The run's "ok"
- * counts its unchanged tables too, so loaded is ok less unchanged. */
+ * counts its unchanged tables and its reseeds queued too, so loaded is ok less both (queries.loaded_tables), and
+ * reseeds queued count as checked with the unchanged ones. */
 function finishedProgress(run: Row): Progress {
-  const unchanged = Number(run.skipped || 0);
-  return { total: Number(run.total || 0), unchanged, loaded: Math.max(0, Number(run.ok || 0) - unchanged),
+  const loaded = Math.max(0, Number(run.ok || 0) - Number(run.skipped || 0) - Number(run.reseeded || 0));
+  return { total: Number(run.total || 0), unchanged: Math.max(0, Number(run.ok || 0) - loaded), loaded,
            inFlight: 0, failed: Number(run.failed || 0) };
 }
 
@@ -159,7 +160,7 @@ export default function RunDetail() {
               <div className="metrics">
                 <Figure label="Loaded" value={fmtInt(p.loaded)} sub="tables read and written" tone={p.loaded ? "ok" : ""} />
                 {live && <Figure label="In flight" value={fmtInt(p.inFlight)} sub="tables being read now" tone="run" />}
-                <Figure label="Unchanged" value={fmtInt(p.unchanged)} sub="no change at the source" />
+                <Figure label="Unchanged" value={fmtInt(p.unchanged)} sub={!live && Number(r.reseeded) ? `no change at the source, or one of ${fmtInt(r.reseeded)} queued for a reseed` : "no change at the source"} />
                 <Figure label="Failed" value={fmtInt(p.failed)} tone={p.failed ? "bad" : ""} />
                 <Figure label="Worked" value={fmtInt(p.loaded + p.inFlight + p.failed)} sub="tables that needed a read" />
               </div>

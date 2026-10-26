@@ -114,3 +114,30 @@ def test_a_window_starting_mid_slot_never_cuts_a_job_run_short():
     assert [(jr["slot"].hour, len(jr["members"])) for jr in placed] == [(14, 2)]
     whole = ij.place(SCHEDULES[0], MEMBERS, RUNS, datetime(2026, 10, 26, 13, 0, tzinfo=UTC), end, NOW)
     assert [(jr["slot"].hour, len(jr["members"])) for jr in whole] == [(14, 2), (13, 2)]
+
+
+def test_a_member_removed_later_keeps_its_runs_in_earlier_job_runs():
+    removed = [dict(m, removed_at=datetime(2026, 10, 26, 13, 45, tzinfo=UTC)) if m["task_collection"] == "c2" else m
+               for m in MEMBERS]
+    placed = ij.place(SCHEDULES[0], removed, RUNS, datetime(2026, 10, 26, 13, 0, tzinfo=UTC), NOW, NOW)
+    by_hour = {jr["slot"].hour: [m["task_collection"] for m in jr["members"]] for jr in placed}
+    assert by_hour == {14: ["c1"], 13: ["c1", "c2"]}
+    assert ij.job_runs_of_run(dict(task_collection="c2", started_at="2026-10-26T13:31:00+00:00"), SCHEDULES, removed) == \
+        [{"job_id": 1, "job_name": "East hourly", "slot": "2026-10-26T13:00:00+00:00"}]
+    assert ij.job_runs_of_run(dict(task_collection="c2", started_at="2026-10-26T14:31:00+00:00"), SCHEDULES, removed) == []
+
+
+def test_an_extra_run_counts_in_the_outcome_but_not_as_a_member():
+    jr = {"slot": datetime(2026, 10, 26, 13, tzinfo=UTC), "members": [
+        dict(task_collection="c1", offset_minutes=0, fire_at=datetime(2026, 10, 26, 13, tzinfo=UTC), state="run",
+             run=run(9, "c1", datetime(2026, 10, 26, 13, 0, 20, tzinfo=UTC), ok=10, skipped=10),
+             extra=[run(12, "c1", datetime(2026, 10, 26, 13, 40, tzinfo=UTC), status="failed", failed=1, ok=9, skipped=9)])]}
+    s = ij.summarize(SCHEDULES[0], jr, {}, {"c1": 10}, {}, NOW)
+    assert (s["outcome"]["label"], s["ran"], s["members"], s["extra"]) == ("Completed with failures", 1, 1, 1)
+    live = dict(jr, members=[dict(jr["members"][0], extra=[run(12, "c1", datetime(2026, 10, 26, 13, 40, tzinfo=UTC), status="running")])])
+    assert ij.summarize(SCHEDULES[0], live, {}, {"c1": 10}, {}, NOW)["outcome"]["label"] == "Running"
+
+
+def test_a_finished_group_runs_reseeds_queued_are_not_loaded_in_its_progress():
+    member = dict(task_collection="c1", state="run", run=dict(status="completed", total=10, ok=10, skipped=4, reseeded=3, failed=0))
+    assert ij._progress(member, {}, 10) == {"total": 10, "unchanged": 7, "loaded": 3, "in_flight": 0, "failed": 0}

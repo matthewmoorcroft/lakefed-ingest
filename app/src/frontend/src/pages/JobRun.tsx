@@ -57,12 +57,12 @@ export default function JobRun() {
               <Figure label="Took" value={r.took_s != null ? fmtDuration(r.took_s) : ""} sub="first group run start to last finish" />
               <Figure label="Speed" value={r.speed_tables_per_min != null ? `${fmtSpeed(r.speed_tables_per_min)} tables/min` : ""} sub="while loading tables" />
             </>}
-            <Figure label="Clusters" value={`${fmtInt(r.clusters)} of ${fmtInt(r.members)}`} sub="one per group run" />
+            <Figure label="Clusters" value={fmtInt(r.clusters)} sub="each group run starts its own" />
             <Figure label="Failed tables" value={fmtInt(r.failed_tables)} sub={Number(r.failed_before) ? `the ${fmtInt(r.failed_before)} job ${plural(r.failed_before, "run")} before also had failed tables` : undefined} />
             <Figure label="Rows written" value={rowsText(r)} sub={live ? "so far" : undefined} />
           </div>
           <Section title={`Group runs: ${fmtInt(r.group_runs.length)}`} note="Running first, then waiting, then finished.">
-            <table className="data">
+            <div className="table-wrap"><table className="data">
               <thead><tr><th>Ingestion group</th><th>Status</th><th>Started</th><th className="num">Took</th><th>Progress</th>
                 <th className="num">Tables/min</th><th className="num">Parallelism</th><th>Cluster</th><th className="num">Failed</th></tr></thead>
               <tbody>
@@ -86,10 +86,10 @@ export default function JobRun() {
                   );
                 })}
               </tbody>
-            </table>
+            </table></div>
           </Section>
           <Section title={`Databases: ${fmtInt(dbs.length)}`} note="Every database with table events in this job run: failed first, then in flight, then done.">
-            <table className="data">
+            <div className="table-wrap"><table className="data">
               <thead><tr><th>Database</th><th>Ingestion group</th><th className="num">Loaded</th><th className="num">In flight</th>
                 <th className="num">Failed</th><th className="num">Rows written</th></tr></thead>
               <tbody>
@@ -103,7 +103,7 @@ export default function JobRun() {
                 ))}
                 {!dbs.length && <tr><td colSpan={6} className="muted">No table events: every table was unchanged, or nothing has started.</td></tr>}
               </tbody>
-            </table>
+            </table></div>
             <Pager offset={dbOffset} limit={DATABASES_PAGE} total={dbs.length} noun="database" onPage={setDbOffset} />
           </Section>
           {r.failures.length > 0 && (

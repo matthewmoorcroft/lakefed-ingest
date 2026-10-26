@@ -446,3 +446,9 @@ export function Pager({ offset, limit, total, noun, onPage }: { offset: number; 
 /** One database's page: its group, server ("-" when blank) and name. */
 export const databasePath = (group: unknown, server: unknown, database: unknown) =>
   `/collections/${encodeURIComponent(String(group))}/databases/${encodeURIComponent(String(server || "-"))}/${encodeURIComponent(String(database ?? ""))}`;
+
+/** A name that wraps only between words, so a hyphenated or underscored name never breaks mid-word. */
+export function Name({ children }: { children: unknown }) {
+  const words = String(children ?? "").split(" ");
+  return <>{words.map((w, i) => <span key={i} className="word">{w}{i < words.length - 1 ? " " : ""}</span>)}</>;
+}

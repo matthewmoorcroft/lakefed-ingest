@@ -213,7 +213,7 @@ def collection_databases(name: str):
             databases.append(d)
         schedules, members = _schedules()
         job_names = [{"id": sc["id"], "name": sc["name"]} for sc in schedules
-                     if any(m["schedule_id"] == sc["id"] and m["task_collection"] == name for m in members)]
+                     if any(m["schedule_id"] == sc["id"] and m["task_collection"] == name for m in _active(members))]
         return {"collection": name, "databases": databases, "running": running[0] if running else None, "jobs": job_names,
                 "batches": batches, "read_at": datetime.now(timezone.utc).isoformat(), "cache_s": MONITOR_CACHE_S}
     return _shared(("collection", name), compute)
@@ -232,12 +232,16 @@ def collections():
 # ---- ingestion jobs and job runs ----------------------------------------------------------------
 
 def _schedules():
-    """Active schedules and their active members, shared like _running."""
+    """Active schedules and all their members, removed ones included (a member's past runs still belong to
+    the job runs of its time in the schedule), shared like _running. _active keeps the current members."""
     def compute():
         rows = db.query(q.schedules_sql())
-        members = db.query(q.schedule_members_sql(), ([r["id"] for r in rows],)) if rows else []
-        return rows, [m for m in members if m["removed_at"] is None]
+        return rows, db.query(q.schedule_members_sql(), ([r["id"] for r in rows],)) if rows else []
     return _shared("schedules", compute)
+
+
+def _active(members: List[dict]) -> List[dict]:
+    return [m for m in members if m.get("removed_at") is None]
 
 
 def _group_stats() -> dict:
@@ -292,11 +296,15 @@ def _jobs_view() -> dict:
                     + [q._when(r["started_at"]) - timedelta(days=1) for r in running if r.get("started_at")], default=now)
         runs = _group_runs(groups, start, now + timedelta(seconds=1))
         view = ij.jobs_view(schedules, members, states, running, runs, stats, now)
-        causes = {}
+        latest_ids = {}
         for job in view["jobs"]:
             latest = next((jr for jr in (job["running_job_run"], job["last_job_run"]) if jr and jr["failed_tables"]), None)
             if job["state_failing"] and latest and latest["run_ids"]:
-                causes[job["id"]] = q.group_errors(db.query(q.run_failures_sql(), (latest["run_ids"],)))
+                latest_ids[job["id"]] = set(latest["run_ids"])
+        causes = {}
+        if latest_ids:      # one read for every failing job's latest job run, split by job
+            failures = db.query(q.run_failures_sql(), (sorted(set().union(*latest_ids.values())),))
+            causes = {job_id: q.group_errors([f for f in failures if f["run_id"] in ids]) for job_id, ids in latest_ids.items()}
         if causes:
             view = ij.jobs_view(schedules, members, states, running, runs, stats, now, causes_by_job=causes)
         return view
@@ -340,7 +348,7 @@ def ingestion_job(job_id: int):
     job = _schedule(job_id)
     now = datetime.now(timezone.utc)
     _, members = _schedules()
-    mine = [m for m in members if m["schedule_id"] == job["id"]]
+    mine = [m for m in _active(members) if m["schedule_id"] == job["id"]]
     sums = next(j for j in rollup.jobs(_states(), [job], members)[0])
     stats, last_runs = _group_stats(), _last_runs()
     cadence = int(job["cadence_minutes"])
@@ -406,40 +414,48 @@ def ingestion_job_run(job_id: int, slot: str):
             "read_at": now.isoformat(), "cache_s": MONITOR_CACHE_S}
 
 
+# How far back Runs reads, at most, to fill a page an outcome filter has thinned.
+JOB_RUNS_HISTORY = timedelta(days=30)
+
+
 @app.get("/api/job-runs")
 def job_runs_across(job: Optional[str] = None, outcome: Optional[str] = None, before: Optional[str] = None,
                     limit: int = 25):
     """Job runs of every job (or one, by id), running first, then newest first, `limit` a page before
-    `before`, with outcome counts over the page's window. job=none lists the group runs of the groups in no
-    job instead, with today's run columns."""
+    `before`, with outcome counts over the windows read. With an outcome filter, older windows are read until
+    the page is full or JOB_RUNS_HISTORY is reached. job=none lists the group runs of the groups in no job
+    instead, with today's run columns."""
     now = datetime.now(timezone.utc)
     end = datetime.fromisoformat(before) if before else now + timedelta(seconds=1)
     limit = max(1, min(int(limit), 100))
     schedules, members = _schedules()
     if job == "none":
-        scheduled = {m["task_collection"] for m in members}
-        unscheduled = sorted({s["task_collection"] for s in _states()} - scheduled)
-        sql, params = q.runs_sql(None, limit=500)
-        rows = [r for r in _with_rows_written(db.query(sql, params))
-                if r["task_collection"] in unscheduled and (not before or str(r["started_at"]) < before)][:limit]
-        return {"group_runs": rows, "job_runs": [], "counts": {}, "next_before": rows[-1]["started_at"] if len(rows) >= limit else None}
+        unscheduled = sorted({s["task_collection"] for s in _states()} - {m["task_collection"] for m in _active(members)})
+        rows = _with_rows_written(db.query(q.group_runs_before_sql(), (unscheduled, end, limit + 1))) if unscheduled else []
+        more = len(rows) > limit
+        rows = rows[:limit]
+        return {"group_runs": rows, "job_runs": [], "counts": {}, "next_before": rows[-1]["started_at"] if more else None}
     chosen = [s for s in schedules if job is None or str(s["id"]) == str(job)]
-    found = []
-    for s in chosen:
-        found += _job_runs_of(s, end - timedelta(minutes=int(s["cadence_minutes"]) * limit), end, now)
+    found, counts, start = [], {}, end
+    while chosen:
+        window_start = min(start - timedelta(minutes=int(s["cadence_minutes"]) * limit) for s in chosen)
+        batch = []
+        for s in chosen:
+            batch += _job_runs_of(s, window_start, start, now)
+        for r in batch:
+            counts[r["outcome"]["label"]] = counts.get(r["outcome"]["label"], 0) + 1
+        found += [r for r in batch if r["outcome"]["label"] != "Running" and (not outcome or r["outcome"]["label"] == outcome)]
+        start = window_start
+        if not outcome or len(found) > limit or end - start >= JOB_RUNS_HISTORY:
+            break
     found.sort(key=lambda r: r["slot"], reverse=True)
-    window_rows = found
-    counts = {}
-    for r in window_rows:
-        counts[r["outcome"]["label"]] = counts.get(r["outcome"]["label"], 0) + 1
-    if outcome:
-        found = [r for r in found if r["outcome"]["label"] == outcome]
+    rest = found[:limit]
     # Running job runs come from the Overview's read, so one overrunning its window is still listed.
     running = [r for r in _jobs_view()["running_job_runs"] if (job is None or str(r["job_id"]) == str(job))
                and (not outcome or outcome == "Running")] if not before else []
-    rest = [r for r in found if r["outcome"]["label"] != "Running"][:limit]
+    more = len(found) > limit or (not outcome and len(found) >= limit)
     return {"job_runs": [{k: v for k, v in r.items() if k != "placed"} for r in running + rest],
-            "counts": counts, "next_before": rest[-1]["slot"] if len(rest) >= limit else None,
+            "counts": counts, "next_before": rest[-1]["slot"] if rest and more else None,
             "jobs": [{"id": s["id"], "name": s["name"]} for s in schedules]}
 
 
@@ -457,6 +473,10 @@ def sources():
         except Exception as e:
             listed, listed_error = [], str(e)
         view = rollup.sources(_states(), listed, db.query(q.not_ingested_sql()), schedules, members)
+        for instance in view["instances"]:
+            for j in instance["jobs"]:
+                if j.get("cadence_minutes"):
+                    j["description"] = sch.describe(int(j["cadence_minutes"]), 0, j.get("timezone") or "UTC")
         return {**view, "connections_error": listed_error, "read_at": datetime.now(timezone.utc).isoformat(),
                 "cache_s": STATES_CACHE_S}
     return _shared("sources", compute, ttl=STATES_CACHE_S)
@@ -479,7 +499,7 @@ def one_database(name: str, server: str, database: str, search: str = "", offset
     running = next((r for r in _running() if r["task_collection"] == name), None)
     schedules, members = _schedules()
     job_names = [{"id": s["id"], "name": s["name"]} for s in schedules
-                 if any(m["schedule_id"] == s["id"] and m["task_collection"] == name for m in members)]
+                 if any(m["schedule_id"] == s["id"] and m["task_collection"] == name for m in _active(members))]
     pattern = f"%{search.strip()}%" if search.strip() else "%"
     offset = max(0, int(offset))
     rows = db.query(q.database_tables_sql(), (name, server, database, running["run_id"] if running else None, pattern,
@@ -574,9 +594,10 @@ def tables(collection: Optional[str] = None, search: Optional[str] = None, statu
     cursor = json.loads(after) if after else None
     if cursor is not None and (not isinstance(cursor, list) or len(cursor) != 5):
         raise HTTPException(400, "after must be the previous page's next_after")
-    sql, params = q.tables_sql(collection or None, search or None, status, limit, database=database, after=cursor)
+    sql, params = q.tables_sql(collection or None, search or None, status, limit + 1, database=database, after=cursor)
     rows = db.query(sql, params)
-    last = rows[-1] if len(rows) == limit else None
+    last = rows[limit - 1] if len(rows) > limit else None      # one row more than a page says there is a next page
+    rows = rows[:limit]
     return {"tables": rows, "limit": limit,
             "next_after": [last["task_collection"], last.get("src_database") or "", last["src_schema"], last["src_table"],
                            last["id"]] if last else None}

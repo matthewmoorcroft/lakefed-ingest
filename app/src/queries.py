@@ -402,6 +402,13 @@ def group_runs_sql() -> str:
             f"where task_collection = any(%s) and started_at >= %s and started_at < %s order by started_at")
 
 
+def group_runs_before_sql() -> str:
+    """The newest runs of some ingestion groups that started before a time, newest first. Params: groups,
+    before, limit."""
+    return (f"select {_RUN_COLUMNS} from {SCHEMA}.ingest_run "
+            f"where task_collection = any(%s) and started_at < %s order by started_at desc limit %s")
+
+
 def job_run_databases_sql() -> str:
     """run_databases_sql over the group runs of one job run, with each database's ingestion group: failing
     first, then in flight, then by name. Param: run ids."""
@@ -628,22 +635,23 @@ JOB_RUN_ORDER = ("Ended without finishing", "Failed", "Completed with failures",
 
 
 def job_run_outcome(members: List[dict]) -> dict:
-    """A job run's outcome from its members (schedules.job_runs): running while any group run is running or
-    any member's start is still ahead; otherwise the worst of its group runs' outcomes, or "Not run" when
-    none ran. The note counts the members that did not run, as "17 of 18 group runs, 1 skipped"."""
+    """A job run's outcome from its members (schedules.job_runs): running while any group run (extra runs
+    included) is running or any member's start is still ahead; otherwise the worst of its group runs'
+    outcomes, extra runs included, or "Not run" when none ran. The note counts the members that did not run, as "17 of 18 group runs, 1 skipped"."""
     runs = [m["run"] for m in members if m.get("run")]
     ran = [r for r in runs if r.get("status") != "skipped"]
+    extras = [r for m in members for r in m.get("extra") or [] if r.get("status") != "skipped"]
     skipped = sum(1 for m in members if m["state"] == "skipped") + (len(runs) - len(ran))
     no_run = sum(1 for m in members if m["state"] == "no run")
     note = None
     if len(ran) < len(members):
         note = ", ".join([f"{len(ran)} of {len(members)} group runs"] + ([f"{skipped} skipped"] if skipped else [])
                          + ([f"{no_run} no run"] if no_run else []))
-    if any(m["state"] == "waiting" for m in members) or any(r.get("status") == "running" for r in runs):
+    if any(m["state"] == "waiting" for m in members) or any(r.get("status") == "running" for r in runs + extras):
         return {"label": "Running", "tone": "run", "note": note}
-    if not ran:
+    if not ran and not extras:
         return {"label": "Not run", "tone": "neutral", "note": note}
-    worst = min((run_outcome(r)["label"] for r in ran), key=lambda label: JOB_RUN_ORDER.index(label)
+    worst = min((run_outcome(r)["label"] for r in ran + extras), key=lambda label: JOB_RUN_ORDER.index(label)
                 if label in JOB_RUN_ORDER else len(JOB_RUN_ORDER))
     tone = {"Completed": "ok", "Completed with failures": "warn"}.get(worst, "bad")
     return {"label": worst, "tone": tone, "note": note}
@@ -654,6 +662,11 @@ def job_run_expected_end(members: List[dict], progress_by_run: dict, p50_by_grou
     each waiting member's start plus its group's typical run. None when there is nothing to go on."""
     ends = []
     for m in members:
+        for extra in m.get("extra") or []:
+            if extra.get("status") == "running":
+                left = time_left(progress_by_run.get(extra.get("run_id")) or {}, now)
+                if left and not (left["basis"] == "typical" and left["seconds"] == 0):
+                    ends.append(now + timedelta(seconds=left["seconds"]))
         run = m.get("run")
         if run and run.get("status") == "running":
             left = time_left(progress_by_run.get(run.get("run_id")) or {}, now)

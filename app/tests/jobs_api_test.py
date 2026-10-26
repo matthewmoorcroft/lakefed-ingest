@@ -55,9 +55,9 @@ def client(monkeypatch):
         q.running_progress_sql(): [], q.last_runs_sql(): [],
         q.collection_run_stats_sql(): [dict(task_collection="c1", p50_s=300, p95_s=400),
                                        dict(task_collection="c2", p50_s=300, p95_s=400)],
-        q.run_failures_sql(): [dict(task_collection="c1", control_id=1, server="srv1", src_database="c1_db",
+        q.run_failures_sql(): [dict(task_collection="c1", run_id=9, control_id=1, server="srv1", src_database="c1_db",
                                     src_schema="dbo", src_table="t1", error="connection reset", finished_at=NOW.isoformat()),
-                               dict(task_collection="c1", control_id=2, server="srv1", src_database="c1_db",
+                               dict(task_collection="c1", run_id=9, control_id=2, server="srv1", src_database="c1_db",
                                     src_schema="dbo", src_table="t2", error="connection reset", finished_at=NOW.isoformat())],
         q.job_run_databases_sql(): [dict(task_collection="c1", server="srv1", src_database="c1_db", loaded=8, failed=2)],
     }
@@ -148,6 +148,8 @@ def test_sources_list_a_uc_connection_with_nothing_registered(client, monkeypatc
     empty = [i for i in body["instances"] if i["nothing_registered"]]
     assert [i["server"] for i in empty] == ["unused_conn"] and body["nothing_registered"] == 1
     assert {i["server"] for i in body["instances"] if not i["nothing_registered"]} == {"srv1"}
+    on_srv1 = next(i for i in body["instances"] if i["server"] == "srv1")
+    assert {j["name"]: j.get("description") for j in on_srv1["jobs"] if j["id"]}["East hourly"] == "hourly at :00"
 
 
 def test_one_database_lists_its_tables_with_the_group_and_its_job(client, monkeypatch):
@@ -166,3 +168,26 @@ def test_one_database_lists_its_tables_with_the_group_and_its_job(client, monkey
     assert (body["tables"][0]["state"], body["total"], body["jobs"]) == ("failing", 1, [{"id": 1, "name": "East hourly"}])
     assert calls[0][:5] == ("c1", "srv1", "c1_db", None, "%t1%")
     assert client.get("/api/collections/c1/databases/srv9/c1_db").status_code == 404
+
+
+def test_an_outcome_filter_reads_older_windows_until_it_finds_matches(client):
+    RUNS.append(group_run(13, "c1", datetime(2026, 10, 26, 9, 1, tzinfo=UTC), status="failed", failed=4))
+    try:
+        body = client.get("/api/job-runs", params={"outcome": "Completed with failures", "limit": 1,
+                                                    "before": "2026-10-26T12:00:00+00:00"}).json()
+    finally:
+        RUNS.pop()
+    assert [r["slot"][11:16] for r in body["job_runs"]] == ["09:00"]
+
+
+def test_runs_of_groups_in_no_job_are_read_from_the_database_before_a_time(client, monkeypatch):
+    calls, real = [], main.db.query
+
+    def query(sql, params=()):
+        if sql == q.group_runs_before_sql():
+            calls.append(params)
+            return [group_run(30, "c4", datetime(2026, 10, 26, 8, 0, tzinfo=UTC))]
+        return real(sql, params)
+    monkeypatch.setattr(main.db, "query", query)
+    body = client.get("/api/job-runs", params={"job": "none", "before": "2026-10-26T12:00:00+00:00"}).json()
+    assert [r["run_id"] for r in body["group_runs"]] == [30] and calls[0][0] == ["c4"]

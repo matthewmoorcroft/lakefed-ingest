@@ -3,7 +3,7 @@ import { useQuery } from "@tanstack/react-query";
 import { Link } from "react-router-dom";
 import { api, qs, type Row } from "../api";
 import {
-  ErrorBox, FillBox, JobStatus, Notice, PageHead, Pager, ProgressBar, RunStatus, Section, Stamp, StateBar, StateKey,
+  ErrorBox, FillBox, JobStatus, Name, Notice, PageHead, Pager, ProgressBar, RunStatus, Section, Stamp, StateBar, StateKey,
   fmtClock, fmtDuration, fmtInt, fmtSpeed, jobRunName, jobRunPath, plural, progressFrom, progressText
 } from "../components";
 
@@ -33,14 +33,14 @@ export function JobsTable({ jobs, notInJob, total, offset, limit, onPage, link, 
   jobs: Row[]; notInJob?: Row | null; total: number; offset: number; limit: number; onPage: (offset: number) => void;
   link?: boolean; fill?: boolean }) {
   const table = (
-      <table className="data">
+      <div className="table-wrap"><table className="data">
         <thead><tr><th>Ingestion job</th><th className="num">Groups</th><th className="num">Databases</th>
           <th className="num">Tables</th><th>State now</th><th className="num">Failing</th><th className="num">Late</th>
           <th>Last job run</th><th>Status</th></tr></thead>
         <tbody>
           {jobs.map((j) => (
             <tr key={j.id ?? "none"}>
-              <td className="name">{j.id != null ? <Link to={jobPath(j.id)}><b>{j.name}</b></Link> : <b>{j.name}</b>}
+              <td className="name">{j.id != null ? <Link to={jobPath(j.id)}><b><Name>{j.name}</Name></b></Link> : <b><Name>{j.name}</Name></b>}
                 <span className="sub">{j.id != null ? j.description : `${fmtInt(j.groups?.length)} ${plural(j.groups?.length, "group")}`}</span></td>
               <td className="num">{fmtInt(j.groups?.length)}</td><td className="num">{fmtInt(j.databases)}</td>
               <td className="num">{fmtInt(j.enabled_tables)}</td><td><StateBar row={j} /></td>
@@ -62,7 +62,7 @@ export function JobsTable({ jobs, notInJob, total, offset, limit, onPage, link, 
           )}
           {!jobs.length && !notInJob && <tr><td colSpan={9} className="muted">No ingestion jobs here.</td></tr>}
         </tbody>
-      </table>
+      </table></div>
   );
   const pager = <Pager offset={offset} limit={limit} total={total} noun="ingestion job" onPage={onPage} />;
   if (fill) return <>{pager}<FillBox min={240}>{table}</FillBox></>;

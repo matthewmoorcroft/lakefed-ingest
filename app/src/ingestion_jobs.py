@@ -56,9 +56,9 @@ def _progress(member: dict, running_by_run: dict, group_tables: int) -> dict:
                 "unchanged": max(q._count(p, "tables_checked") - loaded, 0),
                 "in_flight": q._count(p, "tables_running"), "failed": q._count(p, "tables_failed")}
     if run and run.get("status") != "skipped" and run.get("total") is not None:
-        unchanged = q._count(run, "skipped")
-        return {"total": q._count(run, "total"), "unchanged": unchanged,
-                "loaded": max(q._count(run, "ok") - unchanged, 0), "in_flight": 0, "failed": q._count(run, "failed")}
+        loaded = q.loaded_tables(run)     # its unchanged tables and reseeds queued count as checked, not loaded
+        return {"total": q._count(run, "total"), "unchanged": max(q._count(run, "ok") - loaded, 0),
+                "loaded": loaded, "in_flight": 0, "failed": q._count(run, "failed")}
     return {"total": group_tables, "unchanged": 0, "loaded": 0, "in_flight": 0, "failed": 0}
 
 
@@ -79,7 +79,8 @@ def summarize(job: dict, job_run: dict, running_by_run: dict, group_tables: Dict
     Group runs come with their work (main._with_rows_written)."""
     members = job_run["members"]
     runs = [m["run"] for m in members if m.get("run")] + [r for m in members for r in m.get("extra") or []]
-    ran = [r for r in runs if r.get("status") != "skipped"]
+    ran = [r for r in runs if r.get("status") != "skipped"]       # every group run that ran, extra ones included
+    members_ran = sum(1 for m in members if m.get("run") and m["run"].get("status") != "skipped")
     outcome = q.job_run_outcome(members)
     if outcome["label"] == "Not run" and job.get("paused"):
         outcome = dict(outcome, note="the job is paused")
@@ -95,7 +96,7 @@ def summarize(job: dict, job_run: dict, running_by_run: dict, group_tables: Dict
     progress = _sum(_progress(m, running_by_run, group_tables.get(m["task_collection"], 0)) for m in members)
     out = {
         "slot": job_run["slot"].isoformat(), "job_id": job["id"], "job_name": job["name"], "outcome": outcome,
-        "members": len(members), "ran": len(ran), "extra": sum(len(m.get("extra") or []) for m in members),
+        "members": len(members), "ran": members_ran, "extra": sum(len(m.get("extra") or []) for m in members),
         "started_at": min(starts).isoformat() if starts else None,
         "took_s": (round((max(finishes) - min(starts)).total_seconds())
                    if starts and finishes and not running and outcome["label"] != "Ended without finishing" else None),
@@ -225,11 +226,11 @@ def jobs_view(schedules: List[dict], members: List[dict], states: List[dict], ru
     for s, sums in zip(schedules, job_sums):
         cadence = int(s["cadence_minutes"])
         start = window(cadence, RECENT_JOB_RUNS, now)
-        member_groups = {m["task_collection"] for m in active if m["schedule_id"] == s["id"]}
+        member_groups = {m["task_collection"] for m in members if m["schedule_id"] == s["id"]}
         oldest_running = [_when(r["started_at"]) for r in running if r["task_collection"] in member_groups and r.get("started_at")]
         if oldest_running:     # a group run overrunning the window still belongs to its job run
             start = min(start, min(oldest_running) - timedelta(minutes=cadence))
-        placed = current_and_past(s, active, runs, start, now)
+        placed = current_and_past(s, members, runs, start, now)     # removed members keep their past job runs
         summaries = [summarize(s, jr, running_by_run, group_tables, p50_by_group, now) for jr in placed]
         current = next((x for x in summaries if x["outcome"]["label"] == "Running"), None)
         last = next((x for x in summaries if x["outcome"]["label"] != "Running"), None)
@@ -266,15 +267,18 @@ def jobs_view(schedules: List[dict], members: List[dict], states: List[dict], ru
 
 
 def job_runs_of_run(run: dict, schedules: List[dict], members: List[dict]) -> List[dict]:
-    """The job runs a group run belongs to, one per active schedule its group is in: the slot of its
-    member's latest trigger at or before the run's start."""
+    """The job runs a group run belongs to, one per schedule its group was in when it started: the slot of
+    its member's latest trigger at or before the run's start."""
     started = _when(run.get("started_at"))
     out = []
     if started is None:
         return out
     for s in schedules:
         for m in members:
-            if m["schedule_id"] != s["id"] or m["task_collection"] != run["task_collection"] or m.get("removed_at"):
+            if m["schedule_id"] != s["id"] or m["task_collection"] != run["task_collection"]:
+                continue
+            added, removed = _when(m.get("added_at")), _when(m.get("removed_at"))
+            if (added is not None and started < added) or (removed is not None and started >= removed):
                 continue
             cadence, offset, tz = int(s["cadence_minutes"]), int(m["offset_minutes"]), s.get("timezone") or "UTC"
             fires = sch.fire_times(cadence, offset, tz, started - timedelta(minutes=cadence + 1), started + timedelta(seconds=1))
