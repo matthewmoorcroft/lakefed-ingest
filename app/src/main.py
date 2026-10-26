@@ -370,7 +370,8 @@ def ingestion_job(job_id: int):
     return {**{k: v for k, v in sums.items()}, "description": sch.describe(cadence, 0, job.get("timezone") or "UTC"),
             "stagger_from": min(offsets) if offsets else None, "stagger_to": max(offsets) if offsets else None,
             "parameters": job.get("parameters"), "job_variant": job.get("job_variant"), "paused": job.get("paused"),
-            "last_job_run": {k: v for k, v in finished[0].items() if k != "placed"} if finished else None,
+            "last_job_run": ({k: v for k, v in ij.last_finished(finished).items() if k != "placed"}
+                             if finished else None),
             "median_speed_tables_per_min": speeds[len(speeds) // 2] if speeds else None, "speed_job_runs": len(speeds),
             "p95_took_s": sorted(week)[min(len(week) - 1, int(0.95 * len(week)))] if week else None,
             "groups_detail": group_rows, "read_at": now.isoformat()}

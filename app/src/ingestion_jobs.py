@@ -203,11 +203,19 @@ def status(job: dict, running: Optional[dict], last: Optional[dict], top_cause: 
     return {"label": "Current", "tone": "ok", "detail": [], "cause": None}
 
 
+def last_finished(summaries: List[dict]) -> Optional[dict]:
+    """A job's last finished job run (newest first): the newest one that ran, so a paused job's missed triggers
+    (Not run) don't hide its last real outcome; the newest Not run when none ran."""
+    finished = [s for s in summaries if s["outcome"]["label"] != "Running"]
+    return next((s for s in finished if s["outcome"]["label"] != "Not run"), finished[0] if finished else None)
+
+
 def consecutive_failed(summaries: List[dict]) -> int:
-    """How many of a job's latest finished job runs in a row had failed tables (newest first)."""
+    """How many of a job's latest finished job runs in a row had failed tables (newest first). Triggers that
+    did not run (Not run) are passed over, as they say nothing about the tables."""
     count = 0
     for s in summaries:
-        if s["outcome"]["label"] == "Running":
+        if s["outcome"]["label"] in ("Running", "Not run"):
             continue
         if not s["failed_tables"]:
             break
@@ -242,7 +250,7 @@ def jobs_view(schedules: List[dict], members: List[dict], states: List[dict], ru
         placed = current_and_past(s, members, runs, start, now)     # removed members keep their past job runs
         summaries = [summarize(s, jr, running_by_run, group_tables, p50_by_group, now) for jr in placed]
         current = next((x for x in summaries if x["outcome"]["label"] == "Running"), None)
-        last = next((x for x in summaries if x["outcome"]["label"] != "Running"), None)
+        last = last_finished(summaries)
         mine = [m for m in active if m["schedule_id"] == s["id"]]
         causes = causes_by_job.get(s["id"]) or []
         warnings = [w for m in mine for w in sch.warnings(cadence, (stats_by_group.get(m["task_collection"]) or {}).get("p95_s"),
