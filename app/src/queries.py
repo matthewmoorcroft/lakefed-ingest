@@ -25,6 +25,9 @@ SLA_BREACHED = ("(t.task_enabled and t.freshness_sla_minutes is not null "
 # Where a table's source lives, for grouping by server: the instance group when set (for example the
 # SQL Server name), else the UC connection, else the host. Alias t = control.
 SERVER = "coalesce(t.source_instance_group, t.src_connection, t.src_host, '')"
+# One source database: its server (SERVER) and its name, so two servers' databases of the same name stay
+# two databases. Alias t = control.
+DATABASE = f"({SERVER}, coalesce(t.src_database, ''))"
 
 # Each enabled table in exactly one state, the first that applies: failing, waiting for a first load,
 # late (SLA breached), else current. Aliases: t = control, cp = checkpoint.
@@ -57,7 +60,7 @@ with tables as (
            count(*) filter (where t.task_enabled and t.freshness_sla_minutes is null) as no_sla_tables,
            count(*) filter (where {SLA_BREACHED})                                   as sla_breached_tables,
            max(cp.last_success_at)                                                  as last_success_at,
-           count(distinct t.src_database) filter (where t.task_enabled)            as databases,
+           count(distinct {DATABASE}) filter (where t.task_enabled)               as databases,
            count(distinct {SERVER}) filter (where t.task_enabled)                  as servers,
            min({SERVER}) filter (where t.task_enabled)                             as server,
            {STATE_COUNTS}
@@ -185,8 +188,8 @@ with run as (
     select started_at from {SCHEMA}.ingest_run
     where task_collection = %s and status = 'running' order by started_at desc limit 1
 )
-select coalesce(t.src_database, '') as src_database,
-       min({SERVER}) as server,
+select {SERVER} as server,
+       coalesce(t.src_database, '') as src_database,
        count(*) filter (where t.task_enabled) as tables,
        {STATE_COUNTS},
        count(*) filter (where t.task_enabled
@@ -196,46 +199,70 @@ select coalesce(t.src_database, '') as src_database,
 from {SCHEMA}.control t
 left join {SCHEMA}.checkpoint cp on cp.control_id = t.id
 where t.task_collection = %s
-group by 1
-order by 1"""
+group by 1, 2
+order by 2, 1"""
 
 
 def collection_database_rows_sql() -> str:
-    """Rows written per source database of a collection: by first loads (seed, reseed or full) over
-    every run, which is the source's row count at each first load, and by changes in the last 24 hours;
-    with the loads that recorded no count (batched appends record one total on the run), and the
-    running run's tables loaded, in flight and failed. Params: task_collection."""
+    """Rows written per source database (server and name) of a collection: by first loads (seed, reseed
+    or full), each table's latest successful one only, which is the source's row count at that load, so
+    a reseed or a full reload replaces a table's count instead of adding to it; and by changes in the
+    last 24 hours. With the first loads that recorded no count (batched appends record one total on the
+    run), and the running run's tables loaded, in flight and failed. Events of a deleted control row
+    count under a blank server. Params: task_collection."""
     return f"""
-select coalesce(e.src_database, '') as src_database,
-       sum(e.rows_merged) filter (where e.status = 'ok' and e.action in ('seed', 'reseed', 'full')) as rows_first_loads,
-       count(*) filter (where e.status = 'ok' and e.action in ('seed', 'reseed', 'full'))         as first_loads,
-       count(*) filter (where e.status = 'ok' and e.action in ('seed', 'reseed', 'full')
-                        and e.rows_merged is null)                                     as first_loads_uncounted,
-       sum(e.rows_merged) filter (where e.status = 'ok' and e.action = 'increment'
-                                  and e.finished_at > now() - interval '24 hours')                as rows_changes_24h,
-       count(*) filter (where e.status = 'ok' and r.status = 'running')                          as loaded_this_run,
-       count(*) filter (where e.status = 'running' and r.status = 'running')                     as in_flight,
-       count(*) filter (where e.status = 'failed' and r.status = 'running')                      as failed_this_run
-from {SCHEMA}.ingest_event e
-join {SCHEMA}.ingest_run r on r.run_id = e.run_id
-where e.task_collection = %s
-group by 1"""
+with ev as (
+    select {SERVER} as server,
+           coalesce(e.src_database, '') as src_database,
+           e.id, e.run_id, e.control_id, e.action, e.status, e.finished_at, e.rows_merged
+    from {SCHEMA}.ingest_event e
+    left join {SCHEMA}.control t on t.id = e.control_id
+    where e.task_collection = %s
+),
+latest_first as (
+    select distinct on (control_id) server, src_database, rows_merged
+    from ev where status = 'ok' and action in ('seed', 'reseed', 'full')
+    order by control_id, finished_at desc nulls last, id desc
+),
+first_loads as (
+    select server, src_database, sum(rows_merged) as rows_first_loads, count(*) as first_loads,
+           count(*) filter (where rows_merged is null) as first_loads_uncounted
+    from latest_first group by 1, 2
+),
+activity as (
+    select ev.server, ev.src_database,
+           sum(ev.rows_merged) filter (where ev.status = 'ok' and ev.action = 'increment'
+                                       and ev.finished_at > now() - interval '24 hours') as rows_changes_24h,
+           count(*) filter (where ev.status = 'ok' and r.status = 'running')             as loaded_this_run,
+           count(*) filter (where ev.status = 'running' and r.status = 'running')        as in_flight,
+           count(*) filter (where ev.status = 'failed' and r.status = 'running')         as failed_this_run
+    from ev join {SCHEMA}.ingest_run r on r.run_id = ev.run_id
+    group by 1, 2
+)
+select a.server, a.src_database, f.rows_first_loads, coalesce(f.first_loads, 0) as first_loads,
+       coalesce(f.first_loads_uncounted, 0) as first_loads_uncounted, a.rows_changes_24h,
+       a.loaded_this_run, a.in_flight, a.failed_this_run
+from activity a
+left join first_loads f on f.server = a.server and f.src_database = a.src_database"""
 
 
 def run_databases_sql() -> str:
-    """One row per source database of a run: tables loaded, in flight and failed, and rows written
-    (uncounted: loads with no per-table count, such as members of a batched append). Param: run_id."""
+    """One row per source database (server and name) of a run: tables loaded, in flight and failed, and
+    rows written (uncounted: loads with no per-table count, such as members of a batched append). Events
+    of a deleted control row count under a blank server. Param: run_id."""
     return f"""
-select coalesce(src_database, '') as src_database,
-       count(*) filter (where status = 'ok')      as loaded,
-       count(*) filter (where status = 'running') as in_flight,
-       count(*) filter (where status = 'failed')  as failed,
-       sum(rows_merged)                           as rows_written,
-       count(*) filter (where status = 'ok' and rows_merged is null) as uncounted
-from {SCHEMA}.ingest_event
-where run_id = %s
-group by 1
-order by 1"""
+select {SERVER} as server,
+       coalesce(e.src_database, '') as src_database,
+       count(*) filter (where e.status = 'ok')      as loaded,
+       count(*) filter (where e.status = 'running') as in_flight,
+       count(*) filter (where e.status = 'failed')  as failed,
+       sum(e.rows_merged)                           as rows_written,
+       count(*) filter (where e.status = 'ok' and e.rows_merged is null) as uncounted
+from {SCHEMA}.ingest_event e
+left join {SCHEMA}.control t on t.id = e.control_id
+where e.run_id = %s
+group by 1, 2
+order by 2, 1"""
 
 
 def run_rows_sql() -> str:
@@ -255,12 +282,24 @@ def run_batch_rows_sql() -> str:
             f"where detail is not null and started_at > now() - make_interval(hours => %s)")
 
 
+def database_key(server, database) -> str:
+    """A source database (server and name) as one text, as DATABASE_KEY spells it in SQL."""
+    return f"{server or ''}\x1f{database or ''}"
+
+
+# database_key in SQL. Alias t = control, e = ingest_event.
+DATABASE_KEY = f"{SERVER} || chr(31) || coalesce(e.src_database, '')"
+
+
 def collection_batch_runs_sql() -> str:
     """A collection's runs with a detail, and the databases whose loads in that run recorded no count:
-    a batched append's total belongs to those databases. Param: task_collection."""
-    return (f"select r.run_id, r.detail, array_remove(array_agg(distinct e.src_database), null) as databases "
+    a batched append's total belongs to those databases. ``databases`` names them; ``keys`` are their
+    database_key (server and name), for matching. Param: task_collection."""
+    return (f"select r.run_id, r.detail, array_remove(array_agg(distinct e.src_database), null) as databases, "
+            f"array_agg(distinct {DATABASE_KEY}) as keys "
             f"from {SCHEMA}.ingest_run r join {SCHEMA}.ingest_event e on e.run_id = r.run_id "
             f"and e.status = 'ok' and e.rows_merged is null "
+            f"left join {SCHEMA}.control t on t.id = e.control_id "
             f"where r.task_collection = %s and r.detail is not null group by r.run_id, r.detail")
 
 

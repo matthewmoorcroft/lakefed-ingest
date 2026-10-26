@@ -1,0 +1,93 @@
+"""Per-database views against a real Postgres, on a collection whose two servers each have a database
+named Sales: a database is its server and its name, never its name alone. Also: a table's rows in first
+loads are its latest first load's, so a reseed does not add to them.
+
+Skipped unless LAKEFED_APP_TEST_PG names a Postgres server (see monitoring_pg_test.py)."""
+import os
+import sys
+import uuid
+from pathlib import Path
+
+import pytest
+import queries as q
+
+URI = os.environ.get("LAKEFED_APP_TEST_PG")
+pytestmark = pytest.mark.skipif(not URI, reason="LAKEFED_APP_TEST_PG not set")
+REPO = Path(__file__).resolve().parents[2]
+
+
+@pytest.fixture(scope="module")
+def pg():
+    psycopg = pytest.importorskip("psycopg")
+    sys.path.insert(0, str(REPO / "src" / "lakefed_ingest"))
+    import state_store
+    name = f"lakefed_app_test_{uuid.uuid4().hex[:8]}"
+    admin = psycopg.connect(URI, autocommit=True)
+    admin.execute(f"create database {name}")
+    conn = psycopg.connect(psycopg.conninfo.make_conninfo(URI, dbname=name), autocommit=True)
+    try:
+        for statement in state_store.split_sql_statements((REPO / "src/lakefed_ingest/lakebase_schema.sql").read_text()):
+            conn.execute(statement)
+        _fixture(conn)
+        yield conn
+    finally:
+        conn.close()
+        admin.execute(f"drop database {name}")
+        admin.close()
+
+
+def _fixture(conn):
+    # Two servers, each with a database called Sales of three tables, in one collection.
+    for server, host in (("srvX", "host-x"), ("srvY", "host-y")):
+        conn.execute(
+            "insert into lakefed_ingest.control (task_collection, src_host, src_database, src_schema, src_table, "
+            "sink_catalog, sink_schema, sink_table, primary_key, select_list, source_instance_group, created_at) "
+            "select 'c2', %s, 'Sales', 'dbo', 't' || g, 'm', %s, 't' || g, 'id', 'id', %s, now() - interval '3 days' "
+            "from generate_series(1, 3) g", (host, server, server))
+    conn.execute("insert into lakefed_ingest.checkpoint (control_id, src_database, src_schema, src_table, phase, status, "
+                 "last_success_at) select id, src_database, src_schema, src_table, 'incremental', 'ok', "
+                 "now() - interval '10 minutes' from lakefed_ingest.control")
+    # Run 10 seeded everything (100 rows a table on srvX, 200 on srvY); run 12 reseeded srvX (150 a table);
+    # run 13 is going now and has loaded one srvY table with 5 changed rows.
+    conn.execute("insert into lakefed_ingest.ingest_run (run_id, task_collection, started_at, finished_at, status) values "
+                 "(10, 'c2', now() - interval '2 days', now() - interval '2 days', 'completed'), "
+                 "(12, 'c2', now() - interval '1 day', now() - interval '1 day', 'completed'), "
+                 "(13, 'c2', now() - interval '5 minutes', null, 'running')")
+    insert = ("insert into lakefed_ingest.ingest_event (run_id, task_collection, control_id, src_database, src_schema, "
+              "src_table, action, status, started_at, finished_at, rows_merged) "
+              "select %s, 'c2', id, src_database, src_schema, src_table, %s, 'ok', %s::timestamptz, %s::timestamptz, %s "
+              "from lakefed_ingest.control where source_instance_group = any(%s)")
+    two_days, one_day = "now() - interval '2 days'", "now() - interval '1 day'"
+    for run, action, at, rows_each, servers in ((10, "seed", two_days, 100, ["srvX"]), (10, "seed", two_days, 200, ["srvY"]),
+                                                (12, "reseed", one_day, 150, ["srvX"])):
+        when = conn.execute(f"select {at}").fetchone()[0]
+        conn.execute(insert, (run, action, when, when, rows_each, servers))
+    conn.execute("insert into lakefed_ingest.ingest_event (run_id, task_collection, control_id, src_database, src_schema, "
+                 "src_table, action, status, started_at, finished_at, rows_merged) "
+                 "select 13, 'c2', id, src_database, src_schema, src_table, 'increment', 'ok', now() - interval '2 minutes', "
+                 "now() - interval '1 minute', 5 from lakefed_ingest.control "
+                 "where source_instance_group = 'srvY' and src_table = 't1'")
+
+
+def rows(conn, sql, params=()):
+    cur = conn.execute(sql, params)
+    cols = [d.name for d in cur.description]
+    return [dict(zip(cols, r)) for r in cur.fetchall()]
+
+
+def test_two_servers_databases_of_the_same_name_are_two_databases(pg):
+    c = {r["task_collection"]: r for r in rows(pg, q.collections_overview_sql())}["c2"]
+    assert (c["databases"], c["servers"]) == (2, 2)
+    dbs = rows(pg, q.collection_databases_sql(), ("c2", "c2"))
+    assert sorted((d["server"], d["src_database"], d["tables"]) for d in dbs) == [("srvX", "Sales", 3), ("srvY", "Sales", 3)]
+    written = {(d["server"], d["src_database"]): d for d in rows(pg, q.collection_database_rows_sql(), ("c2",))}
+    assert set(written) == {("srvX", "Sales"), ("srvY", "Sales")}
+    assert written[("srvY", "Sales")]["loaded_this_run"] == 1 and written[("srvX", "Sales")]["loaded_this_run"] == 0
+    by_run = {(d["server"], d["src_database"]): d for d in rows(pg, q.run_databases_sql(), (10,))}
+    assert {k: v["rows_written"] for k, v in by_run.items()} == {("srvX", "Sales"): 300, ("srvY", "Sales"): 600}
+
+
+def test_rows_in_first_loads_are_each_tables_latest_first_load(pg):
+    written = {(d["server"], d["src_database"]): d for d in rows(pg, q.collection_database_rows_sql(), ("c2",))}
+    assert (written[("srvX", "Sales")]["rows_first_loads"], written[("srvX", "Sales")]["first_loads"]) == (450, 3)
+    assert (written[("srvY", "Sales")]["rows_first_loads"], written[("srvY", "Sales")]["first_loads"]) == (600, 3)

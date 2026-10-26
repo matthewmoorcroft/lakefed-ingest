@@ -72,8 +72,8 @@ export default function CollectionPage() {
                 const dp: Progress = { total: tablesHere, unchanged: Math.max(0, checked - loaded), loaded,
                                        inFlight: Number(d.in_flight || 0), failed: Number(d.failed_this_run || 0) };
                 return (
-                  <tr key={d.src_database}>
-                    <td><b>{d.src_database || "(none)"}</b></td>
+                  <tr key={`${d.server}\u001f${d.src_database}`}>
+                    <td><b>{d.src_database || "(none)"}</b>{servers.length > 1 && <span className="sub">{d.server || "(no server)"}</span>}</td>
                     {run && <td><ProgressBar p={dp} /></td>}
                     {run && <td className="num">{fmtInt(checked)} of {fmtInt(tablesHere)}</td>}
                     {run && <td className="num">{fmtInt(d.in_flight || 0)}</td>}
@@ -108,9 +108,9 @@ export default function CollectionPage() {
 }
 
 function download(name: string, rows: Row[]) {
-  const head = ["database", "tables", "current", "late", "first_load", "failing", "oldest_success_at", "rows_first_loads",
+  const head = ["server", "database", "tables", "current", "late", "first_load", "failing", "oldest_success_at", "rows_first_loads",
                 "first_loads_uncounted", "rows_in_batches", "rows_changes_24h"];
-  const lines = rows.map((d) => [d.src_database, d.tables, d.state_current, d.state_late, d.state_first_load, d.state_failing,
+  const lines = rows.map((d) => [d.server, d.src_database, d.tables, d.state_current, d.state_late, d.state_first_load, d.state_failing,
     d.oldest_success_at ?? "", d.rows_first_loads ?? "", d.first_loads_uncounted ?? "",
     (d.batches ?? []).reduce((a: number, b: Row) => a + Number(b.rows || 0), 0), d.rows_changes_24h ?? ""].join(","));
   const url = URL.createObjectURL(new Blob([[head.join(","), ...lines].join("\n")], { type: "text/csv" }));

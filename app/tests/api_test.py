@@ -265,3 +265,18 @@ def test_run_detail_returns_the_run_its_rows_and_live_progress(monkeypatch):
     body = client.get("/api/runs/5").json()
     assert body["run_id"] == 5 and body["rows_written"] == 120 and body["progress"]["tables_running"] == 3
     assert client.get("/api/runs/6").status_code == 404
+
+
+def test_a_collections_databases_keep_two_servers_databases_of_one_name_apart(monkeypatch):
+    states = [dict(server="srvX", src_database="Sales", tables=3), dict(server="srvY", src_database="Sales", tables=3)]
+    written = [dict(server="srvX", src_database="Sales", rows_first_loads=450, first_loads=3),
+               dict(server="srvY", src_database="Sales", rows_first_loads=600, first_loads=3)]
+    batches = [dict(run_id=9, detail='{"batch_rows": 70}', databases=["Sales"], keys=[q.database_key("srvY", "Sales")])]
+
+    def query(sql, params=()):
+        return {q.collection_database_rows_sql(): written, q.running_runs_sql(): [], q.collection_batch_runs_sql(): batches,
+                q.collection_databases_sql(): states}[sql]
+    monkeypatch.setattr(main.db, "query", query)
+    body = TestClient(main.app).get("/api/collections/two_servers_one_name/databases").json()
+    got = {(d["server"], d["src_database"]): (d["rows_first_loads"], d["batches"]) for d in body["databases"]}
+    assert got == {("srvX", "Sales"): (450, []), ("srvY", "Sales"): (600, [{"run_id": 9, "rows": 70}])}

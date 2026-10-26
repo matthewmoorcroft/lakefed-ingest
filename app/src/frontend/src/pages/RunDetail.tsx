@@ -52,6 +52,7 @@ export default function RunDetail() {
   const p = r ? (live ? (r.progress ? progressOf(r.progress) : null) : finishedProgress(r)) : null;
   const dbs = databases.data ?? [];
   const total = (k: string) => dbs.reduce((a, d) => a + Number(d[k] || 0), 0);
+  const manyServers = new Set(dbs.map((d) => d.server)).size > 1;
   const failedEvents = (events.data ?? []).filter((e) => e.status === "failed").length;
   const rows = r ? <>{r.rows_partial ? "at least " : ""}<BigCount value={r.rows_written} /></> : "";
   return (
@@ -94,7 +95,8 @@ export default function RunDetail() {
                   <th className="num">Rows written</th></tr></thead>
                 <tbody>
                   {dbs.map((d) => (
-                    <tr key={d.src_database}><td><b>{d.src_database || "(none)"}</b></td><td className="num">{fmtInt(d.loaded)}</td>
+                    <tr key={`${d.server}\u001f${d.src_database}`}><td><b>{d.src_database || "(none)"}</b>
+                      {manyServers && <span className="sub">{d.server || "(no server)"}</span>}</td><td className="num">{fmtInt(d.loaded)}</td>
                       <td className="num">{fmtInt(d.in_flight)}</td>
                       <td className="num" style={{ color: Number(d.failed) ? "var(--bad)" : undefined }}>{fmtInt(d.failed)}</td>
                       <td className="num">{Number(d.uncounted) ? `at least ${fmtInt(d.rows_written || 0)}` : fmtInt(d.rows_written || 0)}</td></tr>

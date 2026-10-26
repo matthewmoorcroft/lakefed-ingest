@@ -152,21 +152,22 @@ def collection_databases(name: str):
     """A collection's source databases: state now, this run's progress, rows in first loads and in
     changes (24 h), and batched appends' totals placed on the databases they loaded."""
     def compute():
-        rows = {r["src_database"]: r for r in db.query(q.collection_database_rows_sql(), (name,))}
+        rows = {q.database_key(r["server"], r["src_database"]): r for r in db.query(q.collection_database_rows_sql(), (name,))}
         running = [r for r in db.query(q.running_runs_sql()) if r["task_collection"] == name]
         batches = []
         for b in db.query(q.collection_batch_runs_sql(), (name,)):
             total, unknown = q.batch_rows(b["detail"])
             if total or unknown:
                 batches.append({"run_id": b["run_id"], "rows": total, "rows_unknown": unknown,
-                                "databases": sorted(b["databases"] or [])})
+                                "databases": sorted(b["databases"] or []), "keys": sorted(b["keys"] or [])})
         databases = []
         for d in db.query(q.collection_databases_sql(), (name, name)):
-            r = rows.get(d["src_database"], {})
+            key = q.database_key(d["server"], d["src_database"])
+            r = rows.get(key, {})
             d.update({k: r.get(k) for k in ("rows_first_loads", "first_loads", "first_loads_uncounted",
                                              "rows_changes_24h", "loaded_this_run", "in_flight", "failed_this_run")})
             d["batches"] = [{"run_id": b["run_id"], "rows": b["rows"]} for b in batches
-                            if b["databases"] == [d["src_database"]]]
+                            if b["keys"] == [key]]
             databases.append(d)
         return {"collection": name, "databases": databases, "running": running[0] if running else None,
                 "batches": batches, "read_at": datetime.now(timezone.utc).isoformat(), "cache_s": MONITOR_CACHE_S}
