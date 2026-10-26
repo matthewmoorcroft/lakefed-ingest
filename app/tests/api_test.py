@@ -433,7 +433,7 @@ def test_adding_a_table_that_would_put_its_database_in_a_second_collection_is_re
 def test_moving_some_of_a_databases_tables_to_another_collection_is_refused(client):
     client.db.split = {q.database_key(CONTROL[7])}
     r = client.post("/api/tables/edit", json={"ids": [7], "changes": {"task_collection": "c2"}, "dry_run": False})
-    assert r.status_code == 409 and "more than one collection" in r.json()["detail"]
+    assert r.status_code == 409 and "more than one ingestion group" in r.json()["detail"]
 
 
 def test_registering_tables_into_another_collection_than_their_database_is_refused(client):

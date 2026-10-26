@@ -83,7 +83,7 @@ def _refuse_split_databases(cur, rows):
     split = cur.fetchall()
     if split:
         _, database, collections = split[0]
-        raise HTTPException(409, f"database {database} would have tables in more than one collection "
+        raise HTTPException(409, f"database {database} would have tables in more than one ingestion group "
                                  f"({', '.join(collections)}); move all of its tables together")
 
 
