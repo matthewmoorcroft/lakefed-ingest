@@ -77,7 +77,7 @@ variables:
     description: Table retries in the whole run; once spent, failures fail at once.
     default: "20"
   spark_conf:
-    description: Spark session settings for a run, a JSON object of setting to value; blank keeps the cluster's.
+    description: Spark session settings for a run, a JSON object of setting to value (a string, number or boolean; blank keeps the cluster's).
     default: ""
 
 targets:

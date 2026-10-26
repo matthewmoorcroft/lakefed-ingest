@@ -789,23 +789,43 @@ def existing_sinks(spark, configs) -> Optional[set]:
     return found
 
 
-def apply_session_conf(spark, text) -> dict:
-    """Set this run's Spark session settings from ``text``, a JSON object of setting -> value (job
-    parameter ``spark_conf``; blank: none), so one cluster can run collections with different code
-    generation or write settings. Values are set as strings (JSON booleans as true/false). Returns
-    what was set."""
+def spark_conf_settings(text) -> dict:
+    """The Spark session settings of the job parameter ``spark_conf``: a JSON object of setting -> value
+    (blank: none), as strings. A string or number is used as written; a boolean becomes "true" or "false".
+    Anything else (null, a list, an object, NaN) is refused: its text would be a value nobody wrote ("None",
+    "[1]"). Raises ValueError, naming the setting."""
     if text is None or not str(text).strip():
         return {}
     try:
-        settings = json.loads(text)
+        settings = json.loads(text, parse_constant=_refuse_json_constant)
     except ValueError as e:
         raise ValueError(f"spark_conf is not JSON: {e}") from e
     if not isinstance(settings, dict):
         raise ValueError("spark_conf must be a JSON object of setting -> value")
-    applied = {str(k): (str(v).lower() if isinstance(v, bool) else str(v)) for k, v in settings.items()}
-    for key, value in applied.items():
+    out = {}
+    for key, value in settings.items():
+        if isinstance(value, bool):
+            out[str(key)] = "true" if value else "false"
+        elif isinstance(value, (str, int, float)):
+            out[str(key)] = str(value)
+        else:
+            kind = "null" if value is None else type(value).__name__
+            raise ValueError(f"spark_conf setting {key!r} must be a string, number or boolean, not {kind}")
+    return out
+
+
+def _refuse_json_constant(name: str):
+    raise ValueError(f"{name} is not a setting value")
+
+
+def apply_session_conf(spark, text) -> dict:
+    """Set this run's Spark session settings from ``spark_conf`` (see ``spark_conf_settings``; all of them
+    are checked before the first is set), so one cluster can run collections with different code generation
+    or write settings. Returns what was set."""
+    settings = spark_conf_settings(text)
+    for key, value in settings.items():
         spark.conf.set(key, value)
-    return applied
+    return settings
 
 
 def _is_partitioned(cfg: dict) -> bool:
