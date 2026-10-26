@@ -207,7 +207,7 @@ where control_id in (...);
 ## `database_check`: one check stamp per unchanged database
 
 When every table of a source database is unchanged (nothing to read, no seed, reseed or pending
-append), a run writes one row here instead of stamping `last_success_at` on each of its tables: the database's CT version when checked (`checked_version`),
+append, and every incremental table's sink exists), a run writes one row here instead of stamping `last_success_at` on each of its tables: the database's CT version when checked (`checked_version`),
 `checked_at`, the number of `tables` and the `run_id`. It is keyed by the collection, the database's
 server identity (`source`: host or connection, port, credential, as `state_store.database_source`)
 and `src_database`. The stamp vouches for a `ct` table of that database in phase `incremental` whose
@@ -241,7 +241,7 @@ Inserted when a run starts (`status = 'running'`) and finalized when it ends.
 | `job_run_id`, `cluster_id` | The Databricks job run and cluster, for cross-referencing the Jobs UI |
 | `parallelism` | The run's concurrency budget |
 | `started_at`, `finished_at` | Timing |
-| `status` | `running` → `completed` \| `failed` (any table failed); `skipped` when another run of the same collection held the lock |
+| `status` | `running` → `completed` \| `failed` (any table failed, or a run with a `work_id` found the collection locked by another run: its databases were not ingested); `skipped` when another run of the same collection held the lock and the run had no `work_id`; a check run that raised is `failed` with `detail.check.error` |
 | `total`, `ok`, `failed` | Table counts (`total` holds the tables the run planned while it runs) |
 | `skipped` | Tables that were unchanged (nothing to read) |
 | `reseeded` | Tables queued for a reseed |
