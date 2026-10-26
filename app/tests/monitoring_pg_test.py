@@ -123,7 +123,7 @@ def test_a_collections_databases_show_this_runs_progress_and_their_rows(pg):
     assert dbs["db1"]["server"] == "srv1"
     assert (written["db2"]["rows_first_loads"], written["db2"]["first_loads_uncounted"]) == (None, 9)
     assert written["db2"]["failed_this_run"] == 1
-    batch = rows(pg, q.collection_batch_runs_sql(), ("c1",))
+    batch = rows(pg, q.collection_batch_runs_sql(), ("c1", "c1"))
     assert [(b["run_id"], b["databases"]) for b in batch] == [(1, ["db2"])]
     assert q.batch_rows(batch[0]["detail"]) == (500, 0)
 
@@ -143,7 +143,7 @@ def test_connection_databases_match_by_name_or_host_case_insensitively(pg):
 
 
 def test_failed_tables_are_one_row_per_table_with_its_failures(pg):
-    found = rows(pg, q.failed_tables_sql(), (24, 10, 24))
+    found = rows(pg, q.failed_tables_sql(), (24, 10))
     assert [(r["src_database"], r["src_table"], r["failures"]) for r in found] == [("db2", "t9", 1)]
     assert found[0]["error"].startswith("[FAILED_JDBC.CONNECTION]") and found[0]["first_at"] == found[0]["last_at"]
-    assert rows(pg, q.failed_tables_sql(), (24, 0, 24)) == []
+    assert rows(pg, q.failed_tables_sql(), (24, 0)) == []

@@ -151,9 +151,11 @@ def error_groups(hours: int = 24):
     hours = max(1, min(int(hours), 168))
 
     def compute():
-        rows = db.query(q.failed_tables_sql(), (hours, ERROR_TABLES_LIMIT + 1, hours))
-        shown = rows[:ERROR_TABLES_LIMIT]
-        return {"groups": q.group_errors(shown), "tables_shown": len(shown), "truncated": len(rows) > len(shown)}
+        rows = db.query(q.failed_tables_sql(), (hours, ERROR_TABLES_LIMIT + 1))
+        tables = list(dict.fromkeys(r["control_id"] for r in rows))
+        kept = set(tables[:ERROR_TABLES_LIMIT])
+        shown = [r for r in rows if r["control_id"] in kept]
+        return {"groups": q.group_errors(shown), "tables_shown": len(kept), "truncated": len(tables) > len(kept)}
     return _shared(("errors", hours), compute)
 
 
@@ -165,7 +167,7 @@ def collection_databases(name: str):
         rows = {q.database_key(r["server"], r["src_database"]): r for r in db.query(q.collection_database_rows_sql(), (name,))}
         running = [r for r in db.query(q.running_runs_sql()) if r["task_collection"] == name]
         batches = []
-        for b in db.query(q.collection_batch_runs_sql(), (name,)):
+        for b in db.query(q.collection_batch_runs_sql(), (name, name)):
             total, unknown = q.batch_rows(b["detail"])
             if total or unknown:
                 batches.append({"run_id": b["run_id"], "rows": total, "rows_unknown": unknown,

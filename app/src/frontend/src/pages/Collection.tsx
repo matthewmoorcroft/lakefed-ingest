@@ -36,7 +36,7 @@ export default function CollectionPage() {
   const servers = [...new Set(dbs.map((d) => d.server).filter(Boolean))];
   const totalFirst = dbs.reduce((a, d) => a + Number(d.rows_first_loads || 0)
     + (d.batches ?? []).reduce((x: number, b: Row) => x + Number(b.rows || 0), 0), 0);
-  const unattributed = (data.data?.batches ?? []).filter((b) => (b.databases ?? []).length !== 1);
+  const unattributed = (data.data?.batches ?? []).filter((b) => (b.keys ?? []).length !== 1);
   return (
     <>
       <PageHead crumb={<span className="eyebrow"><Link to="/overview">Overview</Link> · Ingestion group · How far along is each database?</span>} title={name}

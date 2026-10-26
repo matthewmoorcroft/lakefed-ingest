@@ -180,14 +180,15 @@ order by 1"""
 
 def server_health(row: dict) -> str:
     """A server's one-word health from its enabled tables by state: "healthy" only when every table is
-    current; otherwise the worst state any table is in (failing, then late, then first load)."""
+    current; otherwise the worst state any table is in (failing, then late, then first load), and
+    "unknown" when the counts don't add up."""
     count = lambda k: int(row.get(k) or 0)
     if not count("tables"):
         return "no tables"
     for state, label in (("state_failing", "failing"), ("state_late", "late"), ("state_first_load", "first load")):
         if count(state):
             return label
-    return "healthy"
+    return "healthy" if count("state_current") == count("tables") else "unknown"
 
 
 def collection_databases_sql() -> str:
@@ -304,18 +305,22 @@ DATABASE_KEY = f"{SERVER} || chr(31) || coalesce(e.src_database, '')"
 
 
 def collection_batch_runs_sql() -> str:
-    """A collection's runs with a detail whose loads with no count were all first loads (seed, reseed or
-    full), and the databases of those loads: such a run's batched append total is rows in first loads
-    of those databases. A run that also batched changes is left out, because its one total can't be
-    split between first loads and changes. ``databases`` names them; ``keys`` are their database_key
-    (server and name), for matching. Param: task_collection."""
+    """A collection's runs with a detail whose loads with no count were all their tables' latest first
+    loads (seed, reseed or full), and the databases of those loads: such a run's batched append total is
+    rows in first loads of those databases. A run that also batched changes is left out, because its one
+    total can't be split between first loads and changes, and so is an older batch a later first load
+    replaced. ``databases`` names them; ``keys`` are their database_key (server and name), for
+    matching. Params: task_collection, task_collection."""
     return (f"select r.run_id, r.detail, array_remove(array_agg(distinct e.src_database), null) as databases, "
             f"array_agg(distinct {DATABASE_KEY}) as keys "
             f"from {SCHEMA}.ingest_run r join {SCHEMA}.ingest_event e on e.run_id = r.run_id "
             f"and e.status = 'ok' and e.rows_merged is null "
             f"left join {SCHEMA}.control t on t.id = e.control_id "
+            f"left join (select distinct on (control_id) control_id, id from {SCHEMA}.ingest_event "
+            f"           where task_collection = %s and status = 'ok' and action in ('seed', 'reseed', 'full') "
+            f"           order by control_id, finished_at desc nulls last, id desc) latest on latest.control_id = e.control_id "
             f"where r.task_collection = %s and r.detail is not null group by r.run_id, r.detail "
-            f"having bool_and(e.action in ('seed', 'reseed', 'full'))")
+            f"having bool_and(e.action in ('seed', 'reseed', 'full') and e.id = latest.id)")
 
 
 def batch_rows(detail) -> tuple:
@@ -352,8 +357,10 @@ _ERROR_PATTERNS = tuple((name, label, re.compile("|".join(rf"(?<![a-z0-9_]){re.e
 
 
 def classify_error(error: Optional[str]) -> Tuple[str, str]:
-    """(class, label) of an error message; ('other', 'Other errors') when nothing matches."""
-    text = (error or "").lower()
+    """(class, label) of an error message; ('other', 'Other errors') when nothing matches. Quoted names
+    (a column or table the message names, such as 'network') are left out, so a name is never read as a
+    cause."""
+    text = re.sub(r"'[^'\s]{1,256}'", "''", (error or "").lower())
     for name, label, pattern in _ERROR_PATTERNS:
         if pattern.search(text):
             return name, label
@@ -370,33 +377,41 @@ def error_signature(error: Optional[str]) -> str:
 
 
 def failed_tables_sql() -> str:
-    """One row per table that failed in the last N hours, newest failure first: its newest failed event
-    (the error the groups classify), how many times it failed, and its first and last failure. Params:
-    hours, limit (tables), hours."""
+    """The tables that failed in the last N hours, newest failure first, at most `limit` tables: one row
+    per table and error message, with how many times the table failed with it, its first and last time,
+    and the table's server (SERVER). A table that failed for two causes has a row for each.
+    Params: hours, limit (tables)."""
     return f"""
-with failing as (
-    select control_id, count(*) as failures, min(finished_at) as first_at, max(finished_at) as last_at,
-           max(started_at) as last_started_at
+with recent as (
+    select control_id, error, task_collection, src_database, src_schema, src_table, started_at, finished_at
     from {SCHEMA}.ingest_event
     where status = 'failed' and started_at > now() - make_interval(hours => %s)
-    group by control_id
-    order by last_started_at desc
-    limit %s
+),
+tables as (
+    select control_id, max(started_at) as table_last_started_at from recent
+    group by control_id order by table_last_started_at desc limit %s
+),
+causes as (
+    select r.control_id, r.error, count(*) as failures, min(r.finished_at) as first_at, max(r.finished_at) as last_at,
+           (array_agg(r.task_collection order by r.started_at desc))[1] as task_collection,
+           (array_agg(r.src_database order by r.started_at desc))[1] as src_database,
+           (array_agg(r.src_schema order by r.started_at desc))[1] as src_schema,
+           (array_agg(r.src_table order by r.started_at desc))[1] as src_table,
+           max(tb.table_last_started_at) as table_last_started_at
+    from recent r join tables tb on tb.control_id = r.control_id
+    group by r.control_id, r.error
 )
-select e.finished_at, e.task_collection, e.run_id, e.control_id, e.src_database, e.src_schema, e.src_table,
-       e.stage, e.error, f.failures, f.first_at, f.last_at
-from failing f
-join lateral (select * from {SCHEMA}.ingest_event e
-              where e.control_id = f.control_id and e.status = 'failed'
-                and e.started_at > now() - make_interval(hours => %s)
-              order by e.started_at desc limit 1) e on true
-order by f.last_started_at desc"""
+select c.control_id, c.error, c.failures, c.first_at, c.last_at, c.last_at as finished_at, c.task_collection,
+       c.src_database, c.src_schema, c.src_table, {SERVER} as server
+from causes c
+left join {SCHEMA}.control t on t.id = c.control_id
+order by c.table_last_started_at desc, c.control_id, c.last_at desc"""
 
 
 def group_errors(rows: List[dict]) -> List[dict]:
     """Failed tables grouped by cause (class and signature), most tables first: tables (each counted
-    once, however often it failed), failures, databases (with collection), first and last time, and one
-    raw example message. Takes failed_tables_sql's rows (one per table, with its failures and times) or
+    once per cause, however often it failed), failures, databases (server and name, with collection),
+    first and last time, and one raw example message. Takes failed_tables_sql's rows (one per table, with its failures and times) or
     plain failed events (one per failure), and counts a table once either way."""
     groups: dict = {}
     for r in rows:
@@ -411,8 +426,9 @@ def group_errors(rows: List[dict]) -> List[dict]:
         if table not in g["seen"]:
             g["seen"].add(table)
             g["tables"] += 1
-            db = g["databases"].setdefault((r.get("task_collection"), r.get("src_database")), {
-                "task_collection": r.get("task_collection"), "src_database": r.get("src_database"), "tables": []})
+            db = g["databases"].setdefault((r.get("task_collection"), r.get("server"), r.get("src_database")), {
+                "task_collection": r.get("task_collection"), "server": r.get("server"),
+                "src_database": r.get("src_database"), "tables": []})
             db["tables"].append(f"{r.get('src_schema')}.{r.get('src_table')}")
         for at in (r.get("first_at") or r.get("finished_at"), r.get("last_at") or r.get("finished_at")):
             if at:
@@ -422,7 +438,7 @@ def group_errors(rows: List[dict]) -> List[dict]:
     for g in sorted(groups.values(), key=lambda g: -g["tables"]):
         del g["seen"]
         g["databases"] = sorted(g["databases"].values(),
-                                key=lambda d: (str(d["task_collection"]), str(d["src_database"])))
+                                key=lambda d: (str(d["task_collection"]), str(d["src_database"]), str(d["server"])))
         out.append(g)
     return out
 

@@ -286,6 +286,7 @@ def test_a_server_is_healthy_only_when_every_enabled_table_is_current():
         return q.server_health({"tables": 0, "state_current": 0, "state_late": 0, "state_first_load": 0,
                                 "state_failing": 0, **counts})
     assert health(tables=10, state_current=10) == "healthy"
+    assert health(tables=10, state_current=9) != "healthy"
     assert health(tables=10, state_current=9, state_failing=1) == "failing"
     assert health(tables=10, state_late=10) == "late"
     assert health(tables=10, state_first_load=10) == "first load"

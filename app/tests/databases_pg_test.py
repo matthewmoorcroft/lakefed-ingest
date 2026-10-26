@@ -30,6 +30,7 @@ def pg():
             conn.execute(statement)
         _fixture(conn)
         _batched_changes(conn)
+        _batched_full_reloads(conn)
         yield conn
     finally:
         conn.close()
@@ -81,6 +82,29 @@ def _batched_changes(conn):
                  "now() - interval '1 hour', null from lakefed_ingest.control where source_instance_group = 'srvX'")
 
 
+def _batched_full_reloads(conn):
+    # Collection c3: one table reloaded in full by a batched append twice (200 rows, then 240), and a
+    # table that failed first on a connection and then on a missing column.
+    conn.execute("insert into lakefed_ingest.control (task_collection, src_host, src_database, src_schema, src_table, "
+                 "sink_catalog, sink_schema, sink_table, primary_key, select_list, source_instance_group, load_type) "
+                 "values ('c3', 'host-z', 'Shop', 'dbo', 'prices', 'm', 'z', 'prices', 'id', 'id', 'srvZ', 'full'), "
+                 "('c3', 'host-z', 'Shop', 'dbo', 'orders', 'm', 'z', 'orders', 'id', 'id', 'srvZ', 'ct')")
+    for run, rows_, ago in ((20, 200, "3 hours"), (21, 240, "2 hours")):
+        conn.execute(f"insert into lakefed_ingest.ingest_run (run_id, task_collection, started_at, finished_at, status, "
+                     f"detail) values ({run}, 'c3', now() - interval '{ago}', now() - interval '{ago}', 'completed', "
+                     f"'{{\"batch_rows\": {rows_}, \"batch_rows_unknown\": 0}}')")
+        conn.execute(f"insert into lakefed_ingest.ingest_event (run_id, task_collection, control_id, src_database, "
+                     f"src_schema, src_table, action, status, started_at, finished_at, rows_merged) select {run}, 'c3', id, "
+                     f"src_database, src_schema, src_table, 'full', 'ok', now() - interval '{ago}', now() - interval '{ago}', "
+                     f"null from lakefed_ingest.control where task_collection = 'c3' and src_table = 'prices'")
+    for run, error, ago in ((20, "connection reset", "3 hours"), (21, "Invalid column name 'qty'.", "2 hours")):
+        conn.execute("insert into lakefed_ingest.ingest_event (run_id, task_collection, control_id, src_database, "
+                     "src_schema, src_table, action, status, started_at, finished_at, error) select %s, 'c3', id, "
+                     "src_database, src_schema, src_table, 'increment', 'failed', now() - %s::interval, "
+                     "now() - %s::interval, %s from lakefed_ingest.control where task_collection = 'c3' "
+                     "and src_table = 'orders'", (run, ago, ago, error))
+
+
 def rows(conn, sql, params=()):
     cur = conn.execute(sql, params)
     cols = [d.name for d in cur.description]
@@ -106,4 +130,14 @@ def test_rows_in_first_loads_are_each_tables_latest_first_load(pg):
 
 
 def test_a_batch_of_changes_is_not_placed_under_rows_in_first_loads(pg):
-    assert [b["run_id"] for b in rows(pg, q.collection_batch_runs_sql(), ("c2",))] == []
+    assert [b["run_id"] for b in rows(pg, q.collection_batch_runs_sql(), ("c2", "c2"))] == []
+
+
+def test_a_table_reloaded_in_batches_twice_counts_only_its_latest_batch(pg):
+    assert [b["run_id"] for b in rows(pg, q.collection_batch_runs_sql(), ("c3", "c3"))] == [21]
+
+
+def test_failed_tables_give_each_cause_of_a_table_and_its_server(pg):
+    found = [r for r in rows(pg, q.failed_tables_sql(), (24, 10)) if r["task_collection"] == "c3"]
+    assert sorted((r["src_table"], r["server"], r["error"]) for r in found) == [
+        ("orders", "srvZ", "Invalid column name 'qty'."), ("orders", "srvZ", "connection reset")]

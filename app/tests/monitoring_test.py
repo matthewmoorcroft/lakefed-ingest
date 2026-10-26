@@ -17,6 +17,8 @@ def test_monitoring_statements_are_parameterized_and_schema_qualified():
         assert "{" not in sql            # every f-string placeholder was filled
     assert q.collection_databases_sql().count("%s") == 2
     assert q.collection_database_rows_sql().count("%s") == 1
+    assert q.collection_batch_runs_sql().count("%s") == 2
+    assert q.failed_tables_sql().count("%s") == 2
     assert q.connection_databases_sql().count("%s") == 2
 
 
@@ -57,6 +59,10 @@ def test_batch_rows_reads_a_run_detail_safely(detail, expected):
     ("Invalid column name 'network_id'.", "missing"),
     ("Invalid column name 'timeout_ms'.", "missing"),
     ("Invalid column name 'socket_count'.", "missing"),
+    ("Invalid column name 'network'.", "missing"),
+    ("Invalid column name 'socket'.", "missing"),
+    ("Invalid column name 'timeout'.", "missing"),
+    ("Invalid object name 'dbo.network'.", "missing"),
     ("A network-related or instance-specific error occurred while establishing a connection", "connection"),
     ("java.net.SocketException: Connection reset", "connection"),
     ("The TCP/IP connection to the host failed: network is unreachable", "connection"),
@@ -108,6 +114,24 @@ def test_error_groups_say_when_the_list_was_cut_short(monkeypatch):
     assert sum(g["tables"] for g in body["groups"]) == 3
 
 
+def test_a_table_failing_for_two_causes_is_in_both_groups():
+    base = dict(task_collection="c1", control_id=7, src_database="db1", src_schema="dbo", src_table="orders")
+    rows = [dict(base, finished_at="2026-10-23T09:00:00+00:00", error="Invalid column name 'qty'.", failures=1),
+            dict(base, finished_at="2026-10-23T08:00:00+00:00", error="connection reset", failures=1)]
+    by_class = {g["error_class"]: g for g in q.group_errors(rows)}
+    assert set(by_class) == {"missing", "connection"}
+    assert by_class["connection"]["tables"] == by_class["missing"]["tables"] == 1
+    assert by_class["connection"]["last_at"] == "2026-10-23T08:00:00+00:00"
+
+
+def test_failure_groups_keep_two_servers_databases_of_one_name_apart():
+    rows = [dict(task_collection="c1", server=s, control_id=i, src_database="Sales", src_schema="dbo", src_table=t,
+                 finished_at="2026-10-23T09:00:00+00:00", error="connection reset")
+            for i, s, t in ((1, "srvX", "orders"), (2, "srvY", "customers"))]
+    g = q.group_errors(rows)[0]
+    assert sorted((d["server"], d["tables"][0]) for d in g["databases"]) == [("srvX", "dbo.orders"), ("srvY", "dbo.customers")]
+
+
 # ---- API (needs FastAPI and httpx, like api_test.py) --------------------------------------------
 
 @pytest.fixture
@@ -133,7 +157,7 @@ def api(monkeypatch):
                                 rows_written=None, uncounted=3)],
         q.recent_errors_sql(): [dict(finished_at="2026-10-23T07:40:00+00:00", task_collection="c1", src_database="db1",
                                      src_schema="dbo", src_table="t", error="connection reset")],
-        q.failed_tables_sql(): [dict(finished_at="2026-10-23T07:40:00+00:00", task_collection="c1", src_database="db1",
+        q.failed_tables_sql(): [dict(finished_at="2026-10-23T07:40:00+00:00", task_collection="c1", control_id=1, src_database="db1",
                                      src_schema="dbo", src_table="t", error="connection reset")],
         q.connection_databases_sql(): [dict(src_database="db1", collections="c1, c2", tables=4,
                                             newest_success_at=None)],

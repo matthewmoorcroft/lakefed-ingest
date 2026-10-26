@@ -146,7 +146,7 @@ export default function OverviewPage() {
         <ErrorBox error={groups.error} />
         {groups.data && groups.data.groups.length === 0 && <Notice tone="ok">No failed tables in the last 24 hours.</Notice>}
         {groups.data?.truncated && <Notice tone="warn">Showing the {fmtInt(groups.data.tables_shown)} tables that failed most
-          recently; more failed in the last 24 hours. The Tables page's failing filter lists them all.</Notice>}
+          recently; more failed in the last 24 hours. The Tables page's failing filter lists every table failing now.</Notice>}
         {(groups.data?.groups ?? []).map((g) => (
           <div className="err-group" key={`${g.error_class}:${g.signature}`}>
             <div><div className="what">{g.label}{" "}
@@ -154,7 +154,7 @@ export default function OverviewPage() {
               <div className="where">{fmtInt(g.tables)} {plural(g.tables, "table")}
                 {Number(g.failures) > Number(g.tables) ? <> ({fmtInt(g.failures)} failures)</> : null} in {g.databases.length}{" "}
                 {g.databases.length === 1 ? "database" : "databases"}:{" "}
-                {g.databases.slice(0, 6).map((d: Row) => `${d.src_database} (${d.task_collection}): ${d.tables.slice(0, 4).join(", ")}`
+                {g.databases.slice(0, 6).map((d: Row) => `${d.src_database}${d.server ? ` on ${d.server}` : ""} (${d.task_collection}): ${d.tables.slice(0, 4).join(", ")}`
                   + (d.tables.length > 4 ? ` and ${d.tables.length - 4} more` : "")).join("; ")}
                 {g.databases.length > 6 && `; and ${g.databases.length - 6} more databases`}</div></div>
             <div className="where" style={{ textAlign: "right" }}>first {fmtClock(g.first_at)}<br />last {fmtClock(g.last_at)}</div>
