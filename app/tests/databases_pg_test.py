@@ -29,6 +29,7 @@ def pg():
         for statement in state_store.split_sql_statements((REPO / "src/lakefed_ingest/lakebase_schema.sql").read_text()):
             conn.execute(statement)
         _fixture(conn)
+        _batched_changes(conn)
         yield conn
     finally:
         conn.close()
@@ -69,6 +70,17 @@ def _fixture(conn):
                  "where source_instance_group = 'srvY' and src_table = 't1'")
 
 
+def _batched_changes(conn):
+    # Run 14 appended srvX's changes in a batch: one total on the run, no count on its events.
+    conn.execute("insert into lakefed_ingest.ingest_run (run_id, task_collection, started_at, finished_at, status, detail) "
+                 "values (14, 'c2', now() - interval '1 hour', now() - interval '1 hour', 'completed', "
+                 "'{\"batch_rows\": 999, \"batch_rows_unknown\": 0}')")
+    conn.execute("insert into lakefed_ingest.ingest_event (run_id, task_collection, control_id, src_database, src_schema, "
+                 "src_table, action, status, started_at, finished_at, rows_merged) "
+                 "select 14, 'c2', id, src_database, src_schema, src_table, 'increment', 'ok', now() - interval '1 hour', "
+                 "now() - interval '1 hour', null from lakefed_ingest.control where source_instance_group = 'srvX'")
+
+
 def rows(conn, sql, params=()):
     cur = conn.execute(sql, params)
     cols = [d.name for d in cur.description]
@@ -91,3 +103,7 @@ def test_rows_in_first_loads_are_each_tables_latest_first_load(pg):
     written = {(d["server"], d["src_database"]): d for d in rows(pg, q.collection_database_rows_sql(), ("c2",))}
     assert (written[("srvX", "Sales")]["rows_first_loads"], written[("srvX", "Sales")]["first_loads"]) == (450, 3)
     assert (written[("srvY", "Sales")]["rows_first_loads"], written[("srvY", "Sales")]["first_loads"]) == (600, 3)
+
+
+def test_a_batch_of_changes_is_not_placed_under_rows_in_first_loads(pg):
+    assert [b["run_id"] for b in rows(pg, q.collection_batch_runs_sql(), ("c2",))] == []

@@ -202,7 +202,12 @@ export default function BulkImport() {
   const validate = useMutation({ mutationFn: () => api.post(`/discoveries/${did}/register`, payload(true)) });
   const register = useMutation({
     mutationFn: () => api.post(`/discoveries/${did}/register`, payload(false)),
-    onSuccess: () => { qc.invalidateQueries({ queryKey: ["review"] }); qc.invalidateQueries({ queryKey: ["collections"] }); },
+    // Registering changes what lakefed tracks on the connection, so its card and database list refresh too.
+    onSuccess: () => {
+      for (const key of ["review", "collections", "connections", "connection-databases", "overview", "tables"]) {
+        qc.invalidateQueries({ queryKey: [key] });
+      }
+    },
   });
   const result = (register.data ?? validate.data) as Row | undefined;
   const nIncluded = rows.filter((r) => r.include).length;

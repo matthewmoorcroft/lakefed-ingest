@@ -304,15 +304,18 @@ DATABASE_KEY = f"{SERVER} || chr(31) || coalesce(e.src_database, '')"
 
 
 def collection_batch_runs_sql() -> str:
-    """A collection's runs with a detail, and the databases whose loads in that run recorded no count:
-    a batched append's total belongs to those databases. ``databases`` names them; ``keys`` are their
-    database_key (server and name), for matching. Param: task_collection."""
+    """A collection's runs with a detail whose loads with no count were all first loads (seed, reseed or
+    full), and the databases of those loads: such a run's batched append total is rows in first loads
+    of those databases. A run that also batched changes is left out, because its one total can't be
+    split between first loads and changes. ``databases`` names them; ``keys`` are their database_key
+    (server and name), for matching. Param: task_collection."""
     return (f"select r.run_id, r.detail, array_remove(array_agg(distinct e.src_database), null) as databases, "
             f"array_agg(distinct {DATABASE_KEY}) as keys "
             f"from {SCHEMA}.ingest_run r join {SCHEMA}.ingest_event e on e.run_id = r.run_id "
             f"and e.status = 'ok' and e.rows_merged is null "
             f"left join {SCHEMA}.control t on t.id = e.control_id "
-            f"where r.task_collection = %s and r.detail is not null group by r.run_id, r.detail")
+            f"where r.task_collection = %s and r.detail is not null group by r.run_id, r.detail "
+            f"having bool_and(e.action in ('seed', 'reseed', 'full'))")
 
 
 def batch_rows(detail) -> tuple:
