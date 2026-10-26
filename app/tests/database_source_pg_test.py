@@ -15,8 +15,9 @@ import queries as q
 URI = os.environ.get("LAKEFED_APP_TEST_PG")
 pytestmark = pytest.mark.skipif(not URI, reason="LAKEFED_APP_TEST_PG not set")
 REPO = Path(__file__).resolve().parents[2]
-CASES = [{"src_type": t, "src_host": "Host-A", "src_connection": "conn", "src_port": port, "secret_key": secret}
+CASES = [{"src_type": t, "src_host": host, "src_connection": "conn", "src_port": port, "secret_key": secret}
          for t in (None, "", "sqlserver", "oracle", "postgresql", "mysql", "db2")
+         for host in ("Host-A", None)
          for port in (None, 0, 1433, 1521, 5432, 3306, 3307)
          for secret in (None, "k1")]
 
@@ -50,17 +51,20 @@ def test_the_sql_stamp_key_is_the_python_one_for_every_source_type_and_port(pg):
     blank = CASES.index({"src_type": "sqlserver", "src_host": "Host-A", "src_connection": "conn", "src_port": None,
                          "secret_key": "k1"})
     assert in_sql[blank] == "host-a|1433|k1"
+    connection_backed = CASES.index({"src_type": "sqlserver", "src_host": None, "src_connection": "conn",
+                                     "src_port": None, "secret_key": None})
+    assert in_sql[connection_backed] == "conn|0|conn"
 
 
-def test_reapplying_the_schema_drops_the_stamps_under_the_old_blank_port_key(pg):
+def test_reapplying_the_schema_leaves_every_check_stamp_alone(pg):
+    stamps = ["srv|0|k", "conn|0|conn", "srv|1433|k"]
     pg.execute("delete from lakefed_ingest.database_check")
-    stamps = [("srv|0|k", "db_old"), ("srv|1433|k", "db_new"), ("srv|1433|a|0|b", "db_pipe")]
-    for source, database in stamps:
+    for source in stamps:
         pg.execute("insert into lakefed_ingest.database_check (task_collection, source, src_database, "
-                   "checked_version, tables) values ('c1', %s, %s, 1, 1)", (source, database))
+                   "checked_version, tables) values ('c1', %s, 'db1', 1, 1)", (source,))
     _apply_schema(pg)
     left = sorted(r[0] for r in pg.execute("select source from lakefed_ingest.database_check").fetchall())
-    assert left == ["srv|1433|a|0|b", "srv|1433|k"]
+    assert left == sorted(stamps)
 
 
 def _engine():

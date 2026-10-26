@@ -327,8 +327,13 @@ def test_the_database_source_copies_agree_for_every_source_type_and_port():
     import source_adapters
     assert q.DEFAULT_PORTS == {t: source_adapters.get_adapter(t).default_port for t in source_adapters.SRC_TYPES}
     assert q.database_source({"src_type": "mysql", "src_host": "Srv", "src_port": None, "secret_key": "k"}) == "srv|3306|k"
+    assert q.database_source({"src_type": "mysql", "src_connection": "conn", "src_port": None, "secret_key": None}) \
+        == "conn|0|conn"
     for src_type in (None, "", "SQLServer", "oracle", "postgresql", "mysql", "db2"):
-        for port in (None, 0, 1433, 1521, 5432, 3306, 3307):
-            row = {"src_type": src_type, "src_host": "Srv", "src_port": port, "secret_key": "k"}
-            assert q.database_source(row) == engine.database_source(row), row
+        for host in ("Srv", None):
+            for connection in (None, "conn"):
+                for port in (None, 0, 1433, 1521, 5432, 3306, 3307):
+                    row = {"src_type": src_type, "src_host": host, "src_connection": connection, "src_port": port,
+                           "secret_key": "k"}
+                    assert q.database_source(row) == engine.database_source(row), row
     assert "database_check dc" in q.DATABASE_CHECK_JOIN and "dc.source = " + q.database_source_sql("t") in q.DATABASE_CHECK_JOIN

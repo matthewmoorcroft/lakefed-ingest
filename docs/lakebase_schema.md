@@ -215,13 +215,17 @@ and `src_database`. The stamp vouches for a `ct` table of that database in phase
 `greatest(checkpoint.last_success_at, database_check.checked_at)`. A table behind the version (it
 changed since), re-seeding, or of another strategy reads its own stamp only.
 
-A blank port in the key is the source type's default port (1433 sqlserver, 1521 oracle, 5432 postgresql,
-3306 mysql; 0 for an unknown type), so a row with a blank port and one with the default share a stamp.
-Before schema version 4 a blank port was keyed as 0. The upgrade to 4 deletes those stamps (`source` with
-`|0|` as its port). Each database that lost one is checked once more: its tables are detected, and when
-nothing changed it is stamped under the new key. Until that check runs, its tables read their own
-`last_success_at`, which an unchanged database does not advance, so the freshness SLA can show them late
-for about one check cycle.
+In the key, a blank port is the source type's default port (1433 sqlserver, 1521 oracle, 5432 postgresql,
+3306 mysql; 0 for an unknown type), so a row with a blank port and one with the default share a stamp. The
+exception is a connection-backed row (no `src_host`): its host and port come from the UC connection, whose port
+the control row does not carry, so its blank port stays 0.
+
+The key changed in this version without a schema change. A database whose rows have a host and a blank port
+was stamped under `|0|` before, and that key is no longer read. Each such database is checked once more: its
+tables are detected and, when nothing changed, it is stamped under the new key. Until that check runs, its
+tables read their own `last_success_at`, which an unchanged database does not advance, so the freshness SLA can
+show them late for about one check cycle. The old rows stay in `database_check`; nothing deletes or rewrites
+them, and they are never read. Connection-backed stamps keep their key and stay valid.
 
 ## `check_work`: the check job's work list
 

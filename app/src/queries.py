@@ -21,11 +21,14 @@ DEFAULT_PORTS = {"sqlserver": 1433, "oracle": 1521, "postgresql": 5432, "mysql":
 def database_source_sql(alias: str) -> str:
     """The server, port and credential a control row reads its database through: the key of its
     database's check stamp (the engine's ``state_store.database_source_sql``; a test keeps them equal).
-    A blank port reads the source type's default port, as ``DEFAULT_PORTS`` lists it."""
+    A blank port reads the source type's default port, as ``DEFAULT_PORTS`` lists it, except on a
+    connection-backed row (no host), whose port is the connection's and stays 0."""
     whens = " ".join(f"when '{src_type}' then {port}" for src_type, port in DEFAULT_PORTS.items())
     default_port = f"(case coalesce(nullif(lower(trim({alias}.src_type)), ''), 'sqlserver') {whens} else 0 end)"
+    connection_backed = f"(nullif({alias}.src_host, '') is null and nullif({alias}.src_connection, '') is not null)"
     return (f"lower(coalesce(nullif({alias}.src_host, ''), nullif({alias}.src_connection, ''), '')) || '|' || "
-            f"coalesce(nullif({alias}.src_port, 0), {default_port}) || '|' || "
+            f"coalesce(nullif({alias}.src_port, 0), "
+            f"case when {connection_backed} then 0 else {default_port} end) || '|' || "
             f"coalesce(nullif({alias}.secret_key, ''), nullif({alias}.src_connection, ''), '')")
 
 
@@ -1418,8 +1421,10 @@ def database_source(row: dict) -> str:
     """``database_source_sql`` of a control-row dict (the engine's ``state_store.database_source``)."""
     host = str(row.get("src_host") or row.get("src_connection") or "").lower()
     credential = row.get("secret_key") or row.get("src_connection") or ""
-    default_port = DEFAULT_PORTS.get((str(row.get("src_type") or "").strip().lower()) or "sqlserver", 0)
-    return f"{host}|{int(row.get('src_port') or default_port)}|{credential}"
+    port = int(row.get("src_port") or 0)
+    if not port and (row.get("src_host") or not row.get("src_connection")):
+        port = DEFAULT_PORTS.get((str(row.get("src_type") or "").strip().lower()) or "sqlserver", 0)
+    return f"{host}|{port}|{credential}"
 
 
 def database_key(row: dict) -> str:
