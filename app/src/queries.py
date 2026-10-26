@@ -295,13 +295,13 @@ def run_batch_rows_sql() -> str:
             f"where detail is not null and started_at > now() - make_interval(hours => %s)")
 
 
-def database_key(server, database) -> str:
-    """A source database (server and name) as one text, as DATABASE_KEY spells it in SQL."""
+def server_database_key(server, database) -> str:
+    """A source database (server and name) as one text, as SERVER_DATABASE_KEY spells it in SQL."""
     return f"{server or ''}\x1f{database or ''}"
 
 
-# database_key in SQL. Alias t = control, e = ingest_event.
-DATABASE_KEY = f"{SERVER} || chr(31) || coalesce(e.src_database, '')"
+# server_database_key in SQL. Alias t = control, e = ingest_event.
+SERVER_DATABASE_KEY = f"{SERVER} || chr(31) || coalesce(e.src_database, '')"
 
 
 def collection_batch_runs_sql() -> str:
@@ -309,10 +309,10 @@ def collection_batch_runs_sql() -> str:
     loads (seed, reseed or full), and the databases of those loads: such a run's batched append total is
     rows in first loads of those databases. A run that also batched changes is left out, because its one
     total can't be split between first loads and changes, and so is an older batch a later first load
-    replaced. ``databases`` names them; ``keys`` are their database_key (server and name), for
+    replaced. ``databases`` names them; ``keys`` are their server_database_key (server and name), for
     matching. Params: task_collection, task_collection."""
     return (f"select r.run_id, r.detail, array_remove(array_agg(distinct e.src_database), null) as databases, "
-            f"array_agg(distinct {DATABASE_KEY}) as keys "
+            f"array_agg(distinct {SERVER_DATABASE_KEY}) as keys "
             f"from {SCHEMA}.ingest_run r join {SCHEMA}.ingest_event e on e.run_id = r.run_id "
             f"and e.status = 'ok' and e.rows_merged is null "
             f"left join {SCHEMA}.control t on t.id = e.control_id "

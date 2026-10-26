@@ -271,7 +271,7 @@ def test_a_collections_databases_keep_two_servers_databases_of_one_name_apart(mo
     states = [dict(server="srvX", src_database="Sales", tables=3), dict(server="srvY", src_database="Sales", tables=3)]
     written = [dict(server="srvX", src_database="Sales", rows_first_loads=450, first_loads=3),
                dict(server="srvY", src_database="Sales", rows_first_loads=600, first_loads=3)]
-    batches = [dict(run_id=9, detail='{"batch_rows": 70}', databases=["Sales"], keys=[q.database_key("srvY", "Sales")])]
+    batches = [dict(run_id=9, detail='{"batch_rows": 70}', databases=["Sales"], keys=[q.server_database_key("srvY", "Sales")])]
 
     def query(sql, params=()):
         return {q.collection_database_rows_sql(): written, q.running_runs_sql(): [], q.collection_batch_runs_sql(): batches,

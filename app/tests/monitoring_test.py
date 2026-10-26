@@ -159,7 +159,7 @@ def api(monkeypatch):
                                                 first_loads_uncounted=0, rows_changes_24h=3, in_flight=1,
                                                 failed_this_run=0)],
         q.collection_batch_runs_sql(): [dict(run_id=7, detail=json.dumps({"batch_rows": 400, "batch_rows_unknown": 0}),
-                                             databases=["db2"], keys=[q.database_key("s1", "db2")])],
+                                             databases=["db2"], keys=[q.server_database_key("s1", "db2")])],
         q.run_rows_sql(): [dict(run_id=9, detail=None, rows_written=12, uncounted=1),
                            dict(run_id=8, detail=json.dumps({"batch_rows": 50, "batch_rows_unknown": 0}),
                                 rows_written=None, uncounted=3)],
