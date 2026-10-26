@@ -133,6 +133,12 @@ def config_error(cfg: dict, mixed_sinks=frozenset(), snapshot_isolation: bool = 
     return None
 
 
+def locked_run_status(work_id: str) -> str:
+    """How a run that finds its collection locked by another sweep ends. A run with a work list was started
+    for databases that only it would ingest, so it fails; a run without one is a plain skip."""
+    return "failed" if str(work_id or "").strip() else "skipped"
+
+
 def sink_checked_configs(configs: List[dict]) -> List[dict]:
     """The rows whose sink table must exist for them to continue (``route_tables`` reseeds a missing
     one): the incremental strategies, ct and cursor. The sweep and the check list the sinks of these."""
