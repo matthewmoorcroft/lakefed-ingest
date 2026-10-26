@@ -164,6 +164,15 @@ def test_sync_of_a_deleted_schedule_deletes_every_job_and_reports_errors():
 OWNER = "inst/db"
 
 
+def test_deleting_a_check_schedule_deletes_its_shared_job_once():
+    fake = FakeJobs({50: sch.group_job_settings(GROUP, ["c1", "c2"], 777, owner=OWNER)})
+    members = [dict(id=1, task_collection="c1", offset_minutes=0, job_id=50),
+               dict(id=2, task_collection="c2", offset_minutes=0, job_id=50)]
+    out = sch.sync(dict(GROUP, deleted_at="2026-10-16"), members, [], fake, 777, owner=OWNER)
+    assert fake.calls == [("delete", 50)]
+    assert [(r.member_id, r.action, r.job_id) for r in out] == [(1, "deleted", 50), (2, "deleted", 50)]
+
+
 def test_sync_adopts_an_unrecorded_tagged_job_and_deletes_untracked_ones():
     mine = lambda c: sch.job_settings(SCHED, c, 0, 555, owner=OWNER)
     fake = FakeJobs({40: mine("c1"),                                     # created, but its id never recorded

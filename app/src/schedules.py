@@ -446,6 +446,10 @@ def sync(schedule: dict, members: List[dict], removed: List[dict], client: JobsC
             out.append(MemberResult(m["task_collection"], m["job_id"], "kept", "adopted by the active member",
                                     m.get("id")))
             continue
+        if int(m["job_id"]) in deleted:     # a check schedule's members share one wrapper job, gone with the first
+            out.append(MemberResult(m["task_collection"], m["job_id"], "deleted", "shared job, already deleted",
+                                    m.get("id")))
+            continue
         try:
             client.delete(m["job_id"])
             deleted.add(int(m["job_id"]))
