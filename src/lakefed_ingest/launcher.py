@@ -30,9 +30,9 @@ from typing import Callable, Dict, Iterable, List, Optional
 
 # A run is over in these life cycle states (the SDK's own wait stops on the same ones).
 TERMINAL_STATES = ("TERMINATED", "SKIPPED", "INTERNAL_ERROR")
-# Outcomes that need nothing more: the run did its work, it started and is going, or the collection's
-# own run, already going, has the work.
-OK_OUTCOMES = ("succeeded", "started", "already_running")
+# Outcomes that need nothing more: the run did its work, it started and is going, the collection's own run,
+# already going, has the work, or its databases wait for the next cycle (deferred, reported).
+OK_OUTCOMES = ("succeeded", "started", "already_running", "deferred")
 # The ingestion job's parameters (resources/lakefed_ingest.yml) a launch hands on to every run, besides
 # task_collection and work_id, which each run gets for itself.
 RUN_PARAMETERS = (
@@ -83,10 +83,23 @@ def idempotency_token(launch_id: str, collection: str) -> str:
     return "lfi-" + hashlib.sha256(f"{launch_id}:{collection}".encode()).hexdigest()[:60]
 
 
-def active_collections(runs: Iterable[dict]) -> set:
-    """The collections that already have an ingest run going, from ``jobs.active_runs``. A run still
-    starting its cluster has not taken its collection's lock yet, so the check can't see it."""
-    return {str(r.get("job_parameters", {}).get("task_collection") or "").strip() for r in runs} - {""}
+def active_collections(runs: Iterable[dict], work_of: Callable[[str, str], set]) -> Dict[str, Optional[frozenset]]:
+    """The collections that already have an ingest run going, from ``jobs.active_runs``, each with the
+    databases its run has: a run without a work list has the whole collection (None), else its work list
+    as ``work_of(work_id, collection)`` reads it. A run still starting its cluster has not taken its
+    collection's lock yet, so the check can't see it."""
+    covered: Dict[str, Optional[frozenset]] = {}
+    for run in runs:
+        parameters = run.get("job_parameters", {})
+        collection = str(parameters.get("task_collection") or "").strip()
+        work = str(parameters.get("work_id") or "").strip()
+        if not collection or (collection in covered and covered[collection] is None):
+            continue
+        if not work:
+            covered[collection] = None
+        else:
+            covered[collection] = covered.get(collection, frozenset()) | frozenset(work_of(work, collection))
+    return covered
 
 
 def outcome(state: dict) -> Optional[str]:
@@ -115,11 +128,13 @@ def capacity(max_concurrent_runs: int, active: int, queue_enabled: bool = False)
 
 def launch(jobs, job_id: int, requests: List[dict], *, launch_id: str = "", max_running: int = 0,
            wait: bool = False, confirm_s: float = 30, poll_s: float = 30, timeout_s: float = 0,
-           already_running=frozenset(), room: Optional[int] = None,
+           already_running: Dict[str, Optional[frozenset]] = None, room: Optional[int] = None,
            sleep: Callable[[float], None] = time.sleep, clock: Callable[[], float] = time.monotonic) -> dict:
     """Start the requested runs, then confirm they started, or, with ``wait``, wait until all have ended.
 
-    - A collection in ``already_running`` is not started again: its own run has the work.
+    - A collection in ``already_running`` (``active_collections``: its running databases, None for all) is not
+      started again: its own run has the work. When that run lacks some of the collection's databases (it was
+      started from an earlier work list), the collection is ``deferred``: those databases wait for the next cycle.
     - At most ``room`` runs are started (None: no limit; see ``capacity``); the rest are ``not_started``.
     - One run failing does not stop the others: each collection's run is independent and safe to finish.
     - Without ``wait`` (the default) every run is started, then the started runs are polled every few
@@ -138,9 +153,16 @@ def launch(jobs, job_id: int, requests: List[dict], *, launch_id: str = "", max_
     runs = [{"collection": r["collection"], "databases": r["databases"], "run_id": None, "outcome": None,
              "state_message": "", "url": None, "poll_errors": 0, "request": r} for r in requests]
     pending = []
+    already_running = already_running or {}
     for entry in runs:
         if entry["collection"] in already_running:
-            entry["outcome"] = "already_running"
+            covered = already_running[entry["collection"]]
+            if covered is None or set(entry["request"]["work"]) <= covered:
+                entry["outcome"] = "already_running"
+            else:
+                entry["outcome"] = "deferred"
+                entry["state_message"] = ("a run already going was started from an earlier work list without these "
+                                          "databases: the next cycle starts them")
         elif room is not None and len(pending) >= room:
             entry["outcome"] = "not_started"
             entry["state_message"] = "the ingestion job is at its maximum concurrent runs; the next cycle starts it"

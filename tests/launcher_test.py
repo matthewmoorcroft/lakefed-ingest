@@ -182,7 +182,8 @@ def test_a_run_databricks_skipped_or_could_not_start_is_reported_and_fails_the_s
 def test_a_collection_with_a_run_going_is_not_started_again():
     jobs, clock = _Jobs(active=["c1"]), _Clock()
     requests = launcher.run_requests(_per_collection(c1=["a"], c2=["b"]))
-    summary = launcher.launch(jobs, 7, requests, already_running=launcher.active_collections(jobs.active_runs(7)),
+    summary = launcher.launch(jobs, 7, requests,
+                              already_running=launcher.active_collections(jobs.active_runs(7), work_of=_no_work),
                               sleep=clock.sleep, clock=clock)
     assert [s["job_parameters"]["task_collection"] for s in jobs.started] == ["c2"]
     by = {r["collection"]: r for r in summary["runs"]}
@@ -190,10 +191,33 @@ def test_a_collection_with_a_run_going_is_not_started_again():
     assert launcher.failures(summary) == []                # its own run carries on with that work
 
 
-def test_active_collections_reads_the_runs_parameters():
+def _no_work(work_id, collection):
+    raise AssertionError("a run without a work list has no lookup")
+
+
+def test_active_collections_reads_each_runs_collection_and_the_databases_it_has():
     runs = [{"run_id": 1, "job_parameters": {"task_collection": "c1", "parallelism": "8"}},
-            {"run_id": 2, "job_parameters": {}}, {"run_id": 3, "job_parameters": {"task_collection": " c2 "}}]
-    assert launcher.active_collections(runs) == {"c1", "c2"}
+            {"run_id": 2, "job_parameters": {}},
+            {"run_id": 3, "job_parameters": {"task_collection": " c2 ", "work_id": "w:c2"}}]
+    lists = {("w:c2", "c2"): {("s1", "x")}}
+    got = launcher.active_collections(runs, work_of=lambda work_id, collection: lists[(work_id, collection)])
+    assert got == {"c1": None, "c2": frozenset({("s1", "x")})}
+
+
+def test_a_run_going_on_an_earlier_work_list_defers_the_databases_it_does_not_have():
+    running = [{"run_id": 1, "job_parameters": {"task_collection": "c1", "work_id": "old:c1"}}]
+    already = launcher.active_collections(running, work_of=lambda work_id, collection: {("s1", "a")})
+    jobs, clock = _Jobs(), _Clock()
+    requests = launcher.run_requests(_per_collection(c1=["a", "b"], c2=["x"]))
+    summary = launcher.launch(jobs, 7, requests, already_running=already, sleep=clock.sleep, clock=clock)
+    by = {r["collection"]: r for r in summary["runs"]}
+    assert by["c1"]["outcome"] == "deferred" and by["c1"]["run_id"] is None and "next cycle" in by["c1"]["state_message"]
+    assert [s["job_parameters"]["task_collection"] for s in jobs.started] == ["c2"]
+    assert launcher.failures(summary) == []                # reported, and its databases are checked again next time
+
+    covered = launcher.run_requests(_per_collection(c1=["a"]))
+    summary = launcher.launch(_Jobs(), 7, covered, already_running=already, sleep=clock.sleep, clock=clock)
+    assert summary["runs"][0]["outcome"] == "already_running"
 
 
 def test_a_stopped_step_cancels_the_runs_it_started_that_are_still_going():
