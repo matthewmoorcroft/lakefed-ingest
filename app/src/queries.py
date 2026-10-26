@@ -178,6 +178,18 @@ group by 1
 order by 1"""
 
 
+def server_health(row: dict) -> str:
+    """A server's one-word health from its enabled tables by state: "healthy" only when every table is
+    current; otherwise the worst state any table is in (failing, then late, then first load)."""
+    count = lambda k: int(row.get(k) or 0)
+    if not count("tables"):
+        return "no tables"
+    for state, label in (("state_failing", "failing"), ("state_late", "late"), ("state_first_load", "first load")):
+        if count(state):
+            return label
+    return "healthy"
+
+
 def collection_databases_sql() -> str:
     """One row per source database of a collection: its enabled tables by state, its oldest and newest
     success, and, while a run of the collection is going, how many of its tables that run has checked

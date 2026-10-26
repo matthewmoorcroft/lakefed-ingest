@@ -3,12 +3,15 @@ import { Link, useNavigate } from "react-router-dom";
 import { api, type Row } from "../api";
 import {
   BigCount, ErrorBox, Notice, PageHead, ProgressBar, ProgressKey, RunStatus, Section, Stamp, StateBar, StateKey, Tag,
-  fmtAgo, fmtClock, fmtDuration, fmtInt, progressOf, progressText, plural
+  fmtAgo, fmtClock, fmtDuration, fmtInt, progressOf, progressText, plural, type Tone
 } from "../components";
 
 interface Overview { collections: Row[]; running: Row[]; servers: Row[]; read_at: string; cache_s: number }
 
 const sum = (rows: Row[], k: string) => rows.reduce((a, r) => a + Number(r[k] || 0), 0);
+
+/** The tone of a server's health tag (queries.server_health). */
+const HEALTH_TONE: Record<string, Tone> = { healthy: "ok", failing: "bad", late: "warn", "first load": "first", "no tables": "" };
 
 export default function OverviewPage() {
   const nav = useNavigate();
@@ -91,7 +94,7 @@ export default function OverviewPage() {
               <div className="top"><div><h3>{s.server || "(no server)"}</h3>
                 <div className="meta">{fmtInt(s.databases)} {plural(s.databases, "database")} · {fmtInt(s.tables)} {plural(s.tables, "table")} · {s.collections} {plural(s.collections, "ingestion group")}</div></div>
                 {Number(s.running_collections) > 0 ? <Tag tone="run">{s.running_collections} running</Tag>
-                  : Number(s.state_failing) > 0 ? <Tag tone="bad">Failing</Tag> : <Tag tone="ok">Healthy</Tag>}</div>
+                  : <Tag tone={HEALTH_TONE[s.health] ?? ""}>{s.health ? s.health[0].toUpperCase() + s.health.slice(1) : "Unknown"}</Tag>}</div>
               <StateBar row={s} />
               <div className="nums">
                 <div><b>{Number(s.tables) ? Math.floor((100 * Number(s.state_current)) / Number(s.tables)) : 0}%</b><span>current</span></div>

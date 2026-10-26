@@ -135,7 +135,7 @@ def overview():
         for c in collections:
             c["rows_24h"] = int(c.get("rows_24h") or 0) + batches.get(c["task_collection"], 0)
         return {"collections": collections, "running": db.query(q.running_runs_sql()),
-                "servers": db.query(q.servers_sql()), "read_at": datetime.now(timezone.utc).isoformat(),
+                "servers": [dict(s, health=q.server_health(s)) for s in db.query(q.servers_sql())], "read_at": datetime.now(timezone.utc).isoformat(),
                 "cache_s": MONITOR_CACHE_S}
     return _shared("overview", compute)
 

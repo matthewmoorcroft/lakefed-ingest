@@ -279,3 +279,16 @@ def test_reseed_flips_clear_status_and_any_pending_append():
     for sql in (q.force_reseed_sql(), q.flip_to_seeding_sql()):
         assert "phase = 'seeding'" in sql and "status = 'ok'" in sql
         assert "pending_position = null" in sql and "pending_run_id = null" in sql
+
+
+def test_a_server_is_healthy_only_when_every_enabled_table_is_current():
+    def health(**counts):
+        return q.server_health({"tables": 0, "state_current": 0, "state_late": 0, "state_first_load": 0,
+                                "state_failing": 0, **counts})
+    assert health(tables=10, state_current=10) == "healthy"
+    assert health(tables=10, state_current=9, state_failing=1) == "failing"
+    assert health(tables=10, state_late=10) == "late"
+    assert health(tables=10, state_first_load=10) == "first load"
+    assert health(tables=10, state_current=5, state_late=2, state_first_load=3) == "late"
+    assert health(tables=0) == "no tables"
+    assert health(tables=None, state_current=None) == "no tables"
