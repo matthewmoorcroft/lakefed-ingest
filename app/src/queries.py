@@ -732,6 +732,7 @@ ERROR_CLASSES = (
     ("timeout", "Timed out", ("timeout", "timed out")),
     ("permission", "Permission denied at the source or sink",
      ("permission", "denied", "not authorized", "login failed")),
+    ("change_tracking", "Change Tracking is off at the source", ("change tracking is not enabled",)),
     ("missing", "A table, column or object is missing", ("invalid object name", "does not exist", "not found",
                                                           "invalid column")),
     ("schema", "The schema does not match", ("schema", "mismatch", "cannot cast", "data type")),

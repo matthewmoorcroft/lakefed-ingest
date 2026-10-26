@@ -78,6 +78,11 @@ def test_batch_rows_reads_a_run_detail_safely(detail, expected):
     ("A network-related or instance-specific error occurred while establishing a connection", "connection"),
     ("java.net.SocketException: Connection reset", "connection"),
     ("The TCP/IP connection to the host failed: network is unreachable", "connection"),
+    # The engine's own messages when Change Tracking is off on a table or a database (ct_engine.py).
+    ("Change Tracking is not enabled on this source table (CHANGE_TRACKING_MIN_VALID_VERSION() is NULL); enable "
+     "it, then the table re-seeds", "change_tracking"),
+    ("Change Tracking is not enabled on this source database (CHANGE_TRACKING_CURRENT_VERSION() is NULL)",
+     "change_tracking"),
 ])
 def test_classify_error(error, expected):
     assert q.classify_error(error)[0] == expected
