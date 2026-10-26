@@ -145,7 +145,7 @@ def jobs(states: Iterable[dict], schedules: Iterable[dict], members: Iterable[di
 def sources(states: Iterable[dict], connections: Iterable[dict], not_ingested: Iterable[dict],
             schedules: Iterable[dict], members: Iterable[dict]) -> dict:
     """Per source instance (server), by name: how it is read (the UC connections its rows name, else their
-    JDBC hosts), its ingestion jobs only (jobs(), over its own rows; groups stay on their job's page), its
+    JDBC hosts), its ingestion jobs only (jobs(), over its own rows and groups; groups stay on their job's page), its
     groups, databases, tables by state, and the tables discovered on its hosts with no control row yet. Then
     every readable UC connection that no row names, by name or host, as "nothing registered". Totals: instances
     with tables, connections with nothing registered, and tables discovered and not registered."""
@@ -166,8 +166,10 @@ def sources(states: Iterable[dict], connections: Iterable[dict], not_ingested: I
         used_hosts |= all_hosts
         found = [d for d in not_ingested if (d.get("src_host") or "").lower() in all_hosts]
         job_rows, unscheduled = jobs(mine, schedules, members)
+        here = {s["task_collection"] for s in mine if _count(s, "tables")}
         instances.append({**row, "groups": row["collections"], "read_via": read_via, "nothing_registered": False,
-                          "jobs": [j for j in job_rows if j["groups"] and j["enabled_tables"]]
+                          "jobs": [dict(j, groups=[g for g in j["groups"] if g in here])
+                                   for j in job_rows if j["groups"] and j["enabled_tables"]]
                           + ([unscheduled] if unscheduled else []),
                           "not_ingested": found, "not_registered": sum(_count(d, "not_registered") for d in found)})
     empty = [c for c in connections

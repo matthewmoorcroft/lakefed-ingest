@@ -197,7 +197,7 @@ export default function RunDetail() {
                   {dbs.length > 1 && <tr className="total"><td>All databases</td>{live && <td />}{live && <td />}<td className="num">{fmtInt(total("loaded"))}</td>
                     <td className="num">{fmtInt(total("in_flight"))}</td><td className="num">{fmtInt(total("failed"))}</td>
                     <td className="num">{total("uncounted") ? `at least ${fmtInt(total("rows_written"))}` : fmtInt(total("rows_written"))}</td></tr>}
-                  {databases.data && !dbs.length && <tr><td colSpan={live ? 7 : 5} className="muted">No table events: every table was unchanged.</td></tr>}
+                  {databases.data && !dbs.length && <tr><td colSpan={live ? 7 : 5} className="muted">{live ? "No table events yet." : "No table events: every table was unchanged."}</td></tr>}
                 </tbody>
               </table>
             </FillBox>

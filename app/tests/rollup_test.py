@@ -81,6 +81,7 @@ def test_sources_list_instances_with_their_jobs_and_a_connection_with_nothing_re
     assert by_name["srvB"]["read_via"] == [{"kind": "jdbc", "host": "sql-w.example.com"}]
     assert by_name["srvB"]["not_registered"] == 4 and by_name["srvB"]["not_ingested"][0]["largest_not_registered"] == "dbo.big"
     assert [j["name"] for j in by_name["srvB"]["jobs"]] == ["Nightly"] and by_name["srvB"]["state_failing"] == 1
+    assert by_name["srvB"]["jobs"][0]["groups"] == ["c3"]          # its groups on this instance, not all of Nightly's
     assert [j["name"] for j in by_name["srvA"]["jobs"]] == ["East hourly", "Nightly"]
     assert by_name["pg_empty"]["nothing_registered"] is True and by_name["pg_empty"]["tables"] == 0
     assert (found["ingested"], found["nothing_registered"], found["not_registered"]) == (2, 1, 4)
