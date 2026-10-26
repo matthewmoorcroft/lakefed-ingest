@@ -162,3 +162,14 @@ def test_a_group_triggered_with_no_run_yet_is_starting_and_waits_to_start():
     rows = ij.member_views(current, {}, {"c1": 10, "c2": 5}, at)
     assert [(r["task_collection"], r["state"]) for r in rows] == [("c1", "starting"), ("c2", "waiting")]
     assert rows[0]["status"]["label"] == "Starting"
+
+
+def test_a_paused_jobs_last_job_run_is_its_last_real_one_not_a_missed_trigger():
+    """Its missed triggers are Not run: the last job run shown, and the failed-in-a-row count, skip them."""
+    paused = [dict(SCHEDULES[0], paused=True)]
+    job = ij.jobs_view(paused, MEMBERS[:2], STATES, [], [r for r in RUNS if r["run_id"] != 10], STATS, NOW)["jobs"][0]
+    assert (job["last_job_run"]["slot"], job["last_job_run"]["outcome"]["label"]) == (
+        "2026-10-26T13:00:00+00:00", "Completed with failures")
+    assert job["failed_in_a_row"] == 1
+    never = ij.jobs_view(paused, MEMBERS[:2], STATES, [], [], STATS, NOW)["jobs"][0]
+    assert never["last_job_run"]["outcome"] == {"label": "Not run", "tone": "neutral", "note": "the job is paused"}
