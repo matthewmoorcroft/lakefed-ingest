@@ -280,7 +280,7 @@ def test_a_collections_databases_keep_two_servers_databases_of_one_name_apart(mo
 
     def query(sql, params=()):
         return {q.collection_database_rows_sql(): written, q.running_progress_sql(): [], q.collection_batch_runs_sql(): batches,
-                q.collection_databases_sql(): states}[sql]
+                q.collection_databases_sql(): states, q.schedules_sql(): []}[sql]
     monkeypatch.setattr(main.db, "query", query)
     body = TestClient(main.app).get("/api/collections/two_servers_one_name/databases").json()
     got = {(d["server"], d["src_database"]): (d["rows_first_loads"], d["batches"]) for d in body["databases"]}
