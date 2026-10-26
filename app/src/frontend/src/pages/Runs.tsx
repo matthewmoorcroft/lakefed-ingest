@@ -9,23 +9,23 @@ import { ErrorBox, Grid, PageHead, RunStatus, Section, fmtDuration, fmtInt, fmtS
 const worked = (r: Row) => (r.total === null || r.total === undefined ? null : Number(r.total) - Number(r.skipped || 0));
 
 const COLUMNS: ColDef[] = [
-  { field: "run_id", headerName: "Run", width: 90, cellRenderer: (p: any) => <Link to={`/runs/${p.value}`}>#{p.value}</Link> },
-  { field: "task_collection", headerName: "Ingestion group", minWidth: 170 },
-  { field: "status", headerName: "Outcome", minWidth: 190, valueGetter: (p) => p.data?.outcome?.label ?? p.data?.status,
+  { field: "run_id", headerName: "Run", width: 80, minWidth: 80, cellRenderer: (p: any) => <Link to={`/runs/${p.value}`}>#{p.value}</Link> },
+  { field: "task_collection", headerName: "Ingestion group", minWidth: 150 },
+  { field: "status", headerName: "Outcome", minWidth: 170, valueGetter: (p) => p.data?.outcome?.label ?? p.data?.status,
     cellRenderer: (p: any) => <RunStatus status={p.data?.status} outcome={p.data?.outcome} /> },
-  { field: "started_at", headerName: "Started", minWidth: 120,
+  { field: "started_at", headerName: "Started", minWidth: 110,
     valueFormatter: (p) => (p.value ? new Date(p.value).toLocaleString([], { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" }) : "") },
-  { field: "duration_s", headerName: "Took", type: "rightAligned",
+  { field: "duration_s", headerName: "Took", type: "rightAligned", minWidth: 80,
     valueFormatter: (p) => (p.value === null || p.value === undefined ? "" : fmtDuration(p.value)) },
   { colId: "worked", headerName: "Worked", type: "rightAligned", valueGetter: (p) => worked(p.data), valueFormatter: (p) => fmtInt(p.value) },
-  { field: "skipped", headerName: "Unchanged", minWidth: 110, type: "rightAligned", valueFormatter: (p) => fmtInt(p.value) },
-  { field: "failed", headerName: "Failed", type: "rightAligned", valueFormatter: (p) => fmtInt(p.value),
+  { field: "skipped", headerName: "Unchanged", minWidth: 100, type: "rightAligned", valueFormatter: (p) => fmtInt(p.value) },
+  { field: "failed", headerName: "Failed", type: "rightAligned", minWidth: 80, valueFormatter: (p) => fmtInt(p.value),
     cellStyle: (p) => (Number(p.value) ? { color: "var(--bad)", fontWeight: 600 } : null) },
-  { field: "rows_written", headerName: "Rows written", type: "rightAligned", minWidth: 120,
+  { field: "rows_written", headerName: "Rows written", type: "rightAligned", minWidth: 110,
     valueFormatter: (p) => (p.data?.rows_partial ? `at least ${fmtInt(p.value)}` : fmtInt(p.value)) },
-  { field: "speed_tables_per_min", headerName: "Speed", type: "rightAligned", minWidth: 120,
-    valueFormatter: (p) => (p.value === null || p.value === undefined ? "" : `${fmtSpeed(p.value)} tables/min`) },
-  { field: "parallelism", headerName: "Parallelism", type: "rightAligned", minWidth: 110 },
+  { field: "speed_tables_per_min", headerName: "Tables/min", type: "rightAligned", minWidth: 95,
+    valueFormatter: (p) => (p.value === null || p.value === undefined ? "" : fmtSpeed(p.value)) },
+  { field: "parallelism", headerName: "Parallelism", type: "rightAligned", minWidth: 100 },
 ];
 
 export default function Runs() {
@@ -48,7 +48,7 @@ export default function Runs() {
           </select>
         </label>} />
       <ErrorBox error={runs.error} />
-      <Section title="Recent runs" note={<>Worked: tables that needed a read (unchanged tables are advanced in bulk). Speed: tables loaded a
+      <Section title="Recent runs" note={<>Worked: tables that needed a read (unchanged tables are advanced in bulk). Tables/min: tables loaded a
         minute, from the first table's start to the last one's finish, so planning and change detection are left out. Took is
         blank for a run another run closed: it ended without finishing. Rows written: the run's own, per-table counts plus its batches' total, "at least" when some
         loads recorded none. Open a run by its number for its databases and table events.</>}>

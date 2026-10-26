@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import re
+from datetime import datetime
 from typing import List, Optional, Tuple
 
 SCHEMA = "lakefed_ingest"
@@ -77,7 +78,9 @@ def running_progress_sql() -> str:
     """Every running group run's progress in one pass: its group's enabled tables and how many it has
     checked (stamped since it started, on the database's clock like started_at), its table events so far
     (unchanged tables are stamped in bulk without events), the loads that finished in the last 5 minutes
-    (live speed and time left), and its group's 7-day median and p95 run time."""
+    (live speed and time left), and its group's 7-day median and p95 run time. A run another run closed
+    never recorded its totals (its finish is the closing time), so it is left out of the median and p95.
+    Skipped events are reseeds queued: done for this run, though not stamped as checked."""
     return f"""
 with r as (
     select run_id, task_collection, job_run_id, cluster_id, parallelism, started_at
@@ -96,6 +99,7 @@ events as (
            count(*) filter (where e.status = 'ok')      as tables_ok,
            count(*) filter (where e.status = 'failed')  as tables_failed,
            count(*) filter (where e.status = 'running') as tables_running,
+           count(*) filter (where e.status = 'skipped') as tables_skipped,
            min(e.started_at)                            as work_started_at,
            count(*) filter (where e.status = 'ok' and e.finished_at > now() - interval '5 minutes') as ok_last_5m,
            sum(e.rows_merged) filter (where e.status = 'ok' and e.finished_at > now() - interval '5 minutes') as rows_last_5m
@@ -106,7 +110,8 @@ select r.run_id, r.task_collection, r.job_run_id, r.cluster_id, r.parallelism, r
        round(extract(epoch from (now() - r.started_at)))::int as elapsed_s,
        coalesce(tb.enabled_tables, 0) as enabled_tables, coalesce(tb.tables_checked, 0) as tables_checked,
        coalesce(ev.tables_ok, 0) as tables_ok, coalesce(ev.tables_failed, 0) as tables_failed,
-       coalesce(ev.tables_running, 0) as tables_running, ev.work_started_at,
+       coalesce(ev.tables_running, 0) as tables_running, coalesce(ev.tables_skipped, 0) as tables_skipped,
+       ev.work_started_at,
        coalesce(ev.ok_last_5m, 0) as ok_last_5m, ev.rows_last_5m, p.p50_s, p.p95_s
 from r
 left join tables tb on tb.run_id = r.run_id
@@ -116,7 +121,7 @@ left join lateral (
            round(percentile_cont(0.95) within group (order by extract(epoch from (x.finished_at - x.started_at)))::numeric) as p95_s
     from {SCHEMA}.ingest_run x
     where x.task_collection = r.task_collection and x.finished_at is not null and x.status <> 'skipped'
-      and x.started_at > now() - interval '7 days') p on true
+      and x.total is not null and x.started_at > now() - interval '7 days') p on true
 order by r.started_at desc"""
 
 
@@ -466,8 +471,8 @@ def run_outcome(run: dict, progress: Optional[dict] = None) -> dict:
     The engine records a run that loaded with some table failures as failed, and a run another run closed
     (it stopped without finishing) as failed with closed_by_run in its detail. A running run is detecting
     changes until its first table is checked or loaded, then loading changed tables."""
-    status = run.get("status")
-    if status == "completed":
+    status, failed = run.get("status"), _count(run, "failed")
+    if status == "completed" and not failed:
         return {"label": "Completed", "tone": "ok", "note": None}
     if status == "skipped":
         return {"label": "Skipped: already running", "tone": "neutral", "note": None}
@@ -479,25 +484,34 @@ def run_outcome(run: dict, progress: Optional[dict] = None) -> dict:
     closed_by = _detail(run).get("closed_by_run")
     if closed_by is not None:
         return {"label": "Ended without finishing", "tone": "bad", "note": f"closed by run {closed_by}"}
-    failed = _count(run, "failed")
-    if status == "failed" and failed:
+    if status in ("failed", "completed") and failed:
         return {"label": "Completed with failures", "tone": "warn", "note": f"{failed:,} {'table' if failed == 1 else 'tables'} failed"}
     return {"label": "Failed", "tone": "bad", "note": None}
 
 
 def with_outcome(run: dict, progress: Optional[dict] = None) -> dict:
-    """The run with its outcome (run_outcome); a run another run closed has no duration, since its finish
-    is the closing time, not when its work stopped."""
+    """The run with its outcome (run_outcome); a run another run closed has no duration or speed, since
+    its finish (and its last events') is the closing time, not when its work stopped."""
     run["outcome"] = run_outcome(run, progress)
-    if run["outcome"]["label"] == "Ended without finishing":
+    run["ended_without_finishing"] = run["outcome"]["label"] == "Ended without finishing"
+    if run["ended_without_finishing"]:
         run["duration_s"] = None
     return run
 
 
+def _when(value):
+    """A timestamp as a datetime: lakebase.query sends them as ISO text."""
+    return datetime.fromisoformat(value) if isinstance(value, str) else value
+
+
 def work_speed(run: dict) -> Optional[float]:
     """Tables loaded a minute over the run's work span (first table start to last finish), which leaves
-    out planning and change detection. None before any table loaded."""
-    start, end, loaded = run.get("work_started_at"), run.get("work_finished_at"), _count(run, "loaded")
+    out planning and change detection. A finished run's ok counts its unchanged tables (cursor tables whose
+    watermark didn't move record ok events too) and its reseeds queued, so loaded is ok less both; a run
+    with no totals yet counts its ok events. None before any table loaded."""
+    start, end = _when(run.get("work_started_at")), _when(run.get("work_finished_at"))
+    loaded = (max(_count(run, "ok") - _count(run, "skipped") - _count(run, "reseeded"), 0)
+              if run.get("ok") is not None else _count(run, "loaded"))
     if not (start and end and loaded):
         return None
     minutes = max((end - start).total_seconds(), 1) / 60
@@ -510,7 +524,7 @@ LIVE_WINDOW_S = 300
 
 
 def _live_window_minutes(progress: dict, now) -> Optional[float]:
-    start = progress.get("work_started_at")
+    start = _when(progress.get("work_started_at"))
     if not start:
         return None
     loading_s = (now - start).total_seconds()
@@ -537,7 +551,8 @@ def time_left(progress: dict, now) -> Optional[dict]:
     rate = _count(progress, "ok_last_5m") / minutes if minutes else 0
     if rate:
         to_go = max(_count(progress, "enabled_tables") - _count(progress, "tables_checked")
-                    - _count(progress, "tables_running") - _count(progress, "tables_failed"), 0)
+                    - _count(progress, "tables_running") - _count(progress, "tables_failed")
+                    - _count(progress, "tables_skipped"), 0)
         return {"seconds": round(to_go / rate * 60), "basis": "rate"}
     if progress.get("p50_s") is None:
         return None

@@ -343,7 +343,8 @@ def test_runs_carry_their_outcome_and_speed_and_a_closed_run_has_no_duration(mon
         if sql.startswith("select run_id, task_collection, status, started_at"):
             return [dict(r) for r in listed]
         if sql == q.run_work_sql():
-            return [dict(run_id=7, loaded=30, work_started_at=start, work_finished_at=start + timedelta(minutes=3))]
+            return [dict(run_id=7, loaded=30, work_started_at=start, work_finished_at=start + timedelta(minutes=3)),
+                    dict(run_id=8, loaded=1, work_started_at=start, work_finished_at=start + timedelta(hours=12))]
         return []
     monkeypatch.setattr(main.db, "query", query)
     got = {r["run_id"]: r for r in TestClient(main.app).get("/api/runs").json()}
@@ -381,3 +382,14 @@ def test_the_in_flight_list_says_how_many_it_shows(monkeypatch):
     client = TestClient(main.app)
     assert client.get("/api/runs/5/in-flight").json() == {"tables": page, "total": 64, "limit": main.IN_FLIGHT_LIMIT}
     assert client.get("/api/runs/6/in-flight").json()["total"] == 3
+
+
+def test_a_running_run_in_the_list_says_what_it_is_doing(monkeypatch):
+    def query(sql, params=()):
+        if sql.startswith("select run_id, task_collection, status, started_at"):
+            return [dict(run_id=5, task_collection="c1", status="running", detail=None)]
+        if sql == q.running_progress_sql():
+            return [dict(run_id=5, tables_ok=3, enabled_tables=10)]
+        return []
+    monkeypatch.setattr(main.db, "query", query)
+    assert TestClient(main.app).get("/api/runs").json()[0]["outcome"]["label"] == "Loading changed tables"

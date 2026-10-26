@@ -25,13 +25,16 @@ function Figure({ label, value, sub, tone }: { label: string; value: ReactNode; 
   );
 }
 
+/** A run with no recent loads that has run longer than its group's typical run: no estimate is honest. */
+const pastTypical = (r: Row) => r.time_left?.basis === "typical" && Number(r.time_left.seconds) === 0;
+
 /** The run page's title: the group and run, and while running how far it is and about how long is left. */
 function title(id: string, r: Row | undefined, p: Progress | null, live: boolean): ReactNode {
   if (!r) return <>Group run {id}</>;
   const head = <>{r.task_collection}, group run {fmtInt(r.run_id)}</>;
   if (!live) return <>{head} <RunStatus status={r.status} outcome={r.outcome} /></>;
   const pct = p && p.total ? Math.floor((100 * (p.unchanged + p.loaded)) / p.total) : null;
-  const left = r.time_left ? `, ${fmtLeft(r.time_left.seconds)} left` : "";
+  const left = r.time_left && !pastTypical(r) ? `, ${fmtLeft(r.time_left.seconds)} left` : "";
   return <>{head}{pct !== null ? `: ${pct}% checked${left}` : ""} <RunStatus status={r.status} outcome={r.outcome} /></>;
 }
 
@@ -46,7 +49,8 @@ function InFlight({ id }: { id: string }) {
   const tables = found.data?.tables ?? [];
   const shown = all ? tables : tables.slice(0, 8);
   const total = found.data?.total ?? 0;
-  const note = total > tables.length ? `The ${fmtInt(tables.length)} running longest of ${fmtInt(total)}.` : undefined;
+  const note = <>{total > tables.length ? `The ${fmtInt(tables.length)} running longest of ${fmtInt(total)}. ` : ""}
+    Tables in a batched append are not listed: their events are written when the batch commits.</>;
   return (
     <Section title={found.data ? `In flight now: ${shown.length ? `1 to ${fmtInt(shown.length)} of ` : ""}${fmtInt(total)}` : "In flight now"}
       note={note}
@@ -123,8 +127,9 @@ export default function RunDetail() {
             <div className="metrics">
               <Figure label="Speed now" value={r.live_speed ? `${fmtSpeed(r.live_speed.tables_per_min)} tables/min` : ""}
                 sub={r.live_speed ? "over the last 5 minutes of loading" : "shown after 3 minutes of loading"} />
-              <Figure label="Time left" value={r.time_left ? fmtLeft(r.time_left.seconds) : ""}
-                sub={r.time_left?.basis === "typical" ? "from its typical run" : r.time_left ? "at the speed now" : "no typical run yet"} />
+              <Figure label="Time left" value={r.time_left && !pastTypical(r) ? fmtLeft(r.time_left.seconds) : ""}
+                sub={pastTypical(r) ? "past its typical run time" : r.time_left?.basis === "typical" ? "from its typical run"
+                  : r.time_left ? "at the speed now" : "no typical run yet"} />
               <Figure label="Running for" value={fmtDuration(r.duration_s)}
                 sub={r.progress?.p50_s != null ? `typical ${fmtDuration(r.progress.p50_s)}, slowest 5% over ${fmtDuration(r.progress.p95_s)}` : undefined} />
               <Figure label="Rows written" value={rows} sub="so far" />

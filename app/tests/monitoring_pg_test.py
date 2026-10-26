@@ -197,3 +197,15 @@ def test_a_connections_databases_from_the_shared_pass_equal_the_old_query_with_a
         new = rollup.connection_databases(rows(pg, q.database_states_sql()), "no_such_connection", "HOST-A")
     keys = ("src_database", "collections", "tables", "newest_success_at")
     assert [tuple(d[k] for k in keys) for d in new] == [tuple(d[k] for k in keys) for d in old]
+
+
+def test_the_typical_run_leaves_out_runs_another_run_closed_and_reseeds_queued_are_counted(pg):
+    with pg.transaction(force_rollback=True):
+        pg.execute("insert into lakefed_ingest.ingest_run (run_id, task_collection, started_at, finished_at, status, detail) "
+                   "values (90, 'c1', now() - interval '2 days', now(), 'failed', '{\"closed_by_run\": 2}')")
+        pg.execute("insert into lakefed_ingest.ingest_event (run_id, task_collection, control_id, src_database, src_schema, "
+                   "src_table, action, status, started_at, finished_at) select 2, 'c1', id, src_database, src_schema, "
+                   "src_table, 'reseed', 'skipped', now() - interval '1 minute', now() - interval '1 minute' "
+                   "from lakefed_ingest.control where src_database = 'db2' and src_table = 't10'")
+        found = {r["run_id"]: r for r in rows(pg, q.running_progress_sql())}[2]
+    assert found["p50_s"] == 0 and found["tables_skipped"] == 1

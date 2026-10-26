@@ -236,18 +236,19 @@ def runs(collection: Optional[str] = None, limit: int = 200):
 
 
 def _with_rows_written(out: List[dict]) -> List[dict]:
-    """Each run with the rows it wrote and its work (queries.run_work_sql): first table start to last
-    finish, and tables loaded."""
+    """Each run with the rows it wrote, its work (queries.run_work_sql): first table start to last finish,
+    and tables loaded, its outcome and its speed. Running runs take their progress from _running."""
     if out:
         work = {r["run_id"]: r for r in db.query(q.run_work_sql(), ([r["run_id"] for r in out],))}
+        progress = {p["run_id"]: p for p in _running()} if any(r.get("status") == "running" for r in out) else {}
         for r in out:
             w = work.get(r["run_id"], {})
             r.update({k: w.get(k) for k in ("work_started_at", "work_finished_at", "loaded")})
             batched, batched_unknown = q.batch_rows(r.get("detail"))
             r["rows_written"] = int(w.get("rows_written") or 0) + batched
             r["rows_partial"] = bool(batched_unknown) if batched else bool(w.get("uncounted"))
-            q.with_outcome(r)
-            r["speed_tables_per_min"] = q.work_speed(r)
+            q.with_outcome(r, progress.get(r["run_id"]))
+            r["speed_tables_per_min"] = None if r["ended_without_finishing"] else q.work_speed(r)
     return out
 
 
