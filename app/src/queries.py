@@ -83,11 +83,12 @@ select {SERVER} as server, t.src_connection, lower(t.src_host) as src_host, t.ta
        count(*) filter (where t.task_enabled) as tables,
        count(*) filter (where t.task_enabled and t.freshness_sla_minutes is null) as no_sla_tables,
        {STATE_COUNTS},
-       min(cp.last_success_at) filter (where t.task_enabled) as oldest_success_at,
-       max(cp.last_success_at) filter (where t.task_enabled) as newest_success_at,
-       max(cp.last_success_at) as newest_any_success_at
+       min({LAST_SUCCESS}) filter (where t.task_enabled) as oldest_success_at,
+       max({LAST_SUCCESS}) filter (where t.task_enabled) as newest_success_at,
+       max({LAST_SUCCESS}) as newest_any_success_at
 from {SCHEMA}.control t
 left join {SCHEMA}.checkpoint cp on cp.control_id = t.id
+{DATABASE_CHECK_JOIN}
 group by 1, 2, 3, 4, 5"""
 
 
@@ -101,23 +102,25 @@ order by task_collection, started_at desc"""
 
 
 def running_progress_sql() -> str:
-    """Every running group run's progress in one pass: its group's enabled tables and how many it has
-    checked (stamped since it started, on the database's clock like started_at), its table events so far
+    """Every running group run's progress in one pass: its group's enabled tables (a work-list run's
+    planned tables: its total, recorded at the start) and how many it has checked (stamped since it
+    started, on the database's clock like started_at, a database check stamp included), its table events so far
     (unchanged tables are stamped in bulk without events), the loads that finished in the last 5 minutes
     (live speed and time left), and its group's 7-day median and p95 run time. A run another run closed
     never recorded its totals (its finish is the closing time), so it is left out of the median and p95.
     Skipped events are reseeds queued: done for this run, though not stamped as checked."""
     return f"""
 with r as (
-    select run_id, task_collection, job_run_id, cluster_id, parallelism, started_at
+    select run_id, task_collection, job_run_id, cluster_id, parallelism, started_at, total
     from {SCHEMA}.ingest_run where status = 'running'
 ),
 tables as (
     select r.run_id,
            count(*) filter (where t.task_enabled) as enabled_tables,
-           count(*) filter (where t.task_enabled and cp.last_success_at >= r.started_at) as tables_checked
+           count(*) filter (where t.task_enabled and {LAST_SUCCESS} >= r.started_at) as tables_checked
     from r join {SCHEMA}.control t on t.task_collection = r.task_collection
     left join {SCHEMA}.checkpoint cp on cp.control_id = t.id
+    {DATABASE_CHECK_JOIN}
     group by r.run_id
 ),
 events as (
@@ -134,7 +137,7 @@ events as (
 )
 select r.run_id, r.task_collection, r.job_run_id, r.cluster_id, r.parallelism, r.started_at,
        round(extract(epoch from (now() - r.started_at)))::int as elapsed_s,
-       coalesce(tb.enabled_tables, 0) as enabled_tables, coalesce(tb.tables_checked, 0) as tables_checked,
+       coalesce(r.total, tb.enabled_tables, 0) as enabled_tables, coalesce(tb.tables_checked, 0) as tables_checked,
        coalesce(ev.tables_ok, 0) as tables_ok, coalesce(ev.tables_failed, 0) as tables_failed,
        coalesce(ev.tables_running, 0) as tables_running, coalesce(ev.tables_skipped, 0) as tables_skipped,
        ev.work_started_at,

@@ -118,6 +118,10 @@ def test_a_work_list_runs_progress_is_over_its_planned_tables_and_counts_stamps(
                    (q.database_source({"src_host": "Host-A", "src_port": None, "secret_key": None}),))
         r = rows(pg, q.running_runs_sql())[0]
         assert (r["enabled_tables"], r["tables_checked"]) == (10, 7 + 8)
+        shared = rows(pg, q.running_progress_sql())[0]
+        assert (shared["enabled_tables"], shared["tables_checked"]) == (10, 7 + 8)
+        states = [s for s in rows(pg, q.database_states_sql()) if s["src_database"] == "db2"]
+        assert states and all(s["newest_success_at"] is not None for s in states)
         db2 = {d["src_database"]: d for d in rows(pg, q.collection_databases_sql(), ("c1", "c1"))}["db2"]
         assert db2["checked_this_run"] == 8
 
