@@ -141,3 +141,22 @@ def test_an_extra_run_counts_in_the_outcome_but_not_as_a_member():
 def test_a_finished_group_runs_reseeds_queued_are_not_loaded_in_its_progress():
     member = dict(task_collection="c1", state="run", run=dict(status="completed", total=10, ok=10, skipped=4, reseeded=3, failed=0))
     assert ij._progress(member, {}, 10) == {"total": 10, "unchanged": 7, "loaded": 3, "in_flight": 0, "failed": 0}
+
+
+def test_a_paused_jobs_triggers_never_wait_or_start():
+    """A paused job fires nothing, so its members in the current slot are not run, and it is not running."""
+    paused = [dict(SCHEDULES[0], paused=True)]
+    v = ij.jobs_view(paused, MEMBERS[:2], STATES, [], [], STATS, datetime(2026, 10, 26, 14, 5, tzinfo=UTC))
+    job = v["jobs"][0]
+    assert job["running_job_run"] is None and job["status"]["label"] != "Running"
+    assert job["last_job_run"]["outcome"] == {"label": "Not run", "tone": "neutral", "note": "the job is paused"}
+
+
+def test_a_group_triggered_with_no_run_yet_is_starting_and_waits_to_start():
+    at = datetime(2026, 10, 26, 14, 5, tzinfo=UTC)
+    job = ij.jobs_view(SCHEDULES[:1], MEMBERS[:2], STATES, [], [], STATS, at)["jobs"][0]
+    assert job["status"]["label"] == "Running" and job["running_job_run"]["waiting"] == 2
+    current = ij.current_and_past(SCHEDULES[0], MEMBERS[:2], [], at - timedelta(hours=1), at)[0]
+    rows = ij.member_views(current, {}, {"c1": 10, "c2": 5}, at)
+    assert [(r["task_collection"], r["state"]) for r in rows] == [("c1", "starting"), ("c2", "waiting")]
+    assert rows[0]["status"]["label"] == "Starting"

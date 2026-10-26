@@ -108,3 +108,11 @@ def test_a_running_group_run_past_its_typical_time_gives_no_expected_end():
     running = _member("run", dict(status="running", run_id=7), group="a")
     overdue = {7: dict(enabled_tables=100, tables_checked=50, ok_last_5m=0, work_started_at=None, elapsed_s=5000, p50_s=900)}
     assert q.job_run_expected_end([running], overdue, {}, NOW) is None
+
+
+def test_a_member_starting_keeps_the_job_run_running_and_ends_its_typical_run_from_now():
+    done = _member("run", dict(status="completed", failed=0))
+    starting = _member("starting", fire=NOW - timedelta(minutes=5), group="b")
+    outcome = q.job_run_outcome([done, starting])
+    assert (outcome["label"], outcome["note"]) == ("Running", "1 of 2 group runs, 1 starting")
+    assert q.job_run_expected_end([done, starting], {}, {"b": 600}, NOW) == NOW + timedelta(minutes=10)

@@ -29,7 +29,8 @@ export default function JobRun() {
   const live = r?.outcome?.label === "Running";
   const p = progressFrom(r?.progress);
   const checkedPct = p.total ? Math.floor((100 * (p.unchanged + p.loaded)) / p.total) : 0;
-  const notStarted = (r?.group_runs ?? []).filter((g: Row) => g.state === "waiting").reduce((a: number, g: Row) => a + Number(g.progress?.total || 0), 0);
+  const notStarted = (r?.group_runs ?? []).filter((g: Row) => g.state === "waiting" || g.state === "starting")
+    .reduce((a: number, g: Row) => a + Number(g.progress?.total || 0), 0);
   const dbs: Row[] = r?.databases ?? [];
   const manyServers = new Set(dbs.map((d) => d.server)).size > 1;
   return (
@@ -74,6 +75,7 @@ export default function JobRun() {
                       <td className="name"><Link to={`/collections/${encodeURIComponent(g.task_collection)}`}><b>{g.task_collection}</b></Link>
                         {g.extra && <span className="sub">extra run, started by hand?</span>}</td>
                       <td>{waiting ? <Tag tone={"" as Tone}>Waiting, starts {fmtClock(g.fire_at)}</Tag>
+                        : g.state === "starting" ? <Tag tone="run">Starting, triggered {fmtClock(g.fire_at)}</Tag>
                         : g.run_id ? <Link to={`/runs/${g.run_id}`}><RunStatus status={null} outcome={g.status} /></Link>
                         : <RunStatus status={null} outcome={g.status} />}</td>
                       <td>{g.started_at ? fmtClock(g.started_at) : ""}</td>

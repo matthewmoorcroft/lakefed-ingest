@@ -28,12 +28,18 @@ def window(cadence: int, slots: int, end: datetime) -> datetime:
 def place(job: dict, members: List[dict], runs: List[dict], start: datetime, end: datetime, now: datetime):
     """The job's job runs whose slot starts in [start, end), newest first (schedules.job_runs), with their
     members' runs. Triggers are placed from one slot earlier, so a window starting mid-slot keeps every
-    member of its first job run (a member's offset is under a cadence, and under an hour past hourly)."""
+    member of its first job run (a member's offset is under a cadence, and under an hour past hourly). A paused
+    job fires nothing, so none of its members is waiting or starting."""
     mine = [m for m in members if m["schedule_id"] == job["id"]]
     groups = {m["task_collection"] for m in mine}
     cadence = int(job["cadence_minutes"])
     placed = sch.job_runs(cadence, job.get("timezone") or "UTC", mine, [r for r in runs if r["task_collection"] in groups],
                           start - timedelta(minutes=max(cadence, 60)), end, now)
+    if job.get("paused"):
+        for jr in placed:
+            for m in jr["members"]:
+                if m["state"] in ("waiting", "starting"):
+                    m["state"] = "no run"
     return [jr for jr in placed if jr["slot"] >= start]
 
 
@@ -124,7 +130,7 @@ def summarize(job: dict, job_run: dict, running_by_run: dict, group_tables: Dict
             "expected_end": end.isoformat() if end else None,
             "running_s": round((now - min(starts)).total_seconds()) if starts else None,
             "typical_s": round(max(typical)) if typical else None,
-            "waiting": sum(1 for m in members if m["state"] == "waiting"),
+            "waiting": sum(1 for m in members if m["state"] in ("waiting", "starting")),
             "running_group_runs": sum(1 for r in ran if r.get("status") == "running"),
         })
     return out
@@ -144,6 +150,8 @@ def member_views(job_run: dict, running_by_run: dict, group_tables: Dict[str, in
                 status = q.run_outcome(run, p if run.get("status") == "running" else None)
             elif m["state"] == "waiting":
                 status = {"label": f"Waiting, starts {_when(m['fire_at']).isoformat()}", "tone": "", "note": None}
+            elif m["state"] == "starting":
+                status = {"label": "Starting", "tone": "run", "note": None}
             elif m["state"] == "skipped":
                 status = {"label": "Skipped: still running", "tone": "neutral", "note": "the previous group run was still going"}
             else:

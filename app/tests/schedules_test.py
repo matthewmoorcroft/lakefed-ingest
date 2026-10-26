@@ -297,3 +297,12 @@ def test_a_member_whose_start_is_still_ahead_is_waiting():
                          datetime(2026, 10, 26, 15, tzinfo=UTC), now=datetime(2026, 10, 26, 14, 10, tzinfo=UTC))
     waiting = found[0]["members"][1]
     assert waiting["state"] == "waiting" and waiting["fire_at"] == datetime(2026, 10, 26, 14, 30, tzinfo=UTC)
+
+
+def test_a_member_triggered_in_the_current_slot_with_no_group_run_yet_is_starting():
+    """Its cluster may still be starting, for up to 15 minutes after the trigger; then it is "no run"."""
+    found = sch.job_runs(30, "UTC", _members(("a", 0), ("b", 15)), [], datetime(2026, 10, 26, 20, tzinfo=UTC),
+                         datetime(2026, 10, 26, 21, tzinfo=UTC), now=datetime(2026, 10, 26, 20, 35, tzinfo=UTC))
+    current, past = found[0]["members"], found[1]["members"]
+    assert [(m["task_collection"], m["state"]) for m in current] == [("a", "starting"), ("b", "waiting")]
+    assert [m["state"] for m in past] == ["no run", "no run"]

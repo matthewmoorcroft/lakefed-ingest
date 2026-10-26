@@ -84,7 +84,7 @@ def test_the_overview_lists_jobs_not_in_any_job_and_attention_without_a_paused_l
     assert east["last_job_run"]["outcome"]["label"] == "Completed with failures"
     assert east["status"]["label"] == "Running" and "2 tables failing" in east["status"]["detail"]     # c2 starts at 14:30
     assert east["status"]["cause"] == "Could not connect to the source database"
-    assert body["running_total"] == 1 and body["running_job_runs"][0]["waiting"] == 1
+    assert body["running_total"] == 1 and body["running_job_runs"][0]["waiting"] == 2     # c1 starting, c2 at 14:30
     assert [j["name"] for j in body["attention"]] == ["East hourly"] and body["attention_total"] == 1
     assert body["not_in_job"]["groups"] == ["c4"]
     assert body["totals"]["enabled_tables"] == 22 and "collections" not in body and "servers" not in body

@@ -636,18 +636,20 @@ JOB_RUN_ORDER = ("Ended without finishing", "Failed", "Completed with failures",
 
 def job_run_outcome(members: List[dict]) -> dict:
     """A job run's outcome from its members (schedules.job_runs): running while any group run (extra runs
-    included) is running or any member's start is still ahead; otherwise the worst of its group runs'
+    included) is running or any member is waiting for or starting its trigger; otherwise the worst of its group runs'
     outcomes, extra runs included, or "Not run" when none ran. The note counts the members that did not run, as "17 of 18 group runs, 1 skipped"."""
     runs = [m["run"] for m in members if m.get("run")]
     ran = [r for r in runs if r.get("status") != "skipped"]
     extras = [r for m in members for r in m.get("extra") or [] if r.get("status") != "skipped"]
     skipped = sum(1 for m in members if m["state"] == "skipped") + (len(runs) - len(ran))
     no_run = sum(1 for m in members if m["state"] == "no run")
+    starting = sum(1 for m in members if m["state"] == "starting")
     note = None
     if len(ran) < len(members):
         note = ", ".join([f"{len(ran)} of {len(members)} group runs"] + ([f"{skipped} skipped"] if skipped else [])
-                         + ([f"{no_run} no run"] if no_run else []))
-    if any(m["state"] == "waiting" for m in members) or any(r.get("status") == "running" for r in runs + extras):
+                         + ([f"{starting} starting"] if starting else []) + ([f"{no_run} no run"] if no_run else []))
+    if (any(m["state"] in ("waiting", "starting") for m in members)
+            or any(r.get("status") == "running" for r in runs + extras)):
         return {"label": "Running", "tone": "run", "note": note}
     if not ran and not extras:
         return {"label": "Not run", "tone": "neutral", "note": note}
@@ -658,8 +660,9 @@ def job_run_outcome(members: List[dict]) -> dict:
 
 
 def job_run_expected_end(members: List[dict], progress_by_run: dict, p50_by_group: dict, now):
-    """When a running job run should end: the latest of each running group run's time left (time_left) and
-    each waiting member's start plus its group's typical run. None when there is nothing to go on."""
+    """When a running job run should end: the latest of each running group run's time left (time_left), each
+    waiting member's start plus its group's typical run, and for a member starting, its typical run from now.
+    None when there is nothing to go on."""
     ends = []
     for m in members:
         for extra in m.get("extra") or []:
@@ -674,6 +677,8 @@ def job_run_expected_end(members: List[dict], progress_by_run: dict, p50_by_grou
                 ends.append(now + timedelta(seconds=left["seconds"]))
         elif m["state"] == "waiting" and p50_by_group.get(m["task_collection"]) is not None:
             ends.append(_when(m["fire_at"]) + timedelta(seconds=int(p50_by_group[m["task_collection"]])))
+        elif m["state"] == "starting" and p50_by_group.get(m["task_collection"]) is not None:
+            ends.append(now + timedelta(seconds=int(p50_by_group[m["task_collection"]])))
     return max(ends) if ends else None
 
 

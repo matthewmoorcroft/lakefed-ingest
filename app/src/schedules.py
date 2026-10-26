@@ -163,6 +163,10 @@ def slot_of(fire: datetime, offset: int, tz: str) -> datetime:
     return (local - timedelta(minutes=offset)).astimezone(timezone.utc)
 
 
+# How long a member's trigger shows as starting before it counts as "no run": a job cluster takes minutes to start.
+STARTING_MINUTES = 15
+
+
 def job_runs(cadence: int, tz: str, members: List[dict], runs: List[dict], start: datetime, end: datetime,
              now: datetime) -> List[dict]:
     """A schedule's job runs whose triggers fall in [start, end), newest first, each with one entry per
@@ -171,7 +175,8 @@ def job_runs(cadence: int, tz: str, members: List[dict], runs: List[dict], start
     A group run belongs to its member's latest trigger at or before its start; the first in a slot is the
     slot's run and later ones are extra (started by hand, most likely). A member with no run is waiting when
     its trigger is still ahead, skipped when its group's previous run was still going at the trigger (wrapper
-    jobs allow one run and don't queue), else "no run". Only triggers and runs while the member belonged to
+    jobs allow one run and don't queue), starting for STARTING_MINUTES after its trigger (its cluster may still
+    be starting), else "no run". Only triggers and runs while the member belonged to
     the schedule count. `runs` may start before `start`: earlier runs are only read for skipped triggers."""
     by_group: Dict[str, List[dict]] = {}
     for r in sorted(runs, key=lambda r: _when(r["started_at"])):
@@ -198,6 +203,8 @@ def job_runs(cadence: int, tz: str, members: List[dict], runs: List[dict], start
             elif any(_when(r["started_at"]) < fire and r.get("status") != "skipped"
                      and (r.get("finished_at") is None or _when(r["finished_at"]) > fire) for r in history):
                 state = "skipped"
+            elif now < min(following, fire + timedelta(minutes=STARTING_MINUTES)):
+                state = "starting"
             else:
                 state = "no run"
             slots.setdefault(slot_of(fire, offset, tz), []).append(
