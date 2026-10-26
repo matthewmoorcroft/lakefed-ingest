@@ -112,6 +112,9 @@ def run_check(store, lock_store, collections: List[str], detect_one: Callable, *
                                       mixed_sinks=mixed_sinks,
                                       reseed_on_new_columns=reseed_on_new_columns,
                                       snapshot_isolation=snapshot_isolation, force=force, map_fn=map_fn)
+            if not lock_store.is_alive():
+                raise RuntimeError("the collection's lock connection dropped during the check, so the lock is gone "
+                                   "and nothing was written")
             writes_started = time.monotonic()
             store.bulk_advance_unchanged(result["rows"])
             store.stamp_databases(collection, result["database_stamps"], run_id)
@@ -129,7 +132,7 @@ def run_check(store, lock_store, collections: List[str], detect_one: Callable, *
                 _finish_failed(store, run_id, error)
             raise
         finally:
-            lock_store.unlock_collection(collection)
+            _release_lock(lock_store, collection)
 
     started = time.monotonic()
     with ThreadPoolExecutor(max_workers=max(1, min(len(collections), collection_workers)),
@@ -154,6 +157,15 @@ def _close_abandoned_runs(store, collection: str, run_id) -> None:
         store.close_abandoned_runs(collection, run_id)
     except Exception as e:
         print(f"[telemetry] could not close earlier unfinished runs of {collection}: {str(e)[:200]}")
+
+
+def _release_lock(lock_store, collection: str) -> None:
+    """Release the collection's lock. Best effort: a dropped lock connection has already let go of it, and
+    a failure here must not replace the outcome of the check."""
+    try:
+        lock_store.unlock_collection(collection)
+    except Exception as e:
+        print(f"[telemetry] could not release the lock of {collection}: {str(e)[:200]}")
 
 
 def _finish_failed(store, run_id, error: BaseException) -> None:
