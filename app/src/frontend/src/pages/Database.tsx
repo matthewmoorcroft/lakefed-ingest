@@ -38,8 +38,8 @@ export default function Database() {
         <Link to={`/collections/${encodeURIComponent(name)}`}>{name}</Link> · Database</span>}
         title={database || "(none)"}
         lead={d && <>On <strong>{d.server || "(no server)"}</strong>, in ingestion group <Link to={`/collections/${encodeURIComponent(name)}`}><strong>{name}</strong></Link>
-          {d.jobs.length ? <> ({d.jobs.map((j: Row) => j.name).join(", ")})</> : <> (in no job)</>}: <strong>{fmtInt(d.tables)}</strong> enabled{" "}
-          {plural(d.tables, "table")}{running && <>; <Link to={`/runs/${d.running.run_id}`}>group run {fmtInt(d.running.run_id)}</Link> is going now</>}.{" "}
+          {d.jobs.length ? <> ({d.jobs.map((j: Row) => j.name).join(", ")})</> : <> (in no job)</>}: <strong>{fmtInt(d.enabled_tables)}</strong> enabled{" "}
+          {plural(d.enabled_tables, "table")}{running && <>; <Link to={`/runs/${d.running.run_id}`}>group run {fmtInt(d.running.run_id)}</Link> is going now</>}.{" "}
           <Link to={`/tables${qs({ collection: name, database })}`}>Edit these tables</Link></>}
         right={<Stamp at={d?.read_at} every={running ? 15 : 60} error={found.error} />} />
       <ErrorBox error={found.error} />

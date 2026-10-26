@@ -505,9 +505,10 @@ def one_database(name: str, server: str, database: str, search: str = "", offset
     rows = db.query(q.database_tables_sql(), (name, server, database, running["run_id"] if running else None, pattern,
                                               DATABASE_TABLES_PAGE, offset))
     total = db.query(q.database_tables_count_sql(), (name, server, database, pattern))[0]["tables"]
-    return {"task_collection": name, "server": server, "src_database": database, **sums, "jobs": job_names,
-            "running": running, "tables": rows, "total": total, "offset": offset, "limit": DATABASE_TABLES_PAGE,
-            "read_at": datetime.now(timezone.utc).isoformat()}
+    enabled = sums.pop("tables")     # "tables" in the answer is this page of them
+    return {"task_collection": name, "server": server, "src_database": database, **sums, "enabled_tables": enabled,
+            "jobs": job_names, "running": running, "tables": rows, "total": total, "offset": offset,
+            "limit": DATABASE_TABLES_PAGE, "read_at": datetime.now(timezone.utc).isoformat()}
 
 
 # ---- runs ---------------------------------------------------------------------------------------

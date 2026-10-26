@@ -166,6 +166,7 @@ def test_one_database_lists_its_tables_with_the_group_and_its_job(client, monkey
     monkeypatch.setattr(main.db, "query", query)
     body = client.get("/api/collections/c1/databases/srv1/c1_db?search=t1").json()
     assert (body["tables"][0]["state"], body["total"], body["jobs"]) == ("failing", 1, [{"id": 1, "name": "East hourly"}])
+    assert (body["enabled_tables"], body["state_current"], body["state_failing"]) == (10, 8, 2)     # the database's, not the page's
     assert calls[0][:5] == ("c1", "srv1", "c1_db", None, "%t1%")
     assert client.get("/api/collections/c1/databases/srv9/c1_db").status_code == 404
 
