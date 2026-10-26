@@ -133,6 +133,12 @@ def config_error(cfg: dict, mixed_sinks=frozenset(), snapshot_isolation: bool = 
     return None
 
 
+def sink_checked_configs(configs: List[dict]) -> List[dict]:
+    """The rows whose sink table must exist for them to continue (``route_tables`` reseeds a missing
+    one): the incremental strategies, ct and cursor. The sweep and the check list the sinks of these."""
+    return [c for c in configs if ss.strategy_name(c) in (ls.CT, ls.CURSOR)]
+
+
 def route_tables(configs: List[dict], checkpoints: Dict[int, dict], mixed_sinks=frozenset(),
                  reseed_on_new_columns: bool = True, snapshot_isolation: bool = False,
                  existing_sinks: Optional[set] = None):

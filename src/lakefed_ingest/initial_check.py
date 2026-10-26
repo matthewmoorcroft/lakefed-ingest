@@ -18,15 +18,21 @@ from __future__ import annotations
 import json
 import time
 from concurrent.futures import ThreadPoolExecutor
-from typing import Callable, Dict, List
+from typing import Callable, Dict, List, Optional
 
 import planner
 
 
-def check_collection(configs: List[dict], checkpoints: Dict[int, dict], detect_one: Callable, stamps=None,
-                     interval_s: float = 0, mixed_sinks=frozenset(), reseed_on_new_columns: bool = True,
-                     snapshot_isolation: bool = False, force=frozenset(), now=None, map_fn=map) -> dict:
+def check_collection(configs: List[dict], checkpoints: Dict[int, dict], detect_one: Callable, *,
+                     existing_sinks: Optional[set], stamps=None, interval_s: float = 0, mixed_sinks=frozenset(),
+                     reseed_on_new_columns: bool = True, snapshot_isolation: bool = False, force=frozenset(),
+                     now=None, map_fn=map) -> dict:
     """Check one collection's databases.
+
+    ``existing_sinks`` is the set of sink tables that exist (``ct_engine.existing_sinks``). It is
+    required, so a check can't run without knowing whether a sink was dropped (a dropped sink would
+    otherwise be stamped as unchanged). None means the sinks couldn't be listed: then nothing is
+    vouched for, and every database with a table to check goes to the ingest, which checks them itself.
 
     ``detect_one(members) -> planner.detect_group output`` checks one detection group (one source
     database); ``map_fn`` runs it over the groups (the notebook passes a parallel map). ``force``
@@ -44,10 +50,13 @@ def check_collection(configs: List[dict], checkpoints: Dict[int, dict], detect_o
     """
     plans, candidates, legacy = planner.route_tables(configs, checkpoints, mixed_sinks=mixed_sinks,
                                                      reseed_on_new_columns=reseed_on_new_columns,
-                                                     snapshot_isolation=snapshot_isolation)
+                                                     snapshot_isolation=snapshot_isolation,
+                                                     existing_sinks=existing_sinks)
     forced = {str(name) for name in force}
     elsewhere = (planner.database_keys(p["cfg"] for p in plans) | planner.database_keys(c for c, _ in legacy)
                  | planner.database_keys(c for c in configs if c.get("src_database") in forced))
+    if existing_sinks is None:
+        elsewhere |= planner.database_keys(c for c, _ in candidates)
     to_detect = [members for members in planner.group_by_source(candidates).values()
                  if not (planner.database_keys(c for c, _ in members) & elsewhere)]
     outputs = list(map_fn(detect_one, to_detect))
@@ -68,11 +77,14 @@ def check_collection(configs: List[dict], checkpoints: Dict[int, dict], detect_o
             "fast_exits": sum(int(o["fast_exit"]) for o in outputs)}
 
 
-def run_check(store, lock_store, collections: List[str], detect_one: Callable, *, job_run_id: str = "",
-              cluster_id: str = "", parallelism: int = 32, interval_s: float = 0,
-              reseed_on_new_columns: bool = True, snapshot_isolation: bool = False, force=frozenset(),
-              map_fn=map, collection_workers: int = 8) -> dict:
+def run_check(store, lock_store, collections: List[str], detect_one: Callable, *,
+              existing_sinks_of: Callable, job_run_id: str = "", cluster_id: str = "", parallelism: int = 32,
+              interval_s: float = 0, reseed_on_new_columns: bool = True, snapshot_isolation: bool = False,
+              force=frozenset(), map_fn=map, collection_workers: int = 8) -> dict:
     """Check every collection of the group and write the unchanged databases' stamps.
+
+    ``existing_sinks_of(configs) -> set or None`` lists the sink tables of a collection's rows (the
+    notebook passes ``ct_engine.existing_sinks``); see ``check_collection``.
 
     Each collection is checked under its lock (``lock_store``'s session holds it), with an
     ``ingest_run`` row whose ``detail.check`` records what was found; a collection whose lock another
@@ -93,8 +105,9 @@ def run_check(store, lock_store, collections: List[str], detect_one: Callable, *
             run_id = store.start_run(collection, job_run_id, cluster_id, parallelism)
             configs = store.list_task_configs(collection)
             checkpoints = store.get_checkpoints([c["id"] for c in configs])
-            result = check_collection(configs, checkpoints, detect_one, stamps=store.get_database_checks(collection),
-                                      interval_s=interval_s, mixed_sinks=mixed_sinks,
+            result = check_collection(configs, checkpoints, detect_one, existing_sinks=existing_sinks_of(configs),
+                                      stamps=store.get_database_checks(collection), interval_s=interval_s,
+                                      mixed_sinks=mixed_sinks,
                                       reseed_on_new_columns=reseed_on_new_columns,
                                       snapshot_isolation=snapshot_isolation, force=force, map_fn=map_fn)
             writes_started = time.monotonic()

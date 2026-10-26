@@ -653,3 +653,12 @@ def test_a_run_given_a_work_list_keeps_only_those_databases_of_its_collection():
     work = {planner.database_key(cfgs[1])}
     assert [c["id"] for c in planner.select_work(cfgs, work)] == [2]   # same name on another server: not listed
     assert planner.select_work(cfgs, None) == cfgs                      # no work list: the whole collection
+
+
+def test_the_sink_lookup_covers_the_incremental_rows_only():
+    """The sweep and the check list the sinks of ct and cursor rows (the ones a missing sink reseeds);
+    full reloads have no checkpoint to protect."""
+    ct = _cfg(1, "d1", "a")
+    cursor = dict(_cfg(2, "d1", "b"), load_type="cursor")
+    full = dict(_cfg(3, "d1", "c"), load_type="full")
+    assert [c["id"] for c in planner.sink_checked_configs([ct, cursor, full])] == [1, 2]
