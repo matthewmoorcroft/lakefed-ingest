@@ -655,6 +655,18 @@ def test_a_run_given_a_work_list_keeps_only_those_databases_of_its_collection():
     assert planner.select_work(cfgs, None) == cfgs                      # no work list: the whole collection
 
 
+def test_a_work_list_that_matches_no_enabled_row_is_refused_not_ingested_as_nothing():
+    cfgs = [_cfg(1, "d1", "a"), _cfg(2, "d2", "a")]
+    gone = {("h9|1433|k-d9", "d9")}
+    with pytest.raises(ValueError, match="d9"):
+        planner.select_work(cfgs, gone)
+    with pytest.raises(ValueError):
+        planner.select_work(cfgs, set())
+    partly = {planner.database_key(cfgs[0]), ("h9|1433|k-d9", "d9")}
+    assert [c["id"] for c in planner.select_work(cfgs, partly)] == [1]
+    assert planner.work_without_rows(cfgs, partly) == [("h9|1433|k-d9", "d9")]
+
+
 def test_the_sink_lookup_covers_the_incremental_rows_only():
     """The sweep and the check list the sinks of ct and cursor rows (the ones a missing sink reseeds);
     full reloads have no checkpoint to protect."""

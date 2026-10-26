@@ -455,10 +455,22 @@ def database_keys(cfgs) -> set:
 
 def select_work(configs: List[dict], work: Optional[set]) -> List[dict]:
     """A collection's rows on the databases of a work list ({database_key}), as the check job wrote it
-    for this run (``StateStore.get_check_work``); no work list keeps them all."""
+    for this run (``StateStore.get_check_work``); no work list keeps them all. A list none of whose
+    databases has a row now (moved, disabled or deleted since the check) raises: the run must not
+    succeed having ingested nothing."""
     if work is None:
         return list(configs)
-    return [c for c in configs if database_key(c) in work]
+    selected = [c for c in configs if database_key(c) in work]
+    if not selected:
+        names = ", ".join(sorted({database for _, database in work})) or "none"
+        raise ValueError(f"none of the work list's databases ({names}) has an enabled row in this collection now")
+    return selected
+
+
+def work_without_rows(configs: List[dict], work: Optional[set]) -> List[tuple]:
+    """The databases of a work list that no row of ``configs`` is on, sorted: after ``select_work``, the
+    part of the list that was not ingested."""
+    return sorted(set(work or ()) - database_keys(configs))
 
 
 def stamp_vouches(cp: Optional[dict], stamp: Optional[dict]) -> bool:
