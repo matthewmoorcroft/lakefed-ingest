@@ -140,6 +140,7 @@ class _Store:
     def __init__(self, configs, checkpoints, held=()):
         self.configs, self.checkpoints, self.held = configs, checkpoints, set(held)
         self.runs, self.finished, self.advanced, self.stamped, self.unlocked = [], {}, [], {}, []
+        self.closed = []
 
     def mixed_sinks(self):
         return set()
@@ -171,6 +172,10 @@ class _Store:
 
     def finish_run(self, run_id, **kw):
         self.finished[run_id] = kw
+
+    def close_abandoned_runs(self, collection, run_id):
+        self.closed.append((collection, run_id))
+        return (0, 0)
 
 
 def test_the_check_stamps_the_quiet_databases_and_lists_each_collections_work():
@@ -207,4 +212,25 @@ def test_the_check_releases_a_collections_lock_when_its_check_fails():
         raise AssertionError("the check should fail")
     except RuntimeError as e:
         assert "source unreachable" in str(e)
-    assert store.unlocked == ["c1"] and store.finished == {}
+    assert store.unlocked == ["c1"]
+    assert store.finished[1]["status"] == "failed" and "source unreachable" in store.finished[1]["detail"]
+    assert store.closed == [("c1", 1)]
+
+
+def test_a_check_closes_the_runs_a_dead_sweep_left_open_once_it_holds_the_lock():
+    configs = [_cfg(1, "quiet", "a", "c1")]
+    store = _Store(configs, _recorded(configs, {1: _cp(10)}))
+    summary = ic.run_check(store, store, ["c1"], _detector({"quiet": 10}), existing_sinks_of=_sinks)
+    assert store.closed == [("c1", 1)] and summary["per_collection"][0]["run_id"] == 1
+
+
+def test_a_failing_close_of_abandoned_runs_does_not_stop_the_check():
+    configs = [_cfg(1, "quiet", "a", "c1")]
+    store = _Store(configs, _recorded(configs, {1: _cp(10)}))
+
+    def broken_close(collection, run_id):
+        raise RuntimeError("telemetry down")
+
+    store.close_abandoned_runs = broken_close
+    summary = ic.run_check(store, store, ["c1"], _detector({"quiet": 10}), existing_sinks_of=_sinks)
+    assert summary["per_collection"][0]["work"] == [] and store.finished[1]["status"] == "completed"

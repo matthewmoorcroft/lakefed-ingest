@@ -90,8 +90,8 @@ def run_check(store, lock_store, collections: List[str], detect_one: Callable, *
     ``ingest_run`` row whose ``detail.check`` records what was found; a collection whose lock another
     sweep holds is left to that sweep and listed as busy. ``map_fn`` runs ``detect_one`` over each
     collection's databases (pass a shared thread pool's map to check databases of every collection at
-    once); up to ``collection_workers`` collections are checked at a time. A failed check releases the
-    collection's lock and fails the whole check, so nothing ingests on a half-known state.
+    once); up to ``collection_workers`` collections are checked at a time. A failed check marks its run
+    failed, releases the collection's lock and fails the whole check, so nothing ingests on a half-known state.
 
     Returns the summary; ``per_collection`` holds each checked collection's ``work``.
     """
@@ -101,8 +101,10 @@ def run_check(store, lock_store, collections: List[str], detect_one: Callable, *
         started = time.monotonic()
         if not lock_store.try_lock_collection(collection):
             return None
+        run_id = None
         try:
             run_id = store.start_run(collection, job_run_id, cluster_id, parallelism)
+            _close_abandoned_runs(store, collection, run_id)
             configs = store.list_task_configs(collection)
             checkpoints = store.get_checkpoints([c["id"] for c in configs])
             result = check_collection(configs, checkpoints, detect_one, existing_sinks=existing_sinks_of(configs),
@@ -122,6 +124,10 @@ def run_check(store, lock_store, collections: List[str], detect_one: Callable, *
             store.finish_run(run_id, total=unchanged, ok=unchanged, failed=0, skipped=unchanged, status="completed",
                              detail=json.dumps({"check": check}))
             return {"collection": collection, "run_id": run_id, **check}
+        except BaseException as error:
+            if run_id is not None:
+                _finish_failed(store, run_id, error)
+            raise
         finally:
             lock_store.unlock_collection(collection)
 
@@ -139,3 +145,22 @@ def run_check(store, lock_store, collections: List[str], detect_one: Callable, *
             "table_rows": sum(r["table_rows"] for r in results),
             "database_stamps": sum(r["database_stamps"] for r in results),
             "per_collection": results}
+
+
+def _close_abandoned_runs(store, collection: str, run_id) -> None:
+    """Close the collection's runs a dead sweep or check left open. The check holds the collection's lock
+    here, as the sweep does before it starts. Telemetry only: a failure never stops the check."""
+    try:
+        store.close_abandoned_runs(collection, run_id)
+    except Exception as e:
+        print(f"[telemetry] could not close earlier unfinished runs of {collection}: {str(e)[:200]}")
+
+
+def _finish_failed(store, run_id, error: BaseException) -> None:
+    """Mark the check's run failed, with what stopped it. Best effort: the error that stopped the check is
+    the one that goes on."""
+    detail = json.dumps({"check": {"error": f"{type(error).__name__}: {str(error)[:400]}"}})
+    try:
+        store.finish_run(run_id, total=0, ok=0, failed=0, status="failed", detail=detail)
+    except Exception as e:
+        print(f"[telemetry] could not mark check run {run_id} failed: {str(e)[:200]}")
