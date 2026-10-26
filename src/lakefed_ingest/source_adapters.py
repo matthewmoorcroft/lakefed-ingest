@@ -263,7 +263,7 @@ def get_adapter(src_type: Optional[str]) -> SourceAdapter:
 def default_port(src_type: Optional[str]) -> int:
     """The port a source type is reached on when a control row's port is blank. 0 for a type with no
     adapter, so a stamp key can still be built for a row the ingest refuses."""
-    adapter = _ADAPTERS.get((src_type or "").strip().lower() or SQLSERVER)
+    adapter = _ADAPTERS.get((src_type or "").strip(" ").lower() or SQLSERVER)   # spaces only, as SQL trim() does
     return adapter.default_port if adapter else 0
 
 

@@ -1423,7 +1423,7 @@ def database_source(row: dict) -> str:
     credential = row.get("secret_key") or row.get("src_connection") or ""
     port = int(row.get("src_port") or 0)
     if not port and (row.get("src_host") or not row.get("src_connection")):
-        port = DEFAULT_PORTS.get((str(row.get("src_type") or "").strip().lower()) or "sqlserver", 0)
+        port = DEFAULT_PORTS.get((str(row.get("src_type") or "").strip(" ").lower()) or "sqlserver", 0)
     return f"{host}|{port}|{credential}"
 
 
