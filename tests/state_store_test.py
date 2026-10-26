@@ -1039,12 +1039,15 @@ def test_database_source_reads_a_blank_port_as_the_source_types_default():
         blank = ss.database_source({"src_type": src_type, "src_host": "Srv", "src_port": None, "secret_key": "k"})
         assert blank == f"srv|{port}|k"
         assert ss.database_source({"src_type": src_type, "src_host": "Srv", "src_port": 0, "secret_key": "k"}) == blank
-        assert ss.database_source({"src_type": src_type, "src_host": "Srv", "src_port": port, "secret_key": "k"}) == blank
-    assert ss.database_source({"src_type": "mysql", "src_host": "Srv", "src_port": 3307, "secret_key": "k"}) == "srv|3307|k"
+        jdbc = {"src_type": src_type, "src_host": "Srv", "src_port": port, "secret_key": "k"}
+        assert ss.database_source(jdbc) == blank
+    mysql = {"src_type": "mysql", "src_host": "Srv", "src_port": 3307, "secret_key": "k"}
+    assert ss.database_source(mysql) == "srv|3307|k"
     assert ss.database_source({"src_host": "Srv", "src_port": None, "secret_key": "k"}) == "srv|1433|k"
     assert ss.database_source({"src_type": "db2", "src_host": "Srv", "src_port": None, "secret_key": "k"}) == "srv|0|k"
     # SQL trim() removes spaces only, so a tab is not part of the type name: an unknown type in both copies
-    assert ss.database_source({"src_type": "\toracle", "src_host": "Srv", "src_port": None, "secret_key": "k"}) == "srv|0|k"
+    tab = {"src_type": "\toracle", "src_host": "Srv", "src_port": None, "secret_key": "k"}
+    assert ss.database_source(tab) == "srv|0|k"
 
 
 def test_a_connection_backed_row_keeps_a_blank_port_as_zero():
