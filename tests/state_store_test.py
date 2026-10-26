@@ -584,6 +584,7 @@ SCHEMA_FINGERPRINTS = {
     1: "c035b85032e0df245775f4858dcc2e450ae737e885f326071c7b8546527a96e1",
     2: "8e514a425a7684f353c288677bff216cfe32421980263c197ba453bc10ac989f",
     3: "b748cce2a28ea27b16807b344ebc891908bfed92658f67b6cf4ed360af3d1551",
+    4: "21f48157e88ee612c4aa542291345ac119f3764ac730274661ddd9753b9b85cf",
 }
 
 
@@ -617,6 +618,7 @@ def test_ddl_creates_the_schema_version_table_and_runs_in_a_transaction():
 # Lakebase, Postgres 16). Matched by the start of the normalized statement. A new statement of these
 # kinds fails test_ddl_statements_are_safe_to_re_apply until it's reviewed and listed here.
 REVIEWED_NON_ADDITIVE = (
+    "delete from lakefed_ingest.database_check where source ~ '^[^|]*[|]0[|]'",   # stamps under the old blank-port key
     "alter table lakefed_ingest.control alter column src_port drop default",
     "alter table lakefed_ingest.control alter column primary_key drop not null",
     "alter table lakefed_ingest.control alter column job_name drop not null",
@@ -1034,16 +1036,27 @@ def test_bulk_advance_records_identity_only_when_unknown():
 
 # ---- per-database check stamps ------------------------------------------------------------------
 
+def test_database_source_reads_a_blank_port_as_the_source_types_default():
+    for src_type, port in (("sqlserver", 1433), ("oracle", 1521), ("postgresql", 5432), ("mysql", 3306)):
+        blank = ss.database_source({"src_type": src_type, "src_host": "Srv", "src_port": None, "secret_key": "k"})
+        assert blank == f"srv|{port}|k"
+        assert ss.database_source({"src_type": src_type, "src_host": "Srv", "src_port": 0, "secret_key": "k"}) == blank
+        assert ss.database_source({"src_type": src_type, "src_host": "Srv", "src_port": port, "secret_key": "k"}) == blank
+    assert ss.database_source({"src_type": "mysql", "src_host": "Srv", "src_port": 3307, "secret_key": "k"}) == "srv|3307|k"
+    assert ss.database_source({"src_host": "Srv", "src_port": None, "secret_key": "k"}) == "srv|1433|k"
+    assert ss.database_source({"src_type": "db2", "src_host": "Srv", "src_port": None, "secret_key": "k"}) == "srv|0|k"
+
+
 def test_database_source_names_the_server_port_and_credential_the_way_the_app_reads_it():
     jdbc = {"src_host": "Srv.Example.net", "src_port": 1433, "secret_key": "k-db1", "src_database": "db1"}
     conn = {"src_connection": "lfc_conn", "use_remote_query": True, "src_database": "db1"}
     assert ss.database_source(jdbc) == "srv.example.net|1433|k-db1"
-    assert ss.database_source(conn) == "lfc_conn|0|lfc_conn"
-    assert ss.database_source({**jdbc, "src_port": None, "secret_key": ""}) == "srv.example.net|0|"
+    assert ss.database_source(conn) == "lfc_conn|1433|lfc_conn"
+    assert ss.database_source({**jdbc, "src_port": None, "secret_key": ""}) == "srv.example.net|1433|"
     # the same identity in SQL, for readers that join control rows to their database's stamp
     expr = ss.database_source_sql("t")
     assert "lower(coalesce(nullif(t.src_host, ''), nullif(t.src_connection, ''), ''))" in expr
-    assert "coalesce(t.src_port, 0)" in expr and "coalesce(nullif(t.secret_key, ''), nullif(t.src_connection, ''), '')" in expr
+    assert "coalesce(nullif(t.src_port, 0), (case coalesce(" in expr and "coalesce(nullif(t.secret_key, ''), nullif(t.src_connection, ''), '')" in expr
 
 
 def test_ddl_database_check_is_keyed_by_collection_source_and_database():

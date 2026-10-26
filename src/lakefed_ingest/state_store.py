@@ -127,7 +127,8 @@ def split_sql_statements(ddl: str) -> List[str]:
 # DDL's fingerprint to it, so a schema change can't ship without a bump.
 #   0 = no version recorded (deployed before versions existed)   1 = first recorded version
 #   2 = discovery, control_change, checkpoint identities, freshness SLA, schedules (operations app)
-SCHEMA_VERSION = 3
+#   4 = database check stamps keyed by the source type's default port, not 0 (old keys removed)
+SCHEMA_VERSION = 4
 # Advisory lock that serializes migrations (the setup job and ingestion runs of any collection): two
 # int keys, so it can't collide with a collection's one-key lock whatever the collection is named,
 # and a class of its own (not SOURCE_LOCK_CLASS).
@@ -237,17 +238,23 @@ def identity_values(cfg: dict) -> tuple:
 def database_source(cfg: dict) -> str:
     """The server, port and credential a control row reads its database through, as one string: the
     key a per-database check stamp is kept under, with ``src_database`` and the collection. A blank
-    port reads 0 and a blank host or credential falls back to the connection, exactly as
-    ``database_source_sql`` spells it in SQL, so readers can join a table to its database's stamp."""
+    port reads the source type's default port (the one its adapter connects on), a blank host or
+    credential falls back to the connection, exactly as ``database_source_sql`` spells it in SQL, so
+    readers can join a table to its database's stamp."""
+    import source_adapters as sa
     host = str(cfg.get("src_host") or cfg.get("src_connection") or "").lower()
     credential = cfg.get("secret_key") or cfg.get("src_connection") or ""
-    return f"{host}|{int(cfg.get('src_port') or 0)}|{credential}"
+    port = int(cfg.get("src_port") or sa.default_port(cfg.get("src_type")))
+    return f"{host}|{port}|{credential}"
 
 
 def database_source_sql(alias: str) -> str:
     """``database_source`` of the control row ``alias`` in SQL."""
+    import source_adapters as sa
+    whens = " ".join(f"when '{src_type}' then {sa.get_adapter(src_type).default_port}" for src_type in sa.SRC_TYPES)
+    default_port = f"(case coalesce(nullif(lower(trim({alias}.src_type)), ''), '{sa.SQLSERVER}') {whens} else 0 end)"
     return (f"lower(coalesce(nullif({alias}.src_host, ''), nullif({alias}.src_connection, ''), '')) || '|' || "
-            f"coalesce({alias}.src_port, 0) || '|' || "
+            f"coalesce(nullif({alias}.src_port, 0), {default_port}) || '|' || "
             f"coalesce(nullif({alias}.secret_key, ''), nullif({alias}.src_connection, ''), '')")
 
 

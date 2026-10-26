@@ -283,6 +283,11 @@ create table if not exists lakefed_ingest.database_check (
     constraint database_check_pk primary key (task_collection, source, src_database)
 );
 
+-- Stamps keyed with a blank port (0): before v4 a blank port was keyed as 0, and now it is the source type's
+-- default port. Nothing reads the old keys, so they are removed; the next check of each such database detects
+-- its tables once and stamps it under the new key.
+delete from lakefed_ingest.database_check where source ~ '^[^|]*[|]0[|]';
+
 -- The initial check's work list. Before it starts a collection's run, the check job (check_launch.ipynb)
 -- writes here the databases of that collection that have work, under one work_id, and starts the run with
 -- that work_id; the run then ingests only those databases. A job parameter would not hold them (job
