@@ -194,6 +194,7 @@ def test_the_last_job_run_before_the_window_is_the_newest_slot_not_the_newest_st
     newer = dict(task_collection="c1", started_at="2026-10-26T13:05:00+00:00")          # c1 fires at :00: 13:00's
     found = ij.newest_slots([late_older, newer], job, MEMBERS)
     assert found == [datetime(2026, 10, 26, 13, tzinfo=UTC), datetime(2026, 10, 26, 12, tzinfo=UTC)]
-    failed = [{"outcome": {"label": "Completed with failures"}, "failed_tables": 2}] * 2
-    assert ij.earlier_last(failed + [{"outcome": {"label": "Completed"}, "failed_tables": 0}])["failed_in_a_row"] == 2
+    # Found that way, only its newest job run is read: its failures in a row are at least that one.
+    found = ij.earlier_last([{"outcome": {"label": "Completed with failures"}, "failed_tables": 2}])
+    assert (found["failed_in_a_row"], found["failed_in_a_row_at_least"]) == (1, True)
     assert ij.earlier_last([{"outcome": {"label": "Not run"}, "failed_tables": 0}]) is None

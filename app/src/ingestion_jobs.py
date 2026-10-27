@@ -217,13 +217,13 @@ def newest_slots(runs: List[dict], job: dict, members: List[dict]) -> List[datet
 
 
 def earlier_last(summaries: List[dict]) -> Optional[dict]:
-    """A job's last job run that ran among job runs found before its recent triggers (newest first), with how many
-    in a row of them had failed tables from it on (consecutive_failed); None when none ran."""
+    """A job's last job run that ran, from the job runs of its newest slot found before its recent triggers; None
+    when none ran. Only that job run is read, so its failures in a row are at least its own (one, or none)."""
     last = last_finished(summaries)
     if not last:
         return None
     return dict({k: v for k, v in last.items() if k != "placed"},
-                failed_in_a_row=consecutive_failed(summaries[summaries.index(last):]))
+                failed_in_a_row=1 if last.get("failed_tables") else 0, failed_in_a_row_at_least=True)
 
 
 def consecutive_failed(summaries: List[dict]) -> int:

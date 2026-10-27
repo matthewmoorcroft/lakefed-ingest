@@ -410,25 +410,29 @@ def group_runs_sql() -> str:
             f"where task_collection = any(%s) and started_at >= %s and started_at < %s order by started_at")
 
 
-# How many of a job's newest group runs that ran are read to find its last job run: more than one, since a late
-# run of an older slot can start after a run of the newest, and to count its failures in a row.
-LAST_RAN_LOOKUP = 5
-
-
 def last_ran_group_runs_sql() -> str:
-    """Per job, the LAST_RAN_LOOKUP newest group runs that ran (not skipped) of its groups while each was its
-    member, each with its schedule_id: where a job's last job run is found when none of its recent triggers ran.
+    """Per membership of each job, its group's newest finished group run (not skipped, not running) while it was
+    the member, with its schedule_id: where a job's last job run is found when none of its recent triggers ran.
+    Within one member, start order is slot order, so the newest slot among these is the job's newest that ran.
     Param: schedule ids."""
     return f"""
 select schedule_id, {_RUN_COLUMNS} from (
     select m.schedule_id, r.*,
-           row_number() over (partition by m.schedule_id order by r.started_at desc) as newest
+           row_number() over (partition by m.id order by r.started_at desc) as newest
     from {SCHEMA}.ingest_run r
     join {SCHEMA}.schedule_member m on m.task_collection = r.task_collection
-    where m.schedule_id = any(%s) and r.status <> 'skipped'
+    where m.schedule_id = any(%s) and r.status not in ('skipped', 'running')
       and (m.added_at is null or r.started_at >= m.added_at) and (m.removed_at is null or r.started_at < m.removed_at)
 ) x
-where newest <= {LAST_RAN_LOOKUP}"""
+where newest = 1"""
+
+
+def group_runs_in_windows_sql() -> str:
+    """The runs of each (ingestion group, window start, window end) given, in one read: the job runs of several
+    jobs, each around its own slot. Params: groups, starts, ends (arrays of one length)."""
+    return (f"select {_RUN_COLUMNS} from {SCHEMA}.ingest_run "
+            f"join unnest(%s::text[], %s::timestamptz[], %s::timestamptz[]) as w(task_collection, starts, ends) "
+            f"using (task_collection) where started_at >= w.starts and started_at < w.ends order by started_at")
 
 
 def group_runs_before_sql() -> str:

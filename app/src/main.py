@@ -266,16 +266,23 @@ def _schedule(job_id: int) -> dict:
     return found
 
 
-def _job_runs_of(job: dict, start: datetime, end: datetime, now: datetime) -> List[dict]:
+def _runs_window(job: dict, start: datetime, end: datetime):
+    """The window of group runs that job runs with slots in [start, end) are placed from: two slots before `start`
+    (ij.place starts a slot early, and an earlier run still going at a trigger makes it skipped), and up to two
+    cadences after `end` (a member's offset, then up to its next trigger)."""
+    cadence = int(job["cadence_minutes"])
+    return start - timedelta(minutes=2 * max(cadence, 60)), end + timedelta(minutes=2 * cadence)
+
+
+def _job_runs_of(job: dict, start: datetime, end: datetime, now: datetime,
+                 runs: Optional[List[dict]] = None) -> List[dict]:
     """A job's job runs whose slot started in [start, end), newest first, as ij.summarize shows them, with
-    their placed members. Runs are read from two slots before `start`: ij.place starts a slot early, and an
-    earlier run still going at a trigger makes it skipped."""
+    their placed members, from `runs` when given (read for _runs_window), else read here."""
     _, members = _schedules()
     mine = [m for m in members if m["schedule_id"] == job["id"]]
     cadence = int(job["cadence_minutes"])
-    # A slot's group runs start up to two cadences after it: its member's offset, then up to its next trigger.
-    runs = _group_runs([m["task_collection"] for m in mine], start - timedelta(minutes=2 * max(cadence, 60)),
-                       end + timedelta(minutes=2 * cadence))
+    if runs is None:
+        runs = _group_runs([m["task_collection"] for m in mine], *_runs_window(job, start, end))
     placed = [jr for jr in ij.place(job, mine, runs, start, end + timedelta(minutes=cadence), now)
               if start <= jr["slot"] < end and jr["slot"] <= now]
     running = {r["run_id"]: r for r in _running()}
@@ -285,17 +292,29 @@ def _job_runs_of(job: dict, start: datetime, end: datetime, now: datetime) -> Li
 
 
 def _last_ran(jobs: List[dict], now: datetime) -> dict:
-    """Each job's last job run that ran, however long ago, by job id (jobs whose recent triggers did not run): from
-    the newest group runs of its groups that ran while each was its member (one read for every job), placed into
-    their job runs and summarized over their slots (ij.earlier_last). A job that never ran has none."""
+    """Each job's last job run that ran, however long ago, by job id (jobs whose recent triggers did not run): each
+    member's newest finished group run while it was the member (one read for every job), placed into their job
+    runs, the newest slot summarized (ij.earlier_last) from one more read of the runs around every job's slot. A
+    job that never ran has none."""
     _, members = _schedules()
     candidates = {}
     for r in db.query(q.last_ran_group_runs_sql(), (sorted(j["id"] for j in jobs),)) if jobs else []:
         candidates.setdefault(r["schedule_id"], []).append(r)
+    newest = {j["id"]: slots[0] for j in jobs for slots in [ij.newest_slots(candidates.get(j["id"]) or [], j, members)]
+              if slots}
+    windows = [(m["task_collection"], *_runs_window(j, newest[j["id"]], newest[j["id"]] + timedelta(seconds=1)))
+               for j in jobs if j["id"] in newest for m in members if m["schedule_id"] == j["id"]]
+    groups, starts, ends = (list(column) for column in zip(*windows)) if windows else ([], [], [])
+    runs = _with_rows_written(db.query(q.group_runs_in_windows_sql(), (groups, starts, ends))) if windows else []
     found = {}
     for job in jobs:
-        slots = ij.newest_slots(candidates.get(job["id"]) or [], job, members)
-        last = slots and ij.earlier_last(_job_runs_of(job, slots[-1], slots[0] + timedelta(seconds=1), now))
+        if job["id"] not in newest:
+            continue
+        slot = newest[job["id"]]
+        start, end = _runs_window(job, slot, slot + timedelta(seconds=1))
+        mine = {m["task_collection"] for m in members if m["schedule_id"] == job["id"]}
+        around = [r for r in runs if r["task_collection"] in mine and start <= q._when(r["started_at"]) < end]
+        last = ij.earlier_last(_job_runs_of(job, slot, slot + timedelta(seconds=1), now, runs=around))
         if last:
             found[job["id"]] = last
     return found

@@ -41,8 +41,8 @@ SCHEDULES = [dict(id=1, name="East hourly", cadence_minutes=60, timezone="UTC", 
 MEMBERS = [dict(id=1, schedule_id=1, task_collection="c1", offset_minutes=0, job_id=None, added_at=ADDED, removed_at=None),
            dict(id=2, schedule_id=1, task_collection="c2", offset_minutes=30, job_id=None, added_at=ADDED, removed_at=None),
            dict(id=3, schedule_id=2, task_collection="c3", offset_minutes=0, job_id=None, added_at=ADDED, removed_at=None)]
-# The paused nightly job's group c3 last ran three days ago, long before its recent triggers.
-OLDER = [group_run(5, "c3", datetime(2026, 10, 23, 0, 0, 30, tzinfo=UTC))]
+# The paused nightly job's group c3 last ran ten days ago, before its recent triggers and the 7 days a job page places.
+OLDER = [group_run(5, "c3", datetime(2026, 10, 16, 0, 0, 30, tzinfo=UTC))]
 RUNS = [group_run(9, "c1", datetime(2026, 10, 26, 13, 0, 20, tzinfo=UTC), status="failed", failed=2),
         group_run(10, "c1", datetime(2026, 10, 26, 13, 40, tzinfo=UTC)),
         group_run(8, "c2", datetime(2026, 10, 26, 13, 30, 10, tzinfo=UTC))]
@@ -78,18 +78,26 @@ def client(monkeypatch):
                 found += ran
             newest = {}
             for r in sorted(found, key=lambda r: r["started_at"], reverse=True):
-                newest.setdefault(r["schedule_id"], []).append(r)
-            return [r for rows in newest.values() for r in rows[:q.LAST_RAN_LOOKUP]]
+                if r["status"] != "running":
+                    newest.setdefault((r["schedule_id"], r["task_collection"]), r)
+            return list(newest.values())
+        if sql == q.group_runs_in_windows_sql():
+            calls.append(len(params[0]))
+            return [dict(r) for r in RUNS + OLDER for g, start, end in zip(*params)
+                    if r["task_collection"] == g and start <= datetime.fromisoformat(r["started_at"]) < end]
         if sql == q.group_runs_sql():
             groups, start, end = params
             return [dict(r) for r in RUNS + OLDER if r["task_collection"] in groups
                     and start <= datetime.fromisoformat(r["started_at"]) < end]
         return [dict(r) for r in answers.get(sql, [])]
+    calls = []
     monkeypatch.setattr(main.db, "query", query)
     monkeypatch.setattr(main, "datetime", FixedClock)
     monkeypatch.setattr(main, "MONITOR_CACHE_S", 0)
     monkeypatch.setattr(main, "STATES_CACHE_S", 0)
-    return TestClient(main.app)
+    client = TestClient(main.app)
+    client.window_reads = calls
+    return client
 
 
 def test_the_overview_lists_jobs_not_in_any_job_and_attention_without_a_paused_late_job(client):
@@ -212,8 +220,9 @@ def test_runs_of_groups_in_no_job_are_read_from_the_database_before_a_time(clien
 def test_a_jobs_last_job_run_is_its_last_real_one_however_long_ago_and_never_a_missed_trigger(client):
     jobs = {j["name"]: j for j in client.get("/api/overview").json()["jobs"]}
     nightly = jobs["Nightly"]["last_job_run"]
-    assert (nightly["slot"], nightly["outcome"]["label"]) == ("2026-10-23T00:00:00+00:00", "Completed")
-    assert client.get("/api/ingestion-jobs/2").json()["last_job_run"]["slot"] == "2026-10-23T00:00:00+00:00"
+    assert (nightly["slot"], nightly["outcome"]["label"]) == ("2026-10-16T00:00:00+00:00", "Completed")
+    assert client.window_reads == [1]       # one read, of the windows around every such job's slot
+    assert client.get("/api/ingestion-jobs/2").json()["last_job_run"]["slot"] == "2026-10-16T00:00:00+00:00"
     listed = {j["name"]: j for j in client.get("/api/ingestion-jobs").json()["jobs"]}
     assert all(j["last_job_run"] is None or j["last_job_run"]["outcome"]["label"] != "Not run" for j in listed.values())
 
