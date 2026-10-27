@@ -23,8 +23,8 @@ export default function Sources() {
     <>
       <PageHead crumb={<span className="eyebrow">Sources · What do we read, and what is not ingested yet?</span>}
         title={d ? `${fmtInt(d.ingested)} ${plural(d.ingested, "instance")} ingested, ${fmtInt(d.nothing_registered)} with nothing registered` : "Sources"}
-        lead={d && <>{fmtInt(d.not_registered)} {plural(d.not_registered, "table")} discovered and not registered yet. An instance is a source
-          server: the tables' instance group, else their UC connection or host.</>}
+        lead={d && <>{fmtInt(d.not_registered)} {plural(d.not_registered, "table")} discovered and not registered yet. An instance is the source
+          server the tables' rows reach: their UC connection, or their host and port.</>}
         right={<Stamp at={d?.read_at} every={60} error={found.error} />} />
       <ErrorBox error={found.error} />
       {d?.connections_error && <Notice tone="warn">UC connections could not be listed, so connections with nothing registered are missing: {d.connections_error}</Notice>}
@@ -35,7 +35,9 @@ export default function Sources() {
           <tbody>
             {instances.map((i) => (
               <tr key={i.server} className={pick?.server === i.server ? "selected" : ""} onClick={() => setChosen(i.server)} style={{ cursor: "pointer" }}>
-                <td className="name"><b>{i.server || "(no server)"}</b><ReadVia via={i.read_via} /></td>
+                <td className="name"><b>{i.server || "(no server)"}</b><ReadVia via={i.read_via} />
+                  {(i.labels ?? []).length > 0 && <span className="sub" style={{ color: "var(--warn)" }}>
+                    Instance group set to another name on some rows: {(i.labels as Row[]).map((l) => `${l.label} (${fmtInt(l.tables)} ${plural(l.tables, "table")})`).join(", ")}</span>}</td>
                 <td className="num">{fmtInt(i.jobs.filter((j: Row) => j.id != null).length)}</td><td className="num">{fmtInt(i.groups)}</td>
                 <td className="num">{fmtInt(i.databases)}</td><td className="num">{fmtInt(i.tables)}</td>
                 <td>{i.nothing_registered ? <span className="muted">nothing registered</span> : <StateBar row={i} />}</td>

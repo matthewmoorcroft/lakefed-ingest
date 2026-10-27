@@ -158,8 +158,10 @@ def sources(states: Iterable[dict], connections: Iterable[dict], not_ingested: I
         mine = [s for s in states if s["server"] == row["server"]]
         names = sorted({s["src_connection"] for s in mine if s.get("src_connection")})
         hosts = sorted({(s.get("src_host") or "").lower() for s in mine if s.get("src_host")})
+        # A connection the app cannot list (no rights on it) still shows, with its host marked as not visible.
         read_via = [{"kind": "uc", "name": n, "connection_type": (by_name.get(n) or {}).get("connection_type"),
-                     "host": (by_name.get(n) or {}).get("host")} for n in names]
+                     "host": (by_name.get(n) or {}).get("host"), **({} if n in by_name else {"host_hidden": True})}
+                    for n in names]
         read_via += [{"kind": "jdbc", "host": h} for h in hosts if not any((v.get("host") or "").lower() == h for v in read_via)]
         all_hosts = set(hosts) | {(v.get("host") or "").lower() for v in read_via if v.get("host")}
         used_connections |= set(names)
@@ -167,7 +169,13 @@ def sources(states: Iterable[dict], connections: Iterable[dict], not_ingested: I
         found = [d for d in not_ingested if (d.get("src_host") or "").lower() in all_hosts]
         job_rows, unscheduled = jobs(mine, schedules, members)
         here = {s["task_collection"] for s in mine}
+        labels: Dict[str, int] = {}
+        for s in mine:
+            label = s.get("instance_label")
+            if label and str(label).lower() != str(row["server"]).lower() and _count(s, "tables"):
+                labels[label] = labels.get(label, 0) + _count(s, "tables")
         instances.append({**row, "groups": row["collections"], "read_via": read_via, "nothing_registered": False,
+                          "labels": [{"label": k, "tables": v} for k, v in sorted(labels.items())],
                           "jobs": [dict(j, groups=[g for g in j["groups"] if g in here])
                                    for j in job_rows if j["groups"] and j["enabled_tables"]]
                           + ([unscheduled] if unscheduled else []),
@@ -178,7 +186,7 @@ def sources(states: Iterable[dict], connections: Iterable[dict], not_ingested: I
         found = [d for d in not_ingested if (d.get("src_host") or "").lower() == (c.get("host") or "").lower()]
         instances.append({"server": c["name"], "tables": 0, "databases": 0, "groups": 0, **{k: 0 for k in STATES},
                           "read_via": [{"kind": "uc", "name": c["name"], "connection_type": c.get("connection_type"),
-                                        "host": c.get("host")}], "nothing_registered": True, "jobs": [],
+                                        "host": c.get("host")}], "nothing_registered": True, "jobs": [], "labels": [],
                           "not_ingested": found, "not_registered": sum(_count(d, "not_registered") for d in found)})
     return {"instances": instances, "ingested": sum(1 for i in instances if i["tables"]),
             "nothing_registered": len(empty), "not_registered": sum(i["not_registered"] for i in instances)}

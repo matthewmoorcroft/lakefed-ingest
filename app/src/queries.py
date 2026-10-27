@@ -23,9 +23,16 @@ SLA_BREACHED = ("(t.task_enabled and t.freshness_sla_minutes is not null "
                 "and coalesce(cp.last_success_at, t.created_at) < now() - make_interval(mins => t.freshness_sla_minutes))")
 
 
-# Where a table's source lives, for grouping by server: the instance group when set (for example the
-# SQL Server name), else the UC connection, else the host. Alias t = control.
-SERVER = "coalesce(t.source_instance_group, t.src_connection, t.src_host, '')"
+# The server a table's row reaches, as the engine's per-source query cap counts it (ct_engine.source_key): its UC
+# connection when it reads through one (or names one and no host), else its host and port (the source type's default
+# port when none is set). The instance-group label does not decide it: two labels on one server are one server.
+# Alias t = control.
+_DEFAULT_PORT = ("case lower(coalesce(t.src_type, 'sqlserver')) when 'oracle' then '1521' when 'postgresql' then '5432' "
+                 "when 'mysql' then '3306' else '1433' end")
+SERVER = (f"(case when t.src_connection is not null and (t.use_remote_query or t.src_host is null) "
+          f"then lower(t.src_connection) "
+          f"when t.src_host is not null then lower(t.src_host) || ':' || coalesce(t.src_port::text, {_DEFAULT_PORT}) "
+          f"else '' end)")
 # One source database: its server (SERVER) and its name, so two servers' databases of the same name stay
 # two databases. Alias t = control.
 DATABASE = f"({SERVER}, coalesce(t.src_database, ''))"
@@ -47,13 +54,14 @@ STATE_COUNTS = (
 # ---- overview -----------------------------------------------------------------------------------
 
 def database_states_sql() -> str:
-    """One row per (server, connection, host, ingestion group, database): enabled tables by state
-    (STATE_COUNTS), tables without a freshness target, the oldest and newest success of its enabled tables,
+    """One row per (server, connection, host, ingestion group, database, instance-group label): enabled tables by
+    state (STATE_COUNTS), tables without a freshness target, the oldest and newest success of its enabled tables,
     and the newest of any table (what a UC connection's databases show). The one scan
-    the monitoring views share: rollup.py sums it into groups, servers and connections."""
+    the monitoring views share: rollup.py sums it into groups, servers and connections. The label rides along so
+    Sources can say where it differs from the server."""
     return f"""
 select {SERVER} as server, t.src_connection, lower(t.src_host) as src_host, t.task_collection,
-       coalesce(t.src_database, '') as src_database,
+       coalesce(t.src_database, '') as src_database, t.source_instance_group as instance_label,
        count(*) filter (where t.task_enabled) as tables,
        count(*) filter (where t.task_enabled and t.freshness_sla_minutes is null) as no_sla_tables,
        {STATE_COUNTS},
@@ -62,7 +70,7 @@ select {SERVER} as server, t.src_connection, lower(t.src_host) as src_host, t.ta
        max(cp.last_success_at) as newest_any_success_at
 from {SCHEMA}.control t
 left join {SCHEMA}.checkpoint cp on cp.control_id = t.id
-group by 1, 2, 3, 4, 5"""
+group by 1, 2, 3, 4, 5, 6"""
 
 
 def last_runs_sql() -> str:

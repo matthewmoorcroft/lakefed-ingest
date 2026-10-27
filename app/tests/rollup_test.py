@@ -88,3 +88,16 @@ def test_sources_list_instances_with_their_jobs_and_a_connection_with_nothing_re
     assert [j["name"] for j in by_name["srvA"]["jobs"]] == ["East hourly", "Nightly"]
     assert by_name["pg_empty"]["nothing_registered"] is True and by_name["pg_empty"]["tables"] == 0
     assert (found["ingested"], found["nothing_registered"], found["not_registered"]) == (2, 1, 4)
+
+
+def test_an_instance_says_where_its_rows_labels_differ_and_when_the_app_cannot_see_its_host():
+    # One UC connection the app cannot list, its rows labelled two ways: one instance, its labels named, its host
+    # marked as not visible rather than left out.
+    states = [dict(state("lfc_sql", "c1", "lfc_test", tables=225, connection="lfc_sql"), instance_label="lab-sql-b"),
+              dict(state("lfc_sql", "c2", "lfc_test", tables=775, connection="lfc_sql"), instance_label="LFC_SQL"),
+              dict(state("lfc_sql", "c2", "lfc_test", tables=0, connection="lfc_sql"), instance_label="disabled-only")]
+    found = rollup.sources(states, [], [], SCHEDULES, MEMBERS)["instances"]
+    assert [(i["server"], i["databases"], i["tables"]) for i in found] == [("lfc_sql", 1, 1000)]
+    assert found[0]["labels"] == [{"label": "lab-sql-b", "tables": 225}]      # one that matches the name is no news
+    assert found[0]["read_via"] == [{"kind": "uc", "name": "lfc_sql", "connection_type": None, "host": None,
+                                     "host_hidden": True}]
