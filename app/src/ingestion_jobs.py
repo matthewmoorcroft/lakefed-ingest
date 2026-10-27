@@ -34,7 +34,8 @@ def place(job: dict, members: List[dict], runs: List[dict], start: datetime, end
     groups = {m["task_collection"] for m in mine}
     cadence = int(job["cadence_minutes"])
     placed = sch.job_runs(cadence, job.get("timezone") or "UTC", mine, [r for r in runs if r["task_collection"] in groups],
-                          start - timedelta(minutes=max(cadence, 60)), end, now)
+                          start - timedelta(minutes=max(cadence, 60)), end, now,
+                          check_variant=job.get("job_variant") == sch.CHECK_VARIANT)
     if job.get("paused"):
         for jr in placed:
             for m in jr["members"]:
@@ -53,7 +54,7 @@ def current_and_past(job: dict, members: List[dict], runs: List[dict], start: da
 def _progress(member: dict, running_by_run: dict, group_tables: int) -> dict:
     """One member's part of its job run's progress bar, in the shape of RunDetail's Progress: a running
     group run from the running pass, a finished one from its totals (its ok counts its unchanged tables),
-    and one not started yet as all to go."""
+    one whose check found nothing to load as all unchanged, and one not started yet as all to go."""
     run = member.get("run")
     if run and run.get("status") == "running":
         p = running_by_run.get(run.get("run_id")) or {}
@@ -65,7 +66,8 @@ def _progress(member: dict, running_by_run: dict, group_tables: int) -> dict:
         loaded = q.loaded_tables(run)     # its unchanged tables and reseeds queued count as checked, not loaded
         return {"total": q._count(run, "total"), "unchanged": max(q._count(run, "ok") - loaded, 0),
                 "loaded": loaded, "in_flight": 0, "failed": q._count(run, "failed")}
-    return {"total": group_tables, "unchanged": 0, "loaded": 0, "in_flight": 0, "failed": 0}
+    unchanged = group_tables if member.get("state") == "unchanged" else 0
+    return {"total": group_tables, "unchanged": unchanged, "loaded": 0, "in_flight": 0, "failed": 0}
 
 
 def _sum(parts: Iterable[dict]) -> dict:
@@ -115,6 +117,7 @@ def summarize(job: dict, job_run: dict, running_by_run: dict, group_tables: Dict
         + sum(q._count(running_by_run.get(r.get("run_id")) or {}, "tables_failed") for r in ran
               if r.get("status") == "running"),
         "run_ids": [r["run_id"] for r in runs if r.get("run_id") is not None],
+        "checks": [check_summary(c) for c in job_run.get("checks") or []],     # never counted as group runs
         "progress": progress,
     }
     if running:
@@ -137,10 +140,40 @@ def summarize(job: dict, job_run: dict, running_by_run: dict, group_tables: Dict
     return out
 
 
+def check_summary(check: dict) -> dict:
+    """One of a job run's checks: its record, status, and what it found for its collection."""
+    detail = sch._detail(check).get("check") or {}
+    return {"run_id": check.get("run_id"), "task_collection": check["task_collection"], "status": check.get("status"),
+            "unchanged_tables": detail.get("unchanged_tables"), "databases_with_work": len(detail.get("work") or [])}
+
+
+def check_found(check: dict) -> dict:
+    """A check's own page: its summary, what it found in words, and its error if it failed."""
+    status = _check_status(check)
+    return dict(check_summary(check), found=status["label"], error=status["note"])
+
+
+def _check_status(check: dict) -> dict:
+    found = check_summary(check)
+    if check.get("status") == "running":
+        return {"label": "Checking", "tone": "run", "note": None}
+    if check.get("status") == "failed":
+        return {"label": "Check failed", "tone": "bad", "note": (sch._detail(check).get("check") or {}).get("error")}
+    n = found["databases_with_work"]
+    found = f"{n} {'database' if n == 1 else 'databases'} with work"
+    return {"label": f"Checked: {found}" if n else "Checked: no changes",
+            "tone": "ok", "note": None}
+
+
 def member_views(job_run: dict, running_by_run: dict, group_tables: Dict[str, int], now: datetime) -> List[dict]:
-    """A job run's group runs, one row per member: running first, then waiting, then finished. Each with
-    its state, start or planned start, took or running for, progress, speed, parallelism, cluster and
-    failed tables; extra runs follow their member."""
+    """A job run's lines: its checks first, each a line of its own (check: True), then its group runs, one row per
+    member: running first, then waiting, then finished. Each with its state, start or planned start, took or
+    running for, progress, speed, parallelism, cluster and failed tables; extra runs follow their member."""
+    checks = [{"task_collection": c["task_collection"], "check": True, "state": "check", "extra": False,
+               "offset_minutes": None, "fire_at": None, "status": _check_status(c), "run_id": c.get("run_id"),
+               "started_at": c.get("started_at"), "duration_s": c.get("duration_s"), "progress": None,
+               "speed_tables_per_min": None, "parallelism": None, "cluster_id": c.get("cluster_id"), "failed": 0}
+              for c in job_run.get("checks") or []]
     rows = []
     for m in job_run["members"]:
         for i, run in enumerate([m.get("run")] + list(m.get("extra") or [])):
@@ -153,6 +186,13 @@ def member_views(job_run: dict, running_by_run: dict, group_tables: Dict[str, in
                 status = {"label": f"Waiting, starts {_when(m['fire_at']).isoformat()}", "tone": "", "note": None}
             elif m["state"] == "starting":
                 status = {"label": "Starting", "tone": "run", "note": None}
+            elif m["state"] == "unchanged":
+                status = {"label": "Unchanged", "tone": "ok", "note": "its check found nothing to load"}
+            elif m["state"] == "checking":
+                status = {"label": "Checking", "tone": "run",
+                          "note": "its check is going; a group run starts if it finds work"}
+            elif m["state"] == "check failed":
+                status = {"label": "Check failed", "tone": "bad", "note": "its check failed, so no group run started"}
             elif m["state"] == "skipped":
                 status = {"label": "Skipped: still running", "tone": "neutral", "note": "the previous group run was still going"}
             else:
@@ -169,8 +209,9 @@ def member_views(job_run: dict, running_by_run: dict, group_tables: Dict[str, in
                 "parallelism": (run or {}).get("parallelism"), "cluster_id": (run or {}).get("cluster_id"),
                 "failed": q._count(p or {}, "tables_failed") if live else q._count(run or {}, "failed"),
             })
-    return sorted(rows, key=lambda r: (0 if r["status"]["tone"] == "run" else 1 if r["state"] == "waiting" else 2,
-                                       r["offset_minutes"], r["task_collection"], r["extra"]))
+    return checks + sorted(rows, key=lambda r: (0 if r["status"]["tone"] == "run" else 1 if r["state"] == "waiting"
+                                                else 2,
+                                                r["offset_minutes"], r["task_collection"], r["extra"]))
 
 
 def status(job: dict, running: Optional[dict], last: Optional[dict], top_cause: Optional[str],
@@ -283,22 +324,39 @@ def jobs_view(schedules: List[dict], members: List[dict], states: List[dict], ru
             "running_not_in_job": running_not_in_job, "attention": attention, "totals": totals}
 
 
-def job_runs_of_run(run: dict, schedules: List[dict], members: List[dict]) -> List[dict]:
+def job_runs_of_run(run: dict, schedules: List[dict], members: List[dict],
+                    first_started: Optional[Dict[str, object]] = None) -> List[dict]:
     """The job runs a group run belongs to, one per schedule its group was in when it started: the slot of
-    its member's latest trigger at or before the run's start."""
-    started = _when(run.get("started_at"))
+    its member's latest trigger at or before the run's start. A check schedule's one wrapper fires at the slot,
+    and only a check schedule has the check job's own records (as schedules.job_runs places them).
+    first_started: per group, the first start in the run's check job run or launch. On a check schedule the run
+    shares the trigger of its members' first one, and the member must have belonged at that trigger rather than
+    at the run's own start."""
+    own = _when(run.get("started_at"))
     out = []
-    if started is None:
+    if own is None:
         return out
+    check = sch.is_check(run)
     for s in schedules:
+        check_variant = s.get("job_variant") == sch.CHECK_VARIANT
+        if check and not check_variant:
+            continue
+        mine = {m["task_collection"] for m in members if m["schedule_id"] == s["id"]}
+        firsts = [_when(t) for g, t in (first_started or {}).items() if g in mine and t] if check_variant else []
+        started = min(firsts + [own])
         for m in members:
             if m["schedule_id"] != s["id"] or m["task_collection"] != run["task_collection"]:
                 continue
-            added, removed = _when(m.get("added_at")), _when(m.get("removed_at"))
-            if (added is not None and started < added) or (removed is not None and started >= removed):
+            cadence, tz = int(s["cadence_minutes"]), s.get("timezone") or "UTC"
+            offset = 0 if check_variant else int(m["offset_minutes"])
+            fires = sch.fire_times(cadence, offset, tz, started - timedelta(minutes=cadence + 1),
+                                   started + timedelta(seconds=1))
+            if not fires:
                 continue
-            cadence, offset, tz = int(s["cadence_minutes"]), int(m["offset_minutes"]), s.get("timezone") or "UTC"
-            fires = sch.fire_times(cadence, offset, tz, started - timedelta(minutes=cadence + 1), started + timedelta(seconds=1))
-            if fires:
-                out.append({"job_id": s["id"], "job_name": s["name"], "slot": sch.slot_of(fires[-1], offset, tz).isoformat()})
+            at = fires[-1] if firsts else started
+            added, removed = _when(m.get("added_at")), _when(m.get("removed_at"))
+            if (added is not None and at < added) or (removed is not None and at >= removed):
+                continue
+            out.append({"job_id": s["id"], "job_name": s["name"],
+                        "slot": sch.slot_of(fires[-1], offset, tz).isoformat()})
     return out

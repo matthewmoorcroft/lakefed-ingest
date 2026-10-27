@@ -1,4 +1,5 @@
 """Schedules: cron and offsets, next runs, wrapper job settings, drift, warnings, and sync with a fake client."""
+import json
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -383,3 +384,87 @@ def test_group_runs_of_one_launch_are_one_job_run_however_late_they_start():
                          datetime(2026, 10, 26, 16, tzinfo=UTC), now=datetime(2026, 10, 26, 17, tzinfo=UTC))
     by_hour = {j["slot"].hour: [(m["task_collection"], (m["run"] or {}).get("run_id")) for m in j["members"]] for j in found}
     assert by_hour == {14: [("a", 1), ("b", 2)], 15: [("a", None), ("b", None)]}
+
+
+def _check(group, started, work=(), run_id=None, status="completed"):
+    r = _run(group, started, minutes=1, run_id=run_id, status=status)
+    r["work_id"] = "check-555"
+    r["detail"] = None if status == "running" else json.dumps({"check": {"work": [list(w) for w in work],
+                                                                         "unchanged_tables": 10}})
+    return r
+
+
+def test_the_checks_own_records_are_the_job_runs_checks_not_its_group_runs():
+    quiet = _check("a", datetime(2026, 10, 26, 14, 0, 5, tzinfo=UTC), run_id=1)
+    busy = _check("b", datetime(2026, 10, 26, 14, 0, 6, tzinfo=UTC), work=[("srv|0|srv", "db")], run_id=2)
+    ingest = _run("b", datetime(2026, 10, 26, 14, 9, tzinfo=UTC), run_id=3)
+    ingest["work_id"] = "900:b"
+    found = sch.job_runs(60, "UTC", _members(("a", 0), ("b", 0)), [quiet, busy, ingest],
+                         datetime(2026, 10, 26, 14, tzinfo=UTC), datetime(2026, 10, 26, 15, tzinfo=UTC),
+                         now=datetime(2026, 10, 26, 16, tzinfo=UTC), check_variant=True)
+    members = {m["task_collection"]: m for m in found[0]["members"]}
+    assert (members["a"]["state"], members["a"]["run"]) == ("unchanged", None)
+    assert (members["b"]["state"], members["b"]["run"]["run_id"], members["b"]["extra"]) == ("run", 3, [])
+    assert [(c["task_collection"], c["run_id"]) for c in found[0]["checks"]] == [("a", 1), ("b", 2)]
+    running = _check("a", datetime(2026, 10, 26, 14, 0, 5, tzinfo=UTC), run_id=1, status="running")
+    found = sch.job_runs(60, "UTC", _members(("a", 0)), [running], datetime(2026, 10, 26, 14, tzinfo=UTC),
+                         datetime(2026, 10, 26, 15, tzinfo=UTC), now=datetime(2026, 10, 26, 14, 1, tzinfo=UTC),
+                         check_variant=True)
+    assert found[0]["members"][0]["state"] == "checking" and found[0]["checks"][0]["run_id"] == 1
+    assert sch.is_check({"detail": json.dumps({"check": {"error": "x"}})}) and not sch.is_check({"work_id": "900:b"})
+
+
+def test_a_default_schedule_takes_no_checks_even_of_its_members():
+    # A check started some other way (its own fallback schedule, by hand) is not this schedule's job run.
+    check = _check("a", datetime(2026, 10, 26, 14, 5, tzinfo=UTC), run_id=1)
+    found = sch.job_runs(60, "UTC", _members(("a", 0)), [check], datetime(2026, 10, 26, 14, tzinfo=UTC),
+                         datetime(2026, 10, 26, 15, tzinfo=UTC), now=datetime(2026, 10, 26, 16, tzinfo=UTC))
+    assert (found[0]["members"][0]["state"], found[0]["checks"]) == ("no run", [])
+
+
+def test_a_check_schedule_fires_every_member_at_the_slot_and_keeps_one_check_together():
+    # Offsets stored from a staggered schedule do not apply: the one wrapper fires at the slot. A check job run
+    # that reaches its last collection after the next trigger still belongs to the slot it started in.
+    first = _check("a", datetime(2026, 10, 26, 14, 59, 50, tzinfo=UTC), run_id=1)
+    late = _check("b", datetime(2026, 10, 26, 15, 0, 20, tzinfo=UTC), run_id=2)
+    ingest = _run("b", datetime(2026, 10, 26, 15, 1, tzinfo=UTC), run_id=3)
+    ingest["work_id"] = "900:b"
+    found = sch.job_runs(60, "UTC", _members(("a", 0), ("b", 30)), [first, late, ingest],
+                         datetime(2026, 10, 26, 14, tzinfo=UTC), datetime(2026, 10, 26, 16, tzinfo=UTC),
+                         now=datetime(2026, 10, 26, 17, tzinfo=UTC), check_variant=True)
+    slot = {jr["slot"].hour: jr for jr in found}
+    assert [c["run_id"] for c in slot[14]["checks"]] == [1, 2] and slot[15]["checks"] == []
+    assert {m["task_collection"]: m["offset_minutes"] for m in slot[14]["members"]} == {"a": 0, "b": 0}
+
+
+def test_a_check_counts_for_a_member_that_belonged_at_the_trigger():
+    # Removed just after the trigger, before the check reached it: the check still ran for that job run.
+    check = _check("a", datetime(2026, 10, 26, 14, 3, tzinfo=UTC), run_id=1)
+    members = _members(("a", 0))
+    members[0]["removed_at"] = datetime(2026, 10, 26, 14, 1, tzinfo=UTC)
+    found = sch.job_runs(60, "UTC", members, [check], datetime(2026, 10, 26, 14, tzinfo=UTC),
+                         datetime(2026, 10, 26, 15, tzinfo=UTC), now=datetime(2026, 10, 26, 16, tzinfo=UTC),
+                         check_variant=True)
+    assert (found[0]["members"][0]["state"], [c["run_id"] for c in found[0]["checks"]]) == ("unchanged", [1])
+
+
+def test_a_check_schedules_launched_run_counts_for_a_member_that_belonged_at_the_trigger():
+    check = _check("a", datetime(2026, 10, 26, 14, 0, 5, tzinfo=UTC), work=[("srv|0|srv", "db")], run_id=1)
+    ingest = _run("a", datetime(2026, 10, 26, 14, 3, tzinfo=UTC), run_id=2)
+    ingest["work_id"] = "900:a"
+    members = _members(("a", 0))
+    members[0]["removed_at"] = datetime(2026, 10, 26, 14, 1, tzinfo=UTC)
+    found = sch.job_runs(60, "UTC", members, [check, ingest], datetime(2026, 10, 26, 14, tzinfo=UTC),
+                         datetime(2026, 10, 26, 15, tzinfo=UTC), now=datetime(2026, 10, 26, 16, tzinfo=UTC),
+                         check_variant=True)
+    assert (found[0]["members"][0]["state"], found[0]["members"][0]["run"]["run_id"]) == ("run", 2)
+
+
+def test_a_default_schedule_judges_a_launched_run_by_its_own_start():
+    ingest = _run("a", datetime(2026, 10, 26, 14, 3, tzinfo=UTC), run_id=2)
+    ingest["work_id"] = "900:a"
+    members = _members(("a", 0))
+    members[0]["removed_at"] = datetime(2026, 10, 26, 14, 1, tzinfo=UTC)
+    found = sch.job_runs(60, "UTC", members, [ingest], datetime(2026, 10, 26, 14, tzinfo=UTC),
+                         datetime(2026, 10, 26, 15, tzinfo=UTC), now=datetime(2026, 10, 26, 16, tzinfo=UTC))
+    assert found[0]["members"][0]["run"] is None

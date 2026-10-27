@@ -3,7 +3,7 @@ import { useQuery } from "@tanstack/react-query";
 import { Link, useParams } from "react-router-dom";
 import { api, type Row } from "../api";
 import {
-  Badge, BigCount, ErrorBox, FillBox, Grid, PageHead, ProgressBar, ProgressKey, RunStatus, Section, Stamp, autoColumns,
+  Badge, BigCount, ErrorBox, FillBox, Grid, Notice, PageHead, ProgressBar, ProgressKey, RunStatus, Section, Stamp, autoColumns,
   databasePath, fmtDuration, fmtInt, fmtLeft, fmtSpeed, jobRunName, jobRunPath, plural, progressOf, progressText, type Progress
 } from "../components";
 
@@ -32,7 +32,7 @@ const pastTypical = (r: Row) => r.time_left?.basis === "typical" && Number(r.tim
 /** The run page's title: the group and run, and while running how far it is and about how long is left. */
 function title(id: string, r: Row | undefined, p: Progress | null, live: boolean): ReactNode {
   if (!r) return <>Group run {id}</>;
-  const head = <>{r.task_collection}, group run {fmtInt(r.run_id)}</>;
+  const head = <>{r.task_collection}, {r.check ? "check" : "group run"} {fmtInt(r.run_id)}</>;
   if (!live) return <>{head} <RunStatus status={r.status} outcome={r.outcome} /></>;
   const pct = p && p.total ? Math.floor((100 * (p.unchanged + p.loaded)) / p.total) : null;
   const left = r.time_left && !pastTypical(r) ? `, ${fmtLeft(r.time_left.seconds)} left` : "";
@@ -120,7 +120,7 @@ export default function RunDetail() {
       <PageHead crumb={<span className="eyebrow"><Link to="/overview">Overview</Link> ·{" "}
         {r?.job_runs?.length ? r.job_runs.map((j: Row, i: number) => <span key={j.job_id}>{i > 0 && ", "}
           <Link to={`/ingestion-jobs/${j.job_id}`}>{j.job_name}</Link> · <Link to={jobRunPath(j.job_id, j.slot)}>{jobRunName(j.job_name, j.slot)}</Link></span>)
-          : <Link to="/runs?job=none">Runs</Link>} · Group run</span>}
+          : <Link to="/runs?job=none">Runs</Link>} · {r?.check ? "Check" : "Group run"}</span>}
         title={title(id, r, p, live)}
         lead={r && <>Ingestion group <Link to={`/collections/${encodeURIComponent(r.task_collection)}`}><strong>{r.task_collection}</strong></Link>
           {dbs.length ? <>, <strong>{fmtInt(dbs.length)}</strong> {plural(dbs.length, "database")}</> : null}
@@ -129,10 +129,29 @@ export default function RunDetail() {
           {r.job_run_id ? <>, Databricks job run <strong>{r.job_run_id}</strong></> : null}
           {r.cluster_id ? <>, cluster <strong>{r.cluster_id}</strong></> : null}
           {r.parallelism ? <>, parallelism <strong>{fmtInt(r.parallelism)}</strong></> : null}.
-          {!live && r.outcome?.note ? <> {r.outcome.label}: {r.outcome.note}.</> : null}</>}
+          {!live && r.outcome?.note ? <> {r.outcome.label}: {r.outcome.note}.</> : null}
+          {r.check ? <> The check job's own record of checking this group, not a group run: {r.check.found}.</> : null}</>}
         right={live || run.error ? <Stamp at={run.dataUpdatedAt ? new Date(run.dataUpdatedAt).toISOString() : undefined} every={15} error={run.error} /> : undefined} />
       <ErrorBox error={run.error} />
-      {r && (
+      {r?.check && (
+        <>
+          <div className="metrics">
+            <Figure label={live ? "Running for" : "Took"} value={r.duration_s === null ? "" : fmtDuration(r.duration_s)}
+              sub={live ? undefined : r.duration_s === null ? "it ended without finishing" : `ended ${fmtWhen(r.finished_at)}`} />
+          </div>
+          <Section title="What the check found" note="A group run starts for the group when its check finds databases with work.">
+            {r.check.error && <Notice tone="bad">{r.check.error}</Notice>}
+            {!live && !r.check.error && (
+              <div className="metrics">
+                <Figure label="Unchanged tables" value={fmtInt(r.check.unchanged_tables ?? 0)} sub="stamped as checked" />
+                <Figure label="Databases with work" value={fmtInt(r.check.databases_with_work)}
+                  sub={r.check.databases_with_work ? "its group run ingests only these" : "so no group run started"} />
+              </div>
+            )}
+          </Section>
+        </>
+      )}
+      {r && !r.check && (
         <>
           {live ? (
             <div className="metrics">

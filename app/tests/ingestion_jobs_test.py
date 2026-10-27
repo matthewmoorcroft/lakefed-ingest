@@ -1,4 +1,5 @@
 """Ingestion jobs and job runs as the pages show them (ingestion_jobs.py), from fixed reads."""
+import json
 from datetime import datetime, timedelta, timezone
 
 import ingestion_jobs as ij
@@ -91,6 +92,28 @@ def test_a_group_run_knows_its_job_runs():
     assert ij.job_runs_of_run(dict(task_collection="c4", started_at="2026-10-26T13:31:00+00:00"), SCHEDULES, MEMBERS) == []
 
 
+def test_a_check_knows_only_the_check_schedules_job_run_it_started_in():
+    checks = dict(SCHEDULES[0], id=3, name="Checked hourly", job_variant="check")
+    members = MEMBERS + [dict(MEMBERS[1], schedule_id=3)]
+    check = dict(task_collection="c2", started_at="2026-10-26T13:05:00+00:00", work_id="check-555")
+    assert ij.job_runs_of_run(check, SCHEDULES + [checks], members) == [
+        {"job_id": 3, "job_name": "Checked hourly", "slot": "2026-10-26T13:00:00+00:00"}]
+    # A late check of one check job run, its first check at 13:59:50: the job run that check started, even for a
+    # member removed after that trigger.
+    late = dict(check, started_at="2026-10-26T14:00:20+00:00")
+    removed = MEMBERS + [dict(MEMBERS[1], schedule_id=3, removed_at=datetime(2026, 10, 26, 13, 59, 55, tzinfo=UTC))]
+    first = {"c2": "2026-10-26T13:59:50+00:00"}
+    assert ij.job_runs_of_run(late, SCHEDULES + [checks], removed, first_started=first) == [
+        {"job_id": 3, "job_name": "Checked hourly", "slot": "2026-10-26T13:00:00+00:00"}]
+    # One launch over groups of two schedules: each schedule's job run is from its own members' first start, and a
+    # default schedule goes by the run's own start.
+    launched = dict(task_collection="c2", started_at="2026-10-26T13:31:00+00:00", work_id="900:c2")
+    first = {"c1": "2026-10-26T12:59:00+00:00", "c2": "2026-10-26T13:31:00+00:00"}
+    assert ij.job_runs_of_run(launched, SCHEDULES + [checks], members, first_started=first) == [
+        {"job_id": 1, "job_name": "East hourly", "slot": "2026-10-26T13:00:00+00:00"},
+        {"job_id": 3, "job_name": "Checked hourly", "slot": "2026-10-26T13:00:00+00:00"}]
+
+
 def test_a_group_run_running_longer_than_the_window_still_shows_as_running():
     old_start = NOW - timedelta(days=2)
     running = [dict(RUNNING[0], run_id=20, elapsed_s=2 * 86400, started_at=old_start.isoformat())]
@@ -173,3 +196,28 @@ def test_a_paused_jobs_last_job_run_is_its_last_real_one_not_a_missed_trigger():
     assert job["failed_in_a_row"] == 1
     never = ij.jobs_view(paused, MEMBERS[:2], STATES, [], [], STATS, NOW)["jobs"][0]
     assert never["last_job_run"]["outcome"] == {"label": "Not run", "tone": "neutral", "note": "the job is paused"}
+
+
+def test_a_job_runs_checks_are_lines_of_their_own_kept_out_of_its_group_run_numbers():
+    check = dict(run(20, "c1", datetime(2026, 10, 26, 13, 0, 5, tzinfo=UTC), minutes=1, total=10, ok=10, skipped=10),
+                 work_id="check-555", detail=json.dumps({"check": {"work": [], "unchanged_tables": 10,
+                                                                    "unchanged_databases": 1}}))
+    group_run = dict(RUNS[1])
+    jr = {"slot": datetime(2026, 10, 26, 13, tzinfo=UTC), "checks": [check], "members": [
+        dict(task_collection="c1", offset_minutes=0, fire_at=datetime(2026, 10, 26, 13, tzinfo=UTC), state="unchanged",
+             run=None, extra=[]),
+        dict(task_collection="c2", offset_minutes=30, fire_at=datetime(2026, 10, 26, 13, 30, tzinfo=UTC), state="run",
+             run=group_run, extra=[])]}
+    s = ij.summarize(SCHEDULES[0], jr, {}, {"c1": 10, "c2": 5}, {}, NOW)
+    assert (s["ran"], s["clusters"], s["run_ids"]) == (1, len({group_run.get("cluster_id")} - {None}), [8])
+    assert s["took_s"] == round((datetime.fromisoformat(group_run["finished_at"])
+                                 - datetime.fromisoformat(group_run["started_at"])).total_seconds())
+    assert s["checks"] == [{"run_id": 20, "task_collection": "c1", "status": "completed", "unchanged_tables": 10,
+                            "databases_with_work": 0}]
+    rows = ij.member_views(jr, {}, {"c1": 10, "c2": 5}, NOW)
+    check_rows = [r for r in rows if r.get("check")]
+    assert [(r["task_collection"], r["status"]["label"]) for r in check_rows] == [("c1", "Checked: no changes")]
+    assert [r["state"] for r in rows if not r.get("check")] == ["unchanged", "run"]
+    # Its check vouched for c1's tables: they count as checked unchanged, not as still to go.
+    c2 = ij._progress(jr["members"][1], {}, 5)
+    assert (s["progress"]["total"], s["progress"]["unchanged"]) == (10 + c2["total"], 10 + c2["unchanged"])

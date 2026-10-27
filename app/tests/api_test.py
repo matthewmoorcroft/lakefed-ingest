@@ -254,7 +254,8 @@ def test_connections_lists_only_database_connections_lakefed_can_read(monkeypatc
 
 
 def test_run_detail_returns_the_run_its_rows_and_live_progress(monkeypatch):
-    run = dict(run_id=5, task_collection="c1", status="running", total=10, ok=4, failed=1, skipped=2)
+    run = dict(run_id=5, task_collection="c1", status="running", total=10, ok=4, failed=1, skipped=2,
+               started_at="2026-10-26T13:00:05+00:00")
     calls = []
 
     def query(sql, params=()):
@@ -267,12 +268,21 @@ def test_run_detail_returns_the_run_its_rows_and_live_progress(monkeypatch):
             return [dict(run_id=4, tables_ok=9), dict(run_id=5, tables_ok=4, tables_running=3, enabled_tables=10)]
         if sql == q.schedules_sql():
             return []
+        if sql == q.first_started_sql():
+            assert params == ("check-77", "check-77:%")
+            return [dict(task_collection="c1", started_at=run["started_at"])]
         raise AssertionError(sql)
     monkeypatch.setattr(main.db, "query", query)
     client = TestClient(main.app)
     body = client.get("/api/runs/5").json()
     assert body["run_id"] == 5 and body["rows_written"] == 120 and body["progress"]["tables_running"] == 3
+    assert body["check"] is None
     assert client.get("/api/runs/6").status_code == 404
+    run.update(status="completed", work_id="check-77",
+               detail=json.dumps({"check": {"work": [], "unchanged_tables": 10}}))
+    assert client.get("/api/runs/5").json()["check"] == {
+        "run_id": 5, "task_collection": "c1", "status": "completed", "unchanged_tables": 10, "databases_with_work": 0,
+        "found": "Checked: no changes", "error": None}
 
 
 def test_a_collections_databases_keep_two_servers_databases_of_one_name_apart(monkeypatch):

@@ -21,6 +21,7 @@ Pure helpers (cron, offsets, next runs, job settings, drift, warnings) are unit-
 
 from __future__ import annotations
 
+import json
 import re
 import threading
 from dataclasses import dataclass
@@ -162,11 +163,37 @@ def _when(value) -> Optional[datetime]:
     return datetime.fromisoformat(value) if isinstance(value, str) else value
 
 
+# The check job's own record of checking a collection: an ingest_run row whose work_id is "check-<job run>" (from the
+# start), or whose detail holds the check's summary (records written before the marker).
+CHECK_PREFIX = "check-"
+
+
+def _detail(run: dict) -> dict:
+    detail = run.get("detail")
+    if isinstance(detail, str):
+        try:
+            detail = json.loads(detail)
+        except ValueError:
+            return {}
+    return detail if isinstance(detail, dict) else {}
+
+
+def is_check(run: dict) -> bool:
+    """Whether a run row is the check's own record, not a group run."""
+    return str(run.get("work_id") or "").startswith(CHECK_PREFIX) or "check" in _detail(run)
+
+
+def check_work(run: dict) -> Optional[list]:
+    """A finished check's databases with work for its collection, or None while it runs or when it failed."""
+    check = _detail(run).get("check")
+    return check.get("work") if isinstance(check, dict) and "error" not in check else None
+
+
 def launch_of(run: dict) -> Optional[str]:
     """The check job's launch a group run belongs to: the launch id in its work_id ("<launch_id>:<collection>"),
-    or None for a run started otherwise."""
+    or None for a run started otherwise (and for the check's own record)."""
     work_id = run.get("work_id")
-    return str(work_id).split(":", 1)[0] if work_id else None
+    return str(work_id).split(":", 1)[0] if work_id and not is_check(run) else None
 
 
 def slot_of(fire: datetime, offset: int, tz: str) -> datetime:
@@ -180,8 +207,14 @@ def slot_of(fire: datetime, offset: int, tz: str) -> datetime:
 STARTING_MINUTES = 15
 
 
+def _check_job_run(check: dict) -> str:
+    """The check job run a check record belongs to: every collection it checked shares it."""
+    work_id = str(check.get("work_id") or "")
+    return work_id if work_id.startswith(CHECK_PREFIX) else f"{CHECK_PREFIX}{check.get('job_run_id')}"
+
+
 def job_runs(cadence: int, tz: str, members: List[dict], runs: List[dict], start: datetime, end: datetime,
-             now: datetime) -> List[dict]:
+             now: datetime, check_variant: bool = False) -> List[dict]:
     """A schedule's job runs whose triggers fall in [start, end), newest first, each with one entry per
     member then: its trigger time, its group run and any extra runs, and its state.
 
@@ -190,16 +223,36 @@ def job_runs(cadence: int, tz: str, members: List[dict], runs: List[dict], start
     slot's run and later ones are extra (started by hand, most likely). A member with no run is waiting when
     its trigger is still ahead, skipped when its group's previous run was still going at the trigger (wrapper
     jobs allow one run and don't queue), starting for STARTING_MINUTES after its trigger (its cluster may still
-    be starting), else "no run". Only triggers and runs while the member belonged to
-    the schedule count. `runs` may start before `start`: earlier runs are only read for skipped triggers."""
+    be starting), else "no run". The check job's own records (is_check) are not group runs: each job run lists
+    them as its checks, and a member whose check is going is "checking", whose check failed is "check failed", and
+    whose check found nothing to load is "unchanged". Checks count only on a check_variant schedule, whose one
+    wrapper fires every member at the slot (stored offsets aside); one check job run's checks all belong to the
+    slot it started in. Only triggers and runs while the member belonged to the schedule count (a check: at
+    its trigger). `runs` may start before `start`: earlier runs are only read for skipped triggers."""
     by_group: Dict[str, List[dict]] = {}
+    checks: List[dict] = []
     for r in sorted(runs, key=lambda r: _when(r["started_at"])):
-        by_group.setdefault(r["task_collection"], []).append(r)
+        if not is_check(r):
+            by_group.setdefault(r["task_collection"], []).append(r)
+        elif check_variant:
+            checks.append(r)
+    offset_of = (lambda m: 0) if check_variant else (lambda m: int(m["offset_minutes"]))
+    check_slot: Dict[str, datetime] = {}
+    for c in checks:
+        started = _when(c["started_at"])
+        before = fire_times(cadence, 0, tz, started - timedelta(minutes=cadence + 1), started + timedelta(seconds=1))
+        if before:
+            check_slot.setdefault(_check_job_run(c), slot_of(before[-1], 0, tz))   # checks come oldest first
+    checks_at: Dict[tuple, List[dict]] = {}
+    for c in checks:
+        if _check_job_run(c) in check_slot:
+            checks_at.setdefault((check_slot[_check_job_run(c)], c["task_collection"]), []).append(c)
+    slot_checks: Dict[datetime, List[dict]] = {}
     # Group runs the check job started together share a launch id: they are one job run, the slot of the
     # earliest of them, however late the others start.
     launch_slot: Dict[str, datetime] = {}
     for m in members:
-        offset = int(m["offset_minutes"])
+        offset = offset_of(m)
         for r in by_group.get(m["task_collection"], []):
             launch = launch_of(r)
             if launch is None:
@@ -211,15 +264,17 @@ def job_runs(cadence: int, tz: str, members: List[dict], runs: List[dict], start
                 launch_slot[launch] = min(launch_slot.get(launch, slot), slot)
     slots: Dict[datetime, List[dict]] = {}
     for m in members:
-        group, offset = m["task_collection"], int(m["offset_minutes"])
+        group, offset = m["task_collection"], offset_of(m)
         added, removed = _when(m.get("added_at")), _when(m.get("removed_at"))
         fires = fire_times(cadence, offset, tz, start, end)
         if not fires:
             continue
         fires.append(next_run(cadence, offset, tz, fires[-1] + timedelta(seconds=1)))
         history = by_group.get(group, [])
-        member_runs = [r for r in history if (added is None or _when(r["started_at"]) >= added)
-                       and (removed is None or _when(r["started_at"]) < removed)]
+        # On a check schedule a launched run belongs to its launch's trigger, checked against membership below.
+        member_runs = [r for r in history if (check_variant and launch_of(r) in launch_slot)
+                       or ((added is None or _when(r["started_at"]) >= added)
+                           and (removed is None or _when(r["started_at"]) < removed))]
         for fire, following in zip(fires, fires[1:]):
             if (added is not None and fire < added) or (removed is not None and fire >= removed):
                 continue
@@ -227,10 +282,19 @@ def job_runs(cadence: int, tz: str, members: List[dict], runs: List[dict], start
             in_slot = [r for r in member_runs
                        if (launch_slot.get(launch_of(r)) == slot if launch_of(r) in launch_slot
                            else fire <= _when(r["started_at"]) < following)]
+            checked = checks_at.get((slot, group), [])
+            slot_checks.setdefault(slot, []).extend(checked)
+            last_check = checked[-1] if checked else None
             if in_slot:
                 state = "run"
             elif fire > now:
                 state = "waiting"
+            elif last_check and last_check.get("status") == "running":
+                state = "checking"
+            elif last_check and last_check.get("status") == "failed":
+                state = "check failed"
+            elif last_check and check_work(last_check) == []:
+                state = "unchanged"
             elif any(_when(r["started_at"]) < fire and r.get("status") != "skipped"
                      and (r.get("finished_at") is None or _when(r["finished_at"]) > fire) for r in history):
                 state = "skipped"
@@ -241,7 +305,8 @@ def job_runs(cadence: int, tz: str, members: List[dict], runs: List[dict], start
             slots.setdefault(slot, []).append(
                 {"task_collection": group, "offset_minutes": offset, "fire_at": fire, "state": state,
                  "run": in_slot[0] if in_slot else None, "extra": in_slot[1:]})
-    return [{"slot": slot, "members": sorted(entries, key=lambda e: (e["offset_minutes"], e["task_collection"]))}
+    return [{"slot": slot, "members": sorted(entries, key=lambda e: (e["offset_minutes"], e["task_collection"])),
+             "checks": sorted(slot_checks.get(slot, []), key=lambda c: (_when(c["started_at"]), c["task_collection"]))}
             for slot, entries in sorted(slots.items(), reverse=True)]
 
 

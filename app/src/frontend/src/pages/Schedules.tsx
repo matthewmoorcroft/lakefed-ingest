@@ -27,7 +27,7 @@ function Editor({ initial, options, onDone }: { initial?: Row; options: Options;
   const qc = useQueryClient();
   const save = useMutation({
     mutationFn: () => {
-      const body = { name: f.name, cadence_minutes: Number(f.cadence_minutes), timezone: f.timezone, stagger: f.stagger,
+      const body = { name: f.name, cadence_minutes: Number(f.cadence_minutes), timezone: f.timezone, stagger: f.stagger && f.job_variant !== "check",
         paused: f.paused, notify_emails: f.notify_emails || null, job_variant: f.job_variant, members: f.members,
         parameters: Object.fromEntries(Object.entries(params).filter(([, v]) => v.trim() !== "").map(([k, v]) => [k, v.trim()])) };
       return initial ? api.post(`/schedules/${initial.id}`, body) : api.post("/schedules", body);

@@ -14,7 +14,7 @@ queries below.
 
 | Table | Grain | Written by |
 | --- | --- | --- |
-| `ingest_run` | one row per ingestion run | `ingest` (`start_run` at launch, `finish_run` at end) |
+| `ingest_run` | one row per ingestion run, and one per collection the check job checked (`work_id` `check-<job run>`; leave these out when counting runs) | `ingest` (`start_run` at launch, `finish_run` at end); the check job |
 | `ingest_event` | one row per (run, table) | `ingest` worker (`record_event_start` → `record_event_finish`) |
 | `checkpoint.last_success_at` | per source table | stamped on each successful event (freshness/lag) |
 | `database_check` | per (collection, source database) | stamped when the whole database is unchanged, in place of each table's `last_success_at` |

@@ -557,13 +557,18 @@ def _with_rows_written(out: List[dict]) -> List[dict]:
 @app.get("/api/runs/{run_id}")
 def run_detail(run_id: int):
     """One run: its row, outcome and rows written, and while it is running its live progress (the
-    overview's counts), speed over the last minutes and about how long it has left."""
+    overview's counts), speed over the last minutes and about how long it has left. A check job's own record of
+    a check comes with what it found (check), else check is None."""
     found = _with_rows_written(db.query(q.run_sql(), (int(run_id),)))
     if not found:
         raise HTTPException(404, f"run {run_id} not found")
     run = found[0]
     schedules, members = _schedules()
-    run["job_runs"] = ij.job_runs_of_run(run, schedules, members)
+    key = run.get("work_id") if sch.is_check(run) else sch.launch_of(run)
+    first = ({r["task_collection"]: r["started_at"] for r in db.query(q.first_started_sql(), (key, f"{key}:%"))}
+             if key else {})
+    run["job_runs"] = ij.job_runs_of_run(run, schedules, members, first_started=first)
+    run["check"] = ij.check_found(run) if sch.is_check(run) else None
     if run["status"] == "running":
         progress = next((r for r in _running() if r["run_id"] == run["run_id"]), None)
         now = datetime.now(timezone.utc)
@@ -1061,6 +1066,8 @@ def create_schedule(body: ScheduleBody, request: Request):
     import psycopg
     _validate_schedule(body)
     user = _user(request)
+    # A check schedule's one wrapper fires every member at once.
+    body.stagger = body.stagger and body.job_variant != sch.CHECK_VARIANT
     offs = sch.offsets(body.members, body.cadence_minutes, body.stagger)
     batch = uuid.uuid4().hex[:12]
     try:
@@ -1087,6 +1094,7 @@ def update_schedule(sid: int, body: ScheduleBody, request: Request):
     s, members = _load_schedule(sid)
     if s["deleted_at"] is not None:
         raise HTTPException(409, "schedule was deleted")
+    body.stagger = body.stagger and body.job_variant != sch.CHECK_VARIANT
     new = body.model_dump()
     new["notify_emails"] = new["notify_emails"] or None
     new["job_variant"] = new["job_variant"] or "default"

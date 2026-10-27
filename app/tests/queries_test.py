@@ -14,7 +14,7 @@ def test_every_statement_is_parameterized_and_schema_qualified():
 
 def test_runs_sql_optional_collection_and_limit():
     sql, params = q.runs_sql(None, limit=50)
-    assert "where" not in sql and params == (50,)
+    assert "task_collection" not in sql.split("where")[1] and params == (50,)
     sql, params = q.runs_sql("c1", limit=10)
     assert "where task_collection = %s" in sql and params == ("c1", 10)
 
@@ -339,3 +339,10 @@ def test_the_database_source_copies_agree_for_every_source_type_and_port():
                                "src_port": port, "secret_key": secret}
                         assert q.database_source(row) == engine.database_source(row), row
     assert "database_check dc" in q.DATABASE_CHECK_JOIN and "dc.source = " + q.database_source_sql("t") in q.DATABASE_CHECK_JOIN
+
+
+def test_lists_of_group_runs_leave_out_the_check_jobs_own_records():
+    for sql in (q.runs_sql(None)[0], q.runs_sql("c1")[0], q.group_runs_before_sql(), q.timeline_runs_sql(),
+                q.last_runs_sql(), q.running_progress_sql(), q.collection_run_stats_sql()):
+        assert q.not_a_check() in sql or q.not_a_check("x") in sql
+    assert q.not_a_check() not in q.group_runs_sql()      # job runs place the checks themselves

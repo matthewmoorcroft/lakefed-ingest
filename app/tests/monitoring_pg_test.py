@@ -232,6 +232,27 @@ def test_the_typical_run_leaves_out_runs_another_run_closed_and_reseeds_queued_a
     assert found["p50_s"] == 0 and found["tables_skipped"] == 1
 
 
+def test_the_check_jobs_own_records_are_not_group_runs(pg):
+    # The check job records each check as a run of the group: one running now (marked by its work_id), and an
+    # earlier finished one from before that mark, known by its detail. Neither is the group's run, its last run
+    # or part of its typical run time.
+    with pg.transaction(force_rollback=True):
+        pg.execute("insert into lakefed_ingest.ingest_run (run_id, task_collection, started_at, status, work_id) "
+                   "values (91, 'c1', now() - interval '1 minute', 'running', 'check-77')")
+        pg.execute("insert into lakefed_ingest.ingest_run (run_id, task_collection, started_at, finished_at, status, "
+                   "total, ok, failed, skipped, detail) values (92, 'c1', now() - interval '2 days', "
+                   "now() - interval '2 days' + interval '9 seconds', 'completed', 20, 20, 0, 20, %s)",
+                   (json.dumps({"check": {"work": [], "unchanged_tables": 20}}),))
+        progress = rows(pg, q.running_progress_sql())
+        last = {r["task_collection"]: r["run_id"] for r in rows(pg, q.last_runs_sql())}
+        stats = rows(pg, q.collection_run_stats_sql(), (["c1"],) * 4)[0]
+        first = rows(pg, q.first_started_sql(), ("check-77", "check-77:%"))
+        assert first == rows(pg, "select task_collection, started_at from lakefed_ingest.ingest_run where run_id = 91")
+    assert [r["run_id"] for r in progress] == [2] and progress[0]["p50_s"] == 0
+    assert last == {"c1": 2} and stats["last_run_id"] == 2
+    assert (stats["runs_24h"], stats["p50_s"]) == (1, 0)
+
+
 def test_a_job_runs_databases_list_failing_first_and_keep_two_servers_apart(pg):
     with pg.transaction(force_rollback=True):
         pg.execute("update lakefed_ingest.control set source_instance_group = 'srv2' where src_database = 'db1' "

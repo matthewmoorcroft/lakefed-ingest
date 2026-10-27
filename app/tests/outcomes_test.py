@@ -116,3 +116,12 @@ def test_a_member_starting_keeps_the_job_run_running_and_ends_its_typical_run_fr
     outcome = q.job_run_outcome([done, starting])
     assert (outcome["label"], outcome["note"]) == ("Running", "1 of 2 group runs, 1 starting")
     assert q.job_run_expected_end([done, starting], {}, {"b": 600}, NOW) == NOW + timedelta(minutes=10)
+
+
+def test_a_member_its_check_found_unchanged_completes_and_a_check_going_keeps_the_job_run_running():
+    done = _member("run", dict(status="completed", failed=0))
+    unchanged = _member("unchanged", group="b")
+    outcome = q.job_run_outcome([done, unchanged])
+    assert (outcome["label"], outcome["note"]) == ("Completed", "1 of 2 group runs, 1 unchanged")
+    assert q.job_run_outcome([unchanged, _member("unchanged", group="c")])["label"] == "Completed"
+    assert q.job_run_outcome([done, _member("checking", group="b")])["label"] == "Running"

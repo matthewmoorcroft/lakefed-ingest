@@ -62,7 +62,9 @@ export default function JobRun() {
             <Figure label="Failed tables" value={fmtInt(r.failed_tables)} sub={Number(r.failed_before) ? `the ${fmtInt(r.failed_before)} job ${plural(r.failed_before, "run")} before also had failed tables` : undefined} />
             <Figure label="Rows written" value={rowsText(r)} sub={live ? "so far" : undefined} />
           </div>
-          <Section title={`Group runs: ${fmtInt(r.group_runs.length)}`} note="Running first, then waiting, then finished.">
+          <Section title={`Group runs: ${fmtInt(r.group_runs.filter((g: Row) => !g.check).length)}`}
+            note={r.group_runs.some((g: Row) => g.check) ? "The check job's checks first, then running, then waiting, then finished."
+              : "Running first, then waiting, then finished."}>
             <div className="table-wrap"><table className="data">
               <thead><tr><th>Ingestion group</th><th>Status</th><th>Started</th><th className="num">Took</th><th>Progress</th>
                 <th className="num">Tables/min</th><th className="num">Parallelism</th><th>Cluster</th><th className="num">Failed</th></tr></thead>
@@ -71,19 +73,20 @@ export default function JobRun() {
                   const gp = progressFrom(g.progress);
                   const waiting = g.state === "waiting";
                   return (
-                    <tr key={`${g.task_collection}-${g.run_id ?? g.state}`}>
+                    <tr key={`${g.task_collection}-${g.check ? "check-" : ""}${g.run_id ?? g.state}`}>
                       <td className="name"><Link to={`/collections/${encodeURIComponent(g.task_collection)}`}><b>{g.task_collection}</b></Link>
-                        {g.extra && <span className="sub">extra run, started by hand?</span>}</td>
+                        {g.extra && <span className="sub">extra run, started by hand?</span>}
+                        {g.check && <span className="sub">check</span>}</td>
                       <td>{waiting ? <Tag tone={"" as Tone}>Waiting, starts {fmtClock(g.fire_at)}</Tag>
                         : g.state === "starting" ? <Tag tone="run">Starting, triggered {fmtClock(g.fire_at)}</Tag>
                         : g.run_id ? <Link to={`/runs/${g.run_id}`}><RunStatus status={null} outcome={g.status} /></Link>
                         : <RunStatus status={null} outcome={g.status} />}</td>
                       <td>{g.started_at ? fmtClock(g.started_at) : ""}</td>
                       <td className="num">{g.duration_s != null ? fmtDuration(g.duration_s) : ""}</td>
-                      <td style={{ minWidth: 160 }}><ProgressBar p={gp} /></td>
+                      <td style={{ minWidth: 160 }}>{g.check ? "" : <ProgressBar p={gp} />}</td>
                       <td className="num">{g.speed_tables_per_min != null ? fmtSpeed(g.speed_tables_per_min) : ""}</td>
                       <td className="num">{g.parallelism ?? ""}</td><td className="mono">{g.cluster_id ?? ""}</td>
-                      <td className="num" style={{ color: Number(g.failed) ? "var(--bad)" : undefined }}>{fmtInt(g.failed)}</td>
+                      <td className="num" style={{ color: Number(g.failed) ? "var(--bad)" : undefined }}>{g.check ? "" : fmtInt(g.failed)}</td>
                     </tr>
                   );
                 })}

@@ -92,12 +92,21 @@ left join {SCHEMA}.checkpoint cp on cp.control_id = t.id
 group by 1, 2, 3, 4, 5"""
 
 
+def not_a_check(alias: str = "") -> str:
+    """SQL: the ingest_run row is a group run, not the check job's own record of a check (schedules.is_check):
+    work_id "check-<job run>", or a detail holding the check's summary for records written before that mark."""
+    a = f"{alias}." if alias else ""
+    return (f"left(coalesce({a}work_id, ''), 6) <> 'check-' "
+            f"and left(coalesce({a}detail, ''), 9) <> '{{\"check\":'")
+
+
 def last_runs_sql() -> str:
     """Each ingestion group's latest run."""
     return f"""
 select distinct on (task_collection) task_collection, run_id, status, started_at, finished_at,
        total, ok, failed, skipped, detail
 from {SCHEMA}.ingest_run
+where {not_a_check()}
 order by task_collection, started_at desc"""
 
 
@@ -112,7 +121,7 @@ def running_progress_sql() -> str:
     return f"""
 with r as (
     select run_id, task_collection, job_run_id, cluster_id, parallelism, started_at, total
-    from {SCHEMA}.ingest_run where status = 'running'
+    from {SCHEMA}.ingest_run where status = 'running' and {not_a_check()}
 ),
 tables as (
     select r.run_id,
@@ -150,6 +159,7 @@ left join lateral (
            round(percentile_cont(0.95) within group (order by extract(epoch from (x.finished_at - x.started_at)))::numeric) as p95_s
     from {SCHEMA}.ingest_run x
     where x.task_collection = r.task_collection and x.finished_at is not null and x.status <> 'skipped'
+      and {not_a_check("x")}
       and x.total is not null and x.started_at > now() - interval '7 days') p on true
 order by r.started_at desc"""
 
@@ -262,10 +272,10 @@ _RUN_COLUMNS = ("run_id, task_collection, status, started_at, finished_at, "
 
 
 def runs_sql(collection: Optional[str], limit: int = 100) -> Tuple[str, tuple]:
-    """Recent runs, optionally for one collection. Returns (sql, params)."""
-    where, params = "", ()
+    """Recent group runs, optionally for one collection. Returns (sql, params)."""
+    where, params = f"where {not_a_check()} ", ()
     if collection:
-        where, params = "where task_collection = %s ", (collection,)
+        where, params = f"where task_collection = %s and {not_a_check()} ", (collection,)
     sql = f"select {_RUN_COLUMNS} from {SCHEMA}.ingest_run {where}order by started_at desc limit %s"
     return sql, params + (int(limit),)
 
@@ -438,11 +448,20 @@ def group_runs_sql() -> str:
             f"where task_collection = any(%s) and started_at >= %s and started_at < %s order by started_at")
 
 
+def first_started_sql() -> str:
+    """The first start per ingestion group among the records of one check job run ("check-<job run>") or one
+    launch's group runs ("<launch_id>:<collection>"): on a check schedule they all belong to the job run its
+    members' first one started in. Params: key, key + ":%"."""
+    return (f"select task_collection, min(started_at) as started_at from {SCHEMA}.ingest_run "
+            f"where work_id = %s::text or work_id like %s::text group by task_collection")
+
+
 def group_runs_before_sql() -> str:
-    """The newest runs of some ingestion groups that started before a time, newest first. Params: groups,
+    """The newest group runs of some ingestion groups that started before a time, newest first. Params: groups,
     before, limit."""
     return (f"select {_RUN_COLUMNS} from {SCHEMA}.ingest_run "
-            f"where task_collection = any(%s) and started_at < %s order by started_at desc limit %s")
+            f"where task_collection = any(%s) and started_at < %s and {not_a_check()} "
+            f"order by started_at desc limit %s")
 
 
 def job_run_databases_sql() -> str:
@@ -674,25 +693,33 @@ JOB_RUN_ORDER = ("Ended without finishing", "Failed", "Completed with failures",
 
 def job_run_outcome(members: List[dict]) -> dict:
     """A job run's outcome from its members (schedules.job_runs): running while any group run (extra runs
-    included) is running or any member is waiting for or starting its trigger; otherwise the worst of its group runs'
-    outcomes, extra runs included, or "Not run" when none ran. The note counts the members that did not run, as "17 of 18 group runs, 1 skipped"."""
+    included) is running or any member is waiting for or starting its trigger, or being checked; otherwise the worst
+    of its group runs' outcomes, extra runs included, with a member its check found unchanged as completed and one
+    whose check failed as failed, or "Not run" when none ran. The note counts the members that did not run, as
+    "17 of 18 group runs, 1 skipped"."""
     runs = [m["run"] for m in members if m.get("run")]
     ran = [r for r in runs if r.get("status") != "skipped"]
     extras = [r for m in members for r in m.get("extra") or [] if r.get("status") != "skipped"]
     skipped = sum(1 for m in members if m["state"] == "skipped") + (len(runs) - len(ran))
     no_run = sum(1 for m in members if m["state"] == "no run")
     starting = sum(1 for m in members if m["state"] == "starting")
+    unchanged = sum(1 for m in members if m["state"] == "unchanged")
+    check_failed = sum(1 for m in members if m["state"] == "check failed")
     note = None
     if len(ran) < len(members):
         note = ", ".join([f"{len(ran)} of {len(members)} group runs"] + ([f"{skipped} skipped"] if skipped else [])
-                         + ([f"{starting} starting"] if starting else []) + ([f"{no_run} no run"] if no_run else []))
-    if (any(m["state"] in ("waiting", "starting") for m in members)
+                         + ([f"{starting} starting"] if starting else [])
+                         + ([f"{unchanged} unchanged"] if unchanged else [])
+                         + ([f"{check_failed} check failed"] if check_failed else [])
+                         + ([f"{no_run} no run"] if no_run else []))
+    if (any(m["state"] in ("waiting", "starting", "checking") for m in members)
             or any(r.get("status") == "running" for r in runs + extras)):
         return {"label": "Running", "tone": "run", "note": note}
-    if not ran and not extras:
+    if not ran and not extras and not unchanged and not check_failed:
         return {"label": "Not run", "tone": "neutral", "note": note}
-    worst = min((run_outcome(r)["label"] for r in ran + extras), key=lambda label: JOB_RUN_ORDER.index(label)
-                if label in JOB_RUN_ORDER else len(JOB_RUN_ORDER))
+    # A member its check found unchanged completed with nothing to load; one whose check failed failed.
+    labels = [run_outcome(r)["label"] for r in ran + extras] + ["Completed"] * unchanged + ["Failed"] * check_failed
+    worst = min(labels, key=lambda label: JOB_RUN_ORDER.index(label) if label in JOB_RUN_ORDER else len(JOB_RUN_ORDER))
     tone = {"Completed": "ok", "Completed with failures": "warn"}.get(worst, "bad")
     return {"label": worst, "tone": tone, "note": note}
 
@@ -1568,7 +1595,7 @@ with r as (
     select task_collection, status, started_at, finished_at,
            extract(epoch from (finished_at - started_at)) as dur_s
     from {SCHEMA}.ingest_run
-    where task_collection = any(%s) and started_at > now() - interval '7 days'
+    where task_collection = any(%s) and started_at > now() - interval '7 days' and {not_a_check()}
 ),
 agg as (
     select task_collection,
@@ -1583,7 +1610,7 @@ last as (
     select distinct on (task_collection) task_collection, run_id as last_run_id, status as last_status,
            started_at as last_started, finished_at as last_finished,
            round(extract(epoch from (coalesce(finished_at, now()) - started_at)))::int as last_duration_s
-    from {SCHEMA}.ingest_run where task_collection = any(%s)
+    from {SCHEMA}.ingest_run where task_collection = any(%s) and {not_a_check()}
     order by task_collection, started_at desc
 ),
 sla as (
@@ -1601,7 +1628,8 @@ order by c.task_collection"""
 
 
 def timeline_runs_sql() -> str:
-    """Runs overlapping a window. Params: window end, window start."""
+    """Group runs overlapping a window. Params: window end, window start."""
     return (f"select run_id, task_collection, status, started_at, finished_at, job_run_id, ok, failed, skipped "
             f"from {SCHEMA}.ingest_run "
-            f"where started_at < %s and coalesce(finished_at, now()) > %s order by task_collection, started_at")
+            f"where started_at < %s and coalesce(finished_at, now()) > %s and {not_a_check()} "
+            f"order by task_collection, started_at")
