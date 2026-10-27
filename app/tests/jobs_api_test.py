@@ -41,6 +41,8 @@ SCHEDULES = [dict(id=1, name="East hourly", cadence_minutes=60, timezone="UTC", 
 MEMBERS = [dict(id=1, schedule_id=1, task_collection="c1", offset_minutes=0, job_id=None, added_at=ADDED, removed_at=None),
            dict(id=2, schedule_id=1, task_collection="c2", offset_minutes=30, job_id=None, added_at=ADDED, removed_at=None),
            dict(id=3, schedule_id=2, task_collection="c3", offset_minutes=0, job_id=None, added_at=ADDED, removed_at=None)]
+# The paused nightly job's group c3 last ran three days ago, long before its recent triggers.
+OLDER = [group_run(5, "c3", datetime(2026, 10, 23, 0, 0, 30, tzinfo=UTC))]
 RUNS = [group_run(9, "c1", datetime(2026, 10, 26, 13, 0, 20, tzinfo=UTC), status="failed", failed=2),
         group_run(10, "c1", datetime(2026, 10, 26, 13, 40, tzinfo=UTC)),
         group_run(8, "c2", datetime(2026, 10, 26, 13, 30, 10, tzinfo=UTC))]
@@ -65,9 +67,22 @@ def client(monkeypatch):
     def query(sql, params=()):
         if sql == q.schedule_members_sql():
             return [m for m in MEMBERS if m["schedule_id"] in params[0]]
+        if sql == q.last_ran_group_runs_sql():
+            found = []
+            for m in MEMBERS:
+                if m["schedule_id"] not in params[0]:
+                    continue
+                ran = [dict(r, schedule_id=m["schedule_id"]) for r in RUNS + OLDER if r["task_collection"] == m["task_collection"]
+                       and r["status"] != "skipped" and datetime.fromisoformat(r["started_at"]) >= m["added_at"]
+                       and (m["removed_at"] is None or datetime.fromisoformat(r["started_at"]) < m["removed_at"])]
+                found += ran
+            newest = {}
+            for r in sorted(found, key=lambda r: r["started_at"], reverse=True):
+                newest.setdefault(r["schedule_id"], []).append(r)
+            return [r for rows in newest.values() for r in rows[:q.LAST_RAN_LOOKUP]]
         if sql == q.group_runs_sql():
             groups, start, end = params
-            return [dict(r) for r in RUNS if r["task_collection"] in groups
+            return [dict(r) for r in RUNS + OLDER if r["task_collection"] in groups
                     and start <= datetime.fromisoformat(r["started_at"]) < end]
         return [dict(r) for r in answers.get(sql, [])]
     monkeypatch.setattr(main.db, "query", query)
@@ -192,3 +207,17 @@ def test_runs_of_groups_in_no_job_are_read_from_the_database_before_a_time(clien
     monkeypatch.setattr(main.db, "query", query)
     body = client.get("/api/job-runs", params={"job": "none", "before": "2026-10-26T12:00:00+00:00"}).json()
     assert [r["run_id"] for r in body["group_runs"]] == [30] and calls[0][0] == ["c4"]
+
+
+def test_a_jobs_last_job_run_is_its_last_real_one_however_long_ago_and_never_a_missed_trigger(client):
+    jobs = {j["name"]: j for j in client.get("/api/overview").json()["jobs"]}
+    nightly = jobs["Nightly"]["last_job_run"]
+    assert (nightly["slot"], nightly["outcome"]["label"]) == ("2026-10-23T00:00:00+00:00", "Completed")
+    assert client.get("/api/ingestion-jobs/2").json()["last_job_run"]["slot"] == "2026-10-23T00:00:00+00:00"
+    listed = {j["name"]: j for j in client.get("/api/ingestion-jobs").json()["jobs"]}
+    assert all(j["last_job_run"] is None or j["last_job_run"]["outcome"]["label"] != "Not run" for j in listed.values())
+
+
+def test_a_jobs_page_gives_its_next_trigger_or_none_while_paused(client):
+    assert client.get("/api/ingestion-jobs/1").json()["next_start"] == "2026-10-26T14:30:00+00:00"
+    assert client.get("/api/ingestion-jobs/2").json()["next_start"] is None

@@ -399,12 +399,17 @@ export function progressFrom(p?: Row | null): Progress {
 }
 
 /** A job run's name: its job and its slot's start, "East hourly, 14:00 job run" (with the day when not today). */
-export function jobRunName(jobName: unknown, slot: unknown): string {
+/** A time as a clock reading today, and with its day otherwise ("23 Oct, 21:00"). */
+export function fmtSlot(slot: unknown): string {
+  if (!slot) return "";
   const at = new Date(String(slot));
   const today = new Date().toDateString() === at.toDateString();
-  const when = at.toLocaleString([], today ? { hour: "2-digit", minute: "2-digit" }
+  return at.toLocaleString([], today ? { hour: "2-digit", minute: "2-digit" }
     : { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" });
-  return `${jobName}, ${when} job run`;
+}
+
+export function jobRunName(jobName: unknown, slot: unknown): string {
+  return `${jobName}, ${fmtSlot(slot)} job run`;
 }
 
 export const jobRunPath = (jobId: unknown, slot: unknown) =>

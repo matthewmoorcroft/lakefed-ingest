@@ -263,3 +263,16 @@ def test_tables_page_by_keyset_and_filter_one_database_exactly(pg):
     assert {r["src_database"] for r in first + second} == {"db2"} and len(first) == len(second) == 4
     assert not {r["id"] for r in first} & {r["id"] for r in second}
     assert [r["src_table"] for r in first + second] == sorted(r["src_table"] for r in first + second)
+
+
+def test_a_jobs_last_ran_group_runs_are_its_members_newest_that_ran_while_members(pg):
+    # Job 1's c1 ran 3 days ago (run 1) and is running now (run 2); a skipped run and a run from before c1 joined
+    # the job are not its job's.
+    with pg.transaction(force_rollback=True):
+        pg.execute("insert into lakefed_ingest.schedule (id, name, cadence_minutes) values (1, 'hourly', 60)")
+        pg.execute("insert into lakefed_ingest.schedule_member (schedule_id, task_collection, added_at) "
+                   "values (1, 'c1', now() - interval '4 days')")
+        pg.execute("insert into lakefed_ingest.ingest_run (run_id, task_collection, started_at, status) values "
+                   "(80, 'c1', now() - interval '5 days', 'completed'), (81, 'c1', now() - interval '1 day', 'skipped')")
+        found = rows(pg, q.last_ran_group_runs_sql(), ([1],))
+    assert sorted(r["run_id"] for r in found) == [1, 2] and {r["schedule_id"] for r in found} == {1}

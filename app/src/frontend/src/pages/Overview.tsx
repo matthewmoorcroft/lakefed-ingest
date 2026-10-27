@@ -4,7 +4,7 @@ import { Link } from "react-router-dom";
 import { api, qs, type Row } from "../api";
 import {
   ErrorBox, FillBox, JobStatus, Name, Notice, PageHead, Pager, ProgressBar, RunStatus, Section, Stamp, StateBar, StateKey,
-  fmtClock, fmtDuration, fmtInt, fmtSpeed, jobRunName, jobRunPath, plural, progressFrom, progressText
+  fmtClock, fmtDuration, fmtInt, fmtSlot, fmtSpeed, jobRunName, jobRunPath, plural, progressFrom, progressText
 } from "../components";
 
 interface Overview {
@@ -15,14 +15,15 @@ interface Overview {
 
 const jobPath = (id: unknown) => `/ingestion-jobs/${encodeURIComponent(String(id))}`;
 
-/** A job's last finished job run: its outcome, failed tables and how long it took. */
+/** A job's last job run that ran, however long ago: its outcome, when, failed tables and how long it took. A
+ * trigger that did not run is never shown here; the job's own page lists every trigger. */
 function LastJobRun({ job }: { job: Row }) {
   const last = job.last_job_run;
-  if (!last) return <span className="muted">none yet</span>;
+  if (!last) return <span className="muted">Never run</span>;
   return (
     <>
       <Link to={jobRunPath(job.id, last.slot)}><RunStatus status={null} outcome={last.outcome} /></Link>
-      <span className="sub">{fmtClock(last.slot)}{last.took_s != null && `, took ${fmtDuration(last.took_s)}`}
+      <span className="sub">{fmtSlot(last.slot)}{last.took_s != null && `, took ${fmtDuration(last.took_s)}`}
         {Number(last.failed_tables) > 0 && `, ${fmtInt(last.failed_tables)} failed`}</span>
     </>
   );

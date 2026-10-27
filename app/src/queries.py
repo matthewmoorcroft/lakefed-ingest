@@ -402,6 +402,27 @@ def group_runs_sql() -> str:
             f"where task_collection = any(%s) and started_at >= %s and started_at < %s order by started_at")
 
 
+# How many of a job's newest group runs that ran are read to find its last job run: more than one, since a late
+# run of an older slot can start after a run of the newest, and to count its failures in a row.
+LAST_RAN_LOOKUP = 5
+
+
+def last_ran_group_runs_sql() -> str:
+    """Per job, the LAST_RAN_LOOKUP newest group runs that ran (not skipped) of its groups while each was its
+    member, each with its schedule_id: where a job's last job run is found when none of its recent triggers ran.
+    Param: schedule ids."""
+    return f"""
+select schedule_id, {_RUN_COLUMNS} from (
+    select m.schedule_id, r.*,
+           row_number() over (partition by m.schedule_id order by r.started_at desc) as newest
+    from {SCHEMA}.ingest_run r
+    join {SCHEMA}.schedule_member m on m.task_collection = r.task_collection
+    where m.schedule_id = any(%s) and r.status <> 'skipped'
+      and (m.added_at is null or r.started_at >= m.added_at) and (m.removed_at is null or r.started_at < m.removed_at)
+) x
+where newest <= {LAST_RAN_LOOKUP}"""
+
+
 def group_runs_before_sql() -> str:
     """The newest runs of some ingestion groups that started before a time, newest first. Params: groups,
     before, limit."""
