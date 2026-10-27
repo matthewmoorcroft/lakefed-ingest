@@ -1262,7 +1262,7 @@ def connections():
             return {"connections": [], "error": str(e)[:500]}
         states = _states()
         for c in found:
-            c["tracked"] = rollup.tracked(states, c["name"], c["host"])
+            c["tracked"] = rollup.tracked(states, c["name"], c["host"], c.get("port"), c.get("connection_type"))
         return {"connections": found, "error": None}
     return _shared("connections", compute)
 
@@ -1273,7 +1273,7 @@ def connection_databases(name: str):
     found = next((c for c in connections()["connections"] if c["name"] == name), None)
     if not found:
         raise HTTPException(404, f"connection '{name}' not found")
-    return rollup.connection_databases(_states(), name, found["host"])
+    return rollup.connection_databases(_states(), name, found["host"], found.get("port"), found.get("connection_type"))
 
 
 # ---- single-page app ----------------------------------------------------------------------------

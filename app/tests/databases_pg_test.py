@@ -146,3 +146,14 @@ def test_failed_tables_give_each_cause_of_a_table_and_its_server(pg):
     found = [r for r in rows(pg, q.failed_tables_sql(), (24, 10)) if r["task_collection"] == "c3"]
     assert sorted((r["src_table"], r["server"], r["error"]) for r in found) == [
         ("orders", Z, "Invalid column name 'qty'."), ("orders", Z, "connection reset")]
+
+
+def test_a_table_registered_at_one_port_is_not_registered_at_another(pg):
+    with pg.transaction(force_rollback=True):
+        for discovery, port in (("d1", None), ("d2", 1500)):
+            pg.execute("insert into lakefed_ingest.discovery (discovery_id, src_type, src_host, src_port, src_database, "
+                       "status, finished_at) values (%s, 'sqlserver', 'host-x', %s, 'Sales', 'ok', now())", (discovery, port))
+            pg.execute("insert into lakefed_ingest.discovered_table (discovery_id, src_database, src_schema, src_table) "
+                       "values (%s, 'Sales', 'dbo', 't1')", (discovery,))
+        found = {r["endpoint"]: r for r in rows(pg, q.not_ingested_sql())}
+    assert (found[X]["not_registered"], found["host-x:1500"]["not_registered"]) == (0, 1)

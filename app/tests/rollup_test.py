@@ -41,7 +41,7 @@ def test_servers_roll_up_databases_groups_and_running_groups():
 
 
 def test_a_connection_matches_by_name_or_host_case_insensitively():
-    rows = STATES + [state("srvW", "c3", "Ops", tables=1, host="sql-w.example.com")]
+    rows = STATES + [state("sql-w.example.com:1433", "c3", "Ops", tables=1, host="sql-w.example.com")]   # a JDBC server: host:port
     assert [d["src_database"] for d in rollup.connection_databases(rows, "hr_conn", None)] == ["Hr"]
     assert [d["src_database"] for d in rollup.connection_databases(rows, "other", "SQL-W.example.com")] == ["Ops"]
     assert rollup.tracked(rows, "hr_conn", "") == {"databases": 1, "tables": 4, "collections": 1}
@@ -134,3 +134,13 @@ def test_a_connection_is_matched_by_name_whatever_its_case():
     found = rollup.sources(states, connections, [], SCHEDULES, MEMBERS)["instances"]
     assert [(i["server"], i["read_via"][0]["host"]) for i in found] == [("conn_a", "a.example")]
     assert [d["src_database"] for d in rollup.connection_databases(states, "conn_a", "a.example")] == ["Sales"]
+
+
+def test_a_connection_claims_rows_at_its_own_port_and_a_stale_host_on_a_connection_row_is_not_a_jdbc_path():
+    states = [state("db.example:1433", "c1", "A", tables=2, host="db.example"),
+              state("db.example:1500", "c2", "B", tables=3, host="db.example"),
+              state("conn_a", "c3", "C", tables=4, connection="conn_a", host="old.example")]   # reads through conn_a
+    assert [d["src_database"] for d in rollup.connection_databases(states, "on_1500", "db.example", "1500", "SQLSERVER")] == ["B"]
+    assert [d["src_database"] for d in rollup.connection_databases(states, "on_default", "db.example", None, "SQLSERVER")] == ["A"]
+    conn = {i["server"]: i for i in rollup.sources(states, [], [], SCHEDULES, MEMBERS)["instances"]}["conn_a"]
+    assert [v["kind"] for v in conn["read_via"]] == ["uc"]

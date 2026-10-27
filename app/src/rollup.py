@@ -85,18 +85,21 @@ def endpoint(host: Optional[str], port, kind: Optional[str]) -> str:
     return f"{(host or '').lower()}:{effective}"
 
 
-def _on_connection(s: dict, name: str, host: str) -> bool:
+def _on_connection(s: dict, name: str, host: str, port=None, kind: Optional[str] = None) -> bool:
+    """A states row is on a connection: it names it (whatever the case), or it is a JDBC server at its host and
+    port (its server key is that endpoint)."""
     return ((s.get("src_connection") or "").lower() == name.lower()
-            or (bool(host) and (s.get("src_host") or "") == host.lower()))
+            or (bool(host) and s.get("server") == endpoint(host, port, kind)))
 
 
-def connection_databases(states: Iterable[dict], name: str, host: Optional[str]) -> List[dict]:
+def connection_databases(states: Iterable[dict], name: str, host: Optional[str], port=None,
+                         kind: Optional[str] = None) -> List[dict]:
     """The databases lakefed tracks on one UC connection, by name: control rows naming the connection or
-    its host (case-insensitively). Each with its ingestion groups, enabled tables and newest success of any
-    of its tables, enabled or not."""
+    JDBC rows at its host and port (case-insensitively). Each with its ingestion groups, enabled tables and newest
+    success of any of its tables, enabled or not."""
     out: Dict[str, dict] = {}
     for s in states:
-        if not _on_connection(s, name, host or ""):
+        if not _on_connection(s, name, host or "", port, kind):
             continue
         d = out.setdefault(s["src_database"], {"src_database": s["src_database"], "_groups": set(), "tables": 0,
                                                "newest_success_at": None})
@@ -110,9 +113,9 @@ def connection_databases(states: Iterable[dict], name: str, host: Optional[str])
     return rows
 
 
-def tracked(states: Iterable[dict], name: str, host: Optional[str]) -> dict:
+def tracked(states: Iterable[dict], name: str, host: Optional[str], port=None, kind: Optional[str] = None) -> dict:
     """What lakefed tracks on one UC connection: databases, enabled tables and ingestion groups."""
-    dbs = connection_databases(states, name, host)
+    dbs = connection_databases(states, name, host, port, kind)
     group_names = {g.strip() for d in dbs for g in d["collections"].split(",") if g.strip()}
     return {"databases": len(dbs), "tables": sum(d["tables"] for d in dbs), "collections": len(group_names)}
 
@@ -169,7 +172,9 @@ def sources(states: Iterable[dict], connections: Iterable[dict], not_ingested: I
     for row in servers(states):
         mine = [s for s in states if s["server"] == row["server"]]
         names = sorted({s["src_connection"].lower() for s in mine if s.get("src_connection")})
-        hosts = sorted({(s.get("src_host") or "").lower() for s in mine if s.get("src_host")})
+        # JDBC paths only from rows read by host (a row reading through its connection may keep an old host).
+        hosts = sorted({(s.get("src_host") or "").lower() for s in mine
+                        if s.get("src_host") and s["server"] != (s.get("src_connection") or "").lower()})
         # A connection the app cannot list (no rights on it) still shows, with its host marked as not visible.
         read_via = [{"kind": "uc", "name": (by_name.get(n) or {}).get("name") or n,
                      "connection_type": (by_name.get(n) or {}).get("connection_type"),

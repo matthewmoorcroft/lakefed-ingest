@@ -488,7 +488,7 @@ with latest as (
 ),
 found as (
     select l.endpoint, l.src_host, l.src_database, l.finished_at, dt.src_schema, dt.src_table, dt.size_mb,
-           exists (select 1 from {SCHEMA}.control c where lower(c.src_host) = lower(l.src_host)
+           exists (select 1 from {SCHEMA}.control c where c.src_host is not null and {endpoint_sql('c')} = l.endpoint
                    and lower(c.src_database) = lower(dt.src_database) and lower(c.src_schema) = lower(dt.src_schema)
                    and lower(c.src_table) = lower(dt.src_table)) as registered
     from latest l
