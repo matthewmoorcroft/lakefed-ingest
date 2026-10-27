@@ -25,14 +25,20 @@ SLA_BREACHED = ("(t.task_enabled and t.freshness_sla_minutes is not null "
 
 # The server a table's row reaches, as the engine's per-source query cap counts it (ct_engine.source_key): its UC
 # connection when it reads through one (or names one and no host), else its host and port (the source type's default
-# port when none is set). The instance-group label does not decide it: two labels on one server are one server.
-# Alias t = control.
-_DEFAULT_PORT = ("case lower(coalesce(t.src_type, 'sqlserver')) when 'oracle' then '1521' when 'postgresql' then '5432' "
-                 "when 'mysql' then '3306' else '1433' end")
+# port when none is set, or 0, as the engine reads it). The instance-group label does not decide it: two labels on one
+# server are one server. Alias t = control.
+
+
+def endpoint_sql(alias: str) -> str:
+    """SQL: a row's host and effective port, "host:port" (rollup.endpoint in Python), for a table with src_host,
+    src_port and src_type under `alias`."""
+    default = (f"case lower(coalesce({alias}.src_type, 'sqlserver')) when 'oracle' then '1521' "
+               f"when 'postgresql' then '5432' when 'mysql' then '3306' else '1433' end")
+    return f"lower({alias}.src_host) || ':' || coalesce(nullif({alias}.src_port, 0)::text, {default})"
+
+
 SERVER = (f"(case when t.src_connection is not null and (t.use_remote_query or t.src_host is null) "
-          f"then lower(t.src_connection) "
-          f"when t.src_host is not null then lower(t.src_host) || ':' || coalesce(t.src_port::text, {_DEFAULT_PORT}) "
-          f"else '' end)")
+          f"then lower(t.src_connection) when t.src_host is not null then {endpoint_sql('t')} else '' end)")
 # One source database: its server (SERVER) and its name, so two servers' databases of the same name stay
 # two databases. Alias t = control.
 DATABASE = f"({SERVER}, coalesce(t.src_database, ''))"
@@ -430,9 +436,10 @@ where newest = 1"""
 def group_runs_in_windows_sql() -> str:
     """The runs of each (ingestion group, window start, window end) given, in one read: the job runs of several
     jobs, each around its own slot. Params: groups, starts, ends (arrays of one length)."""
-    return (f"select {_RUN_COLUMNS} from {SCHEMA}.ingest_run "
-            f"join unnest(%s::text[], %s::timestamptz[], %s::timestamptz[]) as w(task_collection, starts, ends) "
-            f"using (task_collection) where started_at >= w.starts and started_at < w.ends order by started_at")
+    return (f"select {_RUN_COLUMNS} from {SCHEMA}.ingest_run r where exists ("
+            f"select 1 from unnest(%s::text[], %s::timestamptz[], %s::timestamptz[]) as w(task_collection, starts, ends) "
+            f"where w.task_collection = r.task_collection and r.started_at >= w.starts and r.started_at < w.ends) "
+            f"order by started_at")    # exists: a run in two windows (overlapping, or a group in two jobs) comes once
 
 
 def group_runs_before_sql() -> str:
@@ -469,30 +476,31 @@ def run_failures_sql() -> str:
 
 
 def not_ingested_sql() -> str:
-    """Per discovered (host, database), from its latest successful discovery: tables found, how many have no
-    control row yet (matched as discovered_tables_sql's registered_id is, in any group), and the largest of
-    those."""
+    """Per discovered (host and port, database), from its latest successful discovery: its endpoint ("host:port",
+    as SERVER spells a JDBC server), tables found, how many have no control row yet (matched as
+    discovered_tables_sql's registered_id is, in any group), and the largest of those."""
     return f"""
 with latest as (
-    select distinct on (lower(src_host), lower(src_database)) discovery_id, src_host, src_database, finished_at
-    from {SCHEMA}.discovery where status = 'ok'
-    order by lower(src_host), lower(src_database), finished_at desc
+    select distinct on ({endpoint_sql('d')}, lower(d.src_database)) d.discovery_id, d.src_host, d.src_database,
+           d.finished_at, {endpoint_sql('d')} as endpoint
+    from {SCHEMA}.discovery d where d.status = 'ok'
+    order by {endpoint_sql('d')}, lower(d.src_database), d.finished_at desc
 ),
 found as (
-    select l.src_host, l.src_database, l.finished_at, dt.src_schema, dt.src_table, dt.size_mb,
+    select l.endpoint, l.src_host, l.src_database, l.finished_at, dt.src_schema, dt.src_table, dt.size_mb,
            exists (select 1 from {SCHEMA}.control c where lower(c.src_host) = lower(l.src_host)
                    and lower(c.src_database) = lower(dt.src_database) and lower(c.src_schema) = lower(dt.src_schema)
                    and lower(c.src_table) = lower(dt.src_table)) as registered
     from latest l
     join {SCHEMA}.discovered_table dt on dt.discovery_id = l.discovery_id and dt.src_database = l.src_database
 )
-select src_host, src_database, finished_at as discovered_at, count(*) as discovered,
+select endpoint, src_host, src_database, finished_at as discovered_at, count(*) as discovered,
        count(*) filter (where not registered) as not_registered,
        (array_agg(src_schema || '.' || src_table order by size_mb desc nulls last)
           filter (where not registered))[1] as largest_not_registered
 from found
-group by 1, 2, 3
-order by 1, 2"""
+group by 1, 2, 3, 4
+order by 1, 3"""
 
 
 def _database_rows() -> str:

@@ -299,3 +299,16 @@ def test_two_labels_on_one_connection_are_one_server_and_the_rows_keep_their_lab
     assert {s["server"] for s in states} == {"conn_a"}
     assert sorted((s["instance_label"], s["tables"]) for s in states) == [("lab-b", 3), ("srv1", 7)]
     assert servers["conn_a"]["databases"] == 1 and servers[A]["databases"] == 1
+
+
+def test_a_port_of_zero_is_no_port_as_the_engine_reads_it(pg):
+    with pg.transaction(force_rollback=True):
+        pg.execute("update lakefed_ingest.control set src_port = 0 where src_database = 'db1' and src_table = 't1'")
+        servers = {s["server"] for s in rows(pg, q.database_states_sql())}
+    assert servers == {A}
+
+
+def test_windows_that_overlap_read_a_run_once(pg):
+    now = datetime.now(timezone.utc)
+    twice = rows(pg, q.group_runs_in_windows_sql(), (["c1", "c1"], [now - timedelta(days=4)] * 2, [now] * 2))
+    assert sorted(r["run_id"] for r in twice) == [1, 2]

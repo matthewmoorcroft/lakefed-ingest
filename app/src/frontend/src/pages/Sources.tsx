@@ -35,9 +35,10 @@ export default function Sources() {
           <tbody>
             {instances.map((i) => (
               <tr key={i.server} className={pick?.server === i.server ? "selected" : ""} onClick={() => setChosen(i.server)} style={{ cursor: "pointer" }}>
-                <td className="name"><b>{i.server || "(no server)"}</b><ReadVia via={i.read_via} />
+                <td className="name"><b>{i.name || i.server || "(no server)"}</b><ReadVia via={i.read_via} />
                   {(i.labels ?? []).length > 0 && <span className="sub" style={{ color: "var(--warn)" }}>
-                    Instance group set to another name on some rows: {(i.labels as Row[]).map((l) => `${l.label} (${fmtInt(l.tables)} ${plural(l.tables, "table")})`).join(", ")}</span>}</td>
+                    One server, named differently on its rows' instance group: {(i.labels as Row[]).map((l) =>
+                      `${l.label ?? "no name"} (${fmtInt(l.tables)} ${plural(l.tables, "table")})`).join(", ")}</span>}</td>
                 <td className="num">{fmtInt(i.jobs.filter((j: Row) => j.id != null).length)}</td><td className="num">{fmtInt(i.groups)}</td>
                 <td className="num">{fmtInt(i.databases)}</td><td className="num">{fmtInt(i.tables)}</td>
                 <td>{i.nothing_registered ? <span className="muted">nothing registered</span> : <StateBar row={i} />}</td>
@@ -51,7 +52,7 @@ export default function Sources() {
       </Section>
       {pick && (
         <>
-          <Section title={`${pick.server || "(no server)"}: its ingestion jobs`} note="Jobs only: a job's groups and their databases are on the job's own page.">
+          <Section title={`${pick.name || pick.server || "(no server)"}: its ingestion jobs`} note="Jobs only: a job's groups and their databases are on the job's own page.">
             <div className="table-wrap"><table className="data">
               <thead><tr><th>Ingestion job</th><th className="num">Groups</th><th className="num">Databases</th><th className="num">Tables</th>
                 <th>State now</th><th>Now</th></tr></thead>
