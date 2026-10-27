@@ -2,12 +2,16 @@ import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { Link } from "react-router-dom";
 import { api, type Row } from "../api";
-import { ErrorBox, Host, Name, Notice, PageHead, Section, Stamp, StateBar, StateKey, fmtAgo, fmtInt, plural } from "../components";
+import { ErrorBox, Host, Name, Notice, PageHead, Section, Stamp, StateBar, StateKey, Tip, fmtAgo, fmtInt, plural } from "../components";
 
-/** How an instance is read: its UC connections (name, type, host) or its JDBC hosts. */
+/** How an instance is read: its UC connections (name, type and the host each points at, or that the app cannot see
+ * it) or its JDBC hosts. */
 function ReadVia({ via }: { via: Row[] }) {
   return <>{via.map((v, i) => <span key={i} className="sub">{v.kind === "uc"
-    ? <>UC connection <b>{v.name}</b>{v.connection_type ? ` (${v.connection_type})` : ""}{v.host ? <>, <Host host={v.host} /></> : null}</>
+    ? <>UC connection <b>{v.name}</b>{v.connection_type ? ` (${v.connection_type})` : ""},{" "}
+        {v.host ? <Host host={v.host} />
+          : <Tip text="This app's identity cannot see this UC connection (it has no rights on it), so its host is not known here. The ingestion jobs read through it with their own identity.">
+            <span className="muted" data-host-hidden>host not visible to this app</span></Tip>}</>
     : <>JDBC host <Host host={v.host} /></>}</span>)}</>;
 }
 
@@ -75,7 +79,7 @@ export default function Sources() {
               <thead><tr><th>Database</th><th className="num">Discovered</th><th className="num">Not registered</th><th>Largest not registered</th><th>Discovered</th></tr></thead>
               <tbody>
                 {pick.not_ingested.map((n: Row) => (
-                  <tr key={`${n.src_host}\u001f${n.src_database}`}><td className="name"><b>{n.src_database}</b><span className="sub">{n.src_host}</span></td>
+                  <tr key={`${n.src_host}\u001f${n.src_database}`}><td className="name"><b>{n.src_database}</b><span className="sub"><Host host={n.src_host} /></span></td>
                     <td className="num">{fmtInt(n.discovered)}</td><td className="num">{fmtInt(n.not_registered)}</td>
                     <td>{n.largest_not_registered ?? ""}</td><td>{fmtAgo(n.discovered_at)}</td></tr>
                 ))}

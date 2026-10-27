@@ -145,6 +145,14 @@ table.data tr.total td { font-weight: var(--db-font-weight-semibold); border-top
 table.data td.num, table.data th.num { text-align: right; white-space: nowrap; }
 table.data td a b { font-weight: var(--db-font-weight-normal); }
 table.data td .sub { display: block; font-size: var(--db-font-size-sm); color: var(--muted); font-weight: var(--db-font-weight-normal); }
+/* A host name never breaks across lines: an ellipsis when it does not fit, the full name in its tooltip (Tip). */
+.tip-target { display: inline-block; max-width: 100%; vertical-align: bottom; }
+.host { display: inline-block; max-width: 100%; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+        vertical-align: bottom; }
+.tip-pop { position: fixed; z-index: 1000; max-width: min(560px, calc(100vw - 8px)); padding: 4px 8px;
+           background: var(--db-surface-base, #fff); color: var(--text); border: 1px solid var(--border, #d1d9e1);
+           border-radius: 4px; box-shadow: 0 2px 8px rgba(0, 0, 0, 0.12); font-size: var(--db-font-size-sm);
+           overflow-wrap: anywhere; pointer-events: none; }
 .table-wrap { overflow-x: auto; }
 .table-wrap.fill { overflow-y: auto; }
 .table-wrap.fill table.data thead th { position: sticky; top: 0; background: var(--card); z-index: 1; }
