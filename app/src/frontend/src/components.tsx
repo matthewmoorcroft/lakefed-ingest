@@ -1,4 +1,4 @@
-import { Fragment, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { Fragment, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { AgGridReact } from "ag-grid-react";
 import { themeQuartz, type ColDef, type GridApi, type GridOptions } from "ag-grid-community";
@@ -167,23 +167,42 @@ export function BigCount({ value }: { value: unknown }) {
 }
 
 /** A host name that wraps only after a dot, never inside a name or the port. */
-/** Text shown on hover or focus in the page itself (data-tip), not the browser's title: drawn at the page's top
+/** Text shown on hover, focus or tap in the page itself (data-tip), not the browser's title: drawn at the page's top
  * level, below its target or above it when there is no room, and always kept inside the window, so no table or
- * scrolling box can cut it off. */
-export function Tip({ text, children }: { text: string; children: ReactNode }) {
+ * scrolling box can cut it off. It closes on scroll, resize, Escape or a tap elsewhere, so it never stays behind
+ * at an old place. `focusable` makes it a tab stop (for text that is cut off, or a help note). */
+export function Tip({ text, children, focusable = false }: { text: string; children: ReactNode; focusable?: boolean }) {
   const ref = useRef<HTMLSpanElement>(null);
+  const id = useId();
   const [at, setAt] = useState<DOMRect | null>(null);
   const show = () => ref.current && setAt(ref.current.getBoundingClientRect());
+  const hide = () => setAt(null);
+  useEffect(() => {
+    if (!at) return;
+    const away = (e: Event) => { if (!ref.current?.contains(e.target as Node)) hide(); };
+    const key = (e: KeyboardEvent) => { if (e.key === "Escape") hide(); };
+    window.addEventListener("scroll", hide, true);
+    window.addEventListener("resize", hide);
+    document.addEventListener("pointerdown", away);
+    document.addEventListener("keydown", key);
+    return () => {
+      window.removeEventListener("scroll", hide, true);
+      window.removeEventListener("resize", hide);
+      document.removeEventListener("pointerdown", away);
+      document.removeEventListener("keydown", key);
+    };
+  }, [at]);
   return (
-    <span ref={ref} className="tip-target" data-tip={text} tabIndex={0} onMouseEnter={show} onFocus={show}
-      onMouseLeave={() => setAt(null)} onBlur={() => setAt(null)}>
+    <span ref={ref} className="tip-target" data-tip={text} tabIndex={focusable ? 0 : undefined}
+      aria-describedby={at ? id : undefined} onMouseEnter={show} onFocus={show} onMouseLeave={hide} onBlur={hide}
+      onClick={(e) => { e.stopPropagation(); if (at) hide(); else show(); }}>
       {children}
-      {at && createPortal(<TipPop text={text} target={at} />, document.body)}
+      {at && createPortal(<TipPop id={id} text={text} target={at} />, document.body)}
     </span>
   );
 }
 
-function TipPop({ text, target }: { text: string; target: DOMRect }) {
+function TipPop({ id, text, target }: { id: string; text: string; target: DOMRect }) {
   const ref = useRef<HTMLDivElement>(null);
   const [place, setPlace] = useState({ left: target.left, top: target.bottom + 6, ready: false });
   useLayoutEffect(() => {
@@ -195,14 +214,22 @@ function TipPop({ text, target }: { text: string; target: DOMRect }) {
     const left = Math.min(Math.max(edge, target.left), Math.max(edge, window.innerWidth - box.width - edge));
     setPlace({ left, top, ready: true });
   }, [target]);
-  return <div ref={ref} className="tip-pop" role="tooltip"
+  return <div ref={ref} id={id} className="tip-pop" role="tooltip"
     style={{ left: place.left, top: place.top, visibility: place.ready ? "visible" : "hidden" }}>{text}</div>;
 }
 
 /** A host name on one line: cut with an ellipsis when it does not fit, its full name (and port) on hover. */
 export function Host({ host, port }: { host: string; port?: unknown }) {
   const full = port ? `${host}:${port}` : host;
-  return <Tip text={full}><span className="host">{full}</span></Tip>;
+  const ref = useRef<HTMLSpanElement>(null);
+  const [cut, setCut] = useState(false);       // only a name that is cut off is a tab stop
+  useLayoutEffect(() => {
+    const measure = () => ref.current && setCut(ref.current.scrollWidth > ref.current.clientWidth + 1);
+    measure();
+    window.addEventListener("resize", measure);
+    return () => window.removeEventListener("resize", measure);
+  }, [full]);
+  return <Tip text={full} focusable={cut}><span ref={ref} className="host">{full}</span></Tip>;
 }
 
 /** "database" for one, "databases" for any other count. */

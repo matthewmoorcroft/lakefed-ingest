@@ -10,8 +10,9 @@ function ReadVia({ via }: { via: Row[] }) {
   return <>{via.map((v, i) => <span key={i} className="sub">{v.kind === "uc"
     ? <>UC connection <b>{v.name}</b>{v.connection_type ? ` (${v.connection_type})` : ""},{" "}
         {v.host ? <Host host={v.host} />
-          : <Tip text="This app's identity cannot see this UC connection (it has no rights on it), so its host is not known here. The ingestion jobs read through it with their own identity.">
-            <span className="muted" data-host-hidden>host not visible to this app</span></Tip>}</>
+          : v.host_hidden ? <Tip focusable text="This app's identity cannot see this UC connection (it has no rights on it), so its host is not known here. The ingestion jobs read through it with their own identity.">
+            <span className="muted" data-host-hidden>host not visible to this app</span></Tip>
+          : <span className="muted" data-host-hidden>host not set on the connection</span>}</>
     : <>JDBC host <Host host={v.host} /></>}</span>)}</>;
 }
 
