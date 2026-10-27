@@ -257,7 +257,7 @@ Inserted when a run starts (`status = 'running'`) and finalized when it ends.
 | `total`, `ok`, `failed` | Table counts (`total` holds the tables the run planned while it runs) |
 | `skipped` | Tables that were unchanged (nothing to read) |
 | `reseeded` | Tables queued for a reseed |
-| `work_id` | The check job's work list the run was started for (`<launch_id>:<collection>`): the runs of one launch share its launch id, and the operations app shows them as one job run. Null for a run started otherwise |
+| `work_id` | The check job's work list the run was started for (`<launch_id>:<collection>`): the runs of one launch share its launch id, and the operations app shows them as one job run. `check-<job run>` on the check job's own record of a check (`detail.check` holds what it found): not a group run, so leave these rows out when counting or timing runs. Null for a run started otherwise |
 | `detail` | JSON with run details: change-detection counts per route, timings, peak concurrency, and with `max_queries_per_source` set, each source's share and peak permits (`source_caps`), the rows batched appends committed (`batch_rows`, with `batch_rows_unknown` tables not counted), and table retry totals (`table_retries`) |
 
 ## `ingest_event` — one row per table per run

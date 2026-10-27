@@ -140,7 +140,7 @@ class _Store:
     def __init__(self, configs, checkpoints, held=()):
         self.configs, self.checkpoints, self.held = configs, checkpoints, set(held)
         self.runs, self.finished, self.advanced, self.stamped, self.unlocked = [], {}, [], {}, []
-        self.closed = []
+        self.closed, self.work_ids = [], []
         self.alive = True
 
     def mixed_sinks(self):
@@ -152,8 +152,9 @@ class _Store:
     def unlock_collection(self, collection):
         self.unlocked.append(collection)
 
-    def start_run(self, collection, job_run_id, cluster_id, parallelism):
+    def start_run(self, collection, job_run_id, cluster_id, parallelism, work_id=None):
         self.runs.append((collection, job_run_id, cluster_id, parallelism))
+        self.work_ids.append(work_id)
         return len(self.runs)
 
     def list_task_configs(self, collection):
@@ -196,6 +197,8 @@ def test_the_check_stamps_the_quiet_databases_and_lists_each_collections_work():
     assert detail["work"] == [[SOURCE, "new"]] and store.finished[2]["status"] == "completed"
     assert summary["collections_with_work"] == 1 and summary["databases_with_work"] == 1 and summary["busy"] == []
     assert summary["unchanged_databases"] == 2 and summary["database_stamps"] == 2
+    # The check's own record is marked from the start, so the app tells it from a group run while it is running.
+    assert store.work_ids == ["check-77", "check-77"]
 
 
 def test_the_check_leaves_a_collection_being_swept_to_that_sweep():

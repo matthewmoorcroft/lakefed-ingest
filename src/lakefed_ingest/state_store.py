@@ -425,7 +425,8 @@ def start_run_sql() -> str:
     """Open an ingest_run row (status 'running'); returns the new run_id. total starts as the tables the
     run plans to take (a run on a work list takes fewer than its collection has), until finish_run sets the
     final count. work_id: the work list the check job started it for ("<launch_id>:<collection>"), so the
-    group runs of one launch can be told apart; None for a run started otherwise."""
+    group runs of one launch can be told apart, or "check-<job run>" on the check job's own record of a check;
+    None for a run started otherwise."""
     return (
         f"insert into {RUN_TABLE} "
         "(task_collection, job_run_id, cluster_id, parallelism, total, work_id, status) "
@@ -969,7 +970,7 @@ class StateStore:
     # ---- Observability / telemetry -----------------------------------------------------
     def start_run(self, task_collection, job_run_id, cluster_id, parallelism, planned=None, work_id=None) -> int:
         """Open an ingest_run row; returns its run_id. planned: the tables the run will take, if known;
-        work_id: the check job's work list it runs, if any."""
+        work_id: the check job's work list it runs, if any, or "check-<job run>" for the check's own record."""
         with self._cursor() as cur:
             cur.execute(start_run_sql(),
                         (task_collection, job_run_id, cluster_id, int(parallelism),
