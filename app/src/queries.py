@@ -49,9 +49,22 @@ SLA_BREACHED = ("(t.task_enabled and t.freshness_sla_minutes is not null "
                 f"and coalesce({LAST_SUCCESS}, t.created_at) < now() - make_interval(mins => t.freshness_sla_minutes))")
 
 
-# Where a table's source lives, for grouping by server: the instance group when set (for example the
-# SQL Server name), else the UC connection, else the host. Alias t = control.
-SERVER = "coalesce(t.source_instance_group, t.src_connection, t.src_host, '')"
+# The server a table's row reaches, as the engine's per-source query cap counts it (ct_engine.source_key): its UC
+# connection when it reads through one (or names one and no host), else its host and port (the source type's default
+# port when none is set, or 0, as the engine reads it). The instance-group label does not decide it: two labels on one
+# server are one server. Alias t = control.
+
+
+def endpoint_sql(alias: str) -> str:
+    """SQL: a row's host and effective port, "host:port" (rollup.endpoint in Python), for a table with src_host,
+    src_port and src_type under `alias`."""
+    default = (f"case lower(coalesce({alias}.src_type, 'sqlserver')) when 'oracle' then '1521' "
+               f"when 'postgresql' then '5432' when 'mysql' then '3306' else '1433' end")
+    return f"lower({alias}.src_host) || ':' || coalesce(nullif({alias}.src_port, 0)::text, {default})"
+
+
+SERVER = (f"(case when t.src_connection is not null and (t.use_remote_query or t.src_host is null) "
+          f"then lower(t.src_connection) when t.src_host is not null then {endpoint_sql('t')} else '' end)")
 # One source database: its server (SERVER) and its name, so two servers' databases of the same name stay
 # two databases. Alias t = control.
 DATABASE = f"({SERVER}, coalesce(t.src_database, ''))"
@@ -73,13 +86,14 @@ STATE_COUNTS = (
 # ---- overview -----------------------------------------------------------------------------------
 
 def database_states_sql() -> str:
-    """One row per (server, connection, host, ingestion group, database): enabled tables by state
-    (STATE_COUNTS), tables without a freshness target, the oldest and newest success of its enabled tables,
+    """One row per (server, connection, host, ingestion group, database, instance-group label): enabled tables by
+    state (STATE_COUNTS), tables without a freshness target, the oldest and newest success of its enabled tables,
     and the newest of any table (what a UC connection's databases show). The one scan
-    the monitoring views share: rollup.py sums it into groups, servers and connections."""
+    the monitoring views share: rollup.py sums it into groups, servers and connections. The label rides along so
+    Sources can say where it differs from the server."""
     return f"""
 select {SERVER} as server, t.src_connection, lower(t.src_host) as src_host, t.task_collection,
-       coalesce(t.src_database, '') as src_database,
+       coalesce(t.src_database, '') as src_database, t.source_instance_group as instance_label,
        count(*) filter (where t.task_enabled) as tables,
        count(*) filter (where t.task_enabled and t.freshness_sla_minutes is null) as no_sla_tables,
        {STATE_COUNTS},
@@ -89,7 +103,7 @@ select {SERVER} as server, t.src_connection, lower(t.src_host) as src_host, t.ta
 from {SCHEMA}.control t
 left join {SCHEMA}.checkpoint cp on cp.control_id = t.id
 {DATABASE_CHECK_JOIN}
-group by 1, 2, 3, 4, 5"""
+group by 1, 2, 3, 4, 5, 6"""
 
 
 def not_a_check(alias: str = "") -> str:
@@ -456,6 +470,32 @@ def first_started_sql() -> str:
             f"where work_id = %s::text or work_id like %s::text group by task_collection")
 
 
+def last_ran_group_runs_sql() -> str:
+    """Per membership of each job, its group's newest finished group run (not skipped, not running) while it was
+    the member, with its schedule_id: where a job's last job run is found when none of its recent triggers ran.
+    Within one member, start order is slot order, so the newest slot among these is the job's newest that ran.
+    Param: schedule ids."""
+    return f"""
+select schedule_id, {_RUN_COLUMNS} from (
+    select m.schedule_id, r.*,
+           row_number() over (partition by m.id order by r.started_at desc) as newest
+    from {SCHEMA}.ingest_run r
+    join {SCHEMA}.schedule_member m on m.task_collection = r.task_collection
+    where m.schedule_id = any(%s) and r.status not in ('skipped', 'running')
+      and (m.added_at is null or r.started_at >= m.added_at) and (m.removed_at is null or r.started_at < m.removed_at)
+) x
+where newest = 1"""
+
+
+def group_runs_in_windows_sql() -> str:
+    """The runs of each (ingestion group, window start, window end) given, in one read: the job runs of several
+    jobs, each around its own slot. Params: groups, starts, ends (arrays of one length)."""
+    return (f"select {_RUN_COLUMNS} from {SCHEMA}.ingest_run r where exists ("
+            f"select 1 from unnest(%s::text[], %s::timestamptz[], %s::timestamptz[]) as w(task_collection, starts, ends) "
+            f"where w.task_collection = r.task_collection and r.started_at >= w.starts and r.started_at < w.ends) "
+            f"order by started_at")    # exists: a run in two windows (overlapping, or a group in two jobs) comes once
+
+
 def group_runs_before_sql() -> str:
     """The newest group runs of some ingestion groups that started before a time, newest first. Params: groups,
     before, limit."""
@@ -491,30 +531,31 @@ def run_failures_sql() -> str:
 
 
 def not_ingested_sql() -> str:
-    """Per discovered (host, database), from its latest successful discovery: tables found, how many have no
-    control row yet (matched as discovered_tables_sql's registered_id is, in any group), and the largest of
-    those."""
+    """Per discovered (host and port, database), from its latest successful discovery: its endpoint ("host:port",
+    as SERVER spells a JDBC server), tables found, how many have no control row yet (matched as
+    discovered_tables_sql's registered_id is, in any group), and the largest of those."""
     return f"""
 with latest as (
-    select distinct on (lower(src_host), lower(src_database)) discovery_id, src_host, src_database, finished_at
-    from {SCHEMA}.discovery where status = 'ok'
-    order by lower(src_host), lower(src_database), finished_at desc
+    select distinct on ({endpoint_sql('d')}, lower(d.src_database)) d.discovery_id, d.src_host, d.src_database,
+           d.finished_at, {endpoint_sql('d')} as endpoint
+    from {SCHEMA}.discovery d where d.status = 'ok'
+    order by {endpoint_sql('d')}, lower(d.src_database), d.finished_at desc
 ),
 found as (
-    select l.src_host, l.src_database, l.finished_at, dt.src_schema, dt.src_table, dt.size_mb,
-           exists (select 1 from {SCHEMA}.control c where lower(c.src_host) = lower(l.src_host)
+    select l.endpoint, l.src_host, l.src_database, l.finished_at, dt.src_schema, dt.src_table, dt.size_mb,
+           exists (select 1 from {SCHEMA}.control c where c.src_host is not null and {endpoint_sql('c')} = l.endpoint
                    and lower(c.src_database) = lower(dt.src_database) and lower(c.src_schema) = lower(dt.src_schema)
                    and lower(c.src_table) = lower(dt.src_table)) as registered
     from latest l
     join {SCHEMA}.discovered_table dt on dt.discovery_id = l.discovery_id and dt.src_database = l.src_database
 )
-select src_host, src_database, finished_at as discovered_at, count(*) as discovered,
+select endpoint, src_host, src_database, finished_at as discovered_at, count(*) as discovered,
        count(*) filter (where not registered) as not_registered,
        (array_agg(src_schema || '.' || src_table order by size_mb desc nulls last)
           filter (where not registered))[1] as largest_not_registered
 from found
-group by 1, 2, 3
-order by 1, 2"""
+group by 1, 2, 3, 4
+order by 1, 3"""
 
 
 def _database_rows() -> str:

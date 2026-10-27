@@ -75,17 +75,31 @@ def servers(states: Iterable[dict], running_groups: Optional[set] = None) -> Lis
     return rows
 
 
-def _on_connection(s: dict, name: str, host: str) -> bool:
-    return s.get("src_connection") == name or (bool(host) and (s.get("src_host") or "") == host.lower())
+# A source type's port when none is given, as the engine's adapters read it (source_adapters).
+DEFAULT_PORTS = {"sqlserver": 1433, "oracle": 1521, "postgresql": 5432, "mysql": 3306}
 
 
-def connection_databases(states: Iterable[dict], name: str, host: Optional[str]) -> List[dict]:
+def endpoint(host: Optional[str], port, kind: Optional[str]) -> str:
+    """A server's host and effective port, "host:port", as queries.endpoint_sql spells it (a JDBC server's key)."""
+    effective = int(port) if str(port or "").isdigit() and int(port) else DEFAULT_PORTS.get(str(kind or "").lower(), 1433)
+    return f"{(host or '').lower()}:{effective}"
+
+
+def _on_connection(s: dict, name: str, host: str, port=None, kind: Optional[str] = None) -> bool:
+    """A states row is on a connection: it names it (whatever the case), or it is a JDBC server at its host and
+    port (its server key is that endpoint)."""
+    return ((s.get("src_connection") or "").lower() == name.lower()
+            or (bool(host) and s.get("server") == endpoint(host, port, kind)))
+
+
+def connection_databases(states: Iterable[dict], name: str, host: Optional[str], port=None,
+                         kind: Optional[str] = None) -> List[dict]:
     """The databases lakefed tracks on one UC connection, by name: control rows naming the connection or
-    its host (case-insensitively). Each with its ingestion groups, enabled tables and newest success of any
-    of its tables, enabled or not."""
+    JDBC rows at its host and port (case-insensitively). Each with its ingestion groups, enabled tables and newest
+    success of any of its tables, enabled or not."""
     out: Dict[str, dict] = {}
     for s in states:
-        if not _on_connection(s, name, host or ""):
+        if not _on_connection(s, name, host or "", port, kind):
             continue
         d = out.setdefault(s["src_database"], {"src_database": s["src_database"], "_groups": set(), "tables": 0,
                                                "newest_success_at": None})
@@ -99,9 +113,9 @@ def connection_databases(states: Iterable[dict], name: str, host: Optional[str])
     return rows
 
 
-def tracked(states: Iterable[dict], name: str, host: Optional[str]) -> dict:
+def tracked(states: Iterable[dict], name: str, host: Optional[str], port=None, kind: Optional[str] = None) -> dict:
     """What lakefed tracks on one UC connection: databases, enabled tables and ingestion groups."""
-    dbs = connection_databases(states, name, host)
+    dbs = connection_databases(states, name, host, port, kind)
     group_names = {g.strip() for d in dbs for g in d["collections"].split(",") if g.strip()}
     return {"databases": len(dbs), "tables": sum(d["tables"] for d in dbs), "collections": len(group_names)}
 
@@ -151,34 +165,53 @@ def sources(states: Iterable[dict], connections: Iterable[dict], not_ingested: I
     with tables, connections with nothing registered, and tables discovered and not registered."""
     states, connections, schedules = list(states), list(connections), list(schedules)
     members, not_ingested = list(members), list(not_ingested)
-    by_name = {c["name"]: c for c in connections}
-    used_connections, used_hosts = set(), set()
+    # UC connection names are case-insensitive: matched lowercased, shown as the connection listing spells them.
+    by_name = {c["name"].lower(): c for c in connections}
+    used_connections, used_endpoints = set(), set()
     instances = []
     for row in servers(states):
         mine = [s for s in states if s["server"] == row["server"]]
-        names = sorted({s["src_connection"] for s in mine if s.get("src_connection")})
-        hosts = sorted({(s.get("src_host") or "").lower() for s in mine if s.get("src_host")})
-        read_via = [{"kind": "uc", "name": n, "connection_type": (by_name.get(n) or {}).get("connection_type"),
-                     "host": (by_name.get(n) or {}).get("host")} for n in names]
+        names = sorted({s["src_connection"].lower() for s in mine if s.get("src_connection")})
+        # JDBC paths only from rows read by host (a row reading through its connection may keep an old host).
+        hosts = sorted({(s.get("src_host") or "").lower() for s in mine
+                        if s.get("src_host") and s["server"] != (s.get("src_connection") or "").lower()})
+        # A connection the app cannot list (no rights on it) still shows, with its host marked as not visible.
+        read_via = [{"kind": "uc", "name": (by_name.get(n) or {}).get("name") or n,
+                     "connection_type": (by_name.get(n) or {}).get("connection_type"),
+                     "host": (by_name.get(n) or {}).get("host"), **({} if n in by_name else {"host_hidden": True})}
+                    for n in names]
         read_via += [{"kind": "jdbc", "host": h} for h in hosts if not any((v.get("host") or "").lower() == h for v in read_via)]
-        all_hosts = set(hosts) | {(v.get("host") or "").lower() for v in read_via if v.get("host")}
+        # Where it is, host and port: the server itself for a JDBC server, the endpoint of the connection it is.
+        endpoints = {endpoint(c.get("host"), c.get("port"), c.get("connection_type"))
+                     for c in (by_name.get(row["server"]),) if c and c.get("host")} or {row["server"]}
         used_connections |= set(names)
-        used_hosts |= all_hosts
-        found = [d for d in not_ingested if (d.get("src_host") or "").lower() in all_hosts]
+        used_endpoints |= endpoints
+        found = [d for d in not_ingested if d.get("endpoint") in endpoints]
         job_rows, unscheduled = jobs(mine, schedules, members)
         here = {s["task_collection"] for s in mine}
+        # The instance-group labels on its enabled tables (none counts as one): a single label is the server's name;
+        # more than one is listed, as the rows call one server by different names.
+        labels: Dict[Optional[str], int] = {}
+        for s in mine:
+            if _count(s, "tables"):
+                labels[s.get("instance_label")] = labels.get(s.get("instance_label"), 0) + _count(s, "tables")
+        uniform = len(labels) == 1 and next(iter(labels)) is not None
         instances.append({**row, "groups": row["collections"], "read_via": read_via, "nothing_registered": False,
+                          "name": next(iter(labels)) if uniform else row["server"],
+                          "labels": [] if len(labels) < 2 else [{"label": k, "tables": v} for k, v in
+                                                                 sorted(labels.items(), key=lambda kv: str(kv[0] or ""))],
                           "jobs": [dict(j, groups=[g for g in j["groups"] if g in here])
                                    for j in job_rows if j["groups"] and j["enabled_tables"]]
                           + ([unscheduled] if unscheduled else []),
                           "not_ingested": found, "not_registered": sum(_count(d, "not_registered") for d in found)})
-    empty = [c for c in connections
-             if c["name"] not in used_connections and (c.get("host") or "").lower() not in used_hosts]
+    empty = [c for c in connections if c["name"].lower() not in used_connections
+             and endpoint(c.get("host"), c.get("port"), c.get("connection_type")) not in used_endpoints]
     for c in empty:
-        found = [d for d in not_ingested if (d.get("src_host") or "").lower() == (c.get("host") or "").lower()]
+        found = [d for d in not_ingested if d.get("endpoint") == endpoint(c.get("host"), c.get("port"), c.get("connection_type"))]
         instances.append({"server": c["name"], "tables": 0, "databases": 0, "groups": 0, **{k: 0 for k in STATES},
                           "read_via": [{"kind": "uc", "name": c["name"], "connection_type": c.get("connection_type"),
-                                        "host": c.get("host")}], "nothing_registered": True, "jobs": [],
+                                        "host": c.get("host")}], "nothing_registered": True, "jobs": [], "labels": [],
+                          "name": c["name"],
                           "not_ingested": found, "not_registered": sum(_count(d, "not_registered") for d in found)})
     return {"instances": instances, "ingested": sum(1 for i in instances if i["tables"]),
             "nothing_registered": len(empty), "not_registered": sum(i["not_registered"] for i in instances)}

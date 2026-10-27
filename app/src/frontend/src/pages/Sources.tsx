@@ -2,12 +2,17 @@ import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { Link } from "react-router-dom";
 import { api, type Row } from "../api";
-import { ErrorBox, Host, Name, Notice, PageHead, Section, Stamp, StateBar, StateKey, fmtAgo, fmtInt, plural } from "../components";
+import { ErrorBox, Host, Name, Notice, PageHead, Section, Stamp, StateBar, StateKey, Tip, fmtAgo, fmtInt, plural } from "../components";
 
-/** How an instance is read: its UC connections (name, type, host) or its JDBC hosts. */
+/** How an instance is read: its UC connections (name, type and the host each points at, or that the app cannot see
+ * it) or its JDBC hosts. */
 function ReadVia({ via }: { via: Row[] }) {
   return <>{via.map((v, i) => <span key={i} className="sub">{v.kind === "uc"
-    ? <>UC connection <b>{v.name}</b>{v.connection_type ? ` (${v.connection_type})` : ""}{v.host ? <>, <Host host={v.host} /></> : null}</>
+    ? <>UC connection <b>{v.name}</b>{v.connection_type ? ` (${v.connection_type})` : ""},{" "}
+        {v.host ? <Host host={v.host} />
+          : v.host_hidden ? <Tip focusable text="This app's identity cannot see this UC connection (it has no rights on it), so its host is not known here. The ingestion jobs read through it with their own identity.">
+            <span className="muted" data-host-hidden>host not visible to this app</span></Tip>
+          : <span className="muted" data-host-hidden>host not set on the connection</span>}</>
     : <>JDBC host <Host host={v.host} /></>}</span>)}</>;
 }
 
@@ -23,8 +28,8 @@ export default function Sources() {
     <>
       <PageHead crumb={<span className="eyebrow">Sources · What do we read, and what is not ingested yet?</span>}
         title={d ? `${fmtInt(d.ingested)} ${plural(d.ingested, "instance")} ingested, ${fmtInt(d.nothing_registered)} with nothing registered` : "Sources"}
-        lead={d && <>{fmtInt(d.not_registered)} {plural(d.not_registered, "table")} discovered and not registered yet. An instance is a source
-          server: the tables' instance group, else their UC connection or host.</>}
+        lead={d && <>{fmtInt(d.not_registered)} {plural(d.not_registered, "table")} discovered and not registered yet. An instance is the source
+          server the tables' rows reach: their UC connection, or their host and port.</>}
         right={<Stamp at={d?.read_at} every={60} error={found.error} />} />
       <ErrorBox error={found.error} />
       {d?.connections_error && <Notice tone="warn">UC connections could not be listed, so connections with nothing registered are missing: {d.connections_error}</Notice>}
@@ -35,7 +40,10 @@ export default function Sources() {
           <tbody>
             {instances.map((i) => (
               <tr key={i.server} className={pick?.server === i.server ? "selected" : ""} onClick={() => setChosen(i.server)} style={{ cursor: "pointer" }}>
-                <td className="name"><b>{i.server || "(no server)"}</b><ReadVia via={i.read_via} /></td>
+                <td className="name"><b>{i.name || i.server || "(no server)"}</b><ReadVia via={i.read_via} />
+                  {(i.labels ?? []).length > 0 && <span className="sub" style={{ color: "var(--warn)" }}>
+                    One server, named differently on its rows' instance group: {(i.labels as Row[]).map((l) =>
+                      `${l.label ?? "no name"} (${fmtInt(l.tables)} ${plural(l.tables, "table")})`).join(", ")}</span>}</td>
                 <td className="num">{fmtInt(i.jobs.filter((j: Row) => j.id != null).length)}</td><td className="num">{fmtInt(i.groups)}</td>
                 <td className="num">{fmtInt(i.databases)}</td><td className="num">{fmtInt(i.tables)}</td>
                 <td>{i.nothing_registered ? <span className="muted">nothing registered</span> : <StateBar row={i} />}</td>
@@ -49,7 +57,7 @@ export default function Sources() {
       </Section>
       {pick && (
         <>
-          <Section title={`${pick.server || "(no server)"}: its ingestion jobs`} note="Jobs only: a job's groups and their databases are on the job's own page.">
+          <Section title={`${pick.name || pick.server || "(no server)"}: its ingestion jobs`} note="Jobs only: a job's groups and their databases are on the job's own page.">
             <div className="table-wrap"><table className="data">
               <thead><tr><th>Ingestion job</th><th className="num">Groups</th><th className="num">Databases</th><th className="num">Tables</th>
                 <th>State now</th><th>Now</th></tr></thead>
@@ -72,7 +80,7 @@ export default function Sources() {
               <thead><tr><th>Database</th><th className="num">Discovered</th><th className="num">Not registered</th><th>Largest not registered</th><th>Discovered</th></tr></thead>
               <tbody>
                 {pick.not_ingested.map((n: Row) => (
-                  <tr key={`${n.src_host}\u001f${n.src_database}`}><td className="name"><b>{n.src_database}</b><span className="sub">{n.src_host}</span></td>
+                  <tr key={`${n.src_host}\u001f${n.src_database}`}><td className="name"><b>{n.src_database}</b><span className="sub"><Host host={n.src_host} /></span></td>
                     <td className="num">{fmtInt(n.discovered)}</td><td className="num">{fmtInt(n.not_registered)}</td>
                     <td>{n.largest_not_registered ?? ""}</td><td>{fmtAgo(n.discovered_at)}</td></tr>
                 ))}

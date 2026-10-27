@@ -3,7 +3,7 @@ import { useQuery } from "@tanstack/react-query";
 import { Link, useParams } from "react-router-dom";
 import { api, qs, type Row } from "../api";
 import {
-  ErrorBox, Name, PageHead, RunStatus, Section, StateBar, StateKey, fmtClock, fmtDuration, fmtInt, fmtSpeed, jobRunPath, plural
+  ErrorBox, Name, PageHead, RunStatus, Section, StateBar, StateKey, fmtClock, fmtDuration, fmtInt, fmtSlot, fmtSpeed, jobRunPath, plural
 } from "../components";
 
 const PAGE = 25;
@@ -69,9 +69,12 @@ export default function IngestionJob() {
         <div className="metrics">
           <div className="metric"><div className="metric-label">Tables now</div><StateBar row={j} />
             <div className="metric-sub">{fmtInt(j.state_current)} current, {fmtInt(j.state_late)} late, {fmtInt(j.state_first_load)} waiting, {fmtInt(j.state_failing)} failing</div></div>
-          <div className="metric"><div className="metric-label">Last finished job run</div>
-            <div className="metric-value small-value">{last ? <Link to={jobRunPath(j.id, last.slot)}><RunStatus status={null} outcome={last.outcome} /></Link> : "none yet"}</div>
-            <div className="metric-sub">{last ? `${fmtClock(last.slot)}${last.took_s != null ? `, took ${fmtDuration(last.took_s)}` : ""}` : ""}</div></div>
+          <div className="metric"><div className="metric-label">Last job run</div>
+            <div className="metric-value small-value">{last ? <Link to={jobRunPath(j.id, last.slot)}><RunStatus status={null} outcome={last.outcome} /></Link> : "Never run"}</div>
+            <div className="metric-sub">{last ? `${fmtSlot(last.slot)}${last.took_s != null ? `, took ${fmtDuration(last.took_s)}` : ""}` : ""}</div></div>
+          <div className="metric"><div className="metric-label">Next trigger</div>
+            <div className="metric-value small-value">{j.paused ? "Paused" : j.next_start ? fmtSlot(j.next_start) : "–"}</div>
+            <div className="metric-sub">{j.paused ? "no trigger fires until it is resumed" : "its first group starts then"}</div></div>
           <div className="metric"><div className="metric-label">Speed</div>
             <div className="metric-value">{j.median_speed_tables_per_min != null ? fmtSpeed(j.median_speed_tables_per_min) : "–"}<small>tables/min</small></div>
             <div className="metric-sub">{Number(j.speed_job_runs) ? `median of the last ${fmtInt(j.speed_job_runs)} job ${plural(j.speed_job_runs, "run")} that loaded tables`
@@ -81,7 +84,7 @@ export default function IngestionJob() {
             <div className="metric-sub">p95 over 7 days</div></div>
         </div>
       )}
-      <Section title="Runs of this job" note="One row per trigger, newest first. Group runs the check job started together are one job run; other group runs are placed by the job's current schedule, and one started by hand inside a slot is an extra run."
+      <Section title="Schedule" note="Every trigger, newest first: the ones that ran, are waiting or starting, were skipped, or did not run. Group runs the check job started together are one job run; other group runs are placed by the job's current schedule, and one started by hand inside a slot is an extra run."
         actions={<span className="pager-buttons">
           <button className="ghost" disabled={!pages.length} onClick={() => setPages(pages.slice(0, -1))}>Newer</button>
           <button className="ghost" disabled={!runs.data?.next_before} onClick={() => setPages([...pages, runs.data!.next_before])}>Older</button>

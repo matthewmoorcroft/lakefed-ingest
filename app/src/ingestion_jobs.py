@@ -245,10 +245,26 @@ def status(job: dict, running: Optional[dict], last: Optional[dict], top_cause: 
 
 
 def last_finished(summaries: List[dict]) -> Optional[dict]:
-    """A job's last finished job run (newest first): the newest one that ran, so a paused job's missed triggers
-    (Not run) don't hide its last real outcome; the newest Not run when none ran."""
-    finished = [s for s in summaries if s["outcome"]["label"] != "Running"]
-    return next((s for s in finished if s["outcome"]["label"] != "Not run"), finished[0] if finished else None)
+    """A job's last finished job run (newest first): the newest one that ran. A trigger that did not run (a paused
+    job's, say) is never it; None when none of them ran."""
+    return next((s for s in summaries if s["outcome"]["label"] not in ("Running", "Not run")), None)
+
+
+def newest_slots(runs: List[dict], job: dict, members: List[dict]) -> List[datetime]:
+    """The job runs some group runs of a job belong to (job_runs_of_run), newest slot first: a late run of an
+    older slot can start after a run of the newest."""
+    slots = {datetime.fromisoformat(p["slot"]) for r in runs for p in job_runs_of_run(r, [job], members)}
+    return sorted(slots, reverse=True)
+
+
+def earlier_last(summaries: List[dict]) -> Optional[dict]:
+    """A job's last job run that ran, from the job runs of its newest slot found before its recent triggers; None
+    when none ran. Only that job run is read, so its failures in a row are at least its own (one, or none)."""
+    last = last_finished(summaries)
+    if not last:
+        return None
+    return dict({k: v for k, v in last.items() if k != "placed"},
+                failed_in_a_row=1 if last.get("failed_tables") else 0, failed_in_a_row_at_least=True)
 
 
 def consecutive_failed(summaries: List[dict]) -> int:
@@ -266,14 +282,17 @@ def consecutive_failed(summaries: List[dict]) -> int:
 
 def jobs_view(schedules: List[dict], members: List[dict], states: List[dict], running: List[dict],
               runs: List[dict], stats_by_group: Dict[str, dict], now: datetime,
-              causes_by_job: Optional[Dict[int, List[dict]]] = None) -> dict:
+              causes_by_job: Optional[Dict[int, List[dict]]] = None,
+              earlier_last_by_job: Optional[Dict[int, dict]] = None) -> dict:
     """Every ingestion job as a row (sums, cadence, next start, last finished job run, the running one, and
     Status), "Not in any job", the running job runs, and the jobs that need attention. `runs` are the group
     runs of the last RECENT_JOB_RUNS triggers of every job, with their work; `stats_by_group` each group's
     run-time percentiles and strictest freshness target (queries.collection_run_stats_sql); `causes_by_job`
-    the grouped failures (queries.group_errors) of each job's last job run with failed tables. Running group
-    runs of groups in no job are listed apart, as they belong to no job run."""
-    causes_by_job = causes_by_job or {}
+    the grouped failures (queries.group_errors) of each job's last job run with failed tables;
+    `earlier_last_by_job` the last job run that ran of each job none of whose recent triggers ran, found before
+    the window (main._last_ran). Running group runs of groups in no job are listed apart, as they belong to no
+    job run."""
+    causes_by_job, earlier_last_by_job = causes_by_job or {}, earlier_last_by_job or {}
     p50_by_group = {g: st.get("p50_s") for g, st in stats_by_group.items()}
     job_sums, not_in_job = rollup.jobs(states, schedules, members)
     groups = rollup.groups(states)
@@ -291,7 +310,7 @@ def jobs_view(schedules: List[dict], members: List[dict], states: List[dict], ru
         placed = current_and_past(s, members, runs, start, now)     # removed members keep their past job runs
         summaries = [summarize(s, jr, running_by_run, group_tables, p50_by_group, now) for jr in placed]
         current = next((x for x in summaries if x["outcome"]["label"] == "Running"), None)
-        last = last_finished(summaries)
+        last = last_finished(summaries) or earlier_last_by_job.get(s["id"])
         mine = [m for m in active if m["schedule_id"] == s["id"]]
         causes = causes_by_job.get(s["id"]) or []
         warnings = [w for m in mine for w in sch.warnings(cadence, (stats_by_group.get(m["task_collection"]) or {}).get("p95_s"),
@@ -300,7 +319,9 @@ def jobs_view(schedules: List[dict], members: List[dict], states: List[dict], ru
         row = {**sums, "description": sch.describe(cadence, 0, s.get("timezone") or "UTC"),
                "next_start": min(next_starts).isoformat() if next_starts and not s.get("paused") else None,
                "last_job_run": last, "running_job_run": current,
-               "failed_in_a_row": consecutive_failed(summaries), "causes": causes[:3]}
+               "failed_in_a_row": (consecutive_failed(summaries) if last_finished(summaries) or not last
+                                   else last.get("failed_in_a_row", 0)),
+               "causes": causes[:3]}
         row["status"] = status(row, current, last, causes[0]["label"] if causes else None, warnings)
         rows.append(row)
         running_job_runs += [x for x in summaries if x["outcome"]["label"] == "Running"]

@@ -85,6 +85,10 @@ def _fixture(conn):
                  "'[FAILED_JDBC.CONNECTION] connection reset')", (ids[("db2", "t9")],))
 
 
+# The server the fixture's rows reach: their host and SQL Server's default port, whatever their label (srv1).
+A = "host-a:1433"
+
+
 def rows(conn, sql, params=()):
     cur = conn.execute(sql, params)
     cols = [d.name for d in cur.description]
@@ -95,7 +99,7 @@ def test_every_enabled_table_is_in_exactly_one_state(pg):
     c = rows(pg, q.collections_overview_sql())[0]
     states = (c["state_current"], c["state_late"], c["state_first_load"], c["state_failing"])
     assert states == (17, 1, 1, 1) and sum(states) == c["enabled_tables"] == 20
-    assert (c["databases"], c["servers"], c["server"]) == (2, 1, "srv1")
+    assert (c["databases"], c["servers"], c["server"]) == (2, 1, A)
     assert c["rows_24h"] == 7
 
 
@@ -103,7 +107,7 @@ def test_running_run_progress_counts_tables_stamped_since_it_started(pg):
     r = rows(pg, q.running_runs_sql())[0]
     assert (r["run_id"], r["enabled_tables"], r["tables_checked"]) == (2, 20, 7)
     assert (r["tables_ok"], r["tables_running"], r["tables_failed"]) == (1, 1, 1)
-    assert r["last_activity_at"] is not None and r["server"] == "srv1"
+    assert r["last_activity_at"] is not None and r["server"] == A
 
 
 def test_a_work_list_runs_progress_is_over_its_planned_tables_and_counts_stamps(pg):
@@ -128,7 +132,7 @@ def test_a_work_list_runs_progress_is_over_its_planned_tables_and_counts_stamps(
 
 def test_servers_roll_up_their_databases(pg):
     s = rows(pg, q.servers_sql())[0]
-    assert (s["server"], s["databases"], s["tables"]) == ("srv1", 2, 20)
+    assert (s["server"], s["databases"], s["tables"]) == (A, 2, 20)
     assert (s["collections"], s["running_collections"]) == (1, 1)
     assert (s["state_failing"], s["state_first_load"], s["state_late"], s["state_current"]) == (1, 1, 1, 17)
 
@@ -141,7 +145,7 @@ def test_a_collections_databases_show_this_runs_progress_and_their_rows(pg):
     assert (written["db1"]["rows_first_loads"], written["db1"]["first_loads_uncounted"]) == (1000, 0)
     db1 = written["db1"]
     assert (db1["rows_changes_24h"], db1["loaded_this_run"], db1["in_flight"]) == (7, 1, 1)
-    assert dbs["db1"]["server"] == "srv1"
+    assert dbs["db1"]["server"] == A
     assert (written["db2"]["rows_first_loads"], written["db2"]["first_loads_uncounted"]) == (None, 9)
     assert written["db2"]["failed_this_run"] == 1
     batch = rows(pg, q.collection_batch_runs_sql(), ("c1", "c1"))
@@ -255,7 +259,7 @@ def test_the_check_jobs_own_records_are_not_group_runs(pg):
 
 def test_a_job_runs_databases_list_failing_first_and_keep_two_servers_apart(pg):
     with pg.transaction(force_rollback=True):
-        pg.execute("update lakefed_ingest.control set source_instance_group = 'srv2' where src_database = 'db1' "
+        pg.execute("update lakefed_ingest.control set src_host = 'Host-B' where src_database = 'db1' "
                    "and src_table = 't1'")
         pg.execute("insert into lakefed_ingest.ingest_event (run_id, task_collection, control_id, src_database, "
                    "src_schema, src_table, action, status, started_at, finished_at, rows_merged) select 1, 'c1', id, "
@@ -264,8 +268,8 @@ def test_a_job_runs_databases_list_failing_first_and_keep_two_servers_apart(pg):
         found = rows(pg, q.job_run_databases_sql(), ([1, 2],))
         failures = rows(pg, q.run_failures_sql(), ([1, 2],))
     assert (found[0]["src_database"], found[0]["failed"]) == ("db2", 1)
-    assert sorted((d["server"], d["task_collection"]) for d in found if d["src_database"] == "db1") == [("srv1", "c1"), ("srv2", "c1")]
-    assert [(f["src_table"], f["server"]) for f in failures] == [("t9", "srv1")]
+    assert sorted((d["server"], d["task_collection"]) for d in found if d["src_database"] == "db1") == [(A, "c1"), ("host-b:1433", "c1")]
+    assert [(f["src_table"], f["server"]) for f in failures] == [("t9", A)]
 
 
 def test_group_runs_in_a_window_oldest_first(pg):
@@ -288,11 +292,11 @@ def test_not_ingested_counts_discovered_tables_with_no_control_row_from_the_late
 
 
 def test_a_databases_tables_come_failing_first_with_their_part_in_the_running_run(pg):
-    found = rows(pg, q.database_tables_sql(), ("c1", "srv1", "db2", 2, "%", 100, 0))
+    found = rows(pg, q.database_tables_sql(), ("c1", A, "db2", 2, "%", 100, 0))
     assert len(found) == 10 and (found[0]["src_table"], found[0]["run_status"]) == ("t9", "failed")
-    assert rows(pg, q.database_tables_sql(), ("c1", "srv1", "db1", 2, "%t8%", 100, 0))[0]["run_status"] == "running"
-    assert [r["src_table"] for r in rows(pg, q.database_tables_sql(), ("c1", "srv1", "db1", None, "%t1%", 100, 0))] == ["t1", "t10"]
-    assert rows(pg, q.database_tables_count_sql(), ("c1", "srv1", "db1", "%"))[0]["tables"] == 10
+    assert rows(pg, q.database_tables_sql(), ("c1", A, "db1", 2, "%t8%", 100, 0))[0]["run_status"] == "running"
+    assert [r["src_table"] for r in rows(pg, q.database_tables_sql(), ("c1", A, "db1", None, "%t1%", 100, 0))] == ["t1", "t10"]
+    assert rows(pg, q.database_tables_count_sql(), ("c1", A, "db1", "%"))[0]["tables"] == 10
 
 
 def test_tables_page_by_keyset_and_filter_one_database_exactly(pg):
@@ -304,3 +308,48 @@ def test_tables_page_by_keyset_and_filter_one_database_exactly(pg):
     assert {r["src_database"] for r in first + second} == {"db2"} and len(first) == len(second) == 4
     assert not {r["id"] for r in first} & {r["id"] for r in second}
     assert [r["src_table"] for r in first + second] == sorted(r["src_table"] for r in first + second)
+
+
+def test_a_jobs_last_ran_group_runs_are_each_members_newest_finished_one_while_a_member(pg):
+    # Job 1's c1 ran 3 days ago (run 1) and is running now (run 2, not finished); a skipped run and a run from
+    # before c1 joined the job are not its job's. One row per member: its newest.
+    with pg.transaction(force_rollback=True):
+        pg.execute("insert into lakefed_ingest.schedule (id, name, cadence_minutes) values (1, 'hourly', 60)")
+        pg.execute("insert into lakefed_ingest.schedule_member (schedule_id, task_collection, added_at) "
+                   "values (1, 'c1', now() - interval '4 days')")
+        pg.execute("insert into lakefed_ingest.ingest_run (run_id, task_collection, started_at, status) values "
+                   "(80, 'c1', now() - interval '5 days', 'completed'), (81, 'c1', now() - interval '1 day', 'skipped')")
+        found = rows(pg, q.last_ran_group_runs_sql(), ([1],))
+    assert [(r["run_id"], r["schedule_id"]) for r in found] == [(1, 1)]
+    now = datetime.now(timezone.utc)
+    starts, ends = [now - timedelta(days=4), now - timedelta(minutes=6)], [now - timedelta(days=2), now]
+    windows = rows(pg, q.group_runs_in_windows_sql(), (["c1", "c1"], starts, ends))
+    assert sorted(r["run_id"] for r in windows) == [1, 2]
+
+
+def test_two_labels_on_one_connection_are_one_server_and_the_rows_keep_their_labels(pg):
+    # db1 read through the UC connection Conn_A, three of its tables labelled lab-b: one server, conn_a, with one
+    # database; the labels come with the rows so a page can say where they differ.
+    with pg.transaction(force_rollback=True):
+        pg.execute("update lakefed_ingest.control set src_connection = 'Conn_A', use_remote_query = true, src_host = null "
+                   "where src_database = 'db1'")
+        pg.execute("update lakefed_ingest.control set source_instance_group = 'lab-b' where src_database = 'db1' "
+                   "and src_table in ('t1', 't2', 't3')")
+        states = [s for s in rows(pg, q.database_states_sql()) if s["src_database"] == "db1"]
+        servers = {s["server"]: s for s in rows(pg, q.servers_sql())}
+    assert {s["server"] for s in states} == {"conn_a"}
+    assert sorted((s["instance_label"], s["tables"]) for s in states) == [("lab-b", 3), ("srv1", 7)]
+    assert servers["conn_a"]["databases"] == 1 and servers[A]["databases"] == 1
+
+
+def test_a_port_of_zero_is_no_port_as_the_engine_reads_it(pg):
+    with pg.transaction(force_rollback=True):
+        pg.execute("update lakefed_ingest.control set src_port = 0 where src_database = 'db1' and src_table = 't1'")
+        servers = {s["server"] for s in rows(pg, q.database_states_sql())}
+    assert servers == {A}
+
+
+def test_windows_that_overlap_read_a_run_once(pg):
+    now = datetime.now(timezone.utc)
+    twice = rows(pg, q.group_runs_in_windows_sql(), (["c1", "c1"], [now - timedelta(days=4)] * 2, [now] * 2))
+    assert sorted(r["run_id"] for r in twice) == [1, 2]

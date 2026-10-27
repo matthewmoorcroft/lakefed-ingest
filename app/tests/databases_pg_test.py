@@ -38,6 +38,11 @@ def pg():
         admin.close()
 
 
+# A server is the one a row reaches (queries.SERVER): its host and port here. The rows' instance-group labels
+# (srvX, srvY, srvZ) do not decide it.
+X, Y, Z = "host-x:1433", "host-y:1433", "host-z:1433"
+
+
 def _fixture(conn):
     # Two servers, each with a database called Sales of three tables, in one collection.
     for server, host in (("srvX", "host-x"), ("srvY", "host-y")):
@@ -115,18 +120,18 @@ def test_two_servers_databases_of_the_same_name_are_two_databases(pg):
     c = {r["task_collection"]: r for r in rows(pg, q.collections_overview_sql())}["c2"]
     assert (c["databases"], c["servers"]) == (2, 2)
     dbs = rows(pg, q.collection_databases_sql(), ("c2", "c2"))
-    assert sorted((d["server"], d["src_database"], d["tables"]) for d in dbs) == [("srvX", "Sales", 3), ("srvY", "Sales", 3)]
+    assert sorted((d["server"], d["src_database"], d["tables"]) for d in dbs) == [(X, "Sales", 3), (Y, "Sales", 3)]
     written = {(d["server"], d["src_database"]): d for d in rows(pg, q.collection_database_rows_sql(), ("c2",))}
-    assert set(written) == {("srvX", "Sales"), ("srvY", "Sales")}
-    assert written[("srvY", "Sales")]["loaded_this_run"] == 1 and written[("srvX", "Sales")]["loaded_this_run"] == 0
+    assert set(written) == {(X, "Sales"), (Y, "Sales")}
+    assert written[(Y, "Sales")]["loaded_this_run"] == 1 and written[(X, "Sales")]["loaded_this_run"] == 0
     by_run = {(d["server"], d["src_database"]): d for d in rows(pg, q.run_databases_sql(), (10,))}
-    assert {k: v["rows_written"] for k, v in by_run.items()} == {("srvX", "Sales"): 300, ("srvY", "Sales"): 600}
+    assert {k: v["rows_written"] for k, v in by_run.items()} == {(X, "Sales"): 300, (Y, "Sales"): 600}
 
 
 def test_rows_in_first_loads_are_each_tables_latest_first_load(pg):
     written = {(d["server"], d["src_database"]): d for d in rows(pg, q.collection_database_rows_sql(), ("c2",))}
-    assert (written[("srvX", "Sales")]["rows_first_loads"], written[("srvX", "Sales")]["first_loads"]) == (450, 3)
-    assert (written[("srvY", "Sales")]["rows_first_loads"], written[("srvY", "Sales")]["first_loads"]) == (600, 3)
+    assert (written[(X, "Sales")]["rows_first_loads"], written[(X, "Sales")]["first_loads"]) == (450, 3)
+    assert (written[(Y, "Sales")]["rows_first_loads"], written[(Y, "Sales")]["first_loads"]) == (600, 3)
 
 
 def test_a_batch_of_changes_is_not_placed_under_rows_in_first_loads(pg):
@@ -140,4 +145,15 @@ def test_a_table_reloaded_in_batches_twice_counts_only_its_latest_batch(pg):
 def test_failed_tables_give_each_cause_of_a_table_and_its_server(pg):
     found = [r for r in rows(pg, q.failed_tables_sql(), (24, 10)) if r["task_collection"] == "c3"]
     assert sorted((r["src_table"], r["server"], r["error"]) for r in found) == [
-        ("orders", "srvZ", "Invalid column name 'qty'."), ("orders", "srvZ", "connection reset")]
+        ("orders", Z, "Invalid column name 'qty'."), ("orders", Z, "connection reset")]
+
+
+def test_a_table_registered_at_one_port_is_not_registered_at_another(pg):
+    with pg.transaction(force_rollback=True):
+        for discovery, port in (("d1", None), ("d2", 1500)):
+            pg.execute("insert into lakefed_ingest.discovery (discovery_id, src_type, src_host, src_port, src_database, "
+                       "status, finished_at) values (%s, 'sqlserver', 'host-x', %s, 'Sales', 'ok', now())", (discovery, port))
+            pg.execute("insert into lakefed_ingest.discovered_table (discovery_id, src_database, src_schema, src_table) "
+                       "values (%s, 'Sales', 'dbo', 't1')", (discovery,))
+        found = {r["endpoint"]: r for r in rows(pg, q.not_ingested_sql())}
+    assert (found[X]["not_registered"], found["host-x:1500"]["not_registered"]) == (0, 1)

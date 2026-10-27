@@ -281,22 +281,58 @@ def _schedule(job_id: int) -> dict:
     return found
 
 
-def _job_runs_of(job: dict, start: datetime, end: datetime, now: datetime) -> List[dict]:
+def _runs_window(job: dict, start: datetime, end: datetime):
+    """The window of group runs that job runs with slots in [start, end) are placed from: two slots before `start`
+    (ij.place starts a slot early, and an earlier run still going at a trigger makes it skipped), and up to two
+    cadences after `end` (a member's offset, then up to its next trigger)."""
+    cadence = int(job["cadence_minutes"])
+    return start - timedelta(minutes=2 * max(cadence, 60)), end + timedelta(minutes=2 * cadence)
+
+
+def _job_runs_of(job: dict, start: datetime, end: datetime, now: datetime,
+                 runs: Optional[List[dict]] = None) -> List[dict]:
     """A job's job runs whose slot started in [start, end), newest first, as ij.summarize shows them, with
-    their placed members. Runs are read from two slots before `start`: ij.place starts a slot early, and an
-    earlier run still going at a trigger makes it skipped."""
+    their placed members, from `runs` when given (read for _runs_window), else read here."""
     _, members = _schedules()
     mine = [m for m in members if m["schedule_id"] == job["id"]]
     cadence = int(job["cadence_minutes"])
-    # A slot's group runs start up to two cadences after it: its member's offset, then up to its next trigger.
-    runs = _group_runs([m["task_collection"] for m in mine], start - timedelta(minutes=2 * max(cadence, 60)),
-                       end + timedelta(minutes=2 * cadence))
+    if runs is None:
+        runs = _group_runs([m["task_collection"] for m in mine], *_runs_window(job, start, end))
     placed = [jr for jr in ij.place(job, mine, runs, start, end + timedelta(minutes=cadence), now)
               if start <= jr["slot"] < end and jr["slot"] <= now]
     running = {r["run_id"]: r for r in _running()}
     tables = {name: g["enabled_tables"] for name, g in rollup.groups(_states()).items()}
     p50 = {g: st.get("p50_s") for g, st in _group_stats().items()}
     return [dict(ij.summarize(job, jr, running, tables, p50, now), placed=jr) for jr in placed]
+
+
+def _last_ran(jobs: List[dict], now: datetime) -> dict:
+    """Each job's last job run that ran, however long ago, by job id (jobs whose recent triggers did not run): each
+    member's newest finished group run while it was the member (one read for every job), placed into their job
+    runs, the newest slot summarized (ij.earlier_last) from one more read of the runs around every job's slot. A
+    job that never ran has none."""
+    _, members = _schedules()
+    candidates = {}
+    for r in db.query(q.last_ran_group_runs_sql(), (sorted(j["id"] for j in jobs),)) if jobs else []:
+        candidates.setdefault(r["schedule_id"], []).append(r)
+    newest = {j["id"]: slots[0] for j in jobs for slots in [ij.newest_slots(candidates.get(j["id"]) or [], j, members)]
+              if slots}
+    windows = [(m["task_collection"], *_runs_window(j, newest[j["id"]], newest[j["id"]] + timedelta(seconds=1)))
+               for j in jobs if j["id"] in newest for m in members if m["schedule_id"] == j["id"]]
+    groups, starts, ends = (list(column) for column in zip(*windows)) if windows else ([], [], [])
+    runs = _with_rows_written(db.query(q.group_runs_in_windows_sql(), (groups, starts, ends))) if windows else []
+    found = {}
+    for job in jobs:
+        if job["id"] not in newest:
+            continue
+        slot = newest[job["id"]]
+        start, end = _runs_window(job, slot, slot + timedelta(seconds=1))
+        mine = {m["task_collection"] for m in members if m["schedule_id"] == job["id"]}
+        around = [r for r in runs if r["task_collection"] in mine and start <= q._when(r["started_at"]) < end]
+        last = ij.earlier_last(_job_runs_of(job, slot, slot + timedelta(seconds=1), now, runs=around))
+        if last:
+            found[job["id"]] = last
+    return found
 
 
 def _jobs_view() -> dict:
@@ -311,17 +347,22 @@ def _jobs_view() -> dict:
                     + [q._when(r["started_at"]) - timedelta(days=1) for r in running if r.get("started_at")], default=now)
         runs = _group_runs(groups, start, now + timedelta(seconds=1))
         view = ij.jobs_view(schedules, members, states, running, runs, stats, now)
+        by_id = {s["id"]: s for s in schedules}
+        # A job none of whose recent triggers ran (paused overnight, say): its last job run is found before them.
+        earlier = _last_ran([by_id[j["id"]] for j in view["jobs"] if j["id"] is not None and not j["last_job_run"]], now)
         latest_ids = {}
         for job in view["jobs"]:
-            latest = next((jr for jr in (job["running_job_run"], job["last_job_run"]) if jr and jr["failed_tables"]), None)
+            last = job["last_job_run"] or earlier.get(job["id"])
+            latest = next((jr for jr in (job["running_job_run"], last) if jr and jr["failed_tables"]), None)
             if job["state_failing"] and latest and latest["run_ids"]:
                 latest_ids[job["id"]] = set(latest["run_ids"])
         causes = {}
         if latest_ids:      # one read for every failing job's latest job run, split by job
             failures = db.query(q.run_failures_sql(), (sorted(set().union(*latest_ids.values())),))
             causes = {job_id: q.group_errors([f for f in failures if f["run_id"] in ids]) for job_id, ids in latest_ids.items()}
-        if causes:
-            view = ij.jobs_view(schedules, members, states, running, runs, stats, now, causes_by_job=causes)
+        if causes or earlier:
+            view = ij.jobs_view(schedules, members, states, running, runs, stats, now, causes_by_job=causes,
+                                earlier_last_by_job=earlier)
         return view
     return _shared("jobs_view", compute)
 
@@ -356,10 +397,10 @@ def ingestion_jobs(filter: str = "all", search: str = "", offset: int = 0, limit
 
 @app.get("/api/ingestion-jobs/{job_id}")
 def ingestion_job(job_id: int):
-    """One ingestion job's details: its schedule and members (wrapper jobs, next starts), its tables by
-    state, its last finished job run, the median speed over its last 24 job runs, its p95 job run time over
-    7 days, and its groups with their last group run and p95 run time. Job runs are placed once over 7 days;
-    the speed is over the newest 24 finished ones."""
+    """One ingestion job's details: its schedule and members (wrapper jobs, next start), its tables by
+    state, its last job run that ran (however long ago), the median speed over its last 24 job runs, its p95 job
+    run time over 7 days, and its groups with their last group run and p95 run time. Job runs are placed once over
+    7 days; the speed is over the newest 24 finished ones."""
     job = _schedule(job_id)
     now = datetime.now(timezone.utc)
     _, members = _schedules()
@@ -382,11 +423,14 @@ def ingestion_job(job_id: int):
                                        if m.get("job_id") else None)})
     speeds = sorted(r["speed_tables_per_min"] for r in finished[:24] if r["speed_tables_per_min"] is not None)
     offsets = [m["offset_minutes"] for m in mine]
+    last = ij.last_finished(finished)
+    last = {k: v for k, v in last.items() if k != "placed"} if last else _last_ran([job], now).get(job["id"])
+    next_starts = [sch.next_run(cadence, int(m["offset_minutes"]), job.get("timezone") or "UTC", now) for m in mine]
     return {**{k: v for k, v in sums.items()}, "description": sch.describe(cadence, 0, job.get("timezone") or "UTC"),
             "stagger_from": min(offsets) if offsets else None, "stagger_to": max(offsets) if offsets else None,
             "parameters": job.get("parameters"), "job_variant": job.get("job_variant"), "paused": job.get("paused"),
-            "last_job_run": ({k: v for k, v in ij.last_finished(finished).items() if k != "placed"}
-                             if finished else None),
+            "last_job_run": last,
+            "next_start": min(next_starts).isoformat() if next_starts and not job.get("paused") else None,
             "median_speed_tables_per_min": speeds[len(speeds) // 2] if speeds else None, "speed_job_runs": len(speeds),
             "p95_took_s": sorted(week)[min(len(week) - 1, int(0.95 * len(week)))] if week else None,
             "groups_detail": group_rows, "read_at": now.isoformat()}
@@ -1246,7 +1290,7 @@ def connections():
             return {"connections": [], "error": str(e)[:500]}
         states = _states()
         for c in found:
-            c["tracked"] = rollup.tracked(states, c["name"], c["host"])
+            c["tracked"] = rollup.tracked(states, c["name"], c["host"], c.get("port"), c.get("connection_type"))
         return {"connections": found, "error": None}
     return _shared("connections", compute)
 
@@ -1257,7 +1301,7 @@ def connection_databases(name: str):
     found = next((c for c in connections()["connections"] if c["name"] == name), None)
     if not found:
         raise HTTPException(404, f"connection '{name}' not found")
-    return rollup.connection_databases(_states(), name, found["host"])
+    return rollup.connection_databases(_states(), name, found["host"], found.get("port"), found.get("connection_type"))
 
 
 # ---- single-page app ----------------------------------------------------------------------------

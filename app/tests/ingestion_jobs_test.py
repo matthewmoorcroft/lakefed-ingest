@@ -174,7 +174,7 @@ def test_a_paused_jobs_triggers_never_wait_or_start():
     v = ij.jobs_view(paused, MEMBERS[:2], STATES, [], [], STATS, datetime(2026, 10, 26, 14, 5, tzinfo=UTC))
     job = v["jobs"][0]
     assert job["running_job_run"] is None and job["status"]["label"] != "Running"
-    assert job["last_job_run"]["outcome"] == {"label": "Not run", "tone": "neutral", "note": "the job is paused"}
+    assert job["last_job_run"] is None      # a trigger that did not run is never its last job run
 
 
 def test_a_group_triggered_with_no_run_yet_is_starting_and_waits_to_start():
@@ -195,7 +195,7 @@ def test_a_paused_jobs_last_job_run_is_its_last_real_one_not_a_missed_trigger():
         "2026-10-26T13:00:00+00:00", "Completed with failures")
     assert job["failed_in_a_row"] == 1
     never = ij.jobs_view(paused, MEMBERS[:2], STATES, [], [], STATS, NOW)["jobs"][0]
-    assert never["last_job_run"]["outcome"] == {"label": "Not run", "tone": "neutral", "note": "the job is paused"}
+    assert never["last_job_run"] is None
 
 
 def test_a_job_runs_checks_are_lines_of_their_own_kept_out_of_its_group_run_numbers():
@@ -221,3 +221,28 @@ def test_a_job_runs_checks_are_lines_of_their_own_kept_out_of_its_group_run_numb
     # Its check vouched for c1's tables: they count as checked unchanged, not as still to go.
     c2 = ij._progress(jr["members"][1], {}, 5)
     assert (s["progress"]["total"], s["progress"]["unchanged"]) == (10 + c2["total"], 10 + c2["unchanged"])
+
+
+def test_a_last_job_run_older_than_the_window_is_the_one_found_before_it():
+    """Paused overnight: the window holds only triggers that did not run, so the last real job run comes from
+    before it (main reads it), never a missed trigger."""
+    paused = [dict(SCHEDULES[0], paused=True)]
+    earlier = {"slot": "2026-10-25T21:00:00+00:00", "outcome": {"label": "Completed", "tone": "ok", "note": None},
+               "failed_tables": 0, "took_s": 300}
+    job = ij.jobs_view(paused, MEMBERS[:2], STATES, [], [], STATS, NOW, earlier_last_by_job={1: earlier})["jobs"][0]
+    assert job["last_job_run"] == earlier
+    assert ij.last_finished([{"outcome": {"label": "Not run"}}, {"outcome": {"label": "Running"}}]) is None
+
+
+def test_the_last_job_run_before_the_window_is_the_newest_slot_not_the_newest_start():
+    # A late run of an older slot can start after a run of a newer one: the newest slot that ran wins, and the
+    # failure streak counts on from it over the job runs found with it.
+    job = dict(SCHEDULES[0])
+    late_older = dict(task_collection="c2", started_at="2026-10-26T13:20:00+00:00")     # c2 fires at :30: 12:00's
+    newer = dict(task_collection="c1", started_at="2026-10-26T13:05:00+00:00")          # c1 fires at :00: 13:00's
+    found = ij.newest_slots([late_older, newer], job, MEMBERS)
+    assert found == [datetime(2026, 10, 26, 13, tzinfo=UTC), datetime(2026, 10, 26, 12, tzinfo=UTC)]
+    # Found that way, only its newest job run is read: its failures in a row are at least that one.
+    found = ij.earlier_last([{"outcome": {"label": "Completed with failures"}, "failed_tables": 2}])
+    assert (found["failed_in_a_row"], found["failed_in_a_row_at_least"]) == (1, True)
+    assert ij.earlier_last([{"outcome": {"label": "Not run"}, "failed_tables": 0}]) is None
