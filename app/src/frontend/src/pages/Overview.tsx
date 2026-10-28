@@ -43,7 +43,8 @@ export function JobsTable({ jobs, notInJob, total, offset, limit, onPage, link, 
     return <th><button className="th-sort" aria-sort={on ? (sort!.descending ? "descending" : "ascending") : "none"}
       onClick={() => onSort!({ by, descending: on ? !sort!.descending : true })}>{label}{on ? (sort!.descending ? " ↓" : " ↑") : ""}</button></th>;
   };
-  const who = (by: unknown, at: unknown) => <>{by ? <Name>{String(by)}</Name> : <span className="muted">unknown</span>}
+  // The user name before the @, the full address on hover, so both columns fit as the Jobs list's Created by does.
+  const who = (by: unknown, at: unknown) => <>{by ? <span title={String(by)}>{String(by).split("@")[0]}</span> : <span className="muted">unknown</span>}
     {at ? <span className="sub">{fmtTime(at)}</span> : null}</>;
   const table = (
       <div className="table-wrap"><table className="data">
