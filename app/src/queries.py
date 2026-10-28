@@ -1662,6 +1662,21 @@ def insert_schedule_sql() -> str:
     return f"insert into {SCHEMA}.schedule ({', '.join(cols)}) values ({vals}) returning id"
 
 
+_STAMP = (f"update {SCHEMA}.schedule set updated_at = now(), "
+          f"options = jsonb_set(coalesce(options, '{{}}'::jsonb), '{{updated_by}}', to_jsonb(%s::text)) ")
+
+
+def touch_jobs_sql() -> str:
+    """Record who last changed these ingestion jobs, and when (options.updated_by, updated_at). Params: user, ids."""
+    return _STAMP + "where id = any(%s) and deleted_at is null"
+
+
+def touch_group_jobs_sql() -> str:
+    """The same for every ingestion job holding one of these groups, when their tables change. Params: user, groups."""
+    return (_STAMP + f"where deleted_at is null and id in (select schedule_id from {SCHEMA}.schedule_member "
+            "where task_collection = any(%s) and removed_at is null)")
+
+
 def update_schedule_sql(fields: List[str]) -> str:
     bad = [f for f in fields if f not in SCHEDULE_FIELDS]
     if bad or not fields:

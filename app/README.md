@@ -73,6 +73,11 @@ with work, with run-now. A quiet cycle starts no ingest cluster. Members are not
 them all), the schedule is one saved job and one parent task while the check runs, and switching a schedule
 to or from `check` replaces its wrapper jobs.
 
+**Who and when.** Each ingestion job shows who created it and when (`created_by`, `created_at`), and who last changed
+it and when: an edit, pause or resume of the job, or any change to its groups' tables (`options.updated_by`,
+`updated_at`). The job page shows them under its title; the Ingestion jobs list has them as Created and Last updated,
+sortable by time. Jobs last changed before the app recorded it show "unknown" for who.
+
 ## Guard rails for edits
 
 Data integrity comes first, so edits go through the server's rules, not the browser's:

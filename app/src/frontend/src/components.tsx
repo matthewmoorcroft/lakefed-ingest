@@ -514,3 +514,27 @@ export function Name({ children }: { children: unknown }) {
   const words = String(children ?? "").split(" ");
   return <>{words.map((w, i) => <Fragment key={i}>{i > 0 && " "}<span className="word">{w}</span></Fragment>)}</>;
 }
+
+/** A menu behind a button, as the Databricks UI keeps a job's less common and destructive actions (the kebab) and the
+    user's details (the avatar). It closes on a click outside or Escape. */
+export function Menu({ label, title, buttonClass = "ghost kebab", children }: { label: ReactNode; title: string;
+                     buttonClass?: string; children: ReactNode }) {
+  const [open, setOpen] = useState(false);
+  const box = useRef<HTMLSpanElement>(null);
+  useEffect(() => {
+    if (!open) return;
+    const close = (e: MouseEvent | KeyboardEvent) => {
+      if (e instanceof KeyboardEvent ? e.key === "Escape" : !box.current?.contains(e.target as Node)) setOpen(false);
+    };
+    document.addEventListener("mousedown", close);
+    document.addEventListener("keydown", close);
+    return () => { document.removeEventListener("mousedown", close); document.removeEventListener("keydown", close); };
+  }, [open]);
+  return (
+    <span className="menu" ref={box}>
+      <button className={buttonClass} aria-haspopup="menu" aria-expanded={open} aria-label={title} title={title}
+        onClick={() => setOpen(!open)}>{label}</button>
+      {open && <div className="menu-items" role="menu" onClick={(e) => (e.target as HTMLElement).closest("button") && setOpen(false)}>{children}</div>}
+    </span>
+  );
+}

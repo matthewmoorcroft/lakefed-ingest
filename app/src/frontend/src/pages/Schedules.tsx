@@ -2,7 +2,7 @@ import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, type Row } from "../api";
 import { usePermissions } from "../permissions";
-import { Badge, ConfirmButton, ErrorBox, Grid, Notice, Section, fmtTime, plural } from "../components";
+import { Badge, ErrorBox, Grid, Menu, Notice, Section, fmtTime, plural } from "../components";
 
 // A schedule runs one or more collections at a cadence. The app turns each (schedule, collection)
 // into a small Databricks job that starts the Databricks ingestion job; editing here keeps those jobs in sync.
@@ -139,12 +139,17 @@ function ScheduleCard({ s, onEdit }: { s: Row; onEdit: () => void }) {
   return (
     <Section title={`${s.name}: ${s.description}`} actions={<>
       {s.paused ? <Badge value="paused" /> : <Badge value="ok" />}
-      <button onClick={onEdit} disabled={!!locked} title={locked ?? undefined}>Edit</button>
+      {/* As a Databricks job page: the less common actions and Delete in the more-actions menu. */}
+      <Menu label="⋮" title="More actions">
+        <button onClick={() => check.mutate()} disabled={check.isPending}>Check jobs</button>
+        <button onClick={() => act.mutate("sync")} disabled={act.isPending || !!locked} title={locked ?? undefined}>Sync jobs</button>
+        <button className="danger-text" disabled={!!refusals?.delete} title={refusals?.delete ?? undefined}
+          onClick={() => window.confirm(`Delete ${s.name}?\n\nIts schedule and its Databricks jobs are deleted. Its groups move to Not in any job, and their tables, target tables, checkpoints and run history all stay.`)
+            && act.mutate("delete")}>Delete job</button>
+      </Menu>
       <button onClick={() => act.mutate(s.paused ? "resume" : "pause")} disabled={act.isPending || !!locked}
         title={locked ?? undefined}>{s.paused ? "Resume" : "Pause"}</button>
-      <button onClick={() => check.mutate()} disabled={check.isPending}>Check jobs</button>
-      <button onClick={() => act.mutate("sync")} disabled={act.isPending || !!locked} title={locked ?? undefined}>Sync jobs</button>
-      <ConfirmButton label="Delete" danger disabled={!!refusals?.delete} onConfirm={() => act.mutateAsync("delete")} />
+      <button onClick={onEdit} disabled={!!locked} title={locked ?? undefined}>Edit</button>
     </>}>
       {locked && <p className="muted small">Edit, {s.paused ? "Resume" : "Pause"}, Sync jobs and Delete: {locked}.</p>}
       <p className="muted small">Time zone {s.timezone}{paramsText(s.parameters) ? ` · ${paramsText(s.parameters)}` : ""}

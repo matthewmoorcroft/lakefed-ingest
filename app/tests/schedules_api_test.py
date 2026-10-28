@@ -25,6 +25,15 @@ class Store:
         return datetime.now(timezone.utc).isoformat()
 
     def run(self, sql, params):
+        if sql in (q.touch_jobs_sql(), q.touch_group_jobs_sql()):
+            import json
+            user, keys = params
+            ids = keys if sql == q.touch_jobs_sql() else {m["schedule_id"] for m in self.members.values()
+                                                          if m["task_collection"] in keys and m["removed_at"] is None}
+            for sid in ids:
+                row = self.schedules[sid]
+                row.update(updated_at=self.now(), options=json.dumps({**sch.options_of(row), "updated_by": user}))
+            return []
         if sql.startswith(f"insert into {q.SCHEMA}.schedule ("):
             if self.unique:
                 import psycopg
@@ -379,3 +388,15 @@ def test_the_permissions_answer_lists_what_the_user_may_not_do_on_each_job_group
     assert answer["run"]["discovery"] == "no discovery job is configured"
     assert answer["new_running_job"]["default"] is None
     assert api.post("/api/jobs/setup/run").status_code == 403
+
+
+def test_a_job_records_who_created_it_and_who_last_changed_it_and_a_sent_name_is_ignored(api, monkeypatch):
+    sid = api.post("/api/schedules", json=dict(BODY, paused=True)).json()["id"]
+    row = api.store.schedules[sid]
+    assert (row["created_by"], sch.updated_by(row)) == ("op@example.com", "op@example.com")
+    other = TestClient(main.app, headers={"X-Forwarded-Email": "second@example.com"})
+    r = other.post(f"/api/schedules/{sid}", json=dict(BODY, paused=True, cadence_minutes=60,
+                                                     options={"updated_by": "someone@else.com"}))
+    assert r.status_code == 200 and sch.updated_by(api.store.schedules[sid]) == "second@example.com"
+    other.post(f"/api/schedules/{sid}/resume")
+    assert sch.updated_by(api.store.schedules[sid]) == "second@example.com"

@@ -4,7 +4,8 @@ import { Link, useNavigate, useParams } from "react-router-dom";
 import { api, qs, type Row } from "../api";
 import { Refused } from "../permissions";
 import {
-  Badge, ErrorBox, Name, Notice, PageHead, RunStatus, Section, StateBar, StateKey, fmtClock, fmtDuration, fmtInt, fmtSlot, fmtSpeed, jobRunPath, plural
+  Badge, ErrorBox, Menu, Name, Notice, PageHead, RunStatus, Section, StateBar, StateKey, fmtClock, fmtDuration, fmtInt, fmtSlot, fmtSpeed,
+  fmtTime, jobRunPath, plural
 } from "../components";
 
 const PAGE = 25;
@@ -76,12 +77,17 @@ export default function IngestionJob() {
           {j.job_variant && j.job_variant !== "default" && <>, Databricks job variant <strong>{j.job_variant}</strong></>}
 .</>}
         right={j && <span className="card-actions">
-          <button className="ghost" disabled={!!j.run_now?.blocked || runNow.isPending} title={j.run_now?.blocked ?? undefined}
-            onClick={() => window.confirm(runNowMessage(j)) && runNow.mutate()}>{runNow.isPending ? "Starting…" : "Run now"}</button>
-          <button className="ghost danger-text" disabled={!!j.delete_blocked || remove.isPending} title={j.delete_blocked ?? undefined}
-            onClick={() => window.confirm(deleteMessage(j)) && remove.mutate()}>{remove.isPending ? "Deleting…" : "Delete"}</button>
-          <button className="primary" disabled={!!j.change_blocked} title={j.change_blocked ?? undefined}
-            onClick={() => navigate(`/ingestion-jobs/${id}/edit`)}>Edit</button></span>} />
+          {/* As a Databricks job page: Delete in the more-actions menu, Edit beside Run now, Run now the primary action. */}
+          <Menu label="⋮" title="More actions">
+            <button className="danger-text" disabled={!!j.delete_blocked || remove.isPending} title={j.delete_blocked ?? undefined}
+              onClick={() => window.confirm(deleteMessage(j)) && remove.mutate()}>{remove.isPending ? "Deleting…" : "Delete job"}</button>
+          </Menu>
+          <button disabled={!!j.change_blocked} title={j.change_blocked ?? undefined}
+            onClick={() => navigate(`/ingestion-jobs/${id}/edit`)}>Edit</button>
+          <button className="primary" disabled={!!j.run_now?.blocked || runNow.isPending} title={j.run_now?.blocked ?? undefined}
+            onClick={() => window.confirm(runNowMessage(j)) && runNow.mutate()}>{runNow.isPending ? "Starting…" : "Run now"}</button></span>} />
+      {j && <p className="muted small">Created by {j.created_by ?? "unknown"}{j.created_at ? `, ${fmtTime(j.created_at)}` : ""} ·
+        Last updated by {j.updated_by ?? "unknown"}{j.updated_at ? `, ${fmtTime(j.updated_at)}` : ""}</p>}
       <Refused action="Run now" refusal={j?.run_now?.blocked} />
       <Refused action="Edit and Delete" refusal={j?.change_blocked} />
       <ErrorBox error={remove.error} />

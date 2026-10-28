@@ -98,6 +98,16 @@ def _log(cur, user, action, control_id, collection, field=None, old=None, new=No
                                      as_text(new), reseed, batch))
 
 
+def _touch(cur, user, jobs_changed=(), groups=()):
+    """Record who last changed these ingestion jobs (or the jobs holding these groups, whose tables changed), and
+    when: the job page and the Ingestion jobs list show it as Last updated."""
+    if jobs_changed:
+        cur.execute(q.touch_jobs_sql(), (user or None, [int(j) for j in jobs_changed]))
+    wanted = sorted({g for g in groups if g})
+    if wanted:
+        cur.execute(q.touch_group_jobs_sql(), (user or None, wanted))
+
+
 def _apply_plans(cur, rows, plans, user, batch):
     """Write planned edits (queries.plan_edit) inside the caller's transaction: each changed field, its change log
     line, a reseed where the plan needs one, then the mixed-sink and split-database checks over the rows as they
@@ -402,18 +412,36 @@ def _job_filter(job: dict, name: str) -> bool:
             "late": bool(job["state_late"]), "paused": bool(job.get("paused"))}[name]
 
 
+# Columns the Ingestion jobs list sorts by, besides its own order (failing first, then late, then by name).
+JOB_SORTS = ("created_at", "updated_at")
+
+
+def _audit(schedule: dict) -> dict:
+    """Who created a job and who last changed it (it or its groups' tables), and when; None where not recorded."""
+    return {"created_by": schedule.get("created_by"), "created_at": schedule.get("created_at"),
+            "updated_by": sch.updated_by(schedule), "updated_at": schedule.get("updated_at")}
+
+
 @app.get("/api/ingestion-jobs")
-def ingestion_jobs(filter: str = "all", search: str = "", offset: int = 0, limit: int = 25):
+def ingestion_jobs(filter: str = "all", search: str = "", offset: int = 0, limit: int = 25, sort: str = "",
+                   descending: bool = True):
     """Every ingestion job, as on the Overview, filtered (each filter with its count) and searched on job and
-    group names, a page at a time; "Not in any job" comes apart, under All."""
+    group names, a page at a time; "Not in any job" comes apart, under All. ``sort`` (created_at or updated_at)
+    orders the whole list by that time, unknown times last."""
     if filter not in JOB_FILTERS:
         raise HTTPException(400, f"filter must be one of {', '.join(JOB_FILTERS)}")
+    if sort and sort not in JOB_SORTS:
+        raise HTTPException(400, f"sort must be one of {', '.join(JOB_SORTS)}")
     view = _jobs_view()
+    audits = {s["id"]: _audit(s) for s in _schedules()[0]}
     needle = search.strip().lower()
-    found = [j for j in view["jobs"]
+    found = [{**j, **audits.get(j["id"], {})} for j in view["jobs"]
              if not needle or needle in str(j["name"]).lower() or any(needle in g.lower() for g in j["groups"])]
     counts = {f: sum(1 for j in found if _job_filter(j, f)) for f in JOB_FILTERS}
     rows = [j for j in found if _job_filter(j, filter)]
+    if sort:
+        known = sorted((j for j in rows if j.get(sort)), key=lambda j: q._when(j[sort]), reverse=descending)
+        rows = known + [j for j in rows if not j.get(sort)]
     not_in_job = view["not_in_job"]
     shown_apart = filter == "all" and not_in_job and (not needle or any(needle in g.lower() for g in not_in_job["groups"]))
     offset, limit = max(0, int(offset)), max(1, min(int(limit), 100))
@@ -509,7 +537,7 @@ def ingestion_job(job_id: int, request: Request):
             # For the Run now button: why it can't start now (None when it can), and what one run starts.
             "run_now": {"blocked": refusals["run"] or _run_now_blocker(job, mine),
                         "groups": len(mine), "check": job.get("job_variant") == sch.CHECK_VARIANT},
-            "delete_blocked": refusals["delete"], "change_blocked": refusals["change"]}
+            "delete_blocked": refusals["delete"], "change_blocked": refusals["change"], **_audit(job)}
 
 
 def _job_groups(job_id: int) -> List[str]:
@@ -698,6 +726,7 @@ def edit_ingestion_job_settings(job_id: int, body: JobSettingsRequest, request: 
             if not found["summary"]["changed"]:
                 return found
             result = jss.apply(cur, groups, body.settings, now, _user(request), uuid.uuid4().hex[:12])
+            _touch(cur, _user(request), [job_id])
             mixed = jss.mixed_sinks(fetch, groups)
             if mixed:
                 raise HTTPException(409, f"target {mixed[0]} would be claimed by a dedicated table and by others; "
@@ -778,6 +807,7 @@ def enable_job_tables(job_id: int, body: JobEnableRequest, request: Request):
             if bool(r["task_enabled"]) != body.enabled:
                 _log(cur, _user(request), "enable" if body.enabled else "disable", r["id"], r["task_collection"],
                      "task_enabled", r["task_enabled"], body.enabled, batch=batch)
+        _touch(cur, _user(request), [job_id])
     return {"updated": len(ids)}
 
 
@@ -814,6 +844,7 @@ def edit_job_table(job_id: int, body: JobTableEditRequest, request: Request):
             return {"summary": summary, "plans": plans[:200]}
         _lock_collections(cur, [r["task_collection"] for r in rows])
         _apply_plans(cur, rows, plans, _user(request), uuid.uuid4().hex[:12])
+        _touch(cur, _user(request), [job_id])
         summary["applied"] = True
         return {"summary": summary, "plans": plans[:200]}
 
@@ -888,6 +919,7 @@ def add_job_databases(job_id: int, body: JobDatabasesRequest, request: Request):
                                int(job["cadence_minutes"]), bool(job.get("stagger")), sch.start_minute(job))
             for g in plan["new_groups"]:
                 cur.execute(q.insert_member_sql(), (job_id, g, offs[g]))
+        _touch(cur, user, [job_id])
         summary.update(applied=True, new_tables=inserted, skipped=len(plan["new"]) - inserted)
     if plan["new_groups"]:
         _sync(job_id, user)
@@ -1147,6 +1179,7 @@ def set_enabled(body: EnableRequest, request: Request):
             if bool(r["task_enabled"]) != body.enabled:
                 _log(cur, _user(request), "enable" if body.enabled else "disable", r["id"], r["task_collection"],
                      "task_enabled", r["task_enabled"], body.enabled, batch=batch)
+        _touch(cur, _user(request), groups=[r["task_collection"] for r in rows])
     return {"updated": len(rows)}
 
 
@@ -1162,6 +1195,7 @@ def reseed(body: Ids, request: Request):
         cur.execute(q.log_reseed_sql(), ("manual", body.ids))
         for r in rows:
             _log(cur, _user(request), "reseed", r["id"], r["task_collection"], reseed="manual", batch=batch)
+        _touch(cur, _user(request), groups=[r["task_collection"] for r in rows])
     return {"updated": n}
 
 
@@ -1178,6 +1212,7 @@ def add_table(row: dict, request: Request):
         _refuse_mixed_sinks(cur, [row])
         _refuse_split_databases(cur, [row])
         _log(cur, _user(request), "add", new_id, row.get("task_collection"))
+        _touch(cur, _user(request), groups=[row.get("task_collection")])
     return {"id": new_id}
 
 
@@ -1219,6 +1254,7 @@ def edit_tables(body: EditRequest, request: Request):
             _refuse_groups([r["task_collection"] for r in rows] + [new_coll], request)
             _lock_collections(cur, [r["task_collection"] for r in rows] + ([new_coll] if new_coll else []))
             _apply_plans(cur, rows, plans, _user(request), batch)
+            _touch(cur, _user(request), groups=[r["task_collection"] for r in rows] + [new_coll])
             summary["applied"] = True
             return {"summary": summary, "plans": plans}
     except psycopg.errors.UniqueViolation:
@@ -1392,6 +1428,7 @@ def register(discovery_id: str, body: RegisterRequest, request: Request):
                                 "errors": [] if res else ["sink already used by another control row"]})
             _refuse_mixed_sinks(cur, [row for _, row in valid])     # all or nothing, like an edit
             _refuse_split_databases(cur, [row for _, row in valid])
+            _touch(cur, _user(request), groups=[body.task_collection])
     else:
         results += [{"table": name, "status": "valid", "errors": []} for name, _ in valid]
     counts = {}
@@ -1454,6 +1491,7 @@ def import_csv(body: ImportRequest, request: Request):
                 else:
                     line["errors"] = ["sink already used by another control row"]
             _refuse_mixed_sinks(cur, [line["row"] for line in plan["lines"] if line["status"] == "imported"])
+            _touch(cur, _user(request), groups=[group])
     return {"task_collection": group, "settings": plan["settings"], "counts": counted(plan["lines"]),
             "lines": [{k: v for k, v in line.items() if k != "row"} for line in plan["lines"]]}
 
@@ -1530,6 +1568,14 @@ def _validate_schedule(body: ScheduleBody):
     errs = sch.validate(body.model_dump(), known, jobs.schedule_variants())
     if errs:
         raise HTTPException(422, {"errors": errs})
+
+
+# Options only the app's own steps write (who last changed the job): a request's value is ignored, the stored kept.
+MANAGED_OPTIONS = ("updated_by",)
+
+
+def _requested_options(body: "ScheduleBody") -> dict:
+    return {k: v for k, v in (body.options or {}).items() if k not in MANAGED_OPTIONS}
 
 
 def _sync(sid: int, user: str) -> List[dict]:
@@ -1646,6 +1692,7 @@ def schedule_options():
 @app.post("/api/schedules")
 def create_schedule(body: ScheduleBody, request: Request):
     import psycopg
+    body.options = _requested_options(body)
     _validate_schedule(body)
     user = _user(request)
     # A check schedule's one wrapper fires every member at once.
@@ -1661,6 +1708,7 @@ def create_schedule(body: ScheduleBody, request: Request):
                                                   body.stagger, body.paused, body.notify_emails or None,
                                                   json.dumps(body.options) if body.options else None, user or None))
             sid = cur.fetchone()[0]
+            _touch(cur, user, [sid])
             for c in sorted(body.members):
                 cur.execute(q.insert_member_sql(), (sid, c, offs[c]))
                 _log(cur, user, "schedule_create", None, c, "schedule", None,
@@ -1674,6 +1722,7 @@ def create_schedule(body: ScheduleBody, request: Request):
 def update_schedule(sid: int, body: ScheduleBody, request: Request):
     """Edit a schedule: fields, and members added or removed. Offsets are recomputed; jobs are synced."""
     import psycopg
+    body.options = _requested_options(body)
     _validate_schedule(body)
     user = _user(request)
     s, members = _load_schedule(sid)
@@ -1688,8 +1737,12 @@ def update_schedule(sid: int, body: ScheduleBody, request: Request):
     new["job_variant"] = new["job_variant"] or "default"
     # A body without options (an older page) keeps the stored ones; an explicit {} clears them.
     new["options"] = (new["options"] or None) if "options" in body.model_fields_set else s.get("options")
+    stored = sch.options_of(s)
+    if "updated_by" in stored:
+        new["options"] = {**(new["options"] or {}), "updated_by": stored["updated_by"]}
+    as_json = lambda v: json.loads(v) if isinstance(v, str) else (v or {})
     changed = [f for f in q.SCHEDULE_FIELDS if (s[f] or None) != (new[f] or None) and not
-               (f in q.JSON_SCHEDULE_FIELDS and (s[f] or {}) == (new[f] or {}))]
+               (f in q.JSON_SCHEDULE_FIELDS and as_json(s[f]) == as_json(new[f]))]
     active = {m["task_collection"]: m for m in members if m["removed_at"] is None}
     added = sorted(set(body.members) - set(active))
     gone = sorted(set(active) - set(body.members))
@@ -1715,6 +1768,8 @@ def update_schedule(sid: int, body: ScheduleBody, request: Request):
             for c, m in active.items():
                 if c in offs and int(m["offset_minutes"]) != offs[c]:
                     cur.execute(q.update_member_offset_sql(), (offs[c], m["id"]))
+            if changed or gone or added:
+                _touch(cur, user, [sid])
     except psycopg.errors.UniqueViolation:
         raise HTTPException(409, f"a schedule named '{body.name}' already exists")
     return {"id": sid, "changed": changed, "added": added, "removed": gone, "sync": _sync(sid, user)}
@@ -1731,6 +1786,7 @@ def _set_paused(sid: int, paused: bool, request: Request):
             cur.execute(q.update_schedule_sql(["paused"]), (paused, int(sid)))
             _log(cur, user, "schedule_pause" if paused else "schedule_resume", None, None, f"{s['name']}.paused",
                  s["paused"], paused)
+            _touch(cur, user, [sid])
     return {"id": sid, "paused": paused, "sync": _sync(sid, user)}
 
 

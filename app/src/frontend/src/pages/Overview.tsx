@@ -4,7 +4,7 @@ import { Link } from "react-router-dom";
 import { api, qs, type Row } from "../api";
 import {
   ErrorBox, FillBox, JobStatus, Name, Notice, PageHead, Pager, ProgressBar, RunStatus, Section, Stamp, StateBar, StateKey,
-  fmtClock, fmtDuration, fmtInt, fmtSlot, fmtSpeed, jobRunName, jobRunPath, plural, progressFrom, progressText
+  fmtClock, fmtDuration, fmtInt, fmtSlot, fmtSpeed, fmtTime, jobRunName, jobRunPath, plural, progressFrom, progressText
 } from "../components";
 
 interface Overview {
@@ -30,14 +30,27 @@ function LastJobRun({ job }: { job: Row }) {
 }
 
 /** Every ingestion job, failing first, with its tables by state and its Status; "Not in any job" last. */
-export function JobsTable({ jobs, notInJob, total, offset, limit, onPage, link, fill }: {
+/** The Ingestion jobs list's sort: a time column and its direction, or none for the list's own order. */
+export interface JobSort { by: "" | "created_at" | "updated_at"; descending: boolean }
+
+export function JobsTable({ jobs, notInJob, total, offset, limit, onPage, link, fill, sort, onSort }: {
   jobs: Row[]; notInJob?: Row | null; total: number; offset: number; limit: number; onPage: (offset: number) => void;
-  link?: boolean; fill?: boolean }) {
+  link?: boolean; fill?: boolean; sort?: JobSort; onSort?: (sort: JobSort) => void }) {
+  // As the Databricks Jobs list: who created each job, and its last change, sortable by time.
+  const audit = !!onSort;
+  const sortHead = (by: JobSort["by"], label: string) => {
+    const on = sort?.by === by;
+    return <th><button className="th-sort" aria-sort={on ? (sort!.descending ? "descending" : "ascending") : "none"}
+      onClick={() => onSort!({ by, descending: on ? !sort!.descending : true })}>{label}{on ? (sort!.descending ? " ↓" : " ↑") : ""}</button></th>;
+  };
+  const who = (by: unknown, at: unknown) => <>{by ? <Name>{String(by)}</Name> : <span className="muted">unknown</span>}
+    {at ? <span className="sub">{fmtTime(at)}</span> : null}</>;
   const table = (
       <div className="table-wrap"><table className="data">
         <thead><tr><th>Ingestion job</th><th className="num">Groups</th><th className="num">Databases</th>
           <th className="num">Tables</th><th>State now</th><th className="num">Failing</th><th className="num">Late</th>
-          <th>Last job run</th><th>Status</th></tr></thead>
+          <th>Last job run</th><th>Status</th>
+          {audit && <>{sortHead("created_at", "Created")}{sortHead("updated_at", "Last updated")}</>}</tr></thead>
         <tbody>
           {jobs.map((j) => (
             <tr key={j.id ?? "none"}>
@@ -49,6 +62,7 @@ export function JobsTable({ jobs, notInJob, total, offset, limit, onPage, link, 
               <td className="num">{fmtInt(j.state_late)}</td>
               <td>{j.id != null ? <LastJobRun job={j} /> : <Link to="/runs?job=none">its group runs</Link>}</td>
               <td><JobStatus status={j.status} /></td>
+              {audit && <><td>{who(j.created_by, j.created_at)}</td><td>{who(j.updated_by, j.updated_at)}</td></>}
             </tr>
           ))}
           {notInJob && (
@@ -59,9 +73,10 @@ export function JobsTable({ jobs, notInJob, total, offset, limit, onPage, link, 
               <td className="num" style={{ color: Number(notInJob.state_failing) ? "var(--bad)" : undefined }}>{fmtInt(notInJob.state_failing)}</td>
               <td className="num">{fmtInt(notInJob.state_late)}</td>
               <td><Link to="/runs?job=none">its group runs</Link></td><td><span className="muted">run by hand or by the Databricks job</span></td>
+              {audit && <><td></td><td></td></>}
             </tr>
           )}
-          {!jobs.length && !notInJob && <tr><td colSpan={9} className="muted">No ingestion jobs here.</td></tr>}
+          {!jobs.length && !notInJob && <tr><td colSpan={audit ? 11 : 9} className="muted">No ingestion jobs here.</td></tr>}
         </tbody>
       </table></div>
   );
@@ -153,7 +168,7 @@ export default function OverviewPage() {
   const unscheduled = d?.not_in_job?.groups?.length ?? 0;
   return (
     <>
-      <PageHead crumb={<span className="eyebrow">Overview · Is everything healthy now?</span>} title={title}
+      <PageHead crumb={<span className="eyebrow">Overview</span>} title={title}
         lead={d && (enabled ? <>{pct}% of <strong>{fmtInt(enabled)}</strong> enabled {plural(enabled, "table")} {enabled === 1 ? "is" : "are"} current,
           in <strong>{fmtInt(t.groups)}</strong> {plural(t.groups, "ingestion group")} and <strong>{fmtInt(t.databases)}</strong>{" "}
           {plural(t.databases, "database")} on <strong>{fmtInt(t.servers)}</strong> {plural(t.servers, "server")}

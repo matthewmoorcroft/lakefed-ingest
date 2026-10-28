@@ -536,3 +536,16 @@ def test_a_check_schedule_at_a_set_time_fires_its_one_wrapper_then_and_names_its
                          start_minute=150, check_variant=True)
     assert found[0]["slot"] == datetime(2026, 10, 26, 2, 30, tzinfo=UTC)
     assert found[0]["members"][0]["run"]["run_id"] == 2 and [c["run_id"] for c in found[0]["checks"]] == [1]
+
+
+def test_a_check_wrapper_tagged_the_old_way_is_kept_and_retagged_with_a_value_aws_accepts():
+    import re
+    assert re.fullmatch(r"[\d \w+\-=.:/@]*", sch.GROUP_TAG)        # the Jobs API's tag value rule on AWS
+    fake = FakeJobs()
+    old = sch.group_job_settings(GROUP, ["c1", "c2"], 777)
+    old["tags"][sch.TAG_COLLECTION] = "*"
+    jid = fake.create(old)
+    members = [dict(id=1, task_collection="c1", job_id=jid), dict(id=2, task_collection="c2", job_id=jid)]
+    results = sch.sync(GROUP, members, [], fake, 777)
+    assert "updated" in {r.action for r in results} and {r.job_id for r in results} == {jid} and len(fake.jobs) == 1
+    assert fake.jobs[jid]["tags"][sch.TAG_COLLECTION] == sch.GROUP_TAG

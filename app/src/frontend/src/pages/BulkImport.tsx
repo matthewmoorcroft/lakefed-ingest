@@ -217,7 +217,7 @@ export default function BulkImport() {
   const nIncluded = rows.filter((r) => r.include).length;
   const nPartitioned = rows.filter((r) => r.include && r.load_partitioned).length;
 
-  const head = <PageHead crumb={<span className="eyebrow">Bulk import · What should we ingest next?</span>} title="Bulk import" lead="Pick a source, see what lakefed already tracks on it, discover the rest, then review and register." />;
+  const head = <PageHead title="Bulk import" lead="Pick a source, see what lakefed already tracks on it, discover the rest, then review and register." />;
   if (!config?.jobs.discover) return <>{head}<Notice tone="warn">DISCOVER_JOB_ID isn't configured for this app.</Notice></>;
   return (
     <>

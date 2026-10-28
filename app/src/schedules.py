@@ -57,7 +57,13 @@ TAG_COLLECTION = "lakefed_ingest_collection"
 TAG_OWNER = "lakefed_ingest_app"     # instance/database: apps of other deployments in the workspace keep out
 JOB_NAME_PREFIX = "lakefed_ingest schedule"
 CHECK_VARIANT = "check"        # one wrapper per schedule, starting the check job (jobs.CHECK_JOB_ID)
-GROUP_TAG = "*"                # TAG_COLLECTION of that wrapper: it starts every member
+GROUP_TAG = "all-members"      # TAG_COLLECTION of that wrapper: it starts every member
+# Earlier wrappers carried "*", which AWS workspaces refuse in a tag value: still recognised, and re-tagged on sync.
+OLD_GROUP_TAGS = ("*",)
+
+
+def is_group_tag(value: Optional[str]) -> bool:
+    return value == GROUP_TAG or value in OLD_GROUP_TAGS
 _EMAIL = re.compile(r"[^@\s,]+@[^@\s,]+\.[^@\s,]+")
 _NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9 _.,:()-]{0,79}")
 
@@ -123,6 +129,18 @@ def timezone_for(cadence: int, tz: Optional[str]) -> str:
     off UTC, so the runs fall on the same local minutes, and in UTC none is skipped or late on a clock-change
     night (Databricks' advice for hourly runs). Daily or every 2 to 12 hours is tied to a time of day: its zone."""
     return "UTC" if int(cadence) <= 60 else (str(tz or "").strip() or "UTC")
+
+
+def options_of(schedule: dict) -> dict:
+    """A schedule's options as a dict (stored as JSON)."""
+    options = schedule.get("options") or {}
+    return json.loads(options) if isinstance(options, str) else options
+
+
+def updated_by(schedule: dict) -> Optional[str]:
+    """Who last changed the job or its groups' tables in the app (options.updated_by), or None: not recorded (jobs
+    last changed before the app recorded it)."""
+    return options_of(schedule).get("updated_by")
 
 
 def start_minute(schedule: dict) -> int:
@@ -622,17 +640,17 @@ def _sync_group(schedule: dict, members: List[dict], client: JobsClient, check_j
     it, or reset it when it drifted; every member records it. The members' own wrapper jobs from another
     variant are left unclaimed, so the caller deletes them as untracked."""
     if check_job_id is None:
-        claimed.update(t for t, tc in (tagged or {}).items() if tc == GROUP_TAG)
+        claimed.update(t for t, tc in (tagged or {}).items() if is_group_tag(tc))
         return [MemberResult(m["task_collection"], m.get("job_id"), "error",
                              "no check job configured for the check variant", m.get("id")) for m in members]
     desired = group_job_settings(schedule, [m["task_collection"] for m in members], check_job_id, view_group, owner)
     try:
         jid, job, action = None, None, "updated"
         candidates = [int(m["job_id"]) for m in members if m.get("job_id")]
-        candidates += sorted(t for t, tc in (tagged or {}).items() if tc == GROUP_TAG)
+        candidates += sorted(t for t, tc in (tagged or {}).items() if is_group_tag(tc))
         for candidate in candidates:
             found = client.get(candidate)
-            if found is not None and ((found.get("settings") or {}).get("tags") or {}).get(TAG_COLLECTION) == GROUP_TAG:
+            if found is not None and is_group_tag(((found.get("settings") or {}).get("tags") or {}).get(TAG_COLLECTION)):
                 jid, job = candidate, found
                 action = "updated" if candidate in [int(m["job_id"]) for m in members if m.get("job_id")] else "adopted"
                 break

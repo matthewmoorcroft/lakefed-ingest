@@ -2,6 +2,7 @@ import { createContext, useContext } from "react";
 import { NavLink, Navigate, Route, Routes } from "react-router-dom";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, type Config } from "./api";
+import { Menu } from "./components";
 import Overview from "./pages/Overview";
 import Runs from "./pages/Runs";
 import RunDetail from "./pages/RunDetail";
@@ -39,7 +40,7 @@ export default function App() {
     <SettingsContext.Provider value={{ config: config.data }}>
       <div className="layout">
         <aside className="sidebar">
-          <div className="brand"><div>lakefed_ingest<small>Operations</small></div></div>
+          <div className="brand"><div>Lakefed Ingest<small>Operations</small></div></div>
           <nav>
             {NAV.map(([group, links]) => (
               <div key={group}>
@@ -50,17 +51,13 @@ export default function App() {
               </div>
             ))}
           </nav>
-          <div className="sidebar-foot">
-            <button className="ghost" onClick={() => qc.invalidateQueries()}>Refresh data</button>
-            {config.data && (
-              <div className="muted small">
-                Lakebase <code>{config.data.lakebase_instance}</code> / <code>{config.data.lakebase_database}</code>
-                {config.data.user && <div>Signed in as {config.data.user}</div>}
-              </div>
-            )}
-          </div>
         </aside>
         <main className="content">
+          {/* As the Databricks workspace's top bar: actions and the signed-in user at the top right. */}
+          <div className="topbar">
+            <button className="ghost" onClick={() => qc.invalidateQueries()}>Refresh data</button>
+            <UserMenu config={config.data} />
+          </div>
           <Routes>
             <Route path="/" element={<Navigate to="/overview" replace />} />
             <Route path="/overview" element={<Overview />} />
@@ -87,5 +84,20 @@ export default function App() {
         </main>
       </div>
     </SettingsContext.Provider>
+  );
+}
+
+
+/** The signed-in user's menu, as the Databricks workspace shows it at the top right: their initials, opening to who
+    they are and which Lakebase database this app reads. */
+function UserMenu({ config }: { config?: Config }) {
+  const user = config?.user ?? "";
+  const initials = user.split("@")[0].split(/[._-]/).filter(Boolean).slice(0, 2).map((part) => part[0].toUpperCase()).join("") || "?";
+  return (
+    <Menu label={initials} buttonClass="avatar" title={user || "Signed in"}>
+      <div className="menu-note"><div className="muted small">Signed in as</div><div>{user || "unknown"}</div></div>
+      {config && <div className="menu-note"><div className="muted small">Lakebase</div>
+        <div className="mono">{config.lakebase_instance}</div><div className="mono">{config.lakebase_database}</div></div>}
+    </Menu>
   );
 }

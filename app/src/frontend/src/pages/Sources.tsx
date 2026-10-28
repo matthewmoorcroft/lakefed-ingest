@@ -26,7 +26,7 @@ export default function Sources() {
   const pick = instances.find((i) => i.server === chosen) ?? instances[0];
   return (
     <>
-      <PageHead crumb={<span className="eyebrow">Sources · What do we read, and what is not ingested yet?</span>}
+      <PageHead crumb={<span className="eyebrow">Sources</span>}
         title={d ? `${fmtInt(d.ingested)} ${plural(d.ingested, "instance")} ingested, ${fmtInt(d.nothing_registered)} with nothing registered` : "Sources"}
         lead={d && <>{fmtInt(d.not_registered)} {plural(d.not_registered, "table")} discovered and not registered yet. An instance is the source
           server the tables' rows reach: their UC connection, or their host and port.</>}

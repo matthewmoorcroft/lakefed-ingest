@@ -3,7 +3,7 @@ import { useQuery } from "@tanstack/react-query";
 import { useSearchParams } from "react-router-dom";
 import { api, qs, type Row } from "../api";
 import { ErrorBox, PageHead, Section, Stamp, StateKey, fmtInt } from "../components";
-import { JobsTable } from "./Overview";
+import { JobsTable, type JobSort } from "./Overview";
 
 const FILTERS = [["all", "All"], ["running", "Running"], ["failing", "Failing"], ["late", "Late"], ["paused", "Paused"]] as const;
 const PAGE = 25;
@@ -17,15 +17,16 @@ export default function IngestionJobs() {
   const filter = params.get("filter") || "all";
   const [search, setSearch] = useState("");
   const [offset, setOffset] = useState(0);
+  const [sort, setSort] = useState<JobSort>({ by: "", descending: true });
   const jobs = useQuery({
-    queryKey: ["ingestion-jobs", filter, search, offset],
-    queryFn: () => api.get<JobsPage>(`/ingestion-jobs${qs({ filter, search, offset, limit: PAGE })}`),
+    queryKey: ["ingestion-jobs", filter, search, offset, sort],
+    queryFn: () => api.get<JobsPage>(`/ingestion-jobs${qs({ filter, search, offset, limit: PAGE, sort: sort.by, descending: sort.descending })}`),
     refetchInterval: 30_000,
   });
   const counts = jobs.data?.counts ?? {};
   return (
     <>
-      <PageHead crumb={<span className="eyebrow">Ingestion jobs · Which jobs need me?</span>} title="Ingestion jobs"
+      <PageHead title="Ingestion jobs"
         lead="Each ingestion job is a schedule: a cadence and its ingestion groups. Failing first, then late, then by name."
         right={<Stamp at={jobs.data?.read_at} every={30} error={jobs.error} />} />
       <ErrorBox error={jobs.error} />
@@ -43,7 +44,8 @@ export default function IngestionJobs() {
       </div>
       <Section title="Jobs" actions={<StateKey />}>
         {jobs.data && <JobsTable jobs={jobs.data.jobs} notInJob={offset + PAGE >= jobs.data.total ? jobs.data.not_in_job : null}
-          total={jobs.data.total} offset={offset} limit={PAGE} onPage={setOffset} fill />}
+          total={jobs.data.total} offset={offset} limit={PAGE} onPage={setOffset} fill
+          sort={sort} onSort={(next) => { setOffset(0); setSort(next); }} />}
       </Section>
     </>
   );

@@ -3,6 +3,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, type Row } from "../api";
 import { Badge, ConfirmButton, ErrorBox, Grid, Metric, Notice, Section, autoColumns } from "../components";
 import { usePermissions } from "../permissions";
+import { useSettings } from "../App";
 
 interface IngestJob { job: Row; active: Row[]; recent: Row[] }
 
@@ -22,6 +23,7 @@ export default function Jobs() {
   });
   const j = job.data?.job;
   const refusals = usePermissions().data?.run;
+  const { config } = useSettings();
   const linkCol = { cellRenderer: (p: any) => p.value ? <a href={p.value} target="_blank" rel="noreferrer">open</a> : null };
   const stateCols = { state: { cellRenderer: (p: any) => <Badge value={p.value} /> }, result: { cellRenderer: (p: any) => <Badge value={p.value} /> }, url: linkCol };
   const coll = collection || collections.data?.[0] || "";
@@ -72,6 +74,8 @@ export default function Jobs() {
         <Grid rows={job.data?.recent ?? (job.error ? [] : undefined)} fillReserve={150} columns={autoColumns(job.data?.recent ?? [], stateCols)} />
       </Section>
       <Section title="Schema setup">
+        {config && <p>State database: Lakebase instance <span className="mono">{config.lakebase_instance}</span>, database{" "}
+          <span className="mono">{config.lakebase_database}</span>.</p>}
         <p className="muted small">Creates or migrates the Lakebase schema. Safe to re-run; upgrades also migrate on the next
           ingestion run.</p>
         <ConfirmButton label="Run setup job" disabled={!!refusals?.setup} onConfirm={() => post.mutateAsync({ path: "/jobs/setup/run" })} />

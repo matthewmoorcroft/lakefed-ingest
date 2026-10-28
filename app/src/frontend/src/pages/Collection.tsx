@@ -41,7 +41,7 @@ export default function CollectionPage() {
     <>
       <PageHead crumb={<span className="eyebrow"><Link to="/overview">Overview</Link> ·{" "}
         {(data.data?.jobs ?? []).map((j) => <span key={j.id}><Link to={`/ingestion-jobs/${j.id}`}>{j.name}</Link> · </span>)}
-        {data.data && !data.data.jobs?.length && <><Link to="/ingestion-jobs">Not in any job</Link> · </>}Ingestion group · How far along is each database?</span>} title={name}
+        {data.data && !data.data.jobs?.length && <><Link to="/ingestion-jobs">Not in any job</Link> · </>}Ingestion group</span>} title={name}
         lead={<><strong>{fmtInt(dbs.length)}</strong> {plural(dbs.length, "database")}, <strong>{fmtInt(tables)}</strong> enabled {plural(tables, "table")}
           {servers.length ? <> on <strong>{servers.join(", ")}</strong></> : null}.{" "}
           <Link to={`/tables?collection=${encodeURIComponent(name)}`}>Its tables</Link> ·{" "}
