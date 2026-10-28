@@ -54,6 +54,12 @@ a:hover { text-decoration: underline; }
 /* Page header */
 .page-head { display: flex; justify-content: space-between; align-items: flex-end; gap: var(--db-space-4); flex-wrap: wrap; margin-bottom: var(--db-space-4); }
 .page-head > div { min-width: 0; max-width: 100%; }
+/* As a Databricks job page: the title and lead wrap, the actions keep the top right at every width above a phone's. */
+@media (min-width: 900px) {
+  .page-head { flex-wrap: nowrap; align-items: flex-start; }
+  .page-head > div:first-child { flex: 1 1 0; }
+  .page-head > div + div { flex: none; }
+}
 .page-head h1 { margin: 0; overflow-wrap: anywhere; }
 .page-head .crumb, .page-head .lead { overflow-wrap: anywhere; }
 .crumb { font-size: var(--db-font-size-sm); color: var(--muted); margin-bottom: var(--db-space-1); }

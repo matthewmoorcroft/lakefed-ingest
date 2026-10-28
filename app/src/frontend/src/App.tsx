@@ -34,7 +34,8 @@ const NAV = [
 ] as const;
 
 // Pages under an ingestion job keep Ingestion jobs selected, as the workspace keeps a job's section selected on its pages.
-const UNDER = { "/ingestion-jobs": ["/ingestion-jobs", "/collections"] } as Record<string, string[]>;
+// A group run (/runs/<id>) is under its job too, as its crumbs say; the Runs list itself stays under Runs.
+const UNDER = { "/ingestion-jobs": ["/ingestion-jobs", "/collections", "/runs/"] } as Record<string, string[]>;
 
 export default function App() {
   const config = useQuery({ queryKey: ["config"], queryFn: () => api.get<Config>("/config") });
@@ -50,7 +51,7 @@ export default function App() {
               <div key={group}>
                 <div className="nav-group">{group}</div>
                 {links.map(([to, label]) => (
-                  <NavLink key={to} to={to} className={({ isActive }) =>
+                  <NavLink key={to} to={to} end className={({ isActive }) =>
                     (isActive || (UNDER[to] ?? []).some((p) => pathname.startsWith(p)) ? "active" : "")}>{label}</NavLink>
                 ))}
               </div>

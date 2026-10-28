@@ -85,7 +85,9 @@ export default function Jobs() {
         ) : <p className="muted">No active runs.</p>}
       </Section>
       <Section title="Recent runs">
-        <Grid rows={job.data?.recent ?? (job.error ? [] : undefined)} fillReserve={150} columns={autoColumns(job.data?.recent ?? [], stateCols)} />
+        {/* Result alone, as the Runs list shows a finished run's outcome; no per-column filters on a short list. */}
+        <Grid rows={job.data?.recent ?? (job.error ? [] : undefined)} fillReserve={150} filters={false}
+          columns={autoColumns(job.data?.recent ?? [], stateCols, ["state"])} />
       </Section>
       <Section title="Schema setup">
         {config && <p>State database: Lakebase instance <span className="mono">{config.lakebase_instance}</span>, database{" "}

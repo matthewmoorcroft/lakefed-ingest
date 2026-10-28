@@ -363,7 +363,8 @@ export default function JobEdit() {
       .then((ok) => ok && go(to));
   };
   // The browser's Back button too: with unsaved changes a guard entry sits on top of this page's history entry, so Back
-  // lands on it and asks; staying puts the guard back, leaving goes back past it.
+  // lands on it and asks; staying puts the guard back, leaving goes back past it. Once the form is clean again (saved,
+  // or the edit undone) the guard comes off, so Back always goes back one page.
   useEffect(() => {
     if (!dirty) return;
     window.history.pushState({ unsavedGuard: true }, "", window.location.href);
@@ -373,7 +374,10 @@ export default function JobEdit() {
       leave(-2);
     };
     window.addEventListener("popstate", back);
-    return () => window.removeEventListener("popstate", back);
+    return () => {
+      window.removeEventListener("popstate", back);
+      if (!leaving.current && window.history.state?.unsavedGuard) window.history.back();
+    };
   }, [dirty]);
   useEffect(() => {
     if (!dirty) return;

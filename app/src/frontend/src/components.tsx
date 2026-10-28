@@ -48,7 +48,7 @@ const HEADINGS: Record<string, string> = {
   src_host: "Server", src_port: "Port", src_connection: "UC connection", sink_catalog: "Target catalog",
   sink_schema: "Target schema", sink_table: "Target table", sink_fqn: "Target table", primary_key: "Primary key",
   changed_at: "Changed at", changed_by: "Changed by", action: "Action", old_value: "Old value", new_value: "New value",
-  run_id: "Run ID", job_id: "Job ID", state: "Status", result: "Result", url: "Link", started: "Started", ended: "Ended", trigger: "Trigger",
+  run_id: "Run ID", job_id: "Job ID", sink: "Target table", state: "Status", result: "Result", url: "Link", started: "Started", ended: "Ended", trigger: "Trigger",
   schedule: "Schedule", freshness_sla_minutes: "Freshness target (minutes)", last_success_at: "Last loaded",
   status: "Status", phase: "Phase", created_at: "Created", updated_at: "Last updated", client_id: "Client ID",
   write_mode: "Write mode", cursor_column: "Cursor column", select_list: "Columns", secret_key: "Secret key",
@@ -496,11 +496,16 @@ export function Modal({ title, action, danger, onClose, children }: { title: str
                         onClose: (confirmed: boolean) => void; children?: ReactNode }) {
   const id = useId();
   const box = useRef<HTMLDivElement>(null);
+  const cancel = useRef<HTMLButtonElement>(null);
   // As Databricks dialogs: Tab and Shift+Tab stay inside it, and focus goes back to what opened it when it closes.
+  // The opener is read before Cancel takes focus (no autoFocus, which would move focus first).
+  const closeRef = useRef(onClose);
+  closeRef.current = onClose;
   useEffect(() => {
     const opener = document.activeElement as HTMLElement | null;
+    cancel.current?.focus();
     const key = (e: KeyboardEvent) => {
-      if (e.key === "Escape") return onClose(false);
+      if (e.key === "Escape") return closeRef.current(false);
       if (e.key !== "Tab" || !box.current) return;
       const stops = [...box.current.querySelectorAll<HTMLElement>("button, a[href], input, select, textarea, [tabindex]")]
         .filter((el) => !el.hasAttribute("disabled") && el.tabIndex >= 0);
@@ -512,14 +517,14 @@ export function Modal({ title, action, danger, onClose, children }: { title: str
     };
     document.addEventListener("keydown", key);
     return () => { document.removeEventListener("keydown", key); opener?.focus?.(); };
-  }, [onClose]);
+  }, []);
   return createPortal(
     <div className="modal-backdrop" onMouseDown={(e) => { if (e.target === e.currentTarget) onClose(false); }}>
       <div className="modal" role="dialog" aria-modal="true" aria-labelledby={id} ref={box}>
         <h2 id={id}>{title}</h2>
         {children && <div className="modal-body">{children}</div>}
         <div className="modal-actions">
-          <button autoFocus onClick={() => onClose(false)}>Cancel</button>
+          <button ref={cancel} onClick={() => onClose(false)}>Cancel</button>
           <button className={danger ? "danger" : "primary"} onClick={() => onClose(true)}>{action}</button>
         </div>
       </div>
