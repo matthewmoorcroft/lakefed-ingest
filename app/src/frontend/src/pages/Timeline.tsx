@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { api, qs, type Row } from "../api";
-import { ErrorBox, Notice, fmtTime, useWidth, plural } from "../components";
+import { PageHead, Stamp, readAt, ErrorBox, Notice, fmtTime, useWidth, plural } from "../components";
 
 // Runs per collection over a window: planned triggers (ticks), runs (bars by outcome) and triggers
 // Databricks skipped because the previous run was still going (red markers).
@@ -32,7 +32,7 @@ export default function TimelinePage() {
     skipped: a.skipped + r.skipped.length }), { runs: 0, failed: 0, skipped: 0 });
   return (
     <>
-      <h1>Timeline</h1>
+      <PageHead title="Timeline" lead="Every group run and trigger in the window, by ingestion group." right={<Stamp at={readAt(t)} every={60} error={t.error} />} />
       <div className="toolbar">
         <label>Window
           <select value={hours} onChange={(e) => setHours(Number(e.target.value))}>

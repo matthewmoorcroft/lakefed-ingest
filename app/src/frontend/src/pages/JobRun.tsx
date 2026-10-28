@@ -1,9 +1,10 @@
 import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { Link, useParams } from "react-router-dom";
+import { useSettings } from "../App";
 import { api, type Row } from "../api";
-import {
-  ErrorBox, PageHead, Pager, ProgressBar, ProgressKey, RunStatus, Section, Stamp, Tag, fmtClock, fmtDuration, fmtInt,
+import { OutLink, clusterUrl,
+  Crumbs, ErrorBox, PageHead, Pager, ProgressBar, ProgressKey, RunStatus, Section, Stamp, Tag, fmtClock, fmtDuration, fmtInt,
   fmtSpeed, jobRunName, plural, progressFrom, progressText, type Tone
 } from "../components";
 import { rowsText } from "./IngestionJob";
@@ -18,6 +19,7 @@ function Figure({ label, value, sub }: { label: string; value: string; sub?: str
 /** One job run: progress over all the job's tables, its group runs (waiting ones with their start), its databases
  * failing first, and its failures by cause. */
 export default function JobRun() {
+  const { config } = useSettings();
   const { id = "", slot = "" } = useParams();
   const [dbOffset, setDbOffset] = useState(0);
   const run = useQuery({
@@ -43,7 +45,8 @@ export default function JobRun() {
   const manyServers = new Set(dbs.map((d) => d.server)).size > 1;
   return (
     <>
-      <PageHead crumb={<span className="eyebrow"><Link to="/overview">Overview</Link> · <Link to={`/ingestion-jobs/${id}`}>{r?.job_name ?? "Ingestion job"}</Link> · Job run</span>}
+      <PageHead crumb={<Crumbs steps={[["Ingestion jobs", "/ingestion-jobs"], [r?.job_name ?? "Ingestion job", `/ingestion-jobs/${id}`], ["Job run"]]} />}
+        tab={r ? jobRunName(r.job_name, r.slot) : "Job run"}
         title={r ? <>{jobRunName(r.job_name, r.slot)}{live ? `: ${checkedPct}% checked${r.expected_end ? `, ends about ${fmtClock(r.expected_end)}` : ""}` : ""}{" "}
           <RunStatus status={null} outcome={r.outcome} /></> : "Job run"}
         lead={r && <>{r.outcome?.note ?? `${fmtInt(r.ran)} of ${fmtInt(r.members)} group ${plural(r.members, "run")}`}
@@ -93,7 +96,7 @@ export default function JobRun() {
                       <td className="num">{g.duration_s != null ? fmtDuration(g.duration_s) : ""}</td>
                       <td style={{ minWidth: 160 }}>{g.check ? "" : <ProgressBar p={gp} />}</td>
                       <td className="num">{g.speed_tables_per_min != null ? fmtSpeed(g.speed_tables_per_min) : ""}</td>
-                      <td className="num">{g.parallelism ?? ""}</td><td className="mono">{g.cluster_id ?? ""}</td>
+                      <td className="num">{g.parallelism ?? ""}</td><td className="mono">{g.cluster_id ? <OutLink href={clusterUrl(config?.workspace_url, g.cluster_id)}>{g.cluster_id}</OutLink> : ""}</td>
                       <td className="num" style={{ color: Number(g.failed) ? "var(--bad)" : undefined }}>{g.check ? "" : fmtInt(g.failed)}</td>
                     </tr>
                   );

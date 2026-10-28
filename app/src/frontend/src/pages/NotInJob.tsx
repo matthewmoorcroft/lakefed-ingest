@@ -1,7 +1,7 @@
 import { useQuery } from "@tanstack/react-query";
 import { Link } from "react-router-dom";
 import { api, type Row } from "../api";
-import { ErrorBox, PageHead, RunStatus, Section, StateBar, StateKey, fmtClock, fmtDuration, fmtInt, plural } from "../components";
+import { Crumbs, ErrorBox, PageHead, RunStatus, Section, StateBar, StateKey, fmtClock, fmtDuration, fmtInt, plural } from "../components";
 
 // The groups in no ingestion job, as a page of their own, so a deployment with no jobs (a read-only share) still
 // opens its groups and, from each group, its tables.
@@ -10,7 +10,7 @@ export default function NotInJob() {
   const d = page.data;
   return (
     <>
-      <PageHead crumb={<span className="eyebrow"><Link to="/overview">Overview</Link> · <Link to="/ingestion-jobs">Ingestion jobs</Link></span>}
+      <PageHead crumb={<Crumbs steps={[["Ingestion jobs", "/ingestion-jobs"]]} />}
         title="Not in any job"
         lead={d && <><strong>{fmtInt(d.groups_detail.length)}</strong> {plural(d.groups_detail.length, "ingestion group")},{" "}
           <strong>{fmtInt(d.databases)}</strong> {plural(d.databases, "database")}, <strong>{fmtInt(d.enabled_tables)}</strong>{" "}

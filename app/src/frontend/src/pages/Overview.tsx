@@ -82,7 +82,7 @@ export function JobsTable({ jobs, notInJob, total, offset, limit, onPage, link, 
       </table></div>
   );
   const pager = <Pager offset={offset} limit={limit} total={total} noun="ingestion job" onPage={onPage} />;
-  if (fill) return <>{pager}<FillBox min={240}>{table}</FillBox></>;
+  if (fill) return <><FillBox min={240} reserve={44}>{table}</FillBox>{pager}</>;
   return (
     <>
       {table}
@@ -164,6 +164,8 @@ export default function OverviewPage() {
   const pct = enabled ? ((100 * Number(t.state_current || 0)) / enabled).toFixed(1) : "0.0";
   const jobs = Number(t.jobs || 0);
   const unscheduled = d?.not_in_job?.groups?.length ?? 0;
+  const idle = !!d && !d.running_total && !d.running_not_in_job.length;
+  const calm = !!d && !d.attention_total;
   return (
     <>
       <PageHead title="Overview"
@@ -180,7 +182,10 @@ export default function OverviewPage() {
           freshness target, so {Number(t.no_sla_tables) === 1 ? "it is" : "they are"} never flagged as late. To set one: Tables, select the
           tables, Bulk edit, then Freshness target.</Notice>
       )}
-      <div className="metrics">
+      {/* Until the first read, the tiles show a dash, never zeros that look like real counts. */}
+      {!d && <div className="metrics">{["Ingestion jobs", "Running now", "Failing", "Late data"].map((label) => (
+        <div key={label} className="metric"><div className="metric-label">{label}</div><div className="metric-value muted">–</div></div>))}</div>}
+      {d && <div className="metrics">
         <div className="metric"><div className="metric-label">Ingestion jobs</div>
           <div className="metric-value">{fmtInt(jobs)}<small>{plural(jobs, "job")}</small></div>
           <div className="metric-sub">{unscheduled ? `and ${fmtInt(unscheduled)} ${plural(unscheduled, "group")} in no job` : "every group is in one"}</div></div>
@@ -194,14 +199,17 @@ export default function OverviewPage() {
         <div className={`metric ${Number(t.late_jobs) ? "warn" : ""}`}><div className="metric-label">Late data</div>
           <div className="metric-value">{fmtInt(t.late_jobs)}<small>{plural(t.late_jobs, "job")}</small></div>
           <div className="metric-sub">{fmtInt(t.state_late)} {plural(t.state_late, "table")} past their freshness target</div></div>
-      </div>
+      </div>}
       <Section title="Ingestion jobs" note="Each job is a schedule and its ingestion groups. Failing first, then late, then by name."
         actions={<StateKey />}>
         {d && <JobsTable jobs={d.jobs} notInJob={offset + d.limit >= d.jobs_total ? d.not_in_job : null} total={d.jobs_total}
           offset={offset} limit={d.limit} onPage={setOffset} link />}
       </Section>
-      {d && <RunningNow runs={d.running_job_runs} total={d.running_total} notInJob={d.running_not_in_job} />}
-      {d && <NeedsAttention jobs={d.attention} total={d.attention_total} />}
+      {/* As the workspace home folds an empty section into a line: a quiet line, not a card, when nothing runs or needs a look. */}
+      {(idle || calm) && <p className="muted small">{idle && <>Nothing running (<Link to="/runs">all runs</Link>)</>}
+        {idle && calm && " · "}{calm && "No job needs attention"}</p>}
+      {d && !idle && <RunningNow runs={d.running_job_runs} total={d.running_total} notInJob={d.running_not_in_job} />}
+      {d && !calm && <NeedsAttention jobs={d.attention} total={d.attention_total} />}
     </>
   );
 }

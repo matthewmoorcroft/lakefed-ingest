@@ -452,3 +452,11 @@ def test_registering_tables_into_another_collection_than_their_database_is_refus
     r = client.post("/api/discoveries/d1/register", json=body)
     assert r.status_code == 409 and "db1" in r.json()["detail"]
 
+
+
+def test_a_databricks_run_link_opens_its_run_page(monkeypatch):
+    monkeypatch.setattr(main.jobs, "run_state", lambda run_id: {"url": f"https://h/jobs/1/runs/{run_id}"})
+    r = TestClient(main.app).get("/api/databricks-runs/42/open", follow_redirects=False)
+    assert r.status_code == 307 and r.headers["location"] == "https://h/jobs/1/runs/42"
+    monkeypatch.setattr(main.jobs, "run_state", lambda run_id: (_ for _ in ()).throw(RuntimeError("Run 43 does not exist. More")))
+    assert TestClient(main.app).get("/api/databricks-runs/43/open", follow_redirects=False).status_code == 404

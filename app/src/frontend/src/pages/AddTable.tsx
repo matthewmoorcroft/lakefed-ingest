@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { api } from "../api";
-import { ErrorBox, Notice, Section } from "../components";
+import { PageHead, ErrorBox, Notice, Section } from "../components";
 import { groupsRefusal, usePermissions } from "../permissions";
 
 // The values in words, as the Edit view names them.
@@ -58,9 +58,8 @@ export default function AddTable() {
   });
   return (
     <>
-      <h1>Add a table</h1>
-      <Section title="New control row">
-        <p className="muted small">Adds one control row; the next run of its ingestion group seeds it. For many tables use Bulk import.</p>
+      <PageHead title="Add a table" lead="Adds one table to an ingestion group; the group's next run loads it. For many tables, use Import CSV or Bulk import." />
+      <Section title="The table">
         <form className="form-grid" onSubmit={(e) => { e.preventDefault(); add.mutate(); }}>
           {FIELDS.map((f) => { const required = f.required && !(row.use_remote_query && JDBC_ONLY.includes(f.key)); return (
             <label key={f.key} className={f.key === "select_list" ? "wide" : ""}>

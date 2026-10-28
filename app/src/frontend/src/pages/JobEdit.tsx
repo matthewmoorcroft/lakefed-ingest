@@ -1,8 +1,8 @@
-import { Fragment, useEffect, useMemo, useState } from "react";
+import { Fragment, useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Link, useNavigate, useParams } from "react-router-dom";
+import { useNavigate, useParams } from "react-router-dom";
 import { api, qs, type Row } from "../api";
-import { ConfirmButton, ErrorBox, Notice, PageHead, Pager, Section, StateBar, fmtInt, plural, useConfirm } from "../components";
+import { Crumbs, ConfirmButton, ErrorBox, Notice, PageHead, Pager, Section, StateBar, fmtInt, plural, useConfirm } from "../components";
 import { usePermissions } from "../permissions";
 
 // Edit an ingestion job: what it ingests (a tree from its servers), how it writes, its identity columns, when it
@@ -337,12 +337,28 @@ export default function JobEdit() {
   const dirty = !!s && (JSON.stringify({ w, identity, differing }) !== loaded
     || (!!baseline && JSON.stringify({ run, params, name }) !== JSON.stringify(baseline)));
   const confirm = useConfirm();
-  const leave = (to: string) => {
-    if (!dirty) return navigate(to);
+  const leaving = useRef(false);
+  // navigate() takes a path or a history step, not a value that may be either.
+  const go = (to: string | number) => { leaving.current = true; if (typeof to === "number") navigate(to); else navigate(to); };
+  const leave = (to: string | number) => {
+    if (!dirty || leaving.current) return go(to);
     confirm.ask({ title: "Leave without saving?", action: "Leave", danger: true,
                   body: "Your changes to this job's settings are not saved. Changes you confirmed in What it ingests are already applied." })
-      .then((ok) => ok && navigate(to));
+      .then((ok) => ok && go(to));
   };
+  // The browser's Back button too: with unsaved changes a guard entry sits on top of this page's history entry, so Back
+  // lands on it and asks; staying puts the guard back, leaving goes back past it.
+  useEffect(() => {
+    if (!dirty) return;
+    window.history.pushState({ unsavedGuard: true }, "", window.location.href);
+    const back = () => {
+      if (leaving.current) return;
+      window.history.pushState({ unsavedGuard: true }, "", window.location.href);
+      leave(-2);
+    };
+    window.addEventListener("popstate", back);
+    return () => window.removeEventListener("popstate", back);
+  }, [dirty]);
   useEffect(() => {
     if (!dirty) return;
     const unload = (e: BeforeUnloadEvent) => { e.preventDefault(); };
@@ -363,8 +379,7 @@ export default function JobEdit() {
   const tablesFail = params.fail_on_table_errors === "true";
   return (
     <>
-      <PageHead crumb={<span className="eyebrow"><Link to="/overview">Overview</Link> · <Link to="/ingestion-jobs">Ingestion jobs</Link> ·{" "}
-          <Link to={`/ingestion-jobs/${id}`}>{schedule?.name ?? "Ingestion job"}</Link></span>}
+      <PageHead crumb={<Crumbs steps={[["Ingestion jobs", "/ingestion-jobs"], [schedule?.name ?? "Ingestion job", `/ingestion-jobs/${id}`], ["Edit"]]} />}
         title={`Edit ${schedule?.name ?? "ingestion job"}`}
         lead={settings.data && <><strong>{fmtInt(settings.data.tables)}</strong> {plural(settings.data.tables, "table")} in{" "}
           <strong>{fmtInt(settings.data.groups.length)}</strong> {plural(settings.data.groups.length, "group")}.</>}
@@ -391,7 +406,7 @@ export default function JobEdit() {
 
       {s && <Section title="How it writes" note="For every table of the job.">
         <div className="form-grid">
-          <label>Fan in<select value={w.fan_in === undefined || w.fan_in === null ? "" : String(w.fan_in)} onChange={(e) => setW({ ...w, fan_in: e.target.value === "true" })}>
+          <label>Fan-in<select value={w.fan_in === undefined || w.fan_in === null ? "" : String(w.fan_in)} onChange={(e) => setW({ ...w, fan_in: e.target.value === "true" })}>
             {w.fan_in == null && <option value="">choose</option>}
             <option value="true">Yes: shared tables</option><option value="false">No: own tables</option></select>
             <span className="help">With fan-in, each database writes only its own rows of a shared table.</span><Mixed s={s.fan_in} /></label>

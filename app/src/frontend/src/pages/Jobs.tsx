@@ -1,11 +1,22 @@
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, type Row } from "../api";
-import { Badge, ConfirmButton, ErrorBox, Grid, Metric, Notice, Section, autoColumns, statusName } from "../components";
+import { Tip, OutLink, PageHead, Stamp, readAt, Badge, ConfirmButton, ErrorBox, Grid, Metric, Notice, Section, autoColumns, statusName } from "../components";
 import { usePermissions } from "../permissions";
 import { useSettings } from "../App";
 
 interface IngestJob { job: Row; active: Row[]; recent: Row[] }
+
+/** A Quartz schedule in words for its common shapes, as Job details shows a schedule; the cron itself is on hover. */
+function cronWords(cron: string): string {
+  const [sec, min, hour, day, month, weekday] = cron.trim().split(/\s+/);
+  const plain = sec === "0" && day === "*" && month === "*" && (weekday === "?" || weekday === "*");
+  const every = /^(?:0\/|\*\/)(\d+)$/.exec(min ?? "");
+  if (plain && every && hour === "*") return `Every ${every[1]} minutes`;
+  if (plain && /^\d+$/.test(min) && hour === "*") return min === "0" ? "Every hour, on the hour" : `Every hour at :${min.padStart(2, "0")}`;
+  if (plain && /^\d+$/.test(min) && /^\d+$/.test(hour)) return `Every day at ${hour.padStart(2, "0")}:${min.padStart(2, "0")}`;
+  return `Cron: ${cron}`;
+}
 
 export default function Jobs() {
   const qc = useQueryClient();
@@ -24,20 +35,21 @@ export default function Jobs() {
   const j = job.data?.job;
   const refusals = usePermissions().data?.run;
   const { config } = useSettings();
-  const linkCol = { cellRenderer: (p: any) => p.value ? <a href={p.value} target="_blank" rel="noreferrer">open</a> : null };
+  const linkCol = { cellRenderer: (p: any) => p.value ? <OutLink href={p.value}>View run</OutLink> : null };
   const stateCols = { state: { cellRenderer: (p: any) => <Badge value={p.value} /> }, result: { cellRenderer: (p: any) => <Badge value={p.value} /> }, url: linkCol };
   const coll = collection || collections.data?.[0] || "";
   const par = parallelism === "" ? Number(j?.parameters?.parallelism || 32) : parallelism;
   return (
     <>
-      <h1>Databricks jobs</h1>
-      <p className="muted">The bundle-deployed Databricks job that ingests one ingestion group a run, and the schema setup job. Ingestion jobs (schedules and their groups) are on the Overview and Ingestion jobs.</p>
+      <PageHead title="Databricks jobs" lead="The Databricks job that ingests one ingestion group a run, and the schema setup job."
+        right={<Stamp at={readAt(job)} every={15} error={job.error} />} />
       <ErrorBox error={job.error || post.error} />
       {message && <Notice tone="ok">{message}</Notice>}
       {j && (
         <Section title={j.name} actions={<a href={j.url} target="_blank" rel="noreferrer">Open in Jobs</a>}>
           <div className="metrics">
-            <Metric label="Schedule" value={j.schedule ?? "none"} />
+            <Metric label="Schedule" value={j.schedule ? <Tip focusable text={`Cron syntax: ${j.schedule}${j.timezone ? ` (${j.timezone})` : ""}`}>
+              {cronWords(j.schedule)}</Tip> : "None"} />
             <Metric label="Schedule status" value={j.schedule_status ? statusName(j.schedule_status) : "–"} />
             <Metric label="Scheduled ingestion group" value={j.default_task_collection ?? "–"} />
           </div>

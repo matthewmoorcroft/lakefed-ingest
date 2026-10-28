@@ -47,5 +47,7 @@ export interface Config {
   lakebase_database: string;
   user: string;
   jobs: { ingest?: string; setup?: string; discover?: string };
+  /** The workspace's address, for links to a run or a cluster; empty when unknown. */
+  workspace_url?: string;
   defaults: { partition_threshold_mb: number; partition_size_mb: number };
 }

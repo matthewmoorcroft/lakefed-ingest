@@ -42,7 +42,7 @@ export default function IngestionJobs() {
         <input type="search" className="search-wide" placeholder="Search jobs and groups" value={search}
           onChange={(e) => { setOffset(0); setSearch(e.target.value); }} />
       </div>
-      <Section title="Jobs" actions={<StateKey />}>
+      <Section title={null} actions={<StateKey />}>
         {jobs.data && <JobsTable jobs={jobs.data.jobs} notInJob={offset + PAGE >= jobs.data.total ? jobs.data.not_in_job : null}
           total={jobs.data.total} offset={offset} limit={PAGE} onPage={setOffset} fill
           sort={sort} onSort={(next) => { setOffset(0); setSort(next); }} />}

@@ -1,5 +1,5 @@
 import { createContext, useContext } from "react";
-import { NavLink, Navigate, Route, Routes } from "react-router-dom";
+import { NavLink, Navigate, Route, Routes, useLocation } from "react-router-dom";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, type Config } from "./api";
 import { Menu } from "./components";
@@ -33,9 +33,13 @@ const NAV = [
               ["/bulk", "Bulk import"], ["/import", "Import CSV"], ["/changes", "Changes"]]],
 ] as const;
 
+// Pages under an ingestion job keep Ingestion jobs selected, as the workspace keeps a job's section selected on its pages.
+const UNDER = { "/ingestion-jobs": ["/ingestion-jobs", "/collections"] } as Record<string, string[]>;
+
 export default function App() {
   const config = useQuery({ queryKey: ["config"], queryFn: () => api.get<Config>("/config") });
   const qc = useQueryClient();
+  const { pathname } = useLocation();
   return (
     <SettingsContext.Provider value={{ config: config.data }}>
       <div className="layout">
@@ -46,7 +50,8 @@ export default function App() {
               <div key={group}>
                 <div className="nav-group">{group}</div>
                 {links.map(([to, label]) => (
-                  <NavLink key={to} to={to} className={({ isActive }) => (isActive ? "active" : "")}>{label}</NavLink>
+                  <NavLink key={to} to={to} className={({ isActive }) =>
+                    (isActive || (UNDER[to] ?? []).some((p) => pathname.startsWith(p)) ? "active" : "")}>{label}</NavLink>
                 ))}
               </div>
             ))}
@@ -92,9 +97,10 @@ export default function App() {
     they are and which Lakebase database this app reads. */
 function UserMenu({ config }: { config?: Config }) {
   const user = config?.user ?? "";
-  const initials = user.split("@")[0].split(/[._-]/).filter(Boolean).slice(0, 2).map((part) => part[0].toUpperCase()).join("") || "?";
+  // Blank until the user is known, so the first paint never shows a placeholder as if it were someone.
+  const initials = user.split("@")[0].split(/[._-]/).filter(Boolean).slice(0, 2).map((part) => part[0].toUpperCase()).join("");
   return (
-    <Menu label={initials} buttonClass="avatar" title={user || "Signed in"}>
+    <Menu label={initials} buttonClass="avatar" title={user || "Your account"}>
       <div className="menu-note"><div className="muted small">Signed in as</div><div>{user || "unknown"}</div></div>
       {config && <div className="menu-note"><div className="muted small">Lakebase</div>
         <div className="mono">{config.lakebase_instance}</div><div className="mono">{config.lakebase_database}</div></div>}

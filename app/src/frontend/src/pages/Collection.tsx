@@ -1,8 +1,8 @@
 import { useQuery } from "@tanstack/react-query";
 import { Link, useParams } from "react-router-dom";
 import { api, type Row } from "../api";
-import {
-  ErrorBox, FillBox, PageHead, ProgressBar, ProgressKey, Section, Stamp, StateBar, StateKey, Tag, databasePath,
+import { valueName,
+  Crumbs, ErrorBox, FillBox, PageHead, ProgressBar, ProgressKey, Section, Stamp, StateBar, StateKey, Tag, databasePath,
   fmtAgo, fmtClock, fmtDuration, fmtInt, progressOf, progressText, type Progress, plural
 } from "../components";
 
@@ -39,9 +39,10 @@ export default function CollectionPage() {
   const unattributed = (data.data?.batches ?? []).filter((b) => (b.keys ?? []).length !== 1);
   return (
     <>
-      <PageHead crumb={<span className="eyebrow"><Link to="/overview">Overview</Link> ·{" "}
-        {(data.data?.jobs ?? []).map((j) => <span key={j.id}><Link to={`/ingestion-jobs/${j.id}`}>{j.name}</Link> · </span>)}
-        {data.data && !data.data.jobs?.length && <><Link to="/ingestion-jobs">Not in any job</Link> · </>}Ingestion group</span>} title={name}
+      <PageHead crumb={<Crumbs steps={[["Ingestion jobs", "/ingestion-jobs"],
+          ...(data.data?.jobs?.length ? (data.data.jobs as Row[]).map((j): [string, string] => [j.name, `/ingestion-jobs/${j.id}`])
+            : data.data ? [["Not in any job", "/ingestion-jobs/not-in-job"] as [string, string]] : []),
+          ["Ingestion group"]]} />} title={name}
         lead={<><strong>{fmtInt(dbs.length)}</strong> {plural(dbs.length, "database")}, <strong>{fmtInt(tables)}</strong> enabled {plural(tables, "table")}
           {servers.length ? <> on <strong>{servers.join(", ")}</strong></> : null}.{" "}
           <Link to={`/tables?collection=${encodeURIComponent(name)}`}>Its tables</Link> ·{" "}
@@ -112,8 +113,8 @@ export default function CollectionPage() {
 
 const SETTING_LABELS: Record<string, string> = {
   src_type: "Source type", use_remote_query: "Read through the UC connection", load_type: "Load type",
-  write_mode: "Write mode", fan_in: "Fan in to shared tables", sink_catalog: "Sink catalog", sink_schema: "Sink schema",
-  sink_table: "Sink table", freshness_sla_minutes: "Freshness target (minutes)", jdbc_options: "Read options",
+  write_mode: "Write mode", fan_in: "Fan-in to shared tables", sink_catalog: "Target catalog", sink_schema: "Target schema",
+  sink_table: "Target table", freshness_sla_minutes: "Freshness target (minutes)", jdbc_options: "Read options",
 };
 
 /** The group's settings as its rows share them (no table of groups), and its tables as the import CSV. */
@@ -136,7 +137,8 @@ function GroupSettings({ name }: { name: string }) {
             <tr key={s.setting}>
               <td>{SETTING_LABELS[s.setting] ?? s.setting}</td>
               <td>{s.mixed ? <>mixed: {Object.entries(s.mixed as Record<string, number>).map(([v, n]) =>
-                `${v || "blank"} (${fmtInt(n)} ${plural(n, "table")})`).join(", ")}</> : show(s.value)}</td>
+                `${valueName(s.setting, v) || "blank"} (${fmtInt(n)} ${plural(n, "table")})`).join(", ")}</>
+                : show(typeof s.value === "string" ? valueName(s.setting, s.value) : s.value)}</td>
             </tr>
           ))}
         </tbody>
