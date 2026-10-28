@@ -520,13 +520,13 @@ function Compute({ jobId }: { jobId: string }) {
           <h4>{job.role === "check" ? "Check job" : "Ingestion job"} <span className="muted mono">{job.name ?? job.job_id}</span></h4>
           {job.error && <p className="muted">{job.error}</p>}
           <table className="data">
-            <thead><tr><th>Task</th><th>Setting</th><th>Value</th><th>Set by</th><th>Our tests ran</th></tr></thead>
+            <thead><tr><th>Task</th><th>Setting</th><th>Value</th><th>Set by</th></tr></thead>
             <tbody>
               {job.compute.map((task: Row) => task.fields.map((f: Row, i: number) => (
                 <tr key={`${task.task}-${f.name}`}>
                   <td>{i === 0 ? <><b>{task.task}</b> <span className="muted">{task.kind}</span></> : ""}</td>
                   <td>{f.name}</td><td className="mono">{f.value}</td>
-                  <td className="muted">{f.source}</td><td className="muted">{f.tested ?? ""}</td>
+                  <td className="muted">{f.source}</td>
                 </tr>
               )))}
             </tbody>

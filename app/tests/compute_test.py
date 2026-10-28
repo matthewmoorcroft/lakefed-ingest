@@ -18,13 +18,13 @@ def _fields(entry):
     return {f["name"]: f for f in entry["fields"]}
 
 
-def test_a_job_cluster_lists_its_settings_each_with_its_source_and_the_tested_default():
+def test_a_job_cluster_lists_its_settings_each_with_its_source():
     [entry] = compute.describe(INGEST)
     assert (entry["task"], entry["kind"], entry["cluster"]) == ("ingest", "job cluster", "sweep_cluster")
     fields = _fields(entry)
     assert fields["Driver node type"]["value"] == "Standard_D16ds_v5"
     assert fields["Driver node type"]["source"] == "bundle variable driver_node_type_id (databricks.yml)"
-    assert fields["Driver node type"]["tested"] == "Standard_D16ds_v5 (the 100,000-table lab runs)"
+    assert "tested" not in fields["Driver node type"]
     assert fields["Workers"]["value"] == "1"
     assert fields["Workers"]["source"] == "bundle variable num_workers (databricks.yml)"
     assert fields["Runtime"]["source"] == "resources/lakefed_ingest.yml"
