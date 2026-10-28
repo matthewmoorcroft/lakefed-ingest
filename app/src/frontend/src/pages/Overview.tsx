@@ -47,7 +47,7 @@ export function JobsTable({ jobs, notInJob, total, offset, limit, onPage, link, 
   const who = (by: unknown, at: unknown) => <>{by ? <span title={String(by)}>{String(by).split("@")[0]}</span> : <span className="muted">unknown</span>}
     {at ? <span className="sub" title={fmtTime(at)}>{fmtShort(at)}</span> : null}</>;
   const table = (
-      <div className="table-wrap"><table className="data">
+      <div className="table-wrap"><table className={audit ? "data fit" : "data"}>
         <thead><tr><th>Ingestion job</th><th className="num">Groups</th>{!audit && <th className="num">Databases</th>}
           <th className="num">Tables</th><th>State now</th><th className="num">Failing</th><th className="num">Late</th>
           <th>Last job run</th><th>Status</th>

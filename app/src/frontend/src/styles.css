@@ -234,6 +234,9 @@ table.data td.name { min-width: 140px; }
 /* A long job name wraps at a set width, so the list's columns fit a 1,280 px window as the Jobs list does. */
 table.data td.name.capped { max-width: 240px; }
 input.search-wide { width: 280px; }
+table.data.fit .status-cell { min-width: 0; }
+table.data.fit .bar { min-width: 80px; }
+table.data.fit th, table.data.fit td { padding-left: 6px; padding-right: 6px; }
 table.data td.mono { white-space: nowrap; }
 .pager { display: flex; align-items: center; justify-content: space-between; gap: var(--db-space-3); flex-wrap: wrap; margin: var(--db-space-2) 0; }
 .pager-buttons { display: inline-flex; gap: var(--db-space-2); }

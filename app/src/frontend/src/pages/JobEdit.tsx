@@ -267,16 +267,20 @@ export default function JobEdit() {
   const [name, setName] = useState("");
   const [params, setParams] = useState<Record<string, string>>({});
   const [addOpen, setAddOpen] = useState(false);
+  // The settings form as it loaded, so "unsaved" means the user changed something, not that a default differs.
+  const [loaded, setLoaded] = useState("");
   const locked: Locked = usePermissions().data?.jobs[id]?.change ?? null;
 
   useEffect(() => {
     if (!s) return;
-    setW({ fan_in: value(s.fan_in), write_mode_changes: value(s.write_mode_changes), write_mode_full: value(s.write_mode_full),
+    const form = { fan_in: value(s.fan_in), write_mode_changes: value(s.write_mode_changes), write_mode_full: value(s.write_mode_full),
       freshness_sla_minutes: value(s.freshness_sla_minutes) ?? "", sink_catalog: value(s.sink_catalog) ?? "",
       sink_schema: value(s.sink_schema) ?? "", sink_table: value(s.sink_table) ?? "", lowercase: value(s.lowercase) ?? true,
-      client_id: value(s.client_id) ?? "{database}" });
-    setIdentity(Object.entries((value(s.identity) as Record<string, string>) ?? {}));
-    setDiffering(Object.fromEntries((settings.data?.identity_differs ?? []).map((name: string) => [name, ""])));
+      client_id: value(s.client_id) ?? "{database}" };
+    const ident = Object.entries((value(s.identity) as Record<string, string>) ?? {});
+    const differs = Object.fromEntries((settings.data?.identity_differs ?? []).map((name: string) => [name, ""]));
+    setW(form); setIdentity(ident); setDiffering(differs);
+    setLoaded(JSON.stringify({ w: form, identity: ident, differing: differs }));
   }, [settings.data]);
   const baseline = useMemo(() => (schedule ? scheduleForm(schedule) : null), [schedule?.id, schedule?.updated_at]);
   useEffect(() => {
@@ -330,7 +334,7 @@ export default function JobEdit() {
 
   // As the Databricks editors do: Save only with something to save, a sign of unsaved changes, and a question before
   // leaving with them (a link in the app, or closing the tab).
-  const dirty = !!s && (Object.keys(changed()).length > 0
+  const dirty = !!s && (JSON.stringify({ w, identity, differing }) !== loaded
     || (!!baseline && JSON.stringify({ run, params, name }) !== JSON.stringify(baseline)));
   const confirm = useConfirm();
   const leave = (to: string) => {

@@ -52,7 +52,7 @@ export default function Runs() {
   const running = list.filter((r) => r.outcome?.label === "Running");
   // As the Databricks Runs list: a paused job's triggers that did not run are not finished runs; they show as one line.
   const pausedSlots = list.filter(pausedNotRun);
-  const finished = list.filter((r) => r.outcome?.label !== "Running" && !pausedNotRun(r));
+  const finished = list.filter((r) => r.outcome?.label !== "Running" && (outcome === "Not run" || !pausedNotRun(r)));
   const withFailed = finished.filter((r) => Number(r.failed_tables) > 0);
   const oldest = finished.length ? finished[finished.length - 1].slot : null;
   const choose = (value: string) => { setPages([]); setOutcome(""); setParams(value ? { job: value } : {}); };
@@ -97,7 +97,7 @@ export default function Runs() {
               <button className="ghost" disabled={!d?.next_before} onClick={() => setPages([...pages, d!.next_before])}>Older</button>
             </span>}>
             {d && <JobRunsTable runs={finished} showJob />}
-            {pausedSlots.length > 0 && <p className="muted small">Not listed: {fmtInt(pausedSlots.length)}{" "}
+            {pausedSlots.length > 0 && outcome !== "Not run" && <p className="muted small">Not listed: {fmtInt(pausedSlots.length)}{" "}
               {plural(pausedSlots.length, "trigger")} of paused jobs that did not run.</p>}
           </Section>
         </>
