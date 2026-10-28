@@ -517,7 +517,7 @@ export function Name({ children }: { children: unknown }) {
 
 /** A menu behind a button, as the Databricks UI keeps a job's less common and destructive actions (the kebab) and the
     user's details (the avatar). It closes on a click outside or Escape. */
-export function Menu({ label, title, buttonClass = "ghost kebab", children }: { label: ReactNode; title: string;
+export function Menu({ label, title, buttonClass = "kebab", children }: { label: ReactNode; title: string;
                      buttonClass?: string; children: ReactNode }) {
   const [open, setOpen] = useState(false);
   const box = useRef<HTMLSpanElement>(null);

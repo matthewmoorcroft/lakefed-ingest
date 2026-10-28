@@ -277,5 +277,5 @@ details.advanced .compute h4 { margin: var(--db-space-3) 0 var(--db-space-2); }
 .menu-note + .menu-note { border-top: 1px solid var(--border); }
 button.avatar { width: 32px; height: 32px; padding: 0; border-radius: 50%; border: 0; background: var(--db-color-action-primary-background-default, #2272b4);
   color: #fff; font-weight: var(--db-font-weight-semibold); font-size: var(--db-font-size-sm); }
-button.kebab { padding: 0 8px; font-size: 18px; line-height: 1; }
+button.kebab { width: 32px; padding: 0; font-size: 18px; line-height: 1; }
 button.th-sort { border: 0; background: transparent; padding: 0; font: inherit; color: inherit; cursor: pointer; }
