@@ -501,3 +501,10 @@ def test_the_edit_view_follows_the_copies_run_and_syncs_the_wrappers_once_it_has
     body = api.get(f"/api/ingestion-jobs/{sid}/cluster").json()
     assert body["applying"] is None and body["copy_job_id"] == 4242 and synced == [sid]
     assert "cluster_copy_run_id" not in sch.options_of(api.store.schedules[sid])
+
+
+def test_a_save_without_options_keeps_the_jobs_start_time(api):
+    daily = dict(BODY, cadence_minutes=1440, paused=True)
+    sid = api.post("/api/schedules", json=dict(daily, options={"start_minute": 150})).json()["id"]
+    assert api.post(f"/api/schedules/{sid}", json=daily).status_code == 200
+    assert sch.options_of(api.store.schedules[sid])["start_minute"] == 150

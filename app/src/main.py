@@ -1814,6 +1814,7 @@ def update_schedule(sid: int, body: ScheduleBody, request: Request):
     """Edit a schedule: fields, and members added or removed. Offsets are recomputed; jobs are synced. A change to its
     own cluster starts the copies job, which makes, updates or deletes its copy of the ingestion job."""
     import psycopg
+    sent_options = "options" in body.model_fields_set   # read first: assigning body.options marks it as sent
     body.options = _requested_options(body)
     _validate_schedule(body)
     _refuse_unknown_node_types(sch.own_cluster(body.model_dump()))
@@ -1828,9 +1829,9 @@ def update_schedule(sid: int, body: ScheduleBody, request: Request):
     new = body.model_dump()
     new["notify_emails"] = new["notify_emails"] or None
     new["job_variant"] = new["job_variant"] or "default"
-    # A body without options (an older page) keeps the stored ones; an explicit {} clears them.
-    new["options"] = (new["options"] or None) if "options" in body.model_fields_set else s.get("options")
     stored = sch.options_of(s)
+    # A body without options (an older page) keeps the stored ones; an explicit {} clears them.
+    new["options"] = (new["options"] or None) if sent_options else (stored or None)
     kept = {k: stored[k] for k in MANAGED_OPTIONS if k in stored}
     if kept:
         new["options"] = {**(new["options"] or {}), **kept}
