@@ -549,7 +549,7 @@ function ClusterFields({ info, error, cluster, setCluster, locked }: { info?: Ro
   // the Databricks job's own first and marked as the default.
   const typeSelect = (key: "driver_node_type_id" | "node_type_id") => {
     const value = String(cluster[key] ?? "");
-    const label = (t: Row) => `${t.id}, ${t.memory_gb} GB memory, ${t.cores} cores${t.id === d[key] ? " (default)" : ""}`;
+    const label = (t: Row) => `${t.id}${t.id === d[key] ? " (default)" : ""} · ${t.memory_gb} GB, ${t.cores} cores`;
     const ordered = [...types.filter((t) => t.id === d[key]), ...types.filter((t) => t.id !== d[key])];
     return (
       <select value={value} disabled={off} onChange={(e) => setCluster({ ...cluster, [key]: e.target.value })}>
