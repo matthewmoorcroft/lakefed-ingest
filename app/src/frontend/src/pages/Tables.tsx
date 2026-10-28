@@ -5,6 +5,7 @@ import { type ColDef } from "ag-grid-community";
 import { api, qs, type Row } from "../api";
 import { Badge, ConfirmButton, ErrorBox, Grid, Notice, Section, autoColumns, fmtInt, plural } from "../components";
 import { EditBulk, EditOne } from "./EditTables";
+import { groupsRefusal, usePermissions } from "../permissions";
 
 /** Each table's freshness target right after whether it is enabled, so it reads with the table, not off to the right. */
 function targetAfterEnabled(columns: ColDef[]): ColDef[] {
@@ -42,6 +43,7 @@ export default function Tables() {
     },
   });
   const ids = selected.map((r) => Number(r.id));
+  const locked = groupsRefusal(usePermissions().data, selected.map((r) => r.task_collection));
   return (
     <>
       <h1>Tables</h1>
@@ -69,18 +71,19 @@ export default function Tables() {
           <button className="ghost" disabled={!tables.data?.next_after} onClick={() => setPages([...pages, JSON.stringify(tables.data!.next_after)])}>Next</button>
           {ids.length > 0 && <>
           <span className="muted">{ids.length} selected</span>
-          <button className="primary" onClick={() => setEditing(ids.length === 1 ? "one" : "bulk")}>
+          <button className="primary" disabled={!!locked} title={locked ?? undefined} onClick={() => setEditing(ids.length === 1 ? "one" : "bulk")}>
             {ids.length === 1 ? "Edit" : "Bulk edit"}
           </button>
-          <ConfirmButton label="Enable" onConfirm={() => act.mutateAsync({ path: "/tables/enable", body: { ids, enabled: true } })} />
-          <ConfirmButton label="Disable" onConfirm={() => act.mutateAsync({ path: "/tables/enable", body: { ids, enabled: false } })} />
-          <ConfirmButton label="Force reseed" danger
+          <ConfirmButton label="Enable" disabled={!!locked} onConfirm={() => act.mutateAsync({ path: "/tables/enable", body: { ids, enabled: true } })} />
+          <ConfirmButton label="Disable" disabled={!!locked} onConfirm={() => act.mutateAsync({ path: "/tables/enable", body: { ids, enabled: false } })} />
+          <ConfirmButton label="Force reseed" danger disabled={!!locked}
             onConfirm={() => act.mutateAsync({ path: "/tables/reseed", body: { ids } })} />
           </>}
         </>}>
         <p className="muted small">Select one row to edit it, or several to bulk edit, enable, disable, or force a reseed
           (the next run copies them again). Changes are refused while the table's ingestion group is running. 100 tables a page,
           by ingestion group, database and table; selections are per page.</p>
+        {locked && <p className="muted small">Edit, Enable, Disable and Force reseed: {locked}.</p>}
         <Grid rows={tables.data?.tables} selection="multiple" onSelect={setSelected} getRowId={(r) => String(r.id)}
           columns={targetAfterEnabled(autoColumns(tables.data?.tables ?? [], {
             task_collection: { headerName: "Ingestion group" },

@@ -56,7 +56,7 @@ default collection. Schedules in the app fill that gap; the app shows each sched
   longer than the strictest `freshness_sla_minutes` among the collection's tables.
 
 Permissions: the app's service principal owns the wrapper jobs it creates (creating jobs needs no extra
-entitlement, and `run_job` tasks need no compute) and already has `CAN_MANAGE_RUN` on the ingestion job.
+entitlement, and `run_job` tasks need no compute) and already has `CAN_MANAGE` on the ingestion job.
 The group in `SCHEDULE_JOB_VIEW_GROUP` (default `users`; blank for owner and admins only) gets
 `CAN_VIEW` on them. For more ingestion jobs (e.g. a larger cluster), add an app `job` resource and an
 `INGEST_JOB_ID_<NAME>` environment variable; schedules can then pick that variant.
@@ -121,15 +121,24 @@ Databricks Apps builds the frontend at deploy time (`npm install`, then `npm run
 
 The app runs as its own service principal (created with the app):
 
-- **Jobs:** `CAN_MANAGE_RUN` on the ingestion, setup and discovery jobs, through app resources: view,
-  run and cancel, but not edit or delete.
+- **Jobs:** `CAN_MANAGE` on the ingestion, check, setup and discovery jobs, through app resources, so it can
+  read their access lists. The app never edits or deletes them.
 - **Lakebase:** granted by the `lakefed_ingest_app_grants` job:
   - `CAN_USE` on the instance (to mint its own short-lived credential);
   - a Postgres role;
   - `SELECT`, `INSERT` and `UPDATE` on the `lakefed_ingest` tables, with no `DELETE`.
-- **Who can act:** everyone with `CAN_USE` on the app acts with these privileges. Grant `CAN_USE`
-  only to operators (app permissions in the workspace UI, or a `permissions` block on the app
-  resource).
+- **Who can act:** every action on an existing ingestion job follows the signed-in user's own Databricks
+  permission on the job its runs execute as (the check job on a check schedule, else the ingestion job), as the
+  Jobs UI does:
+  - running it (Run now), or a new job that isn't paused: `CAN_MANAGE_RUN`;
+  - changing it (Edit and Save, Pause, Resume, Sync jobs), its groups' tables (edit, enable, disable, reseed,
+    Add table, Import CSV, Bulk import's register), or deleting it: `CAN_MANAGE` or owner;
+  - workspace admins may do all of these.
+
+  Running the setup or discovery job, or cancelling a run, needs `CAN_MANAGE_RUN` on that job. Groups in no
+  ingestion job, and new paused jobs, are open to everyone with `CAN_USE` on the app. The server checks every
+  call, and the pages show a refused button disabled with the reason. Permissions are read again after 20
+  seconds.
 
 The app has no Lakebase `database` resource. Some workspaces refuse to attach one even for the
 instance's manager ("User needs MANAGE permission on the resource"), and the grant job works

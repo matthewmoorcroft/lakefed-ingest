@@ -4,6 +4,7 @@ import { AgGridReact } from "ag-grid-react";
 import { type ColDef } from "ag-grid-community";
 import { api, type Row } from "../api";
 import { useSettings } from "../App";
+import { groupsRefusal, usePermissions } from "../permissions";
 import { Badge, ConfirmButton, ErrorBox, FillBox, Grid, Notice, PageHead, Section, Tag, autoColumns, fmtAgo, fmtInt, fmtTime, gridTheme, Host, plural } from "../components";
 
 const EDITABLE = ["include", "load_type", "primary_key", "cursor_column", "load_partitioned", "partition_col",
@@ -80,6 +81,7 @@ function DiscoverForm({ onStarted, prefill }: { onStarted: (id: string, runId: n
   useEffect(() => {
     if (prefill) setF((v) => ({ ...v, src_host: prefill.host ?? "", src_port: prefill.port ?? "" }));
   }, [prefill]);
+  const discoveryRefusal = usePermissions().data?.run.discovery ?? null;
   const start = useMutation({
     mutationFn: () => api.post<{ discovery_id: string; run_id: number; databases: number }>("/discoveries", {
       ...f, src_port: f.src_port ? Number(f.src_port) : null }),
@@ -99,7 +101,8 @@ function DiscoverForm({ onStarted, prefill }: { onStarted: (id: string, runId: n
         <label className="wide">Databases * (comma- or newline-separated)
           <textarea required rows={3} value={f.databases} onChange={(e) => setF({ ...f, databases: e.target.value })} />
         </label>
-        <div className="wide"><button className="primary" disabled={start.isPending}>{start.isPending ? "Starting…" : "Discover"}</button></div>
+        {discoveryRefusal && <p className="wide muted small">Discover: {discoveryRefusal}.</p>}
+        <div className="wide"><button className="primary" disabled={start.isPending || !!discoveryRefusal}>{start.isPending ? "Starting…" : "Discover"}</button></div>
       </form>
       <ErrorBox error={start.error} />
       {start.data && <Notice tone="ok">Discovery {start.data.discovery_id} started for {start.data.databases} {plural(start.data.databases, "database")}{" "}
@@ -153,6 +156,7 @@ export default function BulkImport() {
   const progress = (dbs.data ?? []).map((d) => `${d.src_database}:${d.status}:${d.tables}`).join("|");
 
   const [collection, setCollection] = useState("");
+  const locked = groupsRefusal(usePermissions().data, [collection.trim()]);
   const [shared, setShared] = useState<Shared>({
     sink_catalog: "main", sink_schema: "bronze_{database}", sink_table: "{table}", client_id: "", freshness_sla_minutes: null,
     partition_threshold_mb: config?.defaults.partition_threshold_mb ?? 1024,
@@ -319,11 +323,12 @@ export default function BulkImport() {
             <button className="ghost" disabled={!nIncluded || !collection || validate.isPending} onClick={() => { register.reset(); validate.mutate(); }}>
               Validate {nIncluded} {plural(nIncluded, "table")}
             </button>
-            <ConfirmButton label={`Register ${nIncluded} ${plural(nIncluded, "table")}`} disabled={!nIncluded || !collection}
+            <ConfirmButton label={`Register ${nIncluded} ${plural(nIncluded, "table")}`} disabled={!nIncluded || !collection || !!locked}
               confirmLabel={`Confirm: register ${nIncluded} ${plural(nIncluded, "table")} in '${collection}'`}
               onConfirm={async () => { validate.reset(); await register.mutateAsync(); }} />
             {!collection && <span className="muted">Set the ingestion group first.</span>}
           </div>
+          {locked && <p className="muted small">Register: {locked}.</p>}
           <ErrorBox error={validate.error || register.error} />
           {result && (
             <>

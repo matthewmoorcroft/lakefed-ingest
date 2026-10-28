@@ -19,7 +19,7 @@ import time
 import uuid
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
-from typing import List, Optional
+from typing import Iterable, List, Optional
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, Response
@@ -439,6 +439,30 @@ def groups_not_in_job():
     return {**not_in_job, "name": "Not in any job", "groups_detail": rows}
 
 
+@app.get("/api/permissions")
+def permissions(request: Request):
+    """What the signed-in user may do, from their Databricks permissions, so each page can show a button disabled
+    with the reason (every action checks again on its own call): per ingestion job, run, change and delete; per
+    ingestion group in a job, changing its tables (groups in no job are open); and running each of the bundle's
+    jobs the app starts by hand."""
+    user = _user(request)
+    schedules = db.query(q.schedules_sql())
+    members = db.query(q.schedule_members_sql(), ([s["id"] for s in schedules],)) if schedules else []
+    by_job = {s["id"]: _permission_refusals(s, user) for s in schedules}
+    groups: dict = {}
+    for s in schedules:
+        for m in members:
+            if m["schedule_id"] == s["id"] and m["removed_at"] is None and by_job[s["id"]]["change"]:
+                groups.setdefault(m["task_collection"],
+                                  f"these tables are in the ingestion job {s['name']}: {by_job[s['id']]['change']}")
+    bundle = {name: (_databricks_job_refusals(job_id, user)["run"] if job_id else f"no {name} job is configured")
+              for name, job_id in (("ingestion", jobs.INGEST_JOB_ID), ("setup", jobs.SETUP_JOB_ID),
+                                   ("discovery", jobs.DISCOVER_JOB_ID))}
+    return {"jobs": {str(sid): refusals for sid, refusals in by_job.items()}, "groups": groups, "run": bundle,
+            "new_running_job": {variant: _permission_refusals({"job_variant": variant}, user)["run"]
+                                for variant in jobs.schedule_variants()}}
+
+
 @app.get("/api/ingestion-jobs/{job_id}")
 def ingestion_job(job_id: int, request: Request):
     """One ingestion job's details: its schedule and members (wrapper jobs, next start), its tables by
@@ -485,7 +509,7 @@ def ingestion_job(job_id: int, request: Request):
             # For the Run now button: why it can't start now (None when it can), and what one run starts.
             "run_now": {"blocked": refusals["run"] or _run_now_blocker(job, mine),
                         "groups": len(mine), "check": job.get("job_variant") == sch.CHECK_VARIANT},
-            "delete_blocked": refusals["delete"]}
+            "delete_blocked": refusals["delete"], "change_blocked": refusals["change"]}
 
 
 def _job_groups(job_id: int) -> List[str]:
@@ -506,14 +530,15 @@ def _lock_job(cur, job_id: int) -> List[str]:
 
 def _started_job(job: dict) -> Optional[str]:
     """The Databricks job an ingestion job's runs execute as: the check job on a check schedule, else its variant's
-    ingestion job. Run now and Delete follow the signed-in user's permission on it."""
+    ingestion job. Every action on the ingestion job follows the signed-in user's permission on it."""
     if (job.get("job_variant") or "default") == sch.CHECK_VARIANT:
         return jobs.CHECK_JOB_ID
     return jobs.ingest_variants().get(job.get("job_variant") or "default")
 
 
 def _permission_refusals(job: dict, user: str) -> dict:
-    """{action: why the user may not take it, or None} for Run now and Delete, from their Databricks permission."""
+    """{action: why the user may not take it, or None} for each action on an ingestion job (run, change, delete),
+    from their Databricks permission on the job its runs execute as."""
     started = _started_job(job)
     if not started:
         # An orphaned job (its variant no longer configured) has no Databricks job to ask; admins may clean it up.
@@ -522,13 +547,57 @@ def _permission_refusals(job: dict, user: str) -> dict:
             admin = "admins" in jobs.user_groups(user)
         except Exception:
             admin = False
-        return {"run": reason, "delete": None if admin else f"{reason}, so only a workspace admin can delete it"}
+        admin_only = None if admin else f"{reason}, so only a workspace admin can change or delete it"
+        return {"run": reason, "change": admin_only, "delete": admin_only}
+    refusals = _databricks_job_refusals(started, user)
+    return {action: refusals[action] for action in jobs.ACTION_NEEDS}
+
+
+def _databricks_job_refusals(job_id, user: str) -> dict:
+    """{action: why the user may not take it on this Databricks job, or None}."""
+    label = f"the Databricks job {job_id}"
     try:
-        level = jobs.user_job_permission(started, user)
+        level = jobs.user_job_permission(job_id, user)
     except Exception as e:  # shown on the page and refused; Databricks decides, so no answer means no
-        reason = f"can't read your permission on the Databricks job {started}: {str(e).split('. ')[0]}"
-        return {"run": reason, "delete": reason}
-    return {action: jobs.action_refusal(action, level, f"the Databricks job {started}") for action in ("run", "delete")}
+        reason = f"can't read your permission on {label}: {str(e).split('. ')[0]}"
+        return {action: reason for action in jobs.ACTION_NEEDS}
+    return {action: jobs.action_refusal(action, level, label) for action in jobs.ACTION_NEEDS}
+
+
+def _refuse(refusal: Optional[str]) -> None:
+    if refusal:
+        raise HTTPException(403, refusal)
+
+
+def _refuse_job(job: dict, request: Request, action: str) -> None:
+    """Refuse the call unless the signed-in user may take this action on the ingestion job."""
+    _refuse(_permission_refusals(job, _user(request))[action])
+
+
+def _refuse_run_of(job_id, request: Request) -> None:
+    """Refuse starting (or cancelling) a run of one of the bundle's Databricks jobs without Can Manage Run on it."""
+    _refuse(_databricks_job_refusals(job_id, _user(request))["run"])
+
+
+def _groups_refusal(groups: Iterable[str], user: str) -> Optional[str]:
+    """Why the user may not change tables of these ingestion groups, or None: every ingestion job holding one of them
+    needs their Can Manage. Groups in no job are open, as anyone may set up a new job. Read fresh, not shared."""
+    wanted = {g for g in groups if g}
+    if not wanted:
+        return None
+    schedules = db.query(q.schedules_sql())
+    members = db.query(q.schedule_members_sql(), ([s["id"] for s in schedules],)) if schedules else []
+    holding = {m["schedule_id"] for m in members if m["removed_at"] is None and m["task_collection"] in wanted}
+    for s in schedules:
+        if s["id"] in holding:
+            refusal = _permission_refusals(s, user)["change"]
+            if refusal:
+                return f"these tables are in the ingestion job {s['name']}: {refusal}"
+    return None
+
+
+def _refuse_groups(groups: Iterable[str], request: Request) -> None:
+    _refuse(_groups_refusal(groups, _user(request)))
 
 
 def _run_now_blocker(job: dict, members: List[dict]) -> Optional[str]:
@@ -546,9 +615,7 @@ def run_ingestion_job(job_id: int, request: Request):
     """Start one run of an ingestion job by hand, as its schedule would: its wrapper jobs (one per group, or a check
     schedule's one wrapper, which starts the check job over every group). Refused while a run of it is going."""
     job, members = _load_schedule(job_id)
-    refusal = _permission_refusals(job, _user(request))["run"]
-    if refusal:
-        raise HTTPException(403, refusal)
+    _refuse_job(job, request, "run")
     members = [m for m in members if m.get("removed_at") is None]
     blocker = _run_now_blocker(job, members)
     if blocker:
@@ -621,6 +688,7 @@ def edit_ingestion_job_settings(job_id: int, body: JobSettingsRequest, request: 
     if body.dry_run:
         with _snapshot() as fetch:
             return checked(fetch, groups)[1]
+    _refuse_job(_load_schedule(job_id)[0], request, "change")
     try:
         with db.transaction() as cur:
             groups = _lock_job(cur, job_id)
@@ -696,6 +764,7 @@ def _job_row_ids(cur, groups, scope: JobScope) -> List[int]:
 def enable_job_tables(job_id: int, body: JobEnableRequest, request: Request):
     """Enable or disable a job's tables on a server, in a database, or one table in every database."""
     _job_groups(job_id)
+    _refuse_job(_load_schedule(job_id)[0], request, "change")
     batch = uuid.uuid4().hex[:12]
     with db.transaction() as cur:
         groups = _lock_job(cur, job_id)
@@ -730,6 +799,8 @@ def edit_job_table(job_id: int, body: JobTableEditRequest, request: Request):
         raise HTTPException(400, f"give schema and table, and change only {', '.join(JOB_TABLE_FIELDS)}"
                                  + (f" (not {', '.join(bad)})" if bad else ""))
     _job_groups(job_id)
+    if not body.dry_run:
+        _refuse_job(_load_schedule(job_id)[0], request, "change")
     with db.transaction() as cur:
         groups = _lock_job(cur, job_id)
         ids = _job_row_ids(cur, groups, body) if groups else []
@@ -786,6 +857,7 @@ def add_job_databases(job_id: int, body: JobDatabasesRequest, request: Request):
     if body.dry_run:
         plan, summary = planned(db.query(q.groups_control_rows_sql(), (groups,)) if groups else [])
         return {"summary": summary}
+    _refuse_job(job, request, "change")
     user, batch = _user(request), uuid.uuid4().hex[:12]
     with db.transaction() as cur:
         groups = _lock_job(cur, job_id)
@@ -1068,6 +1140,7 @@ def set_enabled(body: EnableRequest, request: Request):
     batch = uuid.uuid4().hex[:12]
     with db.transaction() as cur:
         rows = _locked_rows(cur, body.ids)
+        _refuse_groups([r["task_collection"] for r in rows], request)
         _lock_collections(cur, [r["task_collection"] for r in rows])
         cur.execute(q.set_enabled_sql(), (body.enabled, body.ids))
         for r in rows:
@@ -1082,6 +1155,7 @@ def reseed(body: Ids, request: Request):
     batch = uuid.uuid4().hex[:12]
     with db.transaction() as cur:
         rows = _locked_rows(cur, body.ids)
+        _refuse_groups([r["task_collection"] for r in rows], request)
         _lock_collections(cur, [r["task_collection"] for r in rows])
         cur.execute(q.force_reseed_sql(), (body.ids,))
         n = cur.rowcount
@@ -1093,6 +1167,7 @@ def reseed(body: Ids, request: Request):
 
 @app.post("/api/tables")
 def add_table(row: dict, request: Request):
+    _refuse_groups([row.get("task_collection")], request)
     errs = q.validate_control_row(row)
     if errs:
         raise HTTPException(422, {"errors": errs})
@@ -1141,6 +1216,7 @@ def edit_tables(body: EditRequest, request: Request):
                 cur.connection.rollback()
                 return {"summary": summary, "plans": plans}
             new_coll = body.changes.get("task_collection")
+            _refuse_groups([r["task_collection"] for r in rows] + [new_coll], request)
             _lock_collections(cur, [r["task_collection"] for r in rows] + ([new_coll] if new_coll else []))
             _apply_plans(cur, rows, plans, _user(request), batch)
             summary["applied"] = True
@@ -1185,21 +1261,32 @@ class RunRequest(BaseModel):
 
 
 @app.post("/api/jobs/ingest/run")
-def run_ingest(body: RunRequest):
+def run_ingest(body: RunRequest, request: Request):
+    _refuse_run_of(_require(jobs.INGEST_JOB_ID, "ingestion"), request)
     rid = jobs.run_now(_require(jobs.INGEST_JOB_ID, "ingestion"),
                        {"task_collection": body.task_collection, "parallelism": str(body.parallelism)})
     return {"run_id": rid}
 
 
 @app.post("/api/jobs/runs/{run_id}/cancel")
-def cancel_run(run_id: int):
+def cancel_run(run_id: int, request: Request):
+    """Cancel a run of one of the app's own Databricks jobs, for a user with Can Manage Run on that job."""
+    job_id = jobs.run_state(run_id)["job_id"]
+    if str(job_id) not in {str(j) for j in _bundle_job_ids() if j}:
+        raise HTTPException(403, "the app only cancels runs of its own Databricks jobs")
+    _refuse_run_of(job_id, request)
     jobs.cancel(run_id)
     return {"cancelled": run_id}
 
 
 @app.post("/api/jobs/setup/run")
-def run_setup():
+def run_setup(request: Request):
+    _refuse_run_of(_require(jobs.SETUP_JOB_ID, "setup"), request)
     return {"run_id": jobs.run_now(_require(jobs.SETUP_JOB_ID, "setup"), {})}
+
+
+def _bundle_job_ids() -> list:
+    return [*jobs.ingest_variants().values(), jobs.CHECK_JOB_ID, jobs.SETUP_JOB_ID, jobs.DISCOVER_JOB_ID]
 
 
 # ---- bulk import --------------------------------------------------------------------------------
@@ -1216,6 +1303,7 @@ def start_discovery(body: DiscoverRequest, request: Request):
     names = q.parse_databases(body.databases)
     if not names:
         raise HTTPException(422, "at least one database is required")
+    _refuse_run_of(_require(jobs.DISCOVER_JOB_ID, "discovery"), request)
     did = uuid.uuid4().hex[:12]
     spec = {"src_type": "sqlserver", "src_host": body.src_host.strip(), "src_port": body.src_port or None,
             "databases": names, "secret_key_template": body.secret_key_template.strip(),
@@ -1290,6 +1378,7 @@ def register(discovery_id: str, body: RegisterRequest, request: Request):
         else:
             valid.append((name, row))
     if not body.dry_run and valid:
+        _refuse_groups([body.task_collection], request)
         batch = uuid.uuid4().hex[:12]
         with db.transaction() as cur:
             _lock_collections(cur, [body.task_collection])
@@ -1344,6 +1433,7 @@ def import_csv(body: ImportRequest, request: Request):
     if body.dry_run:
         plan = planned(db.query(q.collection_control_rows_sql(), (group,)))
     else:
+        _refuse_groups([group], request)
         batch = uuid.uuid4().hex[:12]
         with db.transaction() as cur:
             _lock_collections(cur, [group])
@@ -1561,6 +1651,8 @@ def create_schedule(body: ScheduleBody, request: Request):
     # A check schedule's one wrapper fires every member at once.
     body.stagger = body.stagger and body.job_variant != sch.CHECK_VARIANT
     offs = sch.offsets(body.members, body.cadence_minutes, body.stagger, sch.start_minute(body.model_dump()))
+    if not body.paused:   # anyone may set up a job, but one that runs needs the right to run what it starts
+        _refuse(_permission_refusals({"job_variant": body.job_variant}, user)["run"])
     batch = uuid.uuid4().hex[:12]
     try:
         with db.transaction() as cur:
@@ -1587,6 +1679,9 @@ def update_schedule(sid: int, body: ScheduleBody, request: Request):
     s, members = _load_schedule(sid)
     if s["deleted_at"] is not None:
         raise HTTPException(409, "schedule was deleted")
+    _refuse_job(s, request, "change")
+    if (body.job_variant or "default") != (s["job_variant"] or "default") and not body.paused:
+        _refuse(_permission_refusals({"job_variant": body.job_variant}, user)["run"])
     body.stagger = body.stagger and body.job_variant != sch.CHECK_VARIANT
     new = body.model_dump()
     new["notify_emails"] = new["notify_emails"] or None
@@ -1630,6 +1725,7 @@ def _set_paused(sid: int, paused: bool, request: Request):
     s, _ = _load_schedule(sid)
     if s["deleted_at"] is not None:
         raise HTTPException(409, "schedule was deleted")
+    _refuse_job(s, request, "change")
     if bool(s["paused"]) != paused:
         with db.transaction() as cur:
             cur.execute(q.update_schedule_sql(["paused"]), (paused, int(sid)))
@@ -1654,9 +1750,7 @@ def delete_schedule(sid: int, request: Request):
     move to Not in any job, and their tables, control rows, checkpoints and run history all stay."""
     user = _user(request)
     s, members = _load_schedule(sid)
-    refusal = _permission_refusals(s, user)["delete"]
-    if refusal:
-        raise HTTPException(403, refusal)
+    _refuse_job(s, request, "delete")
     active = [m["id"] for m in members if m["removed_at"] is None]
     with db.transaction() as cur:
         cur.execute(q.delete_schedule_sql(), (int(sid),))
@@ -1669,6 +1763,7 @@ def delete_schedule(sid: int, request: Request):
 @app.post("/api/schedules/{sid}/sync")
 def sync_schedule(sid: int, request: Request):
     """Re-sync the wrapper jobs (recreates missing ones and undoes edits made outside the app)."""
+    _refuse_job(_load_schedule(sid)[0], request, "change")
     return {"id": sid, "sync": _sync(sid, _user(request))}
 
 

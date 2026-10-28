@@ -3,6 +3,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import { api, qs, type Row } from "../api";
 import { ConfirmButton, ErrorBox, Notice, PageHead, Pager, Section, StateBar, fmtInt, plural } from "../components";
+import { usePermissions } from "../permissions";
 
 // Edit an ingestion job: what it ingests (a tree from its servers), how it writes, its identity columns, when it
 // runs and its advanced configuration. Changes in the tree apply at once; the rest is saved with Save.
@@ -10,6 +11,10 @@ import { ConfirmButton, ErrorBox, Notice, PageHead, Pager, Section, StateBar, fm
 const TAGS = "{server} {database} {schema} {table}";
 const CADENCE_LABEL = (m: number) => (m < 60 ? `${m} minutes` : m === 60 ? "hour" : m === 1440 ? "day" : `${m / 60} hours`);
 const PAGE = 25;
+
+/** Why the signed-in user may not change this job (their Databricks permission), or null when they may. */
+type Locked = string | null;
+
 const startMinute = (hhmm: string) => { const [h, m] = String(hhmm || "00:00").split(":").map(Number); return (h || 0) * 60 + (m || 0); };
 const value = (s?: Row) => (s && "value" in s ? s.value : undefined);
 const mixedText = (s?: Row) => (s?.mixed ? Object.entries(s.mixed).map(([v, n]) => `${v || "(none)"}: ${fmtInt(n)}`).join(", ") : "");
@@ -18,7 +23,7 @@ function Mixed({ s }: { s?: Row }) {
   return s?.mixed ? <span className="help">Differs between tables ({mixedText(s)}); a value here sets it for all.</span> : null;
 }
 
-function TableRows({ jobId, server, database }: { jobId: string; server: string; database: string }) {
+function TableRows({ jobId, server, database, locked }: { jobId: string; server: string; database: string; locked: Locked }) {
   const [offset, setOffset] = useState(0);
   const qc = useQueryClient();
   const tables = useQuery({
@@ -40,14 +45,15 @@ function TableRows({ jobId, server, database }: { jobId: string; server: string;
       {(tables.data?.items ?? []).map((t: Row) => (
         <tr key={t.id} className="l3">
           <td className="name">{t.schema}.{t.table}</td>
-          <td><select value={t.load_type} disabled={edit.isPending} title="Changes this table in every database of the job"
+          <td><select value={t.load_type} disabled={edit.isPending || !!locked} title={locked ?? "Changes this table in every database of the job"}
             onChange={(e) => edit.mutate({ ...t, load_type: e.target.value })}>
             <option value="ct">Change tracking</option><option value="cursor">Cursor column</option>
             <option value="full">Full reload</option></select></td>
           <td className="mono">{t.primary_key}</td>
           <td className="num">{fmtInt(t.columns)} columns</td>
           <td className="mono">{t.target}</td>
-          <td><input type="checkbox" checked={!!t.enabled} disabled={enable.isPending} onChange={() => enable.mutate(t)} /></td>
+          <td><input type="checkbox" checked={!!t.enabled} disabled={enable.isPending || !!locked} title={locked ?? undefined}
+            onChange={() => enable.mutate(t)} /></td>
           <td><StateBar row={t} /></td>
         </tr>
       ))}
@@ -59,7 +65,7 @@ function TableRows({ jobId, server, database }: { jobId: string; server: string;
   );
 }
 
-function DatabaseRows({ jobId, server }: { jobId: string; server: string }) {
+function DatabaseRows({ jobId, server, locked }: { jobId: string; server: string; locked: Locked }) {
   const [offset, setOffset] = useState(0);
   const [search, setSearch] = useState("");
   const [open, setOpen] = useState<string | null>(null);
@@ -86,11 +92,11 @@ function DatabaseRows({ jobId, server }: { jobId: string; server: string }) {
             <td></td>
             <td className="num">{fmtInt(d.tables)} {Number(d.missing) > 0 && <span className="tag warn">{fmtInt(d.missing)} missing</span>}</td>
             <td></td>
-            <td><input type="checkbox" checked={Number(d.enabled_tables) > 0} disabled={enable.isPending}
-              title="Enables or disables every table of this database" onChange={() => enable.mutate(d)} /></td>
+            <td><input type="checkbox" checked={Number(d.enabled_tables) > 0} disabled={enable.isPending || !!locked}
+              title={locked ?? "Enables or disables every table of this database"} onChange={() => enable.mutate(d)} /></td>
             <td>{Number(d.enabled_tables) > 0 ? <StateBar row={d} /> : <span className="muted">disabled</span>}</td>
           </tr>
-          {open === d.database && <TableRows jobId={jobId} server={server} database={d.database} />}
+          {open === d.database && <TableRows jobId={jobId} server={server} database={d.database} locked={locked} />}
         </Fragment>
       ))}
       {(dbs.data?.total ?? 0) > PAGE && (
@@ -101,7 +107,7 @@ function DatabaseRows({ jobId, server }: { jobId: string; server: string }) {
   );
 }
 
-function Tree({ jobId }: { jobId: string }) {
+function Tree({ jobId, locked }: { jobId: string; locked: Locked }) {
   const [open, setOpen] = useState<string | null>(null);
   const servers = useQuery({ queryKey: ["job-tree", jobId], queryFn: () => api.get<Row>(`/ingestion-jobs/${jobId}/tree${qs({ limit: 200 })}`) });
   return (
@@ -122,7 +128,7 @@ function Tree({ jobId }: { jobId: string }) {
                 <td className="muted">{fmtInt(s.enabled_tables)} on</td>
                 <td><StateBar row={s} /></td>
               </tr>
-              {open === s.server && <DatabaseRows jobId={jobId} server={s.server} />}
+              {open === s.server && <DatabaseRows jobId={jobId} server={s.server} locked={locked} />}
             </Fragment>
           ))}
           {servers.data && !servers.data.items.length && <tr><td colSpan={7} className="muted">No tables yet: import one database's tables (Import CSV) into one of the job's groups, then add databases here.</td></tr>}
@@ -221,6 +227,7 @@ export default function JobEdit() {
   const [name, setName] = useState("");
   const [params, setParams] = useState<Record<string, string>>({});
   const [addOpen, setAddOpen] = useState(false);
+  const locked: Locked = usePermissions().data?.jobs[id]?.change ?? null;
 
   useEffect(() => {
     if (!s) return;
@@ -300,7 +307,8 @@ export default function JobEdit() {
           <strong>{fmtInt(settings.data.groups.length)}</strong> {plural(settings.data.groups.length, "group")}. Changes in What it ingests
           apply at once; everything else is saved when you press Save.</>}
         right={<span className="card-actions"><button className="ghost" onClick={() => navigate(`/ingestion-jobs/${id}`)}>Cancel</button>
-          <button className="primary" disabled={save.isPending || !s} onClick={() => save.mutate()}>{save.isPending ? "Saving…" : "Save"}</button></span>} />
+          <button className="primary" disabled={save.isPending || !s || !!locked} title={locked ?? undefined} onClick={() => save.mutate()}>{save.isPending ? "Saving…" : "Save"}</button></span>} />
+      {locked && <Notice tone="info">You can see this job's settings but not change them: {locked}.</Notice>}
       <ErrorBox error={settings.error || save.error} />
       {save.isSuccess && <Notice tone="ok">Saved{save.data ? `: ${fmtInt(save.data.summary.changed)} ${plural(save.data.summary.changed, "table")} changed${save.data.summary.reseed ? `, ${fmtInt(save.data.summary.reseed)} to load again` : ""}` : ""}.</Notice>}
 
@@ -310,9 +318,9 @@ export default function JobEdit() {
       </Section>}
 
       <Section title="What it ingests" note="Open a server to see its databases, and a database to see its tables. A table's load type is the same in every database: change it and it changes in all of them."
-        actions={<button className="ghost" onClick={() => setAddOpen(!addOpen)}>{addOpen ? "Close" : "Add databases"}</button>}>
+        actions={<button className="ghost" disabled={!!locked} title={locked ?? undefined} onClick={() => setAddOpen(!addOpen)}>{addOpen ? "Close" : "Add databases"}</button>}>
         {addOpen && <AddDatabases jobId={id} servers={(servers.data?.items ?? []).map((x: Row) => x.server)} />}
-        <Tree jobId={id} />
+        <Tree jobId={id} locked={locked} />
       </Section>
 
       {s && <Section title="How it writes" note="For every table of the job.">

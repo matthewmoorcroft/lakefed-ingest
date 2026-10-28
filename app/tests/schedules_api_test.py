@@ -325,3 +325,57 @@ def test_deleting_a_job_needs_can_manage_on_its_databricks_job(api, monkeypatch)
     assert r.status_code == 403 and api.store.schedules[sid].get("deleted_at") is None
     monkeypatch.setattr(main.jobs, "user_job_permission", lambda job_id, user: "IS_OWNER")
     assert api.post(f"/api/schedules/{sid}/delete").status_code == 200
+
+
+CHANGE_REFUSAL = "changing the job or its tables needs Can Manage on the Databricks job 555; you have Can Manage Run"
+
+
+def test_changing_pausing_resuming_or_syncing_a_job_needs_can_manage_but_running_it_does_not(api, monkeypatch):
+    sid, started = _run_now_setup(api, monkeypatch, BODY)
+    monkeypatch.setattr(main.jobs, "user_job_permission", lambda job_id, user: "CAN_MANAGE_RUN")
+    for call in (lambda: api.post(f"/api/schedules/{sid}", json=dict(BODY, cadence_minutes=60)),
+                 lambda: api.post(f"/api/schedules/{sid}/pause"), lambda: api.post(f"/api/schedules/{sid}/resume"),
+                 lambda: api.post(f"/api/schedules/{sid}/sync")):
+        r = call()
+        assert (r.status_code, r.json()["detail"]) == (403, CHANGE_REFUSAL)
+    assert api.store.schedules[sid]["cadence_minutes"] == 15 and not api.store.schedules[sid]["paused"]
+    assert api.post(f"/api/ingestion-jobs/{sid}/run").status_code == 200 and len(started) == 2
+    detail = api.get(f"/api/ingestion-jobs/{sid}").json()
+    assert (detail["change_blocked"], detail["run_now"]["blocked"]) == (CHANGE_REFUSAL, None)
+
+
+def test_anyone_may_set_up_a_paused_job_but_one_that_runs_needs_the_right_to_run_what_it_starts(api, monkeypatch):
+    monkeypatch.setattr(main.jobs, "user_job_permission", lambda job_id, user: "CAN_VIEW")
+    r = api.post("/api/schedules", json=BODY)
+    assert r.status_code == 403 and r.json()["detail"].startswith("starting a run needs Can Manage Run")
+    assert not api.store.schedules
+    assert api.post("/api/schedules", json=dict(BODY, paused=True)).status_code == 200
+
+
+def test_tables_of_a_group_in_a_job_need_can_manage_on_that_job_and_groups_in_no_job_stay_open(api, monkeypatch):
+    api.post("/api/schedules", json=BODY)
+    monkeypatch.setattr(main.jobs, "user_job_permission", lambda job_id, user: "CAN_MANAGE_RUN")
+    assert main._groups_refusal(["c1", "c3"], "op@example.com") == (
+        f"these tables are in the ingestion job Prod 15: {CHANGE_REFUSAL}")
+    assert main._groups_refusal(["c3"], "op@example.com") is None
+    r = api.post("/api/tables", json={"task_collection": "c2", "src_type": "sqlserver", "src_connection": "conn",
+                                      "use_remote_query": True, "src_database": "d", "src_schema": "dbo",
+                                      "src_table": "t", "sink_catalog": "c", "sink_schema": "s", "sink_table": "t",
+                                      "load_type": "full"})
+    assert r.status_code == 403 and "Prod 15" in r.json()["detail"]
+
+
+def test_the_permissions_answer_lists_what_the_user_may_not_do_on_each_job_group_and_bundle_job(api, monkeypatch):
+    sid = api.post("/api/schedules", json=BODY).json()["id"]
+    monkeypatch.setattr(main.jobs, "SETUP_JOB_ID", "556")
+    monkeypatch.setattr(main.jobs, "DISCOVER_JOB_ID", None)
+    monkeypatch.setattr(main.jobs, "user_job_permission",
+                        lambda job_id, user: "CAN_MANAGE_RUN" if str(job_id) == "555" else "CAN_VIEW")
+    answer = api.get("/api/permissions").json()
+    assert answer["jobs"][str(sid)] == {"run": None, "change": CHANGE_REFUSAL,
+                                        "delete": CHANGE_REFUSAL.replace("changing the job or its tables", "deleting")}
+    assert set(answer["groups"]) == {"c1", "c2"}
+    assert answer["run"]["setup"] == "starting a run needs Can Manage Run on the Databricks job 556; you have Can View"
+    assert answer["run"]["discovery"] == "no discovery job is configured"
+    assert answer["new_running_job"]["default"] is None
+    assert api.post("/api/jobs/setup/run").status_code == 403

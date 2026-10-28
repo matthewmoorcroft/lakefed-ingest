@@ -3,6 +3,7 @@ import { Link, useSearchParams } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, type Row } from "../api";
 import { ConfirmButton, ErrorBox, Notice, PageHead, Section, Tag, fmtInt, plural } from "../components";
+import { groupsRefusal, usePermissions } from "../permissions";
 
 /** The group settings the import fills each row with, in the order config_import.SETTINGS gives them. */
 const SETTINGS: { key: string; label: string; options?: string[]; type?: "number" | "checkbox"; help?: string }[] = [
@@ -51,6 +52,7 @@ export default function ImportCsv() {
   const changed = () => { preview.reset(); apply.reset(); setPreviewed(null); };
   const result = apply.data ?? preview.data;
   const counts: Record<string, number> = result?.counts ?? {};
+  const locked = groupsRefusal(usePermissions().data, [group.trim()]);
   const set = (key: string, value: unknown) => { setGiven({ ...given, [key]: value }); changed(); };
   const shown = (key: string) => (key in given ? given[key] : shared[key]?.value ?? "");
   const isNew = settings.data && !settings.data.tables;
@@ -105,10 +107,11 @@ export default function ImportCsv() {
           <button className="primary" disabled={!group.trim() || !csv.trim() || preview.isPending} onClick={() => preview.mutate()}>Preview</button>
           {preview.data && previewed && (
             <ConfirmButton label={`Import ${fmtInt(counts.valid ?? 0)} ${plural(counts.valid ?? 0, "table")}`}
-              disabled={!!counts.invalid || !counts.valid} onConfirm={() => apply.mutateAsync()} />
+              disabled={!!counts.invalid || !counts.valid || !!locked} onConfirm={() => apply.mutateAsync()} />
           )}
           {preview.data && counts.invalid ? <span className="muted">Fix the invalid lines, then preview again.</span> : null}
         </div>
+        {locked && <p className="muted small">Import: {locked}.</p>}
         <ErrorBox error={preview.error ?? apply.error} />
         {apply.data && <Notice tone="ok">Imported {fmtInt(counts.imported ?? 0)} {plural(counts.imported ?? 0, "table")} into {apply.data.task_collection}
           {counts.skipped ? `; ${fmtInt(counts.skipped)} skipped (already registered)` : ""}. The group's next run seeds them.</Notice>}

@@ -4,6 +4,7 @@ ingestion, setup and discovery jobs through the app's `job` resources: view, run
 from __future__ import annotations
 
 import os
+import time
 from datetime import datetime, timezone
 from typing import List, Optional
 
@@ -67,10 +68,12 @@ def job_summary(job_id) -> dict:
     }
 
 
-# Run now and Delete follow Databricks' own job permissions for the signed-in user: the levels in Databricks' order,
-# what each action needs, and how a level reads on the page.
+# Every action on an existing job follows Databricks' own job permissions for the signed-in user: the levels in
+# Databricks' order, what each action needs (as the Jobs UI asks: run from Can Manage Run, change settings or the
+# schedule and delete from Can Manage), and how a level reads on the page.
 PERMISSION_RANK = {"CAN_VIEW": 1, "CAN_MANAGE_RUN": 2, "CAN_MANAGE": 3, "IS_OWNER": 3}
-ACTION_NEEDS = {"run": ("starting a run", "CAN_MANAGE_RUN"), "delete": ("deleting", "CAN_MANAGE")}
+ACTION_NEEDS = {"run": ("starting a run", "CAN_MANAGE_RUN"), "change": ("changing the job or its tables", "CAN_MANAGE"),
+                "delete": ("deleting", "CAN_MANAGE")}
 PERMISSION_LABEL = {"CAN_VIEW": "Can View", "CAN_MANAGE_RUN": "Can Manage Run", "CAN_MANAGE": "Can Manage",
                     "IS_OWNER": "Is Owner"}
 
@@ -96,17 +99,37 @@ def action_refusal(action: str, level: Optional[str], job_label: str) -> Optiona
     return f"{doing} needs {PERMISSION_LABEL[needs]} on {job_label}; {have}"
 
 
+# A page asks for every button's permission at once and each action checks again, so reads are kept briefly: a grant
+# or revoke in Databricks shows here within this many seconds.
+PERMISSION_CACHE_S = 20
+_permission_cache: dict = {}
+
+
+def _cached(key, read):
+    now = time.monotonic()
+    hit = _permission_cache.get(key)
+    if hit and now - hit[0] < PERMISSION_CACHE_S:
+        return hit[1]
+    value = read()
+    _permission_cache[key] = (now, value)
+    return value
+
+
 def user_groups(user: str) -> List[str]:
     """The workspace groups of a user, by the email the Apps proxy forwards."""
-    found = workspace().users.list(filter=f'userName eq "{user}"', attributes="groups")
-    return [g.display for u in found for g in (u.groups or []) if g.display]
+    def read():
+        found = workspace().users.list(filter=f'userName eq "{user}"', attributes="groups")
+        return [g.display for u in found for g in (u.groups or []) if g.display]
+    return _cached(("groups", user), read)
 
 
 def user_job_permission(job_id, user: str) -> Optional[str]:
     """The signed-in user's highest permission on a Databricks job, read by the app's service principal (which
     needs Can Manage on the job to read its access list)."""
-    acl = workspace().permissions.get("jobs", str(int(job_id))).access_control_list or []
-    return highest_permission([entry.as_dict() for entry in acl], user, user_groups(user))
+    def read():
+        acl = workspace().permissions.get("jobs", str(int(job_id))).access_control_list or []
+        return [entry.as_dict() for entry in acl]
+    return highest_permission(_cached(("acl", str(int(job_id))), read), user, user_groups(user))
 
 
 def job_settings(job_id) -> dict:

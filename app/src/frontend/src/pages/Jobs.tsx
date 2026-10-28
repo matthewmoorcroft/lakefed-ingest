@@ -2,6 +2,7 @@ import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, type Row } from "../api";
 import { Badge, ConfirmButton, ErrorBox, Grid, Metric, Notice, Section, autoColumns } from "../components";
+import { usePermissions } from "../permissions";
 
 interface IngestJob { job: Row; active: Row[]; recent: Row[] }
 
@@ -20,6 +21,7 @@ export default function Jobs() {
     },
   });
   const j = job.data?.job;
+  const refusals = usePermissions().data?.run;
   const linkCol = { cellRenderer: (p: any) => p.value ? <a href={p.value} target="_blank" rel="noreferrer">open</a> : null };
   const stateCols = { state: { cellRenderer: (p: any) => <Badge value={p.value} /> }, result: { cellRenderer: (p: any) => <Badge value={p.value} /> }, url: linkCol };
   const coll = collection || collections.data?.[0] || "";
@@ -48,9 +50,10 @@ export default function Jobs() {
             <label>Parallelism
               <input type="number" min={1} max={256} value={par} onChange={(e) => setParallelism(Number(e.target.value) || "")} />
             </label>
-            <ConfirmButton label="Run now" disabled={!coll}
+            <ConfirmButton label="Run now" disabled={!coll || !!refusals?.ingestion}
               onConfirm={() => post.mutateAsync({ path: "/jobs/ingest/run", body: { task_collection: coll, parallelism: par } })} />
           </div>
+          {refusals?.ingestion && <p className="muted small">Run now and Cancel: {refusals.ingestion}.</p>}
         </Section>
       )}
       <Section title={`Active runs (${job.data?.active.length ?? "…"})`}>
@@ -59,7 +62,7 @@ export default function Jobs() {
             columns={[...autoColumns(job.data.active, stateCols), {
               headerName: "", field: "run_id", width: 150, sortable: false, filter: false,
               cellRenderer: (p: any) => (
-                <ConfirmButton label="Cancel" danger confirmLabel="Confirm"
+                <ConfirmButton label="Cancel" danger confirmLabel="Confirm" disabled={!!refusals?.ingestion}
                   onConfirm={() => post.mutateAsync({ path: `/jobs/runs/${p.value}/cancel` })} />
               ),
             }]} />
@@ -71,7 +74,8 @@ export default function Jobs() {
       <Section title="Schema setup">
         <p className="muted small">Creates or migrates the Lakebase schema. Safe to re-run; upgrades also migrate on the next
           ingestion run.</p>
-        <ConfirmButton label="Run setup job" onConfirm={() => post.mutateAsync({ path: "/jobs/setup/run" })} />
+        <ConfirmButton label="Run setup job" disabled={!!refusals?.setup} onConfirm={() => post.mutateAsync({ path: "/jobs/setup/run" })} />
+        {refusals?.setup && <p className="muted small">Run setup job: {refusals.setup}.</p>}
       </Section>
     </>
   );

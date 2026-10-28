@@ -2,6 +2,7 @@ import { useState } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { api } from "../api";
 import { ErrorBox, Notice, Section } from "../components";
+import { groupsRefusal, usePermissions } from "../permissions";
 
 type Field = { key: string; label: string; required?: boolean; help?: string; type?: "text" | "number" | "checkbox"; options?: string[]; initial?: any };
 
@@ -40,6 +41,7 @@ const JDBC_ONLY = ["src_host", "secret_key"];
 export default function AddTable() {
   const initial = Object.fromEntries(FIELDS.map((f) => [f.key, f.initial ?? (f.type === "checkbox" ? false : "")]));
   const [row, setRow] = useState<Record<string, any>>(initial);
+  const locked = groupsRefusal(usePermissions().data, [row.task_collection]);
   const qc = useQueryClient();
   const add = useMutation({
     mutationFn: () => api.post<{ id: number }>("/tables", {
@@ -72,7 +74,8 @@ export default function AddTable() {
               {f.help && <span className="muted small">{f.help}</span>}
             </label>
           ); })}
-          <div className="wide"><button className="primary" disabled={add.isPending}>Add table</button></div>
+          {locked && <p className="wide muted small">{locked}.</p>}
+          <div className="wide"><button className="primary" disabled={add.isPending || !!locked}>Add table</button></div>
         </form>
         <ErrorBox error={add.error} />
         {add.data && <Notice tone="ok">Added control row {add.data.id}.</Notice>}

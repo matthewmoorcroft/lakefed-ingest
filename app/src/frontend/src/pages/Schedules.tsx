@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, type Row } from "../api";
+import { usePermissions } from "../permissions";
 import { Badge, ConfirmButton, ErrorBox, Grid, Notice, Section, fmtTime, plural } from "../components";
 
 // A schedule runs one or more collections at a cadence. The app turns each (schedule, collection)
@@ -25,6 +26,10 @@ function Editor({ initial, options, onDone }: { initial?: Row; options: Options;
   const [params, setParams] = useState<Record<string, string>>(
     Object.fromEntries(Object.entries(initial?.parameters ?? {}).map(([k, v]) => [k, String(v)])));
   const qc = useQueryClient();
+  const permissions = usePermissions().data;
+  // Anyone may set up a job; one that isn't paused starts runs, so it needs the right to run what it starts.
+  const startsRuns = !f.paused && (!initial || (f.job_variant || "default") !== (initial.job_variant || "default"));
+  const runRefusal = startsRuns ? permissions?.new_running_job[f.job_variant || "default"] ?? null : null;
   const save = useMutation({
     mutationFn: () => {
       const body = { name: f.name, cadence_minutes: Number(f.cadence_minutes), timezone: f.timezone, stagger: f.stagger && f.job_variant !== "check",
@@ -95,7 +100,9 @@ function Editor({ initial, options, onDone }: { initial?: Row; options: Options;
             })}
           </div>
         </div>
-        <div className="wide"><button className="primary" disabled={save.isPending || !f.members.length}>
+        {runRefusal && <p className="wide muted small">A job that isn't paused starts runs, and {runRefusal}. Tick Paused to set it up
+          anyway.</p>}
+        <div className="wide"><button className="primary" disabled={save.isPending || !f.members.length || !!runRefusal}>
           {save.isPending ? "Saving and syncing jobs…" : initial ? "Save and sync jobs" : "Create schedule and jobs"}</button></div>
       </form>
       <ErrorBox error={save.error} />
@@ -119,6 +126,8 @@ function ScheduleCard({ s, onEdit }: { s: Row; onEdit: () => void }) {
     onSuccess: () => qc.invalidateQueries({ queryKey: ["schedules"] }),
   });
   const check = useMutation({ mutationFn: () => api.get<Row>(`/schedules/${s.id}/check`), onSuccess: setDrift });
+  const refusals = usePermissions().data?.jobs[String(s.id)];
+  const locked = refusals?.change ?? null;
   const rows = (s.members as Row[]).map((m) => ({
     collection: m.task_collection, starts: m.when, next_run: s.paused ? "Paused, no run until resumed" : fmtTime(m.next_run),
     last_run: m.last_status, last_started: fmtTime(m.last_started), last_duration: mins(m.last_duration_s),
@@ -130,12 +139,14 @@ function ScheduleCard({ s, onEdit }: { s: Row; onEdit: () => void }) {
   return (
     <Section title={`${s.name}: ${s.description}`} actions={<>
       {s.paused ? <Badge value="paused" /> : <Badge value="ok" />}
-      <button onClick={onEdit}>Edit</button>
-      <button onClick={() => act.mutate(s.paused ? "resume" : "pause")} disabled={act.isPending}>{s.paused ? "Resume" : "Pause"}</button>
+      <button onClick={onEdit} disabled={!!locked} title={locked ?? undefined}>Edit</button>
+      <button onClick={() => act.mutate(s.paused ? "resume" : "pause")} disabled={act.isPending || !!locked}
+        title={locked ?? undefined}>{s.paused ? "Resume" : "Pause"}</button>
       <button onClick={() => check.mutate()} disabled={check.isPending}>Check jobs</button>
-      <button onClick={() => act.mutate("sync")} disabled={act.isPending}>Sync jobs</button>
-      <ConfirmButton label="Delete" danger onConfirm={() => act.mutateAsync("delete")} />
+      <button onClick={() => act.mutate("sync")} disabled={act.isPending || !!locked} title={locked ?? undefined}>Sync jobs</button>
+      <ConfirmButton label="Delete" danger disabled={!!refusals?.delete} onConfirm={() => act.mutateAsync("delete")} />
     </>}>
+      {locked && <p className="muted small">Edit, {s.paused ? "Resume" : "Pause"}, Sync jobs and Delete: {locked}.</p>}
       <p className="muted small">Time zone {s.timezone}{paramsText(s.parameters) ? ` · ${paramsText(s.parameters)}` : ""}
         {s.notify_emails ? ` · failure emails to ${s.notify_emails}` : ""} · settings last changed {fmtTime(s.updated_at)}{s.created_by ? ` · created by ${s.created_by}` : ""}</p>
       {warned > 0 && <Notice tone="warn">{warned} {plural(warned, "ingestion group")} {warned === 1 ? "has" : "have"} warnings: see the warnings column.</Notice>}

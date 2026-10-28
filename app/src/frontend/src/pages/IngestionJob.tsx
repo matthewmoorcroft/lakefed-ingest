@@ -2,6 +2,7 @@ import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import { api, qs, type Row } from "../api";
+import { Refused } from "../permissions";
 import {
   Badge, ErrorBox, Name, Notice, PageHead, RunStatus, Section, StateBar, StateKey, fmtClock, fmtDuration, fmtInt, fmtSlot, fmtSpeed, jobRunPath, plural
 } from "../components";
@@ -79,8 +80,10 @@ export default function IngestionJob() {
             onClick={() => window.confirm(runNowMessage(j)) && runNow.mutate()}>{runNow.isPending ? "Starting…" : "Run now"}</button>
           <button className="ghost danger-text" disabled={!!j.delete_blocked || remove.isPending} title={j.delete_blocked ?? undefined}
             onClick={() => window.confirm(deleteMessage(j)) && remove.mutate()}>{remove.isPending ? "Deleting…" : "Delete"}</button>
-          <button className="primary" onClick={() => navigate(`/ingestion-jobs/${id}/edit`)}>Edit</button></span>} />
-      {j?.run_now?.blocked && <p className="muted small right">Run now: {j.run_now.blocked}.</p>}
+          <button className="primary" disabled={!!j.change_blocked} title={j.change_blocked ?? undefined}
+            onClick={() => navigate(`/ingestion-jobs/${id}/edit`)}>Edit</button></span>} />
+      <Refused action="Run now" refusal={j?.run_now?.blocked} />
+      <Refused action="Edit and Delete" refusal={j?.change_blocked} />
       <ErrorBox error={remove.error} />
       <ErrorBox error={runNow.error} />
       {runNow.isSuccess && <Notice tone="ok">Started: {fmtInt(runNow.data.started.length)} {plural(runNow.data.started.length, "Databricks job run")}. The runs show here as they start.</Notice>}
