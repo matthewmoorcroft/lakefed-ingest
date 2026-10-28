@@ -549,3 +549,11 @@ def test_a_check_wrapper_tagged_the_old_way_is_kept_and_retagged_with_a_value_aw
     results = sch.sync(GROUP, members, [], fake, 777)
     assert "updated" in {r.action for r in results} and {r.job_id for r in results} == {jid} and len(fake.jobs) == 1
     assert fake.jobs[jid]["tags"][sch.TAG_COLLECTION] == sch.GROUP_TAG
+
+
+def test_a_job_never_changed_was_last_updated_by_its_creator_and_an_older_unrecorded_change_is_unknown():
+    created = "2026-10-28T16:01:45+00:00"
+    assert sch.updated_by({"created_by": "a@x.com", "created_at": created, "updated_at": created}) == "a@x.com"
+    assert sch.updated_by({"created_by": "a@x.com", "created_at": created, "updated_at": "2026-10-28T17:00:00+00:00"}) is None
+    assert sch.updated_by({"created_by": "a@x.com", "created_at": created, "updated_at": "2026-10-28T17:00:00+00:00",
+                           "options": {"updated_by": "b@x.com"}}) == "b@x.com"

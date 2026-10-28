@@ -138,9 +138,14 @@ def options_of(schedule: dict) -> dict:
 
 
 def updated_by(schedule: dict) -> Optional[str]:
-    """Who last changed the job or its groups' tables in the app (options.updated_by), or None: not recorded (jobs
+    """Who last changed the job or its groups' tables in the app (options.updated_by). A job never changed since it
+    was created was last updated by its creator, as the Databricks Jobs list shows it. None: not recorded (jobs
     last changed before the app recorded it)."""
-    return options_of(schedule).get("updated_by")
+    recorded = options_of(schedule).get("updated_by")
+    if recorded:
+        return recorded
+    never_changed = schedule.get("updated_at") is not None and schedule.get("updated_at") == schedule.get("created_at")
+    return schedule.get("created_by") if never_changed else None
 
 
 def start_minute(schedule: dict) -> int:

@@ -76,7 +76,7 @@ to or from `check` replaces its wrapper jobs.
 **Who and when.** Each ingestion job shows who created it and when (`created_by`, `created_at`), and who last changed
 it and when: an edit, pause or resume of the job, or any change to its groups' tables (`options.updated_by`,
 `updated_at`). The job page shows them under its title; the Ingestion jobs list has them as Created and Last updated,
-sortable by time. Jobs last changed before the app recorded it show "unknown" for who.
+sortable by time. A job never changed since it was created shows its creator as Last updated by, as the Jobs list does; jobs last changed before the app recorded it show "unknown" for who.
 
 ## Guard rails for edits
 
