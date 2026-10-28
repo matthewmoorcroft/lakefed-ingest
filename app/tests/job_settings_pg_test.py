@@ -54,6 +54,8 @@ def client(monkeypatch):
             conn.cursor().executemany(f"insert into lakefed_ingest.control ({', '.join(COLUMNS)}) values "
                                       f"({', '.join(['%s'] * len(COLUMNS))})", rows)
         monkeypatch.setattr(main.db, "connect", lambda: psycopg.connect(target, autocommit=True))
+        monkeypatch.setattr(main.jobs, "ingest_variants", lambda: {"default": "555"})
+        monkeypatch.setattr(main.jobs, "user_job_permission", lambda job_id, user: "CAN_MANAGE")
         c = TestClient(main.app, headers={"X-Forwarded-Email": "op@example.com"})
         c.target, c.sid = target, sid
         yield c
@@ -204,7 +206,6 @@ def test_a_databases_file_adds_each_database_with_the_jobs_tables_and_a_group_on
 def test_a_daily_start_time_is_stored_and_moves_the_members_offsets(client, monkeypatch):
     import psycopg
     monkeypatch.setattr(main, "_sync", lambda sid, user: [])
-    monkeypatch.setattr(main.jobs, "ingest_variants", lambda: ["default"])
     body = {"name": "Customer", "cadence_minutes": 1440, "timezone": "Europe/London", "members": ["cust_c01", "cust_c02"],
             "options": {"start_minute": 150}, "parameters": {}}
     r = client.post(f"/api/schedules/{client.sid}", json=body)
@@ -213,7 +214,8 @@ def test_a_daily_start_time_is_stored_and_moves_the_members_offsets(client, monk
         options = conn.execute("select options from lakefed_ingest.schedule where id = %s", (client.sid,)).fetchone()[0]
         offsets = conn.execute("select task_collection, offset_minutes from lakefed_ingest.schedule_member "
                                "where removed_at is null order by 1").fetchall()
-    assert options == {"start_minute": 150} and offsets == [("cust_c01", 150), ("cust_c02", 180)]
+    assert options == {"start_minute": 150, "updated_by": "op@example.com"}
+    assert offsets == [("cust_c01", 150), ("cust_c02", 180)]
     assert client.get(f"/api/ingestion-jobs/{client.sid}").json()["description"] == "Every day at 02:30 (Europe/London)"
     bad = client.post(f"/api/schedules/{client.sid}", json=dict(body, cadence_minutes=30))
     assert bad.status_code == 422 and "set time" in bad.text
@@ -222,14 +224,15 @@ def test_a_daily_start_time_is_stored_and_moves_the_members_offsets(client, monk
 def test_a_schedule_save_without_options_keeps_the_start_time(client, monkeypatch):
     import psycopg
     monkeypatch.setattr(main, "_sync", lambda sid, user: [])
-    monkeypatch.setattr(main.jobs, "ingest_variants", lambda: ["default"])
     body = {"name": "Customer", "cadence_minutes": 1440, "timezone": "Europe/London", "members": ["cust_c01", "cust_c02"],
             "parameters": {}}
     assert client.post(f"/api/schedules/{client.sid}", json=dict(body, options={"start_minute": 150})).status_code == 200
     assert client.post(f"/api/schedules/{client.sid}", json=body).status_code == 200
     with psycopg.connect(client.target) as conn:
         assert conn.execute("select options from lakefed_ingest.schedule where id = %s", (client.sid,)).fetchone()[0] == {
-            "start_minute": 150}
+            "start_minute": 150, "updated_by": "op@example.com"}
+    # An explicit {} clears the options a user sets; who last changed the job stays.
     assert client.post(f"/api/schedules/{client.sid}", json=dict(body, options={})).status_code == 200
     with psycopg.connect(client.target) as conn:
-        assert conn.execute("select options from lakefed_ingest.schedule where id = %s", (client.sid,)).fetchone()[0] is None
+        assert conn.execute("select options from lakefed_ingest.schedule where id = %s", (client.sid,)).fetchone()[0] == {
+            "updated_by": "op@example.com"}

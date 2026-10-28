@@ -1735,6 +1735,7 @@ def create_schedule(body: ScheduleBody, request: Request):
 def update_schedule(sid: int, body: ScheduleBody, request: Request):
     """Edit a schedule: fields, and members added or removed. Offsets are recomputed; jobs are synced."""
     import psycopg
+    sent_options = "options" in body.model_fields_set   # read first: assigning body.options marks it as sent
     body.options = _requested_options(body)
     _validate_schedule(body)
     user = _user(request)
@@ -1748,9 +1749,9 @@ def update_schedule(sid: int, body: ScheduleBody, request: Request):
     new = body.model_dump()
     new["notify_emails"] = new["notify_emails"] or None
     new["job_variant"] = new["job_variant"] or "default"
-    # A body without options (an older page) keeps the stored ones; an explicit {} clears them.
-    new["options"] = (new["options"] or None) if "options" in body.model_fields_set else s.get("options")
     stored = sch.options_of(s)
+    # A body without options (an older page) keeps the stored ones; an explicit {} clears them.
+    new["options"] = (new["options"] or None) if sent_options else (stored or None)
     if "updated_by" in stored:
         new["options"] = {**(new["options"] or {}), "updated_by": stored["updated_by"]}
     as_json = lambda v: json.loads(v) if isinstance(v, str) else (v or {})

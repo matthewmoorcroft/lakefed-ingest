@@ -400,3 +400,10 @@ def test_a_job_records_who_created_it_and_who_last_changed_it_and_a_sent_name_is
     assert r.status_code == 200 and sch.updated_by(api.store.schedules[sid]) == "second@example.com"
     other.post(f"/api/schedules/{sid}/resume")
     assert sch.updated_by(api.store.schedules[sid]) == "second@example.com"
+
+
+def test_a_save_without_options_keeps_the_jobs_start_time(api):
+    daily = dict(BODY, cadence_minutes=1440, paused=True)
+    sid = api.post("/api/schedules", json=dict(daily, options={"start_minute": 150})).json()["id"]
+    assert api.post(f"/api/schedules/{sid}", json=daily).status_code == 200
+    assert sch.options_of(api.store.schedules[sid])["start_minute"] == 150
