@@ -183,6 +183,7 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
 button.primary { background: var(--accent); color: var(--accent-text); border-color: var(--accent); }
 button.primary:hover { background: var(--accent-hover); border-color: var(--accent-hover); color: var(--accent-text); }
 button.danger { background: var(--db-negative-surface); color: #fff; border-color: var(--db-negative-surface); }
+button.ghost.danger-text { color: var(--bad); }
 button.ghost { background: transparent; border-color: transparent; color: var(--link); }
 .sidebar button.ghost { color: var(--text); border-color: var(--db-color-action-default-border-default); background: var(--db-surface-base); }
 .confirm { display: inline-flex; gap: 6px; }
@@ -200,6 +201,7 @@ button.ghost { background: transparent; border-color: transparent; color: var(--
 .alert .hint { margin-top: 4px; color: var(--text); }
 .muted { color: var(--muted); } .small { font-size: var(--db-font-size-sm); }
 p.small { margin: 0 0 var(--db-space-2); }
+p.right { text-align: right; max-width: none; }
 .empty { color: var(--muted); padding: var(--db-space-4) 0; }
 
 /* Drawers, change marks, checklists, timeline (Chris's pages) */
@@ -239,3 +241,30 @@ table.data td.mono { white-space: nowrap; }
 .metric-value.small-value { font-size: var(--db-font-size-md); }
 .stamp.stale { color: var(--bad); font-weight: var(--db-font-weight-semibold); max-width: 420px; display: inline-block; }
 table.data.dense th, table.data.dense td { padding-left: var(--db-space-2); padding-right: var(--db-space-2); }
+.csv-input { width: 100%; font-family: var(--db-font-family-mono, ui-monospace, monospace); font-size: var(--db-font-size-sm); }
+
+/* Job Edit: the server › database › table tree, help and impact lines, and the advanced section. */
+table.tree tr.l2 td.name { padding-left: 28px; } table.tree tr.l3 td.name { padding-left: 52px; color: var(--muted); }
+table.tree tr.l2 td[colspan] { padding-left: 28px; } table.tree tr.l3 td[colspan] { padding-left: 52px; }
+.twisty { height: 22px; width: 22px; padding: 0; margin-right: 6px; border: 0; background: transparent; color: var(--muted); }
+.help { display: block; font-size: 12px; color: var(--muted); line-height: 1.35; }
+.impact { font-size: var(--db-font-size-sm); color: var(--warn); background: var(--warn-bg); border-radius: 4px; padding: 4px 8px; }
+.info { display: inline-grid; place-items: center; width: 16px; height: 16px; border-radius: 50%; border: 1px solid var(--border);
+        font-size: 11px; margin-right: 4px; }
+.mono { font-family: var(--db-font-family-mono, ui-monospace, Menlo, monospace); }
+.tree-search { width: min(420px, 100%); }
+table.tree tr.l3 td { padding-top: 3px; padding-bottom: 3px; }
+.add-databases { border: 1px solid var(--border); border-radius: 6px; padding: var(--db-space-3); margin-bottom: var(--db-space-3); }
+details.advanced summary { cursor: pointer; display: flex; gap: var(--db-space-2); align-items: baseline; }
+details.advanced[open] summary { margin-bottom: var(--db-space-3); }
+details.advanced .compute { margin-top: var(--db-space-4); }
+/* Fields stay inside their card: inputs fill their grid cell and never push past it. */
+.form-grid input, .form-grid select { width: 100%; min-width: 0; box-sizing: border-box; }
+.form-grid label.checkbox input { width: auto; }
+.form-grid .emails { max-width: 640px; }
+label.checkbox .help { display: inline; }
+/* Identity columns: as wide as its fields, the action next to them, every cell aligned to the top. */
+table.identity { width: auto; }
+table.identity td { vertical-align: top; }
+table.identity input { width: 260px; }
+details.advanced .compute h4 { margin: var(--db-space-3) 0 var(--db-space-2); }

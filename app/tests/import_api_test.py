@@ -1,0 +1,111 @@
+"""The configuration import's endpoints (main.py), with a fake database: preview, apply, a group's settings and its
+export."""
+import contextlib
+import json
+
+import pytest
+
+pytest.importorskip("fastapi")
+pytest.importorskip("httpx")
+from fastapi.testclient import TestClient  # noqa: E402
+
+import main  # noqa: E402
+import queries as q  # noqa: E402
+from api_test import FakeCursor, FakeDB  # noqa: E402
+
+
+class GroupCursor(FakeCursor):
+    """The fake cursor, also answering the group's rows inside the transaction."""
+    def execute(self, sql, params=()):
+        super().execute(sql, params)
+        if sql == q.collection_control_rows_sql():
+            rows = [r for r in GROUP_ROWS if r["task_collection"] == params[0]]
+            cols = list(GROUP_ROWS[0].keys())
+            self.description = [type("D", (), {"name": c})() for c in cols]
+            self._rows = [tuple(r[c] for c in cols) for r in rows]
+
+SETTINGS = dict(src_type="sqlserver", use_remote_query=True, load_type="ct", sink_catalog="main",
+                sink_schema="bronze_{database}", sink_table="{table}", freshness_sla_minutes=60)
+CSV = ("src_connection,src_database,src_schema,src_table,select_list,primary_key\n"
+       "sql_a,Sales,dbo,orders,\"id,amount\",id\n"
+       "sql_a,Sales,dbo,lines,\"id,qty\",id\n")
+GROUP_ROWS = [dict(id=1, task_collection="g1", src_type="sqlserver", src_host=None, src_port=None, secret_key=None,
+                   src_connection="sql_a", use_remote_query=True, src_database="Hr", src_schema="dbo",
+                   src_table="people", select_list="id", primary_key="id", cursor_column=None, load_type="ct",
+                   write_mode="merge", sink_catalog="main", sink_schema="bronze_hr", sink_table="people",
+                   client_id=None, client_attrs=None, freshness_sla_minutes=60, jdbc_options=None)]
+
+
+@pytest.fixture
+def client(monkeypatch):
+    fake = FakeDB()
+
+    def query(sql, params=()):
+        if sql == q.collection_control_rows_sql():
+            return [dict(r) for r in GROUP_ROWS if r["task_collection"] == params[0]]
+        return []
+    monkeypatch.setattr(main.db, "query", query)
+    monkeypatch.setattr(main.db, "transaction", contextlib.contextmanager(lambda: (yield GroupCursor(fake))))
+    c = TestClient(main.app, headers={"X-Forwarded-Email": "op@example.com"})
+    c.db = fake
+    return c
+
+
+def _import(client, csv_text=CSV, group="g9", settings=SETTINGS, dry_run=True):
+    return client.post("/api/import", json={"task_collection": group, "settings": settings, "csv": csv_text,
+                                            "dry_run": dry_run})
+
+
+def test_a_preview_writes_nothing_and_counts_each_lines_status(client):
+    body = _import(client).json()
+    assert body["counts"] == {"valid": 2} and [line["sink"] for line in body["lines"]] == [
+        "main.bronze_sales.orders", "main.bronze_sales.lines"]
+    assert client.db.of("insert into lakefed_ingest.control (") == []
+
+
+def test_apply_inserts_under_the_groups_lock_and_logs_each_row_as_an_import(client):
+    body = _import(client, dry_run=False).json()
+    assert body["counts"] == {"imported": 1, "skipped": 1}      # the fake's sink for "lines" is taken
+    inserted = [dict(zip(q.CONTROL_INSERT_COLUMNS, p)) for p in client.db.of("insert into lakefed_ingest.control (")]
+    assert [(r["task_collection"], r["src_table"], r["sink_schema"]) for r in inserted] == [
+        ("g9", "orders", "bronze_sales"), ("g9", "lines", "bronze_sales")]
+    assert client.db.of("select pg_try_advisory_xact_lock")
+    assert [p[0:2] for p in client.db.of("insert into lakefed_ingest.control_change")] == [("op@example.com", "import")]
+
+
+def test_apply_is_refused_while_any_line_is_invalid_or_the_file_has_errors(client):
+    bad = CSV + "sql_a,Sales,dbo,people,id,\n"
+    r = _import(client, bad, dry_run=False)
+    assert r.status_code == 422 and r.json()["detail"]["invalid"] == 1
+    assert client.db.of("insert into lakefed_ingest.control (") == []
+    r = _import(client, "load_type\nct\n")
+    assert r.status_code == 422 and r.json()["detail"]["errors"] == ["unknown column load_type: a group setting, set at import"]
+
+
+def test_an_existing_group_lends_its_settings_and_its_tables_show_as_registered(client):
+    text = CSV + "sql_a,Hr,dbo,people,id,id\n"
+    body = _import(client, text, group="g1", settings={}).json()
+    assert body["counts"] == {"valid": 2, "registered": 1}
+    assert body["settings"]["sink_schema"] == "bronze_{database}" and body["settings"]["freshness_sla_minutes"] == 60
+
+
+def test_a_groups_settings_and_its_export(client):
+    settings = client.get("/api/collections/g1/settings").json()
+    assert {s["setting"]: s.get("value") for s in settings["settings"]}["sink_table"] == "{table}"
+    assert settings["tables"] == 1
+    r = client.get("/api/collections/g1/export.csv")
+    assert r.headers["content-type"].startswith("text/csv")
+    assert 'filename="g1.csv"' in r.headers["content-disposition"]
+    assert r.text.splitlines() == ["src_connection,src_database,src_schema,src_table,select_list,primary_key",
+                                   "sql_a,Hr,dbo,people,id,id"]
+    assert client.get("/api/collections/none/settings").json() == {
+        "task_collection": "none", "tables": 0, "settings": json.loads(json.dumps(
+            [{"setting": name, "value": None} for name in __import__("config_import").SETTINGS]))}
+
+
+def test_apply_reads_the_groups_rows_only_after_taking_its_lock(client):
+    _import(client, group="g1", settings={}, dry_run=False)
+    order = [sql for sql, _ in client.db.statements]
+    lock = next(i for i, sql in enumerate(order) if "pg_try_advisory_xact_lock" in sql)
+    read = next(i for i, sql in enumerate(order) if sql == q.collection_control_rows_sql())
+    assert lock < read

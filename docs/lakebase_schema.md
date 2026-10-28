@@ -320,9 +320,11 @@ Nothing here is used by ingestion; control rows are created only when a reviewer
 Written by the operations app (see "Schedules" in `app/README.md`); the ingestion job doesn't read them.
 - **`schedule`:** `name` (unique among active schedules), `cadence_minutes` (5, 10, 15, 20, 30, 60, 120,
   180, 240, 360, 720 or 1440), `timezone`, `parameters` (ingestion job parameters, JSON), `job_variant`,
-  `stagger`, `paused`, `notify_emails`, who created it and when, and `deleted_at` (soft delete).
+  `stagger`, `paused`, `notify_emails`, `options` (JSON, null = none: `start_minute`, a set start time in
+  minutes after local midnight for daily and every 2 to 12 hours schedules), who created it and when, and
+  `deleted_at` (soft delete).
 - **`schedule_member`:** one row per (schedule, collection): `offset_minutes` (start offset within the
-  cadence), `job_id` (the wrapper job the app created), `synced_at`, `sync_error`, and `removed_at`
+  cadence: the schedule's start time plus the member's stagger), `job_id` (the wrapper job the app created), `synced_at`, `sync_error`, and `removed_at`
   (soft remove; the next sync deletes the wrapper job).
 
 Telemetry tables grow with every run. To keep long-term history cheaply, snapshot them to Delta

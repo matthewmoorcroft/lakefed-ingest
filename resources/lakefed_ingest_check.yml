@@ -47,6 +47,7 @@ resources:
               max_queries_per_source: "{{job.parameters.max_queries_per_source}}"
               table_retries: "{{job.parameters.table_retries}}"
               table_retry_budget: "{{job.parameters.table_retry_budget}}"
+              fail_on_table_errors: "{{job.parameters.fail_on_table_errors}}"
               spark_conf: "{{job.parameters.spark_conf}}"
       environments:
         - environment_key: lakebase_client
@@ -91,6 +92,8 @@ resources:
         - name: table_retries
           default: ""
         - name: table_retry_budget
+          default: ""
+        - name: fail_on_table_errors
           default: ""
         - name: spark_conf
           default: ""

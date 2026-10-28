@@ -97,6 +97,8 @@ def api(monkeypatch):
     monkeypatch.setattr(main.db, "workspace", lambda: type("W", (), {"config": type("C", (), {"host": "https://h"})()})())
     monkeypatch.setattr(main.jobs, "schedule_client", lambda: jobs_api)
     monkeypatch.setattr(main.jobs, "ingest_variants", lambda: {"default": "555"})
+    # Run now and Delete ask Databricks for the user's permission: the signed-in operator manages the job here.
+    monkeypatch.setattr(main.jobs, "user_job_permission", lambda job_id, user: "CAN_MANAGE")
     monkeypatch.setattr(main.jobs, "SCHEDULE_JOB_VIEW_GROUP", None)
     monkeypatch.setattr(q, "collections_sql", lambda: "select distinct task_collection from lakefed_ingest.control")
     c = TestClient(main.app, headers={"X-Forwarded-Email": "op@example.com"})
@@ -124,7 +126,7 @@ def test_create_writes_rows_creates_one_job_per_member_and_logs(api):
     listed = api.get("/api/schedules").json()
     assert listed[0]["name"] == "Prod 15" and len(listed[0]["members"]) == 2
     m = {x["task_collection"]: x for x in listed[0]["members"]}
-    assert m["c2"]["when"] == "every 15 minutes at :07 past" and m["c2"]["next_run"] and m["c2"]["job_url"].startswith("https://h/jobs/")
+    assert m["c2"]["when"] == "Every 15 minutes, starting at 7 minutes past the hour (UTC)" and m["c2"]["next_run"] and m["c2"]["job_url"].startswith("https://h/jobs/")
 
 
 def test_validation_and_duplicate_name(api):
@@ -180,7 +182,7 @@ def test_timeline_has_planned_triggers_for_scheduled_collections(api, monkeypatc
     api.store.schedules[1]["updated_at"] = "2020-01-01T00:00:00+00:00"
     rows = {r["task_collection"]: r for r in api.get("/api/timeline?hours=2").json()["collections"]}
     assert 7 <= len(rows["c1"]["planned"]) <= 9
-    assert rows["c2"]["schedules"] == ["Prod 15 (every 15 minutes at :07 past)"]
+    assert rows["c2"]["schedules"] == ["Prod 15 (Every 15 minutes, starting at 7 minutes past the hour (UTC))"]
 
 
 def test_sync_takes_the_schedule_lock_and_a_failed_delete_is_retried(api):
@@ -201,6 +203,9 @@ def test_sync_takes_the_schedule_lock_and_a_failed_delete_is_retried(api):
 def test_delete_without_the_variant_still_deletes_the_jobs(api, monkeypatch):
     sid = api.post("/api/schedules", json=BODY).json()["id"]
     monkeypatch.setattr(main.jobs, "ingest_variants", lambda: {})
+    monkeypatch.setattr(main.jobs, "user_groups", lambda user: ["users"])
+    assert api.post(f"/api/schedules/{sid}/delete").status_code == 403      # only an admin cleans up an orphan
+    monkeypatch.setattr(main.jobs, "user_groups", lambda user: ["admins"])
     r = api.post(f"/api/schedules/{sid}/delete")
     assert r.status_code == 200 and api.jobs.jobs == {}
     assert api.post(f"/api/schedules/{sid}/sync").status_code == 200
@@ -227,6 +232,14 @@ def test_ingest_runs_started_by_a_wrapper_show_their_schedule(api, monkeypatch):
     assert opts["scheduled"] == {"c1": ["Prod 15"], "c2": ["Prod 15"]}
 
 
+def test_a_schedule_body_keeps_minute_schedules_in_utc():
+    import main
+    body = main.ScheduleBody(name="n", cadence_minutes=30, timezone="Europe/London", members=["c1"])
+    assert body.timezone == "UTC"
+    daily = main.ScheduleBody(name="n", cadence_minutes=1440, timezone="Europe/London", members=["c1"])
+    assert daily.timezone == "Europe/London"
+
+
 def test_a_check_schedule_is_offered_only_with_the_check_job_and_syncs_one_job(api, monkeypatch):
     assert "check" not in api.get("/api/schedules/options").json()["variants"]
     monkeypatch.setattr(main.jobs, "CHECK_JOB_ID", "777")
@@ -240,3 +253,75 @@ def test_a_check_schedule_is_offered_only_with_the_check_job_and_syncs_one_job(a
     # The one wrapper fires every member at once: a stagger asked for (the form keeps the last choice) is not kept.
     assert api.store.schedules[r.json()["id"]]["stagger"] is False
     assert {m["offset_minutes"] for m in api.store.members.values()} == {0}
+
+
+def test_a_jobs_compute_lists_what_its_schedule_starts(api, monkeypatch):
+    ingest = {"name": "lakefed_ingest", "tasks": [{"task_key": "ingest", "job_cluster_key": "c"}],
+              "job_clusters": [{"job_cluster_key": "c", "new_cluster": {"node_type_id": "Standard_D8ds_v5",
+                                                                        "num_workers": 1}}]}
+    check = {"name": "lakefed_ingest_check", "tasks": [{"task_key": "check", "environment_key": "e"}]}
+    monkeypatch.setattr(main.jobs, "job_settings", lambda job_id: {"555": ingest, "777": check}[str(job_id)])
+    sid = api.post("/api/schedules", json=BODY).json()["id"]
+    found = api.get(f"/api/ingestion-jobs/{sid}/compute").json()
+    assert [(j["role"], j["job_id"], [t["kind"] for t in j["compute"]]) for j in found["jobs"]] == [
+        ("ingestion", "555", ["job cluster"])]
+    monkeypatch.setattr(main.jobs, "CHECK_JOB_ID", "777")
+    monkeypatch.setattr(main.jobs, "INGEST_JOB_ID", "555")
+    sid = api.post("/api/schedules", json=dict(BODY, name="Group", job_variant="check")).json()["id"]
+    found = api.get(f"/api/ingestion-jobs/{sid}/compute").json()
+    assert [(j["role"], [t["kind"] for t in j["compute"]]) for j in found["jobs"]] == [
+        ("check", ["serverless"]), ("ingestion", ["job cluster"])]
+
+
+def test_a_jobs_compute_says_so_when_a_job_cannot_be_read(api, monkeypatch):
+    def unreadable(job_id):
+        raise RuntimeError("no access")
+    monkeypatch.setattr(main.jobs, "job_settings", unreadable)
+    sid = api.post("/api/schedules", json=BODY).json()["id"]
+    [job] = api.get(f"/api/ingestion-jobs/{sid}/compute").json()["jobs"]
+    assert (job["compute"], job["error"]) == ([], "can't read job 555: no access")
+
+
+def _run_now_setup(api, monkeypatch, body):
+    started = []
+    monkeypatch.setattr(main.jobs, "run_now", lambda job_id, params: started.append(int(job_id)) or 900 + len(started))
+    monkeypatch.setattr(main, "_running", lambda: [])
+    sid = api.post("/api/schedules", json=body).json()["id"]
+    return sid, started
+
+
+def test_run_now_starts_each_members_wrapper_as_the_schedule_would(api, monkeypatch):
+    monkeypatch.setattr(main.jobs, "user_job_permission", lambda job_id, user: "CAN_MANAGE")
+    sid, started = _run_now_setup(api, monkeypatch, BODY)
+    r = api.post(f"/api/ingestion-jobs/{sid}/run")
+    assert r.status_code == 200, r.text
+    wrappers = {m["job_id"] for m in api.store.members.values()}
+    assert set(started) == wrappers and len(started) == 2 and r.json()["started"] == [901, 902]
+
+
+def test_run_now_on_a_check_schedule_starts_its_one_wrapper(api, monkeypatch):
+    monkeypatch.setattr(main.jobs, "user_job_permission", lambda job_id, user: "CAN_MANAGE")
+    monkeypatch.setattr(main.jobs, "CHECK_JOB_ID", "777")
+    sid, started = _run_now_setup(api, monkeypatch, dict(BODY, job_variant="check"))
+    assert api.post(f"/api/ingestion-jobs/{sid}/run").status_code == 200 and len(started) == 1
+
+
+def test_run_now_is_refused_while_a_run_of_the_job_is_going_or_when_turned_off(api, monkeypatch):
+    sid, started = _run_now_setup(api, monkeypatch, BODY)
+    monkeypatch.setattr(main.jobs, "user_job_permission", lambda job_id, user: "CAN_VIEW")
+    r = api.post(f"/api/ingestion-jobs/{sid}/run")
+    assert r.status_code == 403 and r.json()["detail"] == (
+        "starting a run needs Can Manage Run on the Databricks job 555; you have Can View")
+    monkeypatch.setattr(main.jobs, "user_job_permission", lambda job_id, user: "CAN_MANAGE_RUN")
+    monkeypatch.setattr(main, "_running", lambda: [{"task_collection": "c1", "run_id": 5}])
+    r = api.post(f"/api/ingestion-jobs/{sid}/run")
+    assert r.status_code == 409 and "already running" in r.json()["detail"] and started == []
+
+
+def test_deleting_a_job_needs_can_manage_on_its_databricks_job(api, monkeypatch):
+    sid = api.post("/api/schedules", json=BODY).json()["id"]
+    monkeypatch.setattr(main.jobs, "user_job_permission", lambda job_id, user: "CAN_MANAGE_RUN")
+    r = api.post(f"/api/schedules/{sid}/delete")
+    assert r.status_code == 403 and api.store.schedules[sid].get("deleted_at") is None
+    monkeypatch.setattr(main.jobs, "user_job_permission", lambda job_id, user: "IS_OWNER")
+    assert api.post(f"/api/schedules/{sid}/delete").status_code == 200

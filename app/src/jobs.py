@@ -67,6 +67,53 @@ def job_summary(job_id) -> dict:
     }
 
 
+# Run now and Delete follow Databricks' own job permissions for the signed-in user: the levels in Databricks' order,
+# what each action needs, and how a level reads on the page.
+PERMISSION_RANK = {"CAN_VIEW": 1, "CAN_MANAGE_RUN": 2, "CAN_MANAGE": 3, "IS_OWNER": 3}
+ACTION_NEEDS = {"run": ("starting a run", "CAN_MANAGE_RUN"), "delete": ("deleting", "CAN_MANAGE")}
+PERMISSION_LABEL = {"CAN_VIEW": "Can View", "CAN_MANAGE_RUN": "Can Manage Run", "CAN_MANAGE": "Can Manage",
+                    "IS_OWNER": "Is Owner"}
+
+
+def highest_permission(acl: List[dict], user: str, groups: List[str]) -> Optional[str]:
+    """The user's highest level on a job from its access list (Permissions API entries as dicts), counting entries
+    for the user and for any of their groups; a workspace admin manages every job."""
+    if "admins" in groups:
+        return "CAN_MANAGE"
+    email, member_of = (user or "").strip().lower(), set(groups) | {"users"}
+    levels = [p["permission_level"] for entry in acl
+              if (entry.get("user_name") or "").lower() == email or entry.get("group_name") in member_of
+              for p in entry.get("all_permissions") or []]
+    return max(levels, key=lambda level: PERMISSION_RANK.get(level, 0), default=None)
+
+
+def action_refusal(action: str, level: Optional[str], job_label: str) -> Optional[str]:
+    """Why a user with this level on the job may not take the action, or None when they may."""
+    doing, needs = ACTION_NEEDS[action]
+    if PERMISSION_RANK.get(level or "", 0) >= PERMISSION_RANK[needs]:
+        return None
+    have = f"you have {PERMISSION_LABEL.get(level, level)}" if level else "you have no access to it"
+    return f"{doing} needs {PERMISSION_LABEL[needs]} on {job_label}; {have}"
+
+
+def user_groups(user: str) -> List[str]:
+    """The workspace groups of a user, by the email the Apps proxy forwards."""
+    found = workspace().users.list(filter=f'userName eq "{user}"', attributes="groups")
+    return [g.display for u in found for g in (u.groups or []) if g.display]
+
+
+def user_job_permission(job_id, user: str) -> Optional[str]:
+    """The signed-in user's highest permission on a Databricks job, read by the app's service principal (which
+    needs Can Manage on the job to read its access list)."""
+    acl = workspace().permissions.get("jobs", str(int(job_id))).access_control_list or []
+    return highest_permission([entry.as_dict() for entry in acl], user, user_groups(user))
+
+
+def job_settings(job_id) -> dict:
+    """A job's settings as the Jobs API returns them (a plain dict), for compute.describe."""
+    return workspace().jobs.get(int(job_id)).settings.as_dict()
+
+
 def runs(job_id, active_only: bool = False, limit: int = 25) -> List[dict]:
     rows = []
     # The Jobs API caps a page at 25 runs; the SDK pages through, and we stop at `limit`.

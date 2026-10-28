@@ -32,6 +32,7 @@ targets:
       # max_seeds_per_run: "10000"
       # max_queries_per_source: "64"         # see README "Concurrency"
       # table_retries: "2"                    # see README "Table retries"
+      # fail_on_table_errors: "true"         # a run with failed tables ends as failed (README "Table retries")
 ```
 
 The default compute needs ~32 cores; a subscription with a small vCPU quota must use smaller nodes

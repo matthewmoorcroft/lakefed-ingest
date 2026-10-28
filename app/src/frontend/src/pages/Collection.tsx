@@ -105,7 +105,43 @@ export default function CollectionPage() {
           {unattributed.map((b) => `${fmtInt(b.rows)} rows in run #${b.run_id}`).join(", ")}; batches record one total, so these
           are not shown per database.</p>}
       </Section>
+      <GroupSettings name={name} />
     </>
+  );
+}
+
+const SETTING_LABELS: Record<string, string> = {
+  src_type: "Source type", use_remote_query: "Read through the UC connection", load_type: "Load type",
+  write_mode: "Write mode", fan_in: "Fan in to shared tables", sink_catalog: "Sink catalog", sink_schema: "Sink schema",
+  sink_table: "Sink table", freshness_sla_minutes: "Freshness target (minutes)", jdbc_options: "Read options",
+};
+
+/** The group's settings as its rows share them (no table of groups), and its tables as the import CSV. */
+function GroupSettings({ name }: { name: string }) {
+  const settings = useQuery({
+    queryKey: ["collection-settings", name],
+    queryFn: () => api.get<{ tables: number; settings: Row[] }>(`/collections/${encodeURIComponent(name)}/settings`),
+  });
+  const show = (v: unknown) => (v === null || v === undefined || v === "" ? <span className="muted">none</span>
+    : typeof v === "boolean" ? (v ? "yes" : "no") : String(v));
+  return (
+    <Section title="Settings" note="The values every table of the group shares; mixed where they differ. An import into the group takes them."
+      actions={<span className="pager-buttons"><Link to={`/import?group=${encodeURIComponent(name)}`}>Import CSV</Link>
+        <a href={`/api/collections/${encodeURIComponent(name)}/export.csv`}>Export CSV</a></span>}>
+      <ErrorBox error={settings.error} />
+      <div className="table-wrap" style={{ maxWidth: 760 }}><table className="data dense">
+        <thead><tr><th>Setting</th><th>Value</th></tr></thead>
+        <tbody>
+          {(settings.data?.settings ?? []).map((s) => (
+            <tr key={s.setting}>
+              <td>{SETTING_LABELS[s.setting] ?? s.setting}</td>
+              <td>{s.mixed ? <>mixed: {Object.entries(s.mixed as Record<string, number>).map(([v, n]) =>
+                `${v || "blank"} (${fmtInt(n)} ${plural(n, "table")})`).join(", ")}</> : show(s.value)}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table></div>
+    </Section>
   );
 }
 

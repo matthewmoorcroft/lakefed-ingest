@@ -1,9 +1,9 @@
 import { useState } from "react";
-import { useQuery } from "@tanstack/react-query";
-import { Link, useParams } from "react-router-dom";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { Link, useNavigate, useParams } from "react-router-dom";
 import { api, qs, type Row } from "../api";
 import {
-  ErrorBox, Name, PageHead, RunStatus, Section, StateBar, StateKey, fmtClock, fmtDuration, fmtInt, fmtSlot, fmtSpeed, jobRunPath, plural
+  Badge, ErrorBox, Name, Notice, PageHead, RunStatus, Section, StateBar, StateKey, fmtClock, fmtDuration, fmtInt, fmtSlot, fmtSpeed, jobRunPath, plural
 } from "../components";
 
 const PAGE = 25;
@@ -42,8 +42,18 @@ export function JobRunsTable({ runs, showJob }: { runs: Row[]; showJob?: boolean
 
 export default function IngestionJob() {
   const { id = "" } = useParams();
+  const navigate = useNavigate();
   const [pages, setPages] = useState<string[]>([]);
   const before = pages[pages.length - 1];
+  const qc = useQueryClient();
+  const runNow = useMutation({
+    mutationFn: () => api.post<Row>(`/ingestion-jobs/${encodeURIComponent(id)}/run`, {}),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["ingestion-job", id] }),
+  });
+  const remove = useMutation({
+    mutationFn: () => api.post<Row>(`/schedules/${encodeURIComponent(id)}/delete`, {}),
+    onSuccess: () => { qc.invalidateQueries(); navigate("/ingestion-jobs"); },
+  });
   const job = useQuery({ queryKey: ["ingestion-job", id], queryFn: () => api.get<Row>(`/ingestion-jobs/${encodeURIComponent(id)}`),
                          refetchInterval: 60_000 });
   const runs = useQuery({
@@ -56,14 +66,24 @@ export default function IngestionJob() {
   return (
     <>
       <PageHead crumb={<span className="eyebrow"><Link to="/overview">Overview</Link> · <Link to="/ingestion-jobs">Ingestion jobs</Link></span>}
-        title={j ? j.name : "Ingestion job"}
-        lead={j && <>{j.description}{j.stagger_to ? `, starts from :${String(j.stagger_from).padStart(2, "0")} to :${String(j.stagger_to).padStart(2, "0")}` : ""};{" "}
+        title={j ? <>{j.name} {j.paused && <Badge value="Paused" />}</> : "Ingestion job"}
+        lead={j && <>{j.description}{j.stagger_to ? `, its groups starting up to ${j.stagger_to} minutes after that` : ""};{" "}
           <strong>{fmtInt(j.groups?.length)}</strong> {plural(j.groups?.length, "ingestion group")}, <strong>{fmtInt(j.databases)}</strong>{" "}
           {plural(j.databases, "database")}, <strong>{fmtInt(j.enabled_tables)}</strong> {plural(j.enabled_tables, "table")} on{" "}
           <strong>{fmtInt(j.servers)}</strong> {plural(j.servers, "server")}
           {j.parameters?.parallelism && <>, parallelism <strong>{j.parameters.parallelism}</strong></>}
           {j.job_variant && j.job_variant !== "default" && <>, Databricks job variant <strong>{j.job_variant}</strong></>}
-          {j.paused && <>; <strong>paused</strong></>}. <Link to="/schedules">Edit on Schedules</Link>.</>} />
+.</>}
+        right={j && <span className="card-actions">
+          <button className="ghost" disabled={!!j.run_now?.blocked || runNow.isPending} title={j.run_now?.blocked ?? undefined}
+            onClick={() => window.confirm(runNowMessage(j)) && runNow.mutate()}>{runNow.isPending ? "Starting…" : "Run now"}</button>
+          <button className="ghost danger-text" disabled={!!j.delete_blocked || remove.isPending} title={j.delete_blocked ?? undefined}
+            onClick={() => window.confirm(deleteMessage(j)) && remove.mutate()}>{remove.isPending ? "Deleting…" : "Delete"}</button>
+          <button className="primary" onClick={() => navigate(`/ingestion-jobs/${id}/edit`)}>Edit</button></span>} />
+      {j?.run_now?.blocked && <p className="muted small right">Run now: {j.run_now.blocked}.</p>}
+      <ErrorBox error={remove.error} />
+      <ErrorBox error={runNow.error} />
+      {runNow.isSuccess && <Notice tone="ok">Started: {fmtInt(runNow.data.started.length)} {plural(runNow.data.started.length, "Databricks job run")}. The runs show here as they start.</Notice>}
       <ErrorBox error={job.error} />
       {j && (
         <div className="metrics">
@@ -101,7 +121,7 @@ export default function IngestionJob() {
               {j.groups_detail.map((g: Row) => (
                 <tr key={g.task_collection}>
                   <td className="name"><Link to={`/collections/${encodeURIComponent(g.task_collection)}`}><b>{g.task_collection}</b></Link></td>
-                  <td className="num">:{String(g.offset_minutes % 60).padStart(2, "0")}</td>
+                  <td className="num">{g.starts ?? `:${String(g.offset_minutes % 60).padStart(2, "0")}`}</td>
                   <td className="num">{fmtInt(g.databases)}</td><td className="num">{fmtInt(g.enabled_tables)}</td><td><StateBar row={g} /></td>
                   <td className="num" style={{ color: Number(g.state_failing) ? "var(--bad)" : undefined }}>{fmtInt(g.state_failing)}</td>
                   <td>{g.last_run ? <><Link to={`/runs/${g.last_run.run_id}`}><RunStatus status={g.last_run.status} outcome={g.last_run.outcome} /></Link>
@@ -118,3 +138,19 @@ export default function IngestionJob() {
   );
 }
 
+// What Run now starts, for its confirm dialog: one run of every group, each on its own cluster, which costs money.
+function runNowMessage(j: Row): string {
+  const groups = Number(j.run_now?.groups ?? 0);
+  const starts = j.run_now?.check
+    ? `the check job over its ${fmtInt(groups)} ${plural(groups, "group")}, which starts an ingest run, each on its own job cluster, for every group with changes (up to ${fmtInt(groups)} ${plural(groups, "cluster")})`
+    : `an ingest run for each of its ${fmtInt(groups)} ${plural(groups, "group")}, each on its own job cluster (${fmtInt(groups)} ${plural(groups, "cluster")})`;
+  return `Start a run of ${j.name} now?\n\nThis starts ${starts}, over its ${fmtInt(j.enabled_tables)} ${plural(j.enabled_tables, "table")}. ` +
+    "Clusters and the sources' load cost money while they run.";
+}
+
+// What deleting a job does, for its confirm dialog: the job goes, everything it loaded stays.
+function deleteMessage(j: Row): string {
+  return `Delete ${j.name}?\n\nIts schedule and its Databricks jobs are deleted. Its ` +
+    `${fmtInt(j.groups?.length)} ${plural(j.groups?.length, "group")} move to Not in any job, and their ` +
+    `${fmtInt(j.enabled_tables)} ${plural(j.enabled_tables, "table")}, target tables, checkpoints and run history all stay.`;
+}

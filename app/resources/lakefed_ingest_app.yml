@@ -1,8 +1,9 @@
 # The operations app and its one-time grant job.
 #
 # The app runs as its own service principal, with least privilege:
-#   - ingestion, setup, discovery and check jobs: CAN_MANAGE_RUN through app resources (view, run, cancel;
-#     not edit);
+#   - setup and discovery jobs: CAN_MANAGE_RUN through app resources (view, run, cancel; not edit);
+#   - ingestion and check jobs: CAN_MANAGE, so the app can read their access lists: Run now and Delete follow the
+#     signed-in user's own permission on them (jobs.user_job_permission). The app never edits them;
 #   - Lakebase: granted by the lakefed_ingest_app_grants job below (run once after the first deploy,
 #     as the instance manager / tables' owner): CAN_USE on the instance, a Postgres role, and
 #     SELECT / INSERT / UPDATE on the lakefed_ingest tables. The app has no `database` resource:
@@ -34,7 +35,7 @@ resources:
           description: The lakefed_ingest ingestion job.
           job:
             id: ${var.ingest_job_id}
-            permission: CAN_MANAGE_RUN
+            permission: CAN_MANAGE
         - name: setup-job
           description: The lakefed_ingest_setup schema job.
           job:
@@ -49,7 +50,7 @@ resources:
           description: The lakefed_ingest_check job, started by schedules of the check variant.
           job:
             id: ${var.check_job_id}
-            permission: CAN_MANAGE_RUN
+            permission: CAN_MANAGE
 
   jobs:
     lakefed_ingest_app_grants:

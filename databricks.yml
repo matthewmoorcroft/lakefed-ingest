@@ -76,6 +76,9 @@ variables:
   table_retry_budget:
     description: Table retries in the whole run; once spent, failures fail at once.
     default: "20"
+  fail_on_table_errors:
+    description: End a run as failed when any of its tables failed, so the job's failure email fires ("false" = the run succeeds and the failures are recorded).
+    default: "false"
   spark_conf:
     description: Spark session settings for a run, a JSON object of setting to value (a string, number or boolean; blank keeps the cluster's).
     default: ""

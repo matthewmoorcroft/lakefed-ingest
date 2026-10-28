@@ -15,9 +15,12 @@ import Timeline from "./pages/Timeline";
 import Collection from "./pages/Collection";
 import IngestionJobs from "./pages/IngestionJobs";
 import IngestionJob from "./pages/IngestionJob";
+import NotInJob from "./pages/NotInJob";
+import JobEdit from "./pages/JobEdit";
 import JobRun from "./pages/JobRun";
 import Sources from "./pages/Sources";
 import Database from "./pages/Database";
+import ImportCsv from "./pages/ImportCsv";
 
 interface Settings { config?: Config }
 const SettingsContext = createContext<Settings>({});
@@ -26,7 +29,7 @@ export const useSettings = () => useContext(SettingsContext);
 const NAV = [
   ["Monitor", [["/overview", "Overview"], ["/ingestion-jobs", "Ingestion jobs"], ["/runs", "Runs"], ["/sources", "Sources"], ["/timeline", "Timeline"]]],
   ["Manage", [["/tables", "Tables"], ["/schedules", "Schedules"], ["/jobs", "Databricks jobs"], ["/add", "Add table"],
-              ["/bulk", "Bulk import"], ["/changes", "Changes"]]],
+              ["/bulk", "Bulk import"], ["/import", "Import CSV"], ["/changes", "Changes"]]],
 ] as const;
 
 export default function App() {
@@ -62,7 +65,9 @@ export default function App() {
             <Route path="/" element={<Navigate to="/overview" replace />} />
             <Route path="/overview" element={<Overview />} />
             <Route path="/ingestion-jobs" element={<IngestionJobs />} />
+            <Route path="/ingestion-jobs/not-in-job" element={<NotInJob />} />
             <Route path="/ingestion-jobs/:id" element={<IngestionJob />} />
+            <Route path="/ingestion-jobs/:id/edit" element={<JobEdit />} />
             <Route path="/ingestion-jobs/:id/runs/:slot" element={<JobRun />} />
             <Route path="/runs" element={<Runs />} />
             <Route path="/runs/:id" element={<RunDetail />} />
@@ -75,6 +80,7 @@ export default function App() {
             <Route path="/sources" element={<Sources />} />
             <Route path="/add" element={<AddTable />} />
             <Route path="/bulk" element={<BulkImport />} />
+            <Route path="/import" element={<ImportCsv />} />
             <Route path="/changes" element={<Changes />} />
             <Route path="*" element={<Navigate to="/overview" replace />} />
           </Routes>

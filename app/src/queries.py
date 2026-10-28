@@ -1461,6 +1461,77 @@ def control_row_sql() -> str:
     return f"select {cols} from {SCHEMA}.control where id = %s"
 
 
+def collection_control_rows_sql() -> str:
+    """Every control row of one ingestion group, enabled or not, oldest first: what its settings are read from
+    (config_import.group_settings) and what its export writes. Param: task_collection."""
+    cols = ", ".join(("id",) + CONTROL_EDIT_COLUMNS)
+    return f"select {cols} from {SCHEMA}.control where task_collection = %s order by id"
+
+
+def groups_control_rows_sql(for_update: bool = False) -> str:
+    """Every control row of the given ingestion groups, enabled or not, oldest first: an ingestion job's rows, which
+    its settings are read from (job_settings.read). Locked for update when an edit applies. Param: list of groups."""
+    cols = ", ".join(("id",) + CONTROL_EDIT_COLUMNS)
+    return (f"select {cols} from {SCHEMA}.control where task_collection = any(%s) order by id"
+            + (" for update" if for_update else ""))
+
+
+# An ingestion job's tables as a tree: its servers, a server's databases, a database's tables. Each level is
+# searched and paged in SQL, so a job of millions of tables never comes back whole. Aliases t, cp as STATE_COUNTS.
+_JOB_ROWS = (f"from {SCHEMA}.control t left join {SCHEMA}.checkpoint cp on cp.control_id = t.id {DATABASE_CHECK_JOIN} "
+             "where t.task_collection = any(%s)")
+
+
+def groups_row_count_sql() -> str:
+    """How many control rows the given groups have. Param: list of groups."""
+    return f"select count(*) as n from {SCHEMA}.control where task_collection = any(%s)"
+
+
+def job_servers_sql() -> str:
+    """Params: groups, search pattern (ilike), limit, offset. Each row carries the level's total."""
+    return f"""
+select {SERVER} as server, min(t.src_connection) as src_connection, min(lower(t.src_host)) as src_host,
+       count(distinct coalesce(t.src_database, '')) as databases, count(*) as tables,
+       count(*) filter (where t.task_enabled) as enabled_tables, {STATE_COUNTS}, count(*) over () as total
+{_JOB_ROWS} and {SERVER} ilike %s
+group by 1 order by 1 limit %s offset %s"""
+
+
+def job_databases_sql() -> str:
+    """Params: groups (for the job's table count), groups, server, search pattern, limit, offset. ``missing`` is
+    how many of the job's tables the database lacks."""
+    return f"""
+with job_tables as (
+    select count(distinct (lower(src_schema), lower(src_table))) as n from {SCHEMA}.control where task_collection = any(%s)
+)
+select coalesce(t.src_database, '') as database, min(t.client_id) as client_id, count(*) as tables,
+       count(*) filter (where t.task_enabled) as enabled_tables, {STATE_COUNTS},
+       (select n from job_tables) - count(*) as missing, count(*) over () as total
+{_JOB_ROWS} and {SERVER} = %s and coalesce(t.src_database, '') ilike %s
+group by 1 order by 1 limit %s offset %s"""
+
+
+def job_tables_sql() -> str:
+    """Params: groups, server, database, search pattern, limit, offset."""
+    return f"""
+select t.id, t.src_schema as schema, t.src_table as "table", t.load_type, t.primary_key, t.select_list,
+       t.sink_catalog || '.' || t.sink_schema || '.' || t.sink_table as target, t.task_enabled as enabled,
+       t.task_collection, cp.status, cp.phase, cp.last_success_at, {STATE_COUNTS}, count(*) over () as total
+{_JOB_ROWS} and {SERVER} = %s and coalesce(t.src_database, '') = %s
+  and (t.src_schema || '.' || t.src_table) ilike %s
+group by t.id, cp.control_id order by lower(t.src_schema), lower(t.src_table) limit %s offset %s"""
+
+
+def job_row_ids_sql() -> str:
+    """The ids of a job's rows on one server, optionally one database and one table (schema and table; blank =
+    all). Params: groups, server ('' = every server), database, schema, table."""
+    return f"""
+select t.id from {SCHEMA}.control t where t.task_collection = any(%s)
+  and (%s = '' or {SERVER} = %s) and (%s = '' or coalesce(t.src_database, '') = %s)
+  and (%s = '' or lower(t.src_schema) = lower(%s)) and (%s = '' or lower(t.src_table) = lower(%s))
+order by t.id"""
+
+
 def update_control_sql(fields: List[str]) -> str:
     """UPDATE of whitelisted columns only (field names come from CONTROL_EDIT_COLUMNS)."""
     assert fields and all(f in CONTROL_EDIT_COLUMNS for f in fields), fields
@@ -1545,7 +1616,8 @@ def checkpoint_for_sql() -> str:
 # ---- schedules ----------------------------------------------------------------------------------
 
 SCHEDULE_FIELDS = ("name", "cadence_minutes", "timezone", "parameters", "job_variant", "stagger", "paused",
-                   "notify_emails")
+                   "notify_emails", "options")
+JSON_SCHEDULE_FIELDS = ("parameters", "options")
 
 
 def schedules_sql() -> str:
@@ -1586,7 +1658,7 @@ def schedule_lock_key(schedule_id: int) -> int:
 
 def insert_schedule_sql() -> str:
     cols = SCHEDULE_FIELDS + ("created_by",)
-    vals = ", ".join("%s::jsonb" if c == "parameters" else "%s" for c in cols)
+    vals = ", ".join("%s::jsonb" if c in JSON_SCHEDULE_FIELDS else "%s" for c in cols)
     return f"insert into {SCHEMA}.schedule ({', '.join(cols)}) values ({vals}) returning id"
 
 
@@ -1594,7 +1666,7 @@ def update_schedule_sql(fields: List[str]) -> str:
     bad = [f for f in fields if f not in SCHEDULE_FIELDS]
     if bad or not fields:
         raise ValueError(f"not schedule fields: {bad}")
-    sets = ", ".join(f"{f} = %s::jsonb" if f == "parameters" else f"{f} = %s" for f in fields)
+    sets = ", ".join(f"{f} = %s::jsonb" if f in JSON_SCHEDULE_FIELDS else f"{f} = %s" for f in fields)
     return f"update {SCHEMA}.schedule set {sets}, updated_at = now() where id = %s and deleted_at is null"
 
 

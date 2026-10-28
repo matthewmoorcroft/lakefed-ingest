@@ -47,8 +47,11 @@ PARAMETERS = {
     "max_queries_per_source": _whole(0, 1024),
     "table_retries": _whole(0, 10),
     "table_retry_budget": _whole(0, 100000),
+    "fail_on_table_errors": _flag,
 }
 FLAGS = [k for k, check in PARAMETERS.items() if check is _flag]
+# Keys of schedule.options: start_minute = a set start time for daily and every 2 to 12 hours schedules.
+OPTIONS = ("start_minute",)
 TAG_SCHEDULE = "lakefed_ingest_schedule"
 TAG_COLLECTION = "lakefed_ingest_collection"
 TAG_OWNER = "lakefed_ingest_app"     # instance/database: apps of other deployments in the workspace keep out
@@ -99,18 +102,56 @@ def validate(body: dict, known_collections: Iterable[str], variants: Iterable[st
     bad = [e for e in emails(body.get("notify_emails")) if not _EMAIL.fullmatch(e)]
     if bad:
         errs.append(f"notify_emails: invalid address {bad[0]}")
+    options = body.get("options") or {}
+    if not isinstance(options, dict):
+        errs.append("options must be an object")
+    else:
+        errs += [f"options: unknown key {k}" for k in options if k not in OPTIONS]
+        start = options.get("start_minute")
+        if start is not None:
+            if not isinstance(start, int) or isinstance(start, bool) or not 0 <= start < 1440:
+                errs.append("options.start_minute: a minute of the day, 0 to 1439")
+            elif int(body.get("cadence_minutes") or 0) <= 60:
+                errs.append("options.start_minute: only daily and every 2 to 12 hours schedules start at a set time")
     return errs
 
 
 # ---- cadence, offsets, cron, next runs ----------------------------------------------------------
 
-def offsets(collections: Iterable[str], cadence: int, stagger: bool) -> Dict[str, int]:
-    """Start offset (minutes within the cadence) per collection: spread evenly when staggering, in name
-    order so they are stable; all 0 otherwise. For cadences over an hour the offsets stay within the
-    first hour, so staggered members keep starting near the top of their cadence."""
+def timezone_for(cadence: int, tz: Optional[str]) -> str:
+    """The zone a schedule runs in. Every 5 to 60 minutes: UTC, since London (like most zones) is a whole hour
+    off UTC, so the runs fall on the same local minutes, and in UTC none is skipped or late on a clock-change
+    night (Databricks' advice for hourly runs). Daily or every 2 to 12 hours is tied to a time of day: its zone."""
+    return "UTC" if int(cadence) <= 60 else (str(tz or "").strip() or "UTC")
+
+
+def start_minute(schedule: dict) -> int:
+    """A schedule's set start time, minutes after local midnight (schedule.options.start_minute; 0 when unset or
+    for a minute or hourly schedule)."""
+    options = schedule.get("options") or {}
+    if isinstance(options, str):
+        options = json.loads(options)
+    return int(options.get("start_minute") or 0) if int(schedule.get("cadence_minutes") or 0) > 60 else 0
+
+
+def offsets(collections: Iterable[str], cadence: int, stagger: bool, start_minute: int = 0) -> Dict[str, int]:
+    """Start offset (minutes within the cadence) per collection: the schedule's start time, plus a spread in name
+    order when staggering (stable as members come and go). For cadences over an hour the spread stays within the
+    first hour after the start, so staggered members start near it. A minute or hourly schedule has no start."""
     names = sorted(collections)
     span = min(cadence, 60)
-    return {c: (i * span // len(names) if stagger else 0) for i, c in enumerate(names)}
+    start = start_minute if cadence > 60 else 0
+    return {c: (start + (i * span // len(names) if stagger else 0)) % cadence for i, c in enumerate(names)}
+
+
+def member_start(cadence: int, offset: int) -> str:
+    """When a member starts, as its page shows it: a clock time for a set-time schedule, minutes past otherwise."""
+    return f"{offset // 60:02d}:{offset % 60:02d}" if cadence > 60 else _past_the_hour(offset % 60)
+
+
+def stagger_of(offset: int, cadence: int, start_minute: int) -> int:
+    """The part of a member's offset that is its stagger: how long after its job run's start it fires."""
+    return (int(offset) - (start_minute if cadence > 60 else 0)) % cadence
 
 
 def quartz_cron(cadence: int, offset: int) -> str:
@@ -127,14 +168,21 @@ def quartz_cron(cadence: int, offset: int) -> str:
     return f"0 {minute} {first_hour}/{hours} * * ?"
 
 
+def _past_the_hour(minutes: int) -> str:
+    return "on the hour" if not minutes else f"{minutes} minute{'' if minutes == 1 else 's'} past the hour"
+
+
 def describe(cadence: int, offset: int = 0, tz: str = "UTC") -> str:
+    """A schedule in plain words, as cronstrue reads a cron expression ("Every 30 minutes", "at 15 minutes past the
+    hour"), with its time zone in brackets as the Databricks Jobs UI shows it. Minute and hourly schedules run in UTC."""
+    clock = f"{offset // 60:02d}:{offset % 60:02d}"
     if cadence < 60:
-        return f"every {cadence} minutes" + (f" at :{offset:02d} past" if offset else "")
+        return f"Every {cadence} minutes" + (f", starting at {_past_the_hour(offset)}" if offset else "") + " (UTC)"
     if cadence == 60:
-        return f"hourly at :{offset:02d}"
+        return f"Every hour, {'on the hour' if not offset else 'at ' + _past_the_hour(offset)} (UTC)"
     if cadence == 1440:
-        return f"daily at {offset // 60:02d}:{offset % 60:02d} ({tz})"
-    return f"every {cadence // 60} hours from {offset // 60:02d}:{offset % 60:02d} ({tz})"
+        return f"Every day at {clock} ({tz or 'UTC'})"
+    return f"Every {cadence // 60} hours, starting at {clock} ({tz or 'UTC'})"
 
 
 def fire_times(cadence: int, offset: int, tz: str, start: datetime, end: datetime) -> List[datetime]:
@@ -145,7 +193,12 @@ def fire_times(cadence: int, offset: int, tz: str, start: datetime, end: datetim
     out, day = [], midnight
     while day.astimezone(timezone.utc) < end:
         for m in range(offset, 1440, cadence):
-            t = (day + timedelta(minutes=m)).astimezone(timezone.utc)
+            wall = day + timedelta(minutes=m)
+            t = wall.astimezone(timezone.utc)
+            # A wall-clock time the clocks skip that night (inside the spring-forward gap) never fires: Quartz
+            # skips it, so it is not a trigger here either.
+            if t.astimezone(zone).replace(tzinfo=None) != wall.replace(tzinfo=None):
+                continue
             if start <= t < end:
                 out.append(t)
         day = (day + timedelta(days=1, hours=2)).replace(hour=0, minute=0)   # safe across DST changes
@@ -214,7 +267,7 @@ def _check_job_run(check: dict) -> str:
 
 
 def job_runs(cadence: int, tz: str, members: List[dict], runs: List[dict], start: datetime, end: datetime,
-             now: datetime, check_variant: bool = False) -> List[dict]:
+             now: datetime, start_minute: int = 0, check_variant: bool = False) -> List[dict]:
     """A schedule's job runs whose triggers fall in [start, end), newest first, each with one entry per
     member then: its trigger time, its group run and any extra runs, and its state.
 
@@ -236,11 +289,15 @@ def job_runs(cadence: int, tz: str, members: List[dict], runs: List[dict], start
             by_group.setdefault(r["task_collection"], []).append(r)
         elif check_variant:
             checks.append(r)
-    offset_of = (lambda m: 0) if check_variant else (lambda m: int(m["offset_minutes"]))
+    start_offset = (start_minute if cadence > 60 else 0) % cadence
+    offset_of = (lambda m: start_offset) if check_variant else (lambda m: int(m["offset_minutes"]))
+    # A slot is the job run's start: a member's fire time less its stagger (its offset past the start time).
+    slot_at = lambda fire, offset: slot_of(fire, stagger_of(offset, cadence, start_minute), tz)
     check_slot: Dict[str, datetime] = {}
     for c in checks:
         started = _when(c["started_at"])
-        before = fire_times(cadence, 0, tz, started - timedelta(minutes=cadence + 1), started + timedelta(seconds=1))
+        before = fire_times(cadence, start_offset, tz, started - timedelta(minutes=cadence + 1),
+                            started + timedelta(seconds=1))
         if before:
             check_slot.setdefault(_check_job_run(c), slot_of(before[-1], 0, tz))   # checks come oldest first
     checks_at: Dict[tuple, List[dict]] = {}
@@ -260,7 +317,7 @@ def job_runs(cadence: int, tz: str, members: List[dict], runs: List[dict], start
             started = _when(r["started_at"])
             before = fire_times(cadence, offset, tz, started - timedelta(minutes=cadence + 1), started + timedelta(seconds=1))
             if before:
-                slot = slot_of(before[-1], offset, tz)
+                slot = slot_at(before[-1], offset)
                 launch_slot[launch] = min(launch_slot.get(launch, slot), slot)
     slots: Dict[datetime, List[dict]] = {}
     for m in members:
@@ -278,7 +335,7 @@ def job_runs(cadence: int, tz: str, members: List[dict], runs: List[dict], start
         for fire, following in zip(fires, fires[1:]):
             if (added is not None and fire < added) or (removed is not None and fire >= removed):
                 continue
-            slot = slot_of(fire, offset, tz)
+            slot = slot_at(fire, offset)
             in_slot = [r for r in member_runs
                        if (launch_slot.get(launch_of(r)) == slot if launch_of(r) in launch_slot
                            else fire <= _when(r["started_at"]) < following)]
@@ -354,7 +411,8 @@ def group_job_settings(schedule: dict, collections: Iterable[str], check_job_id:
                        view_group: Optional[str] = None, owner: Optional[str] = None) -> dict:
     """Jobs API 2.2 settings of a ``check`` schedule's one wrapper job: at the cadence, it starts the check
     job over every member. Members are not staggered: the check takes them in one go."""
-    s = job_settings(schedule, "", 0, check_job_id, view_group, owner)
+    s = job_settings(schedule, "", start_minute(schedule) % int(schedule["cadence_minutes"]), check_job_id,
+                     view_group, owner)
     params = {"task_collections": ",".join(sorted(collections)),
               **{k: str(v) for k, v in sorted((schedule.get("parameters") or {}).items())}}
     s["name"] = group_job_name(schedule["name"])

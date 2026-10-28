@@ -482,6 +482,9 @@ create table if not exists lakefed_ingest.schedule (
 );
 create unique index if not exists schedule_name_uq
     on lakefed_ingest.schedule (lower(name)) where deleted_at is null;
+-- Schedule options the app sets, as a JSON object (null = none): start_minute, a set start time for daily
+-- and every 2 to 12 hours schedules, in minutes after local midnight.
+alter table lakefed_ingest.schedule add column if not exists options jsonb;
 alter table lakefed_ingest.schedule drop constraint if exists valid_schedule_cadence;
 alter table lakefed_ingest.schedule add constraint valid_schedule_cadence check (
     cadence_minutes in (5, 10, 15, 20, 30, 60, 120, 180, 240, 360, 720, 1440)

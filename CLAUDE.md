@@ -101,6 +101,7 @@ secret). See `README.md`, `docs/deploy.md`, `docs/monitoring.md`, `docs/lakebase
   (cap per source across runs, 0 = none: each run takes cap / runs reading the source, counted from
   shared advisory locks; `parallel.SourceLimiter`), `table_retries` (extra attempts per table after a
   transient source error, 0 = off; `table_retry.py`), `table_retry_budget` (retries per run),
+  `fail_on_table_errors` (a run with failed tables ends as failed, so its failure email fires),
   `db_instance`, `db_name`.
   The tuning parameters' defaults are bundle variables of the same name (`databricks.yml`).
 - `lakefed_ingest_check` → `check_launch.ipynb` (serverless): checks a group of collections

@@ -127,7 +127,10 @@ def split_sql_statements(ddl: str) -> List[str]:
 # DDL's fingerprint to it, so a schema change can't ship without a bump.
 #   0 = no version recorded (deployed before versions existed)   1 = first recorded version
 #   2 = discovery, control_change, checkpoint identities, freshness SLA, schedules (operations app)
-SCHEMA_VERSION = 4
+#   3, 4 = the check job (initial checks, launches)
+#   6 = schedule.options (a set start time). It is 6, not 5: the start-time branch numbered it 5 before it met
+#       the check job's 3 and 4, and a database migrated to that 5 must still get 3 and 4.
+SCHEMA_VERSION = 6
 # Advisory lock that serializes migrations (the setup job and ingestion runs of any collection): two
 # int keys, so it can't collide with a collection's one-key lock whatever the collection is named,
 # and a class of its own (not SOURCE_LOCK_CLASS).

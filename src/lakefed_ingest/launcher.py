@@ -38,7 +38,7 @@ OK_OUTCOMES = ("succeeded", "started", "already_running", "deferred")
 RUN_PARAMETERS = (
     "db_instance", "db_name", "parallelism", "secret_scope", "trust_server_certificate", "snapshot_isolation",
     "reseed_on_new_columns", "append_batch_size", "max_seeds_per_run", "freshness_interval_s", "detection_chunk",
-    "max_queries_per_source", "table_retries", "table_retry_budget", "spark_conf",
+    "max_queries_per_source", "table_retries", "table_retry_budget", "fail_on_table_errors", "spark_conf",
 )
 
 

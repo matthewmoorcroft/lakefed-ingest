@@ -42,10 +42,13 @@ def test_fire_times_and_next_run_match_the_cron():
 
 
 def test_describe():
-    assert sch.describe(15) == "every 15 minutes"
-    assert sch.describe(15, 7) == "every 15 minutes at :07 past"
-    assert sch.describe(60, 5) == "hourly at :05"
-    assert sch.describe(1440, 90, "UTC") == "daily at 01:30 (UTC)"
+    # Plain words, as cronstrue reads a cron expression, with the time zone as the Databricks Jobs UI shows it.
+    assert sch.describe(15) == "Every 15 minutes (UTC)"
+    assert sch.describe(15, 7) == "Every 15 minutes, starting at 7 minutes past the hour (UTC)"
+    assert sch.describe(60) == "Every hour, on the hour (UTC)"
+    assert sch.describe(60, 5) == "Every hour, at 5 minutes past the hour (UTC)"
+    assert sch.describe(1440, 90, "UTC") == "Every day at 01:30 (UTC)"
+    assert sch.describe(360, 390, "Europe/London") == "Every 6 hours, starting at 06:30 (Europe/London)"
 
 
 def test_validate():
@@ -241,7 +244,8 @@ def test_new_job_parameters_validate_like_the_notebook_parses_them():
     for k, v in (("table_retries", "-1"), ("append_batch_size", "0"), ("freshness_interval_s", "1e3"),
                  ("snapshot_isolation", "yes")):
         assert f"parameters.{k}: invalid value" in " ".join(sch.validate(dict(ok, parameters={k: v}), ["c1"], ["default"]))
-    assert set(sch.FLAGS) == {"trust_server_certificate", "snapshot_isolation", "reseed_on_new_columns"}
+    assert set(sch.FLAGS) == {"trust_server_certificate", "snapshot_isolation", "reseed_on_new_columns",
+                             "fail_on_table_errors"}
 
 
 # ---- job runs: group runs placed by cadence slot ------------------------------------------------
@@ -316,6 +320,57 @@ def test_a_member_triggered_in_the_current_slot_with_no_group_run_yet_is_startin
     current, past = found[0]["members"], found[1]["members"]
     assert [(m["task_collection"], m["state"]) for m in current] == [("a", "starting"), ("b", "waiting")]
     assert [m["state"] for m in past] == ["no run", "no run"]
+
+
+def test_minute_and_hourly_schedules_run_in_utc_and_set_times_keep_their_zone():
+    # London is a whole hour off UTC, so :00 and :30 fall on the same instants; in UTC no run is skipped on the
+    # clock-change nights. A daily or every-N-hours schedule is tied to a local time of day, so it keeps its zone.
+    assert sch.timezone_for(30, "Europe/London") == "UTC" and sch.timezone_for(60, "Europe/London") == "UTC"
+    assert sch.timezone_for(120, "Europe/London") == "Europe/London"
+    assert sch.timezone_for(1440, "Europe/London") == "Europe/London"
+    assert sch.timezone_for(1440, "") == "UTC"
+
+
+def test_a_set_start_time_moves_every_members_offset_and_wraps_within_the_cadence():
+    assert sch.offsets(["a", "b"], 1440, True, start_minute=150) == {"a": 150, "b": 180}
+    assert sch.offsets(["a"], 360, False, start_minute=390) == {"a": 30}
+    assert sch.offsets(["a", "b"], 30, True, start_minute=150) == {"a": 0, "b": 15}   # minutes ignore a start
+
+
+def test_a_daily_schedule_at_a_set_time_fires_then_and_its_job_runs_are_named_by_that_time():
+    offsets = sch.offsets(["a", "b"], 1440, True, start_minute=150)
+    assert sch.quartz_cron(1440, offsets["a"]) == "0 30 2 * * ?"
+    start = datetime(2026, 10, 27, tzinfo=timezone.utc)
+    fire = sch.next_run(1440, offsets["b"], "Europe/London", start)
+    assert fire == datetime(2026, 10, 27, 3, 0, tzinfo=timezone.utc)          # 03:00 GMT, the second member
+    assert sch.slot_of(fire, sch.stagger_of(offsets["b"], 1440, 150), "Europe/London") == datetime(
+        2026, 10, 27, 2, 30, tzinfo=timezone.utc)
+    assert sch.describe(1440, 150, "Europe/London") == "Every day at 02:30 (Europe/London)"
+
+
+def test_a_start_time_is_checked_and_only_set_time_schedules_take_one():
+    ok = {"name": "n", "cadence_minutes": 1440, "timezone": "Europe/London", "members": ["c1"], "parameters": {}}
+    assert sch.validate(dict(ok, options={"start_minute": 150}), ["c1"], ["default"]) == []
+    assert sch.validate(dict(ok, options={"start_minute": 1440}), ["c1"], ["default"]) == [
+        "options.start_minute: a minute of the day, 0 to 1439"]
+    assert sch.validate(dict(ok, cadence_minutes=30, options={"start_minute": 150}), ["c1"], ["default"]) == [
+        "options.start_minute: only daily and every 2 to 12 hours schedules start at a set time"]
+    assert sch.validate(dict(ok, options={"color": "red"}), ["c1"], ["default"]) == ["options: unknown key color"]
+
+
+def test_a_set_time_inside_the_clock_change_gap_does_not_fire_that_night():
+    # 29 Mar 2026, London: 01:00 GMT jumps to 02:00 BST, so 01:30 does not exist that night (Quartz skips it).
+    fires = sch.fire_times(1440, 90, "Europe/London", datetime(2026, 3, 28, tzinfo=timezone.utc),
+                           datetime(2026, 3, 31, tzinfo=timezone.utc))
+    assert fires == [datetime(2026, 3, 28, 1, 30, tzinfo=timezone.utc), datetime(2026, 3, 30, 0, 30, tzinfo=timezone.utc)]
+
+
+def test_a_member_starts_at_its_clock_time_and_the_stagger_range_is_its_stagger():
+    assert sch.member_start(1440, 150) == "02:30" and sch.member_start(30, 15) == "15 minutes past the hour"
+    assert sch.member_start(60, 0) == "on the hour" and sch.member_start(60, 1) == "1 minute past the hour"
+    offs = sch.offsets(["a", "b"], 1440, True, start_minute=1430)
+    assert offs == {"a": 1430, "b": 20}
+    assert sorted(sch.stagger_of(o, 1440, 1430) for o in offs.values()) == [0, 30]
 
 
 # ---- the check variant: one wrapper per schedule, starting the check job with every member ---------------
@@ -468,3 +523,16 @@ def test_a_default_schedule_judges_a_launched_run_by_its_own_start():
     found = sch.job_runs(60, "UTC", members, [ingest], datetime(2026, 10, 26, 14, tzinfo=UTC),
                          datetime(2026, 10, 26, 15, tzinfo=UTC), now=datetime(2026, 10, 26, 16, tzinfo=UTC))
     assert found[0]["members"][0]["run"] is None
+
+
+def test_a_check_schedule_at_a_set_time_fires_its_one_wrapper_then_and_names_its_job_runs_by_it():
+    daily = dict(GROUP, cadence_minutes=1440, timezone="UTC", options={"start_minute": 150})
+    assert sch.group_job_settings(daily, ["c1"], 777, owner=OWNER)["schedule"]["quartz_cron_expression"] == "0 30 2 * * ?"
+    check = _check("a", datetime(2026, 10, 26, 2, 30, 5, tzinfo=UTC), work=[("srv|0|srv", "db")], run_id=1)
+    ingest = _run("a", datetime(2026, 10, 26, 2, 33, tzinfo=UTC), run_id=2)
+    ingest["work_id"] = "900:a"
+    found = sch.job_runs(1440, "UTC", _members(("a", 150)), [check, ingest], datetime(2026, 10, 26, tzinfo=UTC),
+                         datetime(2026, 10, 27, tzinfo=UTC), now=datetime(2026, 10, 26, 4, tzinfo=UTC),
+                         start_minute=150, check_variant=True)
+    assert found[0]["slot"] == datetime(2026, 10, 26, 2, 30, tzinfo=UTC)
+    assert found[0]["members"][0]["run"]["run_id"] == 2 and [c["run_id"] for c in found[0]["checks"]] == [1]

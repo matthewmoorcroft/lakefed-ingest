@@ -34,7 +34,7 @@ def place(job: dict, members: List[dict], runs: List[dict], start: datetime, end
     groups = {m["task_collection"] for m in mine}
     cadence = int(job["cadence_minutes"])
     placed = sch.job_runs(cadence, job.get("timezone") or "UTC", mine, [r for r in runs if r["task_collection"] in groups],
-                          start - timedelta(minutes=max(cadence, 60)), end, now,
+                          start - timedelta(minutes=max(cadence, 60)), end, now, sch.start_minute(job),
                           check_variant=job.get("job_variant") == sch.CHECK_VARIANT)
     if job.get("paused"):
         for jr in placed:
@@ -316,7 +316,7 @@ def jobs_view(schedules: List[dict], members: List[dict], states: List[dict], ru
         warnings = [w for m in mine for w in sch.warnings(cadence, (stats_by_group.get(m["task_collection"]) or {}).get("p95_s"),
                                                            (stats_by_group.get(m["task_collection"]) or {}).get("min_sla_minutes"))]
         next_starts = [sch.next_run(cadence, int(m["offset_minutes"]), s.get("timezone") or "UTC", now) for m in mine]
-        row = {**sums, "description": sch.describe(cadence, 0, s.get("timezone") or "UTC"),
+        row = {**sums, "description": sch.describe(cadence, sch.start_minute(s), s.get("timezone") or "UTC"),
                "next_start": min(next_starts).isoformat() if next_starts and not s.get("paused") else None,
                "last_job_run": last, "running_job_run": current,
                "failed_in_a_row": (consecutive_failed(summaries) if last_finished(summaries) or not last
@@ -368,8 +368,8 @@ def job_runs_of_run(run: dict, schedules: List[dict], members: List[dict],
         for m in members:
             if m["schedule_id"] != s["id"] or m["task_collection"] != run["task_collection"]:
                 continue
-            cadence, tz = int(s["cadence_minutes"]), s.get("timezone") or "UTC"
-            offset = 0 if check_variant else int(m["offset_minutes"])
+            cadence, tz, start = int(s["cadence_minutes"]), s.get("timezone") or "UTC", sch.start_minute(s)
+            offset = start % cadence if check_variant else int(m["offset_minutes"])
             fires = sch.fire_times(cadence, offset, tz, started - timedelta(minutes=cadence + 1),
                                    started + timedelta(seconds=1))
             if not fires:
@@ -379,5 +379,5 @@ def job_runs_of_run(run: dict, schedules: List[dict], members: List[dict],
             if (added is not None and at < added) or (removed is not None and at >= removed):
                 continue
             out.append({"job_id": s["id"], "job_name": s["name"],
-                        "slot": sch.slot_of(fires[-1], offset, tz).isoformat()})
+                        "slot": sch.slot_of(fires[-1], sch.stagger_of(offset, cadence, start), tz).isoformat()})
     return out

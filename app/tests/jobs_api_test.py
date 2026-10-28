@@ -172,7 +172,7 @@ def test_sources_list_a_uc_connection_with_nothing_registered(client, monkeypatc
     assert [i["server"] for i in empty] == ["unused_conn"] and body["nothing_registered"] == 1
     assert {i["server"] for i in body["instances"] if not i["nothing_registered"]} == {"srv1"}
     on_srv1 = next(i for i in body["instances"] if i["server"] == "srv1")
-    assert {j["name"]: j.get("description") for j in on_srv1["jobs"] if j["id"]}["East hourly"] == "hourly at :00"
+    assert {j["name"]: j.get("description") for j in on_srv1["jobs"] if j["id"]}["East hourly"] == "Every hour, on the hour (UTC)"
 
 
 def test_one_database_lists_its_tables_with_the_group_and_its_job(client, monkeypatch):
@@ -230,3 +230,24 @@ def test_a_jobs_last_job_run_is_its_last_real_one_however_long_ago_and_never_a_m
 def test_a_jobs_page_gives_its_next_trigger_or_none_while_paused(client):
     assert client.get("/api/ingestion-jobs/1").json()["next_start"] == "2026-10-26T14:30:00+00:00"
     assert client.get("/api/ingestion-jobs/2").json()["next_start"] is None
+
+
+def test_the_groups_in_no_job_have_a_page_of_their_own(client):
+    # A read-only app with no jobs still lets you click through: the "Not in any job" row lists its groups and tables.
+    body = client.get("/api/ingestion-jobs/not-in-job").json()
+    assert [g["task_collection"] for g in body["groups_detail"]] == ["c4"]
+    assert (body["groups_detail"][0]["enabled_tables"], body["groups_detail"][0]["state_current"]) == (3, 3)
+    assert (body["enabled_tables"], body["name"]) == (3, "Not in any job")
+
+
+def test_the_job_page_says_why_run_now_or_delete_cannot_start(client, monkeypatch):
+    monkeypatch.setattr(main.jobs, "ingest_variants", lambda: {"default": "555"})
+    monkeypatch.setattr(main.jobs, "user_job_permission", lambda job_id, user: "CAN_MANAGE_RUN")
+    body = client.get("/api/ingestion-jobs/1").json()
+    assert body["run_now"] == {"blocked": "the job's Databricks jobs are not synced yet", "groups": 2, "check": False}
+    assert body["delete_blocked"] == "deleting needs Can Manage on the Databricks job 555; you have Can Manage Run"
+
+    def unreadable(job_id, user):
+        raise RuntimeError("403")
+    monkeypatch.setattr(main.jobs, "user_job_permission", unreadable)
+    assert client.get("/api/ingestion-jobs/1").json()["run_now"]["blocked"].startswith("can't read your permission")

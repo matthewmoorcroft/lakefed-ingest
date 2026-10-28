@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import os
+from contextlib import contextmanager
 import threading
 import time
 import uuid
@@ -21,11 +22,15 @@ from datetime import datetime, timedelta, timezone
 from typing import List, Optional
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
+import compute
+import config_import as ci
 import ingestion_jobs as ij
+import job_settings as js
+import job_settings_sql as jss
 import jobs
 import lakebase as db
 import queries as q
@@ -91,6 +96,28 @@ def _log(cur, user, action, control_id, collection, field=None, old=None, new=No
     as_text = lambda v: None if v is None else str(v)
     cur.execute(q.log_change_sql(), (user or None, action, control_id, collection, field, as_text(old),
                                      as_text(new), reseed, batch))
+
+
+def _apply_plans(cur, rows, plans, user, batch):
+    """Write planned edits (queries.plan_edit) inside the caller's transaction: each changed field, its change log
+    line, a reseed where the plan needs one, then the mixed-sink and split-database checks over the rows as they
+    now are."""
+    by_id = {r["id"]: r for r in rows}
+    for p in plans:
+        if not p["changes"]:
+            continue
+        fields = list(p["changes"])
+        cur.execute(q.update_control_sql(fields), [p["changes"][f][1] for f in fields] + [p["id"]])
+        coll = p["changes"].get("task_collection", [None, by_id[p["id"]]["task_collection"]])[1]
+        for f in fields:
+            _log(cur, user, "edit", p["id"], coll, f, p["changes"][f][0], p["changes"][f][1],
+                 reseed=p["reseed"], batch=batch)
+        if p["reseed"]:
+            cur.execute(q.flip_to_seeding_sql(), (f"reseed after edit: {p['reseed']}", [p["id"]]))
+            cur.execute(q.log_reseed_sql(), (f"edit:{p['reseed']}", [p["id"]]))
+    edited = [dict(by_id[p["id"]], **{f: v[1] for f, v in p["changes"].items()}) for p in plans]
+    _refuse_mixed_sinks(cur, edited)
+    _refuse_split_databases(cur, edited)
 
 
 def _locked_rows(cur, ids):
@@ -395,8 +422,25 @@ def ingestion_jobs(filter: str = "all", search: str = "", offset: int = 0, limit
             "cache_s": MONITOR_CACHE_S}
 
 
+@app.get("/api/ingestion-jobs/not-in-job")
+def groups_not_in_job():
+    """The groups in no ingestion job, as a page of their own: their tables by state and each group's last run, so a
+    deployment with no jobs (a read-only share) still opens its groups and tables from the jobs list."""
+    schedules, members = _schedules()
+    _, not_in_job = rollup.jobs(_states(), schedules, members)
+    not_in_job = not_in_job or {"groups": []}
+    groups, stats, last_runs = rollup.groups(_states()), _group_stats(), _last_runs()
+    rows = []
+    for name in sorted(not_in_job["groups"]):
+        g, st, last = groups.get(name) or {}, stats.get(name) or {}, last_runs.get(name)
+        rows.append({"task_collection": name, **{k: g.get(k) for k in ("databases", "enabled_tables") + rollup.STATES},
+                     "last_run": dict(last, outcome=q.run_outcome(last)) if last else None,
+                     "p95_s": st.get("p95_s"), "p50_s": st.get("p50_s")})
+    return {**not_in_job, "name": "Not in any job", "groups_detail": rows}
+
+
 @app.get("/api/ingestion-jobs/{job_id}")
-def ingestion_job(job_id: int):
+def ingestion_job(job_id: int, request: Request):
     """One ingestion job's details: its schedule and members (wrapper jobs, next start), its tables by
     state, its last job run that ran (however long ago), the median speed over its last 24 job runs, its p95 job
     run time over 7 days, and its groups with their last group run and p95 run time. Job runs are placed once over
@@ -408,32 +452,374 @@ def ingestion_job(job_id: int):
     sums = next(j for j in rollup.jobs(_states(), [job], members)[0])
     stats, last_runs = _group_stats(), _last_runs()
     cadence = int(job["cadence_minutes"])
+    start = sch.start_minute(job)
     finished = [r for r in _job_runs_of(job, now - timedelta(days=7), now + timedelta(seconds=1), now)
                 if r["outcome"]["label"] != "Running"]
     week = [r["took_s"] for r in finished if r["took_s"] is not None]
     groups = rollup.groups(_states())
     group_rows = []
-    for m in sorted(mine, key=lambda m: (m["offset_minutes"], m["task_collection"])):
+    for m in sorted(mine, key=lambda m: (sch.stagger_of(m["offset_minutes"], cadence, start), m["task_collection"])):
         g, st, last = groups.get(m["task_collection"]) or {}, stats.get(m["task_collection"]) or {}, last_runs.get(m["task_collection"])
         group_rows.append({"task_collection": m["task_collection"], "offset_minutes": m["offset_minutes"],
+                           "starts": sch.member_start(cadence, int(m["offset_minutes"])),
                            **{k: g.get(k) for k in ("databases", "enabled_tables") + rollup.STATES},
                            "last_run": dict(last, outcome=q.run_outcome(last)) if last else None,
                            "p95_s": st.get("p95_s"), "p50_s": st.get("p50_s"),
                            "job_url": (f"{db.workspace().config.host.rstrip('/')}/jobs/{m['job_id']}"
                                        if m.get("job_id") else None)})
     speeds = sorted(r["speed_tables_per_min"] for r in finished[:24] if r["speed_tables_per_min"] is not None)
-    offsets = [m["offset_minutes"] for m in mine]
+    offsets = [sch.stagger_of(m["offset_minutes"], cadence, start) for m in mine]
     last = ij.last_finished(finished)
     last = {k: v for k, v in last.items() if k != "placed"} if last else _last_ran([job], now).get(job["id"])
     next_starts = [sch.next_run(cadence, int(m["offset_minutes"]), job.get("timezone") or "UTC", now) for m in mine]
-    return {**{k: v for k, v in sums.items()}, "description": sch.describe(cadence, 0, job.get("timezone") or "UTC"),
+    refusals = _permission_refusals(job, _user(request))
+    return {**{k: v for k, v in sums.items()},
+            "description": sch.describe(cadence, sch.start_minute(job), job.get("timezone") or "UTC"),
             "stagger_from": min(offsets) if offsets else None, "stagger_to": max(offsets) if offsets else None,
             "parameters": job.get("parameters"), "job_variant": job.get("job_variant"), "paused": job.get("paused"),
             "last_job_run": last,
             "next_start": min(next_starts).isoformat() if next_starts and not job.get("paused") else None,
             "median_speed_tables_per_min": speeds[len(speeds) // 2] if speeds else None, "speed_job_runs": len(speeds),
             "p95_took_s": sorted(week)[min(len(week) - 1, int(0.95 * len(week)))] if week else None,
-            "groups_detail": group_rows, "read_at": now.isoformat()}
+            "groups_detail": group_rows, "read_at": now.isoformat(),
+            # For the Run now button: why it can't start now (None when it can), and what one run starts.
+            "run_now": {"blocked": refusals["run"] or _run_now_blocker(job, mine),
+                        "groups": len(mine), "check": job.get("job_variant") == sch.CHECK_VARIANT},
+            "delete_blocked": refusals["delete"]}
+
+
+def _job_groups(job_id: int) -> List[str]:
+    """An ingestion job's current groups, read fresh (not from the shared schedule cache) since an edit writes
+    their rows."""
+    if not db.query(q.schedule_sql(), (int(job_id),)):
+        raise HTTPException(404, f"ingestion job {job_id} not found")
+    return sorted({m["task_collection"] for m in _active(db.query(q.schedule_members_sql(), ([int(job_id)],)))})
+
+
+def _lock_job(cur, job_id: int) -> List[str]:
+    """Inside an applying transaction: wait for the job's schedule lock (held by member changes and syncs too),
+    then read its current groups, so a group added or removed meanwhile is never edited from a stale list."""
+    cur.execute(q.schedule_lock_sql(), (q.SCHEDULE_LOCK_CLASS, q.schedule_lock_key(job_id)))
+    members = db.fetch(cur, q.schedule_members_sql(), ([int(job_id)],))
+    return sorted({m["task_collection"] for m in members if m["removed_at"] is None})
+
+
+def _started_job(job: dict) -> Optional[str]:
+    """The Databricks job an ingestion job's runs execute as: the check job on a check schedule, else its variant's
+    ingestion job. Run now and Delete follow the signed-in user's permission on it."""
+    if (job.get("job_variant") or "default") == sch.CHECK_VARIANT:
+        return jobs.CHECK_JOB_ID
+    return jobs.ingest_variants().get(job.get("job_variant") or "default")
+
+
+def _permission_refusals(job: dict, user: str) -> dict:
+    """{action: why the user may not take it, or None} for Run now and Delete, from their Databricks permission."""
+    started = _started_job(job)
+    if not started:
+        # An orphaned job (its variant no longer configured) has no Databricks job to ask; admins may clean it up.
+        reason = "no Databricks job is configured for this job's runs"
+        try:
+            admin = "admins" in jobs.user_groups(user)
+        except Exception:
+            admin = False
+        return {"run": reason, "delete": None if admin else f"{reason}, so only a workspace admin can delete it"}
+    try:
+        level = jobs.user_job_permission(started, user)
+    except Exception as e:  # shown on the page and refused; Databricks decides, so no answer means no
+        reason = f"can't read your permission on the Databricks job {started}: {str(e).split('. ')[0]}"
+        return {"run": reason, "delete": reason}
+    return {action: jobs.action_refusal(action, level, f"the Databricks job {started}") for action in ("run", "delete")}
+
+
+def _run_now_blocker(job: dict, members: List[dict]) -> Optional[str]:
+    """Why the job can't be started by hand right now (a run of it is going, or its wrapper jobs aren't synced)."""
+    groups = {m["task_collection"] for m in members}
+    if any(r["task_collection"] in groups for r in _running()):
+        return "a run of this job is already running"
+    if not members or any(not m.get("job_id") for m in members):
+        return "the job's Databricks jobs are not synced yet"
+    return None
+
+
+@app.post("/api/ingestion-jobs/{job_id}/run")
+def run_ingestion_job(job_id: int, request: Request):
+    """Start one run of an ingestion job by hand, as its schedule would: its wrapper jobs (one per group, or a check
+    schedule's one wrapper, which starts the check job over every group). Refused while a run of it is going."""
+    job, members = _load_schedule(job_id)
+    refusal = _permission_refusals(job, _user(request))["run"]
+    if refusal:
+        raise HTTPException(403, refusal)
+    members = [m for m in members if m.get("removed_at") is None]
+    blocker = _run_now_blocker(job, members)
+    if blocker:
+        raise HTTPException(409, blocker)
+    wrappers = sorted({int(m["job_id"]) for m in members})
+    return {"started": [jobs.run_now(wrapper, {}) for wrapper in wrappers]}
+
+
+@app.get("/api/ingestion-jobs/{job_id}/compute")
+def ingestion_job_compute(job_id: int):
+    """What a job's runs execute on, read live from the Jobs API: the check job (on a check schedule) and the
+    ingestion job it starts, each task's compute with where every value comes from (compute.describe)."""
+    job = _load_schedule(job_id)[0]
+    variant = job.get("job_variant") or "default"
+    if variant == sch.CHECK_VARIANT:
+        started = [("check", jobs.CHECK_JOB_ID), ("ingestion", jobs.ingest_variants().get("default"))]
+    else:
+        started = [("ingestion", jobs.ingest_variants().get(variant))]
+    out = []
+    for role, started_job_id in started:
+        entry = {"role": role, "job_id": started_job_id, "name": None, "compute": [], "error": None}
+        if not started_job_id:
+            entry["error"] = f"no {role} job is configured for this app"
+        else:
+            try:
+                settings = jobs.job_settings(started_job_id)
+                entry.update(name=settings.get("name"), compute=compute.describe(settings))
+            except Exception as e:  # shown on the page; the rest of the job's settings still load
+                entry["error"] = f"can't read job {started_job_id}: {e}"
+        out.append(entry)
+    return {"jobs": out}
+
+
+class JobSettingsRequest(BaseModel):
+    settings: dict
+    dry_run: bool = True
+
+
+@app.get("/api/ingestion-jobs/{job_id}/settings")
+def ingestion_job_settings(job_id: int):
+    """What all of a job's tables share (job_settings_sql.read: one scan, whatever the job's size), each setting
+    with its value or its most common values."""
+    groups = _job_groups(job_id)
+    if not groups:
+        return {"job_id": int(job_id), "groups": groups, "tables": 0, "settings": js.read([])}
+    with _snapshot() as fetch:
+        tables, settings = fetch(q.groups_row_count_sql(), (groups,))[0]["n"], jss.read(fetch, groups)
+    return {"job_id": int(job_id), "groups": groups, "tables": tables, "settings": settings,
+            "identity_differs": js.differing_identity_columns(settings["identity"], tables)}
+
+
+@app.post("/api/ingestion-jobs/{job_id}/settings")
+def edit_ingestion_job_settings(job_id: int, body: JobSettingsRequest, request: Request):
+    """Preview (dry_run, the default) or apply a settings edit to every table of a job, in set-based SQL
+    (job_settings_sql): templates filled per row, a reseed where a change-tracked or cursor table gets a new
+    target or client_id, one change-log line per database. Anything it can't take is a 422 naming why. Applying
+    is one transaction under the job's lock and every group's run lock."""
+    import psycopg
+    groups = _job_groups(job_id)
+    if not groups:
+        return {"summary": {"rows": 0, "changed": 0, "reseed": 0, "errors": 0, "applied": False}, "errors": []}
+
+    def checked(fetch, groups):
+        now = jss.read(fetch, groups)
+        found = jss.preview(fetch, groups, body.settings, now)
+        if found["errors"]:
+            raise HTTPException(422, {"errors": found["errors"], "summary": found["summary"]})
+        return now, found
+
+    if body.dry_run:
+        with _snapshot() as fetch:
+            return checked(fetch, groups)[1]
+    try:
+        with db.transaction() as cur:
+            groups = _lock_job(cur, job_id)
+            _lock_collections(cur, groups)
+            fetch = lambda sql, params=(): db.fetch(cur, sql, params)
+            now, found = checked(fetch, groups)
+            if not found["summary"]["changed"]:
+                return found
+            result = jss.apply(cur, groups, body.settings, now, _user(request), uuid.uuid4().hex[:12])
+            mixed = jss.mixed_sinks(fetch, groups)
+            if mixed:
+                raise HTTPException(409, f"target {mixed[0]} would be claimed by a dedicated table and by others; "
+                                         "a target is either one table's own or shared by client_id. Nothing was changed")
+            found["summary"].update(changed=result["changed"], reseed=result["reseed"], applied=True)
+            return found
+    except psycopg.errors.UniqueViolation:
+        raise HTTPException(409, "another control row already writes one of those targets (or that target and "
+                                 "client_id); nothing was changed")
+    except psycopg.errors.CheckViolation as e:
+        raise HTTPException(422, {"errors": [f"a table can't take this change ({e.diag.constraint_name}); "
+                                             "nothing was changed"]})
+
+
+@contextmanager
+def _snapshot():
+    """A fetch over one read-only, repeatable-read transaction, so a read of several queries sees one moment."""
+    with db.transaction() as cur:
+        cur.execute("set transaction isolation level repeatable read, read only")
+        yield lambda sql, params=(): db.fetch(cur, sql, params)
+
+
+@app.get("/api/ingestion-jobs/{job_id}/tree")
+def ingestion_job_tree(job_id: int, server: str = "", database: str = "", search: str = "", offset: int = 0,
+                       limit: int = 50):
+    """One level of a job's tables: its servers; with server, that server's databases; with database too, that
+    database's tables. Searched and paged at each level."""
+    groups = _job_groups(job_id)
+    offset, limit = max(0, int(offset)), max(1, min(int(limit), 200))
+    pattern = f"%{search.strip()}%"
+    if not groups:
+        rows, level = [], "servers"
+    elif not server:
+        level, rows = "servers", db.query(q.job_servers_sql(), (groups, pattern, limit, offset))
+    elif not database:
+        level, rows = "databases", db.query(q.job_databases_sql(), (groups, groups, server, pattern, limit, offset))
+    else:
+        level, rows = "tables", db.query(q.job_tables_sql(), (groups, server, database, pattern, limit, offset))
+        for r in rows:
+            r["columns"] = len([c for c in str(r.pop("select_list") or "").split(",") if c.strip()])
+    total = rows[0]["total"] if rows else 0
+    return {"level": level, "server": server or None, "database": database or None, "total": total,
+            "offset": offset, "limit": limit, "items": [{k: v for k, v in r.items() if k != "total"} for r in rows]}
+
+
+class JobScope(BaseModel):
+    server: str = ""
+    database: str = ""
+    schema_name: str = Field("", alias="schema")
+    table: str = ""
+
+
+class JobEnableRequest(JobScope):
+    enabled: bool
+
+
+def _job_row_ids(cur, groups, scope: JobScope) -> List[int]:
+    cur.execute(q.job_row_ids_sql(), (groups, scope.server, scope.server, scope.database, scope.database,
+                                      scope.schema_name, scope.schema_name, scope.table, scope.table))
+    return [r[0] for r in cur.fetchall()]
+
+
+@app.post("/api/ingestion-jobs/{job_id}/enable")
+def enable_job_tables(job_id: int, body: JobEnableRequest, request: Request):
+    """Enable or disable a job's tables on a server, in a database, or one table in every database."""
+    _job_groups(job_id)
+    batch = uuid.uuid4().hex[:12]
+    with db.transaction() as cur:
+        groups = _lock_job(cur, job_id)
+        ids = _job_row_ids(cur, groups, body) if groups else []
+        if not ids:
+            return {"updated": 0}
+        rows = _locked_rows(cur, ids)
+        _lock_collections(cur, [r["task_collection"] for r in rows])
+        cur.execute(q.set_enabled_sql(), (body.enabled, ids))
+        for r in rows:
+            if bool(r["task_enabled"]) != body.enabled:
+                _log(cur, _user(request), "enable" if body.enabled else "disable", r["id"], r["task_collection"],
+                     "task_enabled", r["task_enabled"], body.enabled, batch=batch)
+    return {"updated": len(ids)}
+
+
+JOB_TABLE_FIELDS = ("load_type", "primary_key", "select_list", "cursor_column", "load_partitioned", "partition_col",
+                    "partition_size_mb")
+
+
+class JobTableEditRequest(JobScope):
+    changes: dict
+    dry_run: bool = True
+
+
+@app.post("/api/ingestion-jobs/{job_id}/tables/edit")
+def edit_job_table(job_id: int, body: JobTableEditRequest, request: Request):
+    """Change one table (schema and table) in every database of a job: its load type, key or columns. Checked
+    and applied as a table edit, all or nothing, under the groups' run locks."""
+    bad = sorted(set(body.changes) - set(JOB_TABLE_FIELDS))
+    if bad or not body.schema_name or not body.table:
+        raise HTTPException(400, f"give schema and table, and change only {', '.join(JOB_TABLE_FIELDS)}"
+                                 + (f" (not {', '.join(bad)})" if bad else ""))
+    _job_groups(job_id)
+    with db.transaction() as cur:
+        groups = _lock_job(cur, job_id)
+        ids = _job_row_ids(cur, groups, body) if groups else []
+        rows = _locked_rows(cur, ids) if ids else []
+        plans = [q.plan_edit([r], body.changes, bulk=False)[0] for r in rows]
+        summary = {"rows": len(plans), "changed": sum(1 for p in plans if p["changes"]),
+                   "reseed": sum(1 for p in plans if p["reseed"]),
+                   "errors": sum(1 for p in plans if p["errors"]), "applied": False}
+        if body.dry_run or summary["errors"] or not summary["changed"]:
+            cur.connection.rollback()
+            return {"summary": summary, "plans": plans[:200]}
+        _lock_collections(cur, [r["task_collection"] for r in rows])
+        _apply_plans(cur, rows, plans, _user(request), uuid.uuid4().hex[:12])
+        summary["applied"] = True
+        return {"summary": summary, "plans": plans[:200]}
+
+
+class JobDatabasesRequest(BaseModel):
+    csv: Optional[str] = None
+    columns: dict = {"server": "server", "database": "database", "enabled": "enabled"}
+    databases: Optional[List[dict]] = None
+    groups_per_server: int = Field(1, ge=1, le=64)
+    full_list: bool = False
+    dry_run: bool = True
+
+
+@app.post("/api/ingestion-jobs/{job_id}/databases")
+def add_job_databases(job_id: int, body: JobDatabasesRequest, request: Request):
+    """Preview (dry_run, the default) or apply databases into a job, from a databases file (its columns matched
+    to server, database and enabled) or a list picked by hand (job_settings.plan_databases). Applying is one
+    transaction under every group's run lock: new tables inserted (a taken target is skipped), enabled flags
+    set, new groups added to the job; then the job's wrapper jobs are synced."""
+    if body.csv is not None:
+        entries, errors = js.read_databases(body.csv, body.columns)
+    else:
+        entries = [{"line": i + 1, "server": str(d.get("server") or "").strip(),
+                    "database": str(d.get("database") or "").strip(), "enabled": q._truthy(d.get("enabled", True))}
+                   for i, d in enumerate(body.databases or [])]
+        errors = [f"line {e['line']}: server and database are required" for e in entries
+                  if not e["server"] or not e["database"]]
+    if errors:
+        raise HTTPException(422, {"errors": errors})
+    job = _load_schedule(job_id)[0]
+
+    def planned(rows):
+        plan = js.plan_databases(rows, entries, job["name"], body.groups_per_server, body.full_list)
+        if plan["errors"]:
+            raise HTTPException(422, {"errors": plan["errors"]})
+        summary = {"databases": len(entries), "new_tables": len(plan["new"]), "enable": len(plan["enable"]),
+                   "disable": len(plan["disable"]), "new_groups": plan["new_groups"], "applied": False}
+        return plan, summary
+
+    groups = _job_groups(job_id)
+    if body.dry_run:
+        plan, summary = planned(db.query(q.groups_control_rows_sql(), (groups,)) if groups else [])
+        return {"summary": summary}
+    user, batch = _user(request), uuid.uuid4().hex[:12]
+    with db.transaction() as cur:
+        groups = _lock_job(cur, job_id)
+        rows = db.fetch(cur, q.groups_control_rows_sql(for_update=True), (groups,)) if groups else []
+        plan, summary = planned(rows)
+        _lock_collections(cur, groups + plan["new_groups"])
+        inserted = 0
+        for row in plan["new"]:
+            cur.execute(q.insert_control_if_absent_sql(), q.control_params(row))
+            res = cur.fetchone()
+            if res:
+                inserted += 1
+                if not row["task_enabled"]:
+                    cur.execute(q.set_enabled_sql(), (False, [res[0]]))
+                _log(cur, user, "import", res[0], row["task_collection"], batch=batch)
+        for enabled, ids in ((True, plan["enable"]), (False, plan["disable"])):
+            if ids:
+                cur.execute(q.set_enabled_sql(), (enabled, ids))
+                for i in ids:
+                    _log(cur, user, "enable" if enabled else "disable", i, None, "task_enabled", not enabled, enabled,
+                         batch=batch)
+        _refuse_mixed_sinks(cur, plan["new"])
+        _refuse_split_databases(cur, plan["new"])
+        if plan["new_groups"]:
+            _, members = _load_schedule(job_id, cur)
+            active = [m for m in members if m["removed_at"] is None]
+            offs = sch.offsets([m["task_collection"] for m in active] + plan["new_groups"],
+                               int(job["cadence_minutes"]), bool(job.get("stagger")), sch.start_minute(job))
+            for g in plan["new_groups"]:
+                cur.execute(q.insert_member_sql(), (job_id, g, offs[g]))
+        summary.update(applied=True, new_tables=inserted, skipped=len(plan["new"]) - inserted)
+    if plan["new_groups"]:
+        _sync(job_id, user)
+    return {"summary": summary}
 
 
 @app.get("/api/ingestion-jobs/{job_id}/runs")
@@ -536,7 +922,7 @@ def sources():
         for instance in view["instances"]:
             for j in instance["jobs"]:
                 if j.get("cadence_minutes"):
-                    j["description"] = sch.describe(int(j["cadence_minutes"]), 0, j.get("timezone") or "UTC")
+                    j["description"] = sch.describe(int(j["cadence_minutes"]), sch.start_minute(j), j.get("timezone") or "UTC")
         return {**view, "connections_error": listed_error, "read_at": datetime.now(timezone.utc).isoformat(),
                 "cache_s": STATES_CACHE_S}
     return _shared("sources", compute, ttl=STATES_CACHE_S)
@@ -756,23 +1142,7 @@ def edit_tables(body: EditRequest, request: Request):
                 return {"summary": summary, "plans": plans}
             new_coll = body.changes.get("task_collection")
             _lock_collections(cur, [r["task_collection"] for r in rows] + ([new_coll] if new_coll else []))
-            by_id = {r["id"]: r for r in rows}
-            user = _user(request)
-            for p in plans:
-                if not p["changes"]:
-                    continue
-                fields = list(p["changes"])
-                cur.execute(q.update_control_sql(fields), [p["changes"][f][1] for f in fields] + [p["id"]])
-                coll = p["changes"].get("task_collection", [None, by_id[p["id"]]["task_collection"]])[1]
-                for f in fields:
-                    _log(cur, user, "edit", p["id"], coll, f, p["changes"][f][0], p["changes"][f][1],
-                         reseed=p["reseed"], batch=batch)
-                if p["reseed"]:
-                    cur.execute(q.flip_to_seeding_sql(), (f"reseed after edit: {p['reseed']}", [p["id"]]))
-                    cur.execute(q.log_reseed_sql(), (f"edit:{p['reseed']}", [p["id"]]))
-            edited = [dict(by_id[p["id"]], **{f: v[1] for f, v in p["changes"].items()}) for p in plans]
-            _refuse_mixed_sinks(cur, edited)
-            _refuse_split_databases(cur, edited)
+            _apply_plans(cur, rows, plans, _user(request), batch)
             summary["applied"] = True
             return {"summary": summary, "plans": plans}
     except psycopg.errors.UniqueViolation:
@@ -941,6 +1311,78 @@ def register(discovery_id: str, body: RegisterRequest, request: Request):
     return {"selected": len(chosen), "counts": counts, "results": results}
 
 
+# ---- configuration import ----------------------------------------------------------------------
+
+class ImportRequest(BaseModel):
+    task_collection: str = Field(min_length=1, max_length=128)
+    settings: dict = {}
+    csv: str
+    dry_run: bool = True
+
+
+@app.post("/api/import")
+def import_csv(body: ImportRequest, request: Request):
+    """Preview (dry_run) or apply a CSV of tables into one ingestion group, with the group's settings
+    (config_import.plan_import). Apply plans again inside one transaction, after taking the group's run lock and
+    reading its rows there, so the settings it inherits are the rows' as they are; it needs every line valid, then
+    inserts each line's row unless its sink is taken (skipped), logs it as an import, and runs the mixed-sink
+    check, as Bulk import's register does. Tables the group already has are skipped."""
+    group = body.task_collection.strip()
+
+    def planned(rows):
+        plan = ci.plan_import(body.csv, group, body.settings, rows)
+        if plan["errors"]:
+            raise HTTPException(422, {"errors": plan["errors"]})
+        return plan
+
+    def counted(lines):
+        counts: dict = {}
+        for line in lines:
+            counts[line["status"]] = counts.get(line["status"], 0) + 1
+        return counts
+
+    if body.dry_run:
+        plan = planned(db.query(q.collection_control_rows_sql(), (group,)))
+    else:
+        batch = uuid.uuid4().hex[:12]
+        with db.transaction() as cur:
+            _lock_collections(cur, [group])
+            plan = planned(db.fetch(cur, q.collection_control_rows_sql(), (group,)))
+            invalid = counted(plan["lines"]).get("invalid")
+            if invalid:
+                raise HTTPException(422, {"errors": ["fix the invalid lines first"], "invalid": invalid})
+            for line in plan["lines"]:
+                if line["status"] == "registered":
+                    line["status"] = "skipped"
+                    continue
+                cur.execute(q.insert_control_if_absent_sql(), q.control_params(line["row"]))
+                res = cur.fetchone()
+                line["status"] = "imported" if res else "skipped"
+                if res:
+                    line["id"] = res[0]
+                    _log(cur, _user(request), "import", res[0], group, batch=batch)
+                else:
+                    line["errors"] = ["sink already used by another control row"]
+            _refuse_mixed_sinks(cur, [line["row"] for line in plan["lines"] if line["status"] == "imported"])
+    return {"task_collection": group, "settings": plan["settings"], "counts": counted(plan["lines"]),
+            "lines": [{k: v for k, v in line.items() if k != "row"} for line in plan["lines"]]}
+
+
+@app.get("/api/collections/{name}/settings")
+def collection_settings(name: str):
+    """An ingestion group's settings, from its rows: each one's shared value, or its mixed values with row counts."""
+    rows = db.query(q.collection_control_rows_sql(), (name,))
+    return {"task_collection": name, "tables": len(rows), "settings": ci.setting_summary(ci.group_settings(rows))}
+
+
+@app.get("/api/collections/{name}/export.csv")
+def collection_export(name: str):
+    """An ingestion group's rows as the import CSV."""
+    rows = db.query(q.collection_control_rows_sql(), (name,))
+    return Response(ci.export_csv(rows), media_type="text/csv",
+                    headers={"Content-Disposition": f'attachment; filename="{q.identifier(name)}.csv"'})
+
+
 # ---- schedules ----------------------------------------------------------------------------------
 
 class ScheduleBody(BaseModel):
@@ -952,12 +1394,18 @@ class ScheduleBody(BaseModel):
     stagger: bool = True
     paused: bool = False
     notify_emails: Optional[str] = None
+    options: dict = {}
     members: List[str] = Field(min_length=1)
 
     @field_validator("timezone")
     @classmethod
     def _tz(cls, v: str) -> str:
         return (v or "").strip() or "UTC"      # stored as given: a blank one would break every page
+
+    @model_validator(mode="after")
+    def _utc_for_minutes(self):
+        self.timezone = sch.timezone_for(self.cadence_minutes, self.timezone)
+        return self
 
 
 def _ingest_job_id(variant: str) -> Optional[int]:
@@ -1074,7 +1522,7 @@ def list_schedules(details: bool = True):
              (db.query(q.collection_run_stats_sql(), (colls, colls, colls, colls)) if colls else [])}
     skipped = _skipped_counts(active) if details else {}
     now = datetime.now(timezone.utc)
-    return [{**s, "description": sch.describe(int(s["cadence_minutes"]), 0, s["timezone"]),
+    return [{**s, "description": sch.describe(int(s["cadence_minutes"]), sch.start_minute(s), s["timezone"]),
              "members": _members_view(s, [m for m in active if m["schedule_id"] == s["id"]], stats, skipped, now)}
             for s in rows]
 
@@ -1112,13 +1560,14 @@ def create_schedule(body: ScheduleBody, request: Request):
     user = _user(request)
     # A check schedule's one wrapper fires every member at once.
     body.stagger = body.stagger and body.job_variant != sch.CHECK_VARIANT
-    offs = sch.offsets(body.members, body.cadence_minutes, body.stagger)
+    offs = sch.offsets(body.members, body.cadence_minutes, body.stagger, sch.start_minute(body.model_dump()))
     batch = uuid.uuid4().hex[:12]
     try:
         with db.transaction() as cur:
             cur.execute(q.insert_schedule_sql(), (body.name.strip(), body.cadence_minutes, body.timezone,
                                                   json.dumps(body.parameters), body.job_variant or "default",
-                                                  body.stagger, body.paused, body.notify_emails or None, user or None))
+                                                  body.stagger, body.paused, body.notify_emails or None,
+                                                  json.dumps(body.options) if body.options else None, user or None))
             sid = cur.fetchone()[0]
             for c in sorted(body.members):
                 cur.execute(q.insert_member_sql(), (sid, c, offs[c]))
@@ -1142,17 +1591,22 @@ def update_schedule(sid: int, body: ScheduleBody, request: Request):
     new = body.model_dump()
     new["notify_emails"] = new["notify_emails"] or None
     new["job_variant"] = new["job_variant"] or "default"
+    # A body without options (an older page) keeps the stored ones; an explicit {} clears them.
+    new["options"] = (new["options"] or None) if "options" in body.model_fields_set else s.get("options")
     changed = [f for f in q.SCHEDULE_FIELDS if (s[f] or None) != (new[f] or None) and not
-               (f == "parameters" and (s[f] or {}) == (new[f] or {}))]
+               (f in q.JSON_SCHEDULE_FIELDS and (s[f] or {}) == (new[f] or {}))]
     active = {m["task_collection"]: m for m in members if m["removed_at"] is None}
     added = sorted(set(body.members) - set(active))
     gone = sorted(set(active) - set(body.members))
-    offs = sch.offsets(body.members, body.cadence_minutes, body.stagger)
+    offs = sch.offsets(body.members, body.cadence_minutes, body.stagger, sch.start_minute(new))
     batch = uuid.uuid4().hex[:12]
     try:
         with db.transaction() as cur:
+            # Serialized with job-wide edits (_lock_job) and syncs, which read the members under this lock.
+            cur.execute(q.schedule_lock_sql(), (q.SCHEDULE_LOCK_CLASS, q.schedule_lock_key(sid)))
             if changed:
-                vals = [json.dumps(new[f]) if f == "parameters" else new[f] for f in changed]
+                vals = [(json.dumps(new[f]) if new[f] is not None else None) if f in q.JSON_SCHEDULE_FIELDS else new[f]
+                        for f in changed]
                 cur.execute(q.update_schedule_sql(changed), vals + [int(sid)])
                 for f in changed:
                     _log(cur, user, "schedule_edit", None, None, f"{s['name']}.{f}", s[f], new[f], batch=batch)
@@ -1196,9 +1650,13 @@ def resume_schedule(sid: int, request: Request):
 
 @app.post("/api/schedules/{sid}/delete")
 def delete_schedule(sid: int, request: Request):
-    """Delete a schedule and its wrapper jobs (the schedule row is kept, marked deleted)."""
+    """Delete a schedule (an ingestion job) and its wrapper jobs; the schedule row is kept, marked deleted. Its groups
+    move to Not in any job, and their tables, control rows, checkpoints and run history all stay."""
     user = _user(request)
     s, members = _load_schedule(sid)
+    refusal = _permission_refusals(s, user)["delete"]
+    if refusal:
+        raise HTTPException(403, refusal)
     active = [m["id"] for m in members if m["removed_at"] is None]
     with db.transaction() as cur:
         cur.execute(q.delete_schedule_sql(), (int(sid),))

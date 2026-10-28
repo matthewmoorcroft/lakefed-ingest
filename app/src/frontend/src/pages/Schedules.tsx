@@ -29,6 +29,8 @@ function Editor({ initial, options, onDone }: { initial?: Row; options: Options;
     mutationFn: () => {
       const body = { name: f.name, cadence_minutes: Number(f.cadence_minutes), timezone: f.timezone, stagger: f.stagger && f.job_variant !== "check",
         paused: f.paused, notify_emails: f.notify_emails || null, job_variant: f.job_variant, members: f.members,
+        // The start time is set on the job's Edit page; kept here as it is, and dropped when the cadence no longer takes one.
+        options: Number(f.cadence_minutes) > 60 ? (initial?.options ?? {}) : {},
         parameters: Object.fromEntries(Object.entries(params).filter(([, v]) => v.trim() !== "").map(([k, v]) => [k, v.trim()])) };
       return initial ? api.post(`/schedules/${initial.id}`, body) : api.post("/schedules", body);
     },
@@ -106,7 +108,7 @@ function SyncResult({ result }: { result?: Row }) {
   const errors = (result.sync as Row[]).filter((r) => r.action === "error");
   const changed = (result.sync as Row[]).filter((r) => ["created", "adopted", "updated", "deleted"].includes(r.action));
   return errors.length ? <Notice tone="bad">Job sync failed for {errors.map((e) => `${e.task_collection || "the schedule"}: ${e.detail}`).join("; ")}</Notice>
-    : <Notice tone="ok">Jobs in sync{changed.length ? `: ${changed.map((c) => `${c.task_collection} ${c.action}`).join(", ")}` : ""}.</Notice>;
+    : <p className="muted">Jobs in sync{changed.length ? `: ${changed.map((c) => `${c.task_collection} ${c.action}`).join(", ")}` : ""}.</p>;
 }
 
 function ScheduleCard({ s, onEdit }: { s: Row; onEdit: () => void }) {
@@ -118,7 +120,7 @@ function ScheduleCard({ s, onEdit }: { s: Row; onEdit: () => void }) {
   });
   const check = useMutation({ mutationFn: () => api.get<Row>(`/schedules/${s.id}/check`), onSuccess: setDrift });
   const rows = (s.members as Row[]).map((m) => ({
-    collection: m.task_collection, starts: m.when, next_run: s.paused ? "paused" : fmtTime(m.next_run),
+    collection: m.task_collection, starts: m.when, next_run: s.paused ? "Paused, no run until resumed" : fmtTime(m.next_run),
     last_run: m.last_status, last_started: fmtTime(m.last_started), last_duration: mins(m.last_duration_s),
     p95_7d: mins(m.p95_s), runs_24h: m.runs_24h, failed_24h: m.failed_24h, skipped_24h: m.skipped_24h ?? "",
     strictest_sla: m.min_sla_minutes ? `${m.min_sla_minutes} min` : "", job: m.job_url, sync: m.sync_error ? "error" : m.job_id ? "ok" : "not synced",
@@ -135,13 +137,14 @@ function ScheduleCard({ s, onEdit }: { s: Row; onEdit: () => void }) {
       <ConfirmButton label="Delete" danger onConfirm={() => act.mutateAsync("delete")} />
     </>}>
       <p className="muted small">Time zone {s.timezone}{paramsText(s.parameters) ? ` · ${paramsText(s.parameters)}` : ""}
-        {s.notify_emails ? ` · failure emails to ${s.notify_emails}` : ""} · updated {fmtTime(s.updated_at)}{s.created_by ? ` · created by ${s.created_by}` : ""}</p>
+        {s.notify_emails ? ` · failure emails to ${s.notify_emails}` : ""} · settings last changed {fmtTime(s.updated_at)}{s.created_by ? ` · created by ${s.created_by}` : ""}</p>
       {warned > 0 && <Notice tone="warn">{warned} {plural(warned, "ingestion group")} {warned === 1 ? "has" : "have"} warnings: see the warnings column.</Notice>}
       <ErrorBox error={act.error || check.error} />
       <SyncResult result={act.data} />
+      {/* The group and its next run stay pinned on the left, so they always show; the other columns scroll. */}
       <Grid rows={rows} fitRows columns={[
-        { field: "collection", headerName: "Ingestion group", pinned: "left" }, { field: "starts", headerName: "Starts" },
-        { field: "next_run", headerName: "Next run" },
+        { field: "collection", headerName: "Ingestion group", pinned: "left" },
+        { field: "next_run", headerName: "Next run", pinned: "left" }, { field: "starts", headerName: "Starts" },
         { field: "last_run", headerName: "Last run", cellRenderer: (p: any) => <Badge value={p.value} /> },
         { field: "last_started", headerName: "Last started" }, { field: "last_duration", headerName: "Last duration" },
         { field: "p95_7d", headerName: "p95 (7 days)" }, { field: "runs_24h", headerName: "Runs (24 h)" },
@@ -150,7 +153,7 @@ function ScheduleCard({ s, onEdit }: { s: Row; onEdit: () => void }) {
         { field: "job", headerName: "Job", cellRenderer: (p: any) => (p.value ? <a href={p.value} target="_blank" rel="noreferrer">open</a> : null) },
         { field: "sync", headerName: "Sync", cellRenderer: (p: any) => <Badge value={p.value === "ok" ? "ok" : "failed"} /> },
         { field: "sync_drift", headerName: "Check", cellRenderer: (p: any) => (p.value ? <Badge value={p.value === "in_sync" ? "ok" : "failed"} /> : null) },
-        { field: "warnings", headerName: "Warnings", flex: 1, minWidth: 320, tooltipField: "warnings" },
+        { field: "warnings", headerName: "Warnings", minWidth: 160, tooltipField: "warnings" },
       ]} />
     </Section>
   );

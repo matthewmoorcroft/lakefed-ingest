@@ -72,6 +72,7 @@ resources:
               max_queries_per_source: "{{job.parameters.max_queries_per_source}}"
               table_retries: "{{job.parameters.table_retries}}"
               table_retry_budget: "{{job.parameters.table_retry_budget}}"
+              fail_on_table_errors: "{{job.parameters.fail_on_table_errors}}"
               spark_conf: "{{job.parameters.spark_conf}}"
           libraries:
             - pypi:
@@ -155,6 +156,9 @@ resources:
         # Retries in the whole run; once spent, failures fail at once (as with retries off).
         - name: table_retry_budget
           default: ${var.table_retry_budget}
+        # On: a run with failed tables ends as failed, so the failure email fires.
+        - name: fail_on_table_errors
+          default: ${var.fail_on_table_errors}
         # Spark session settings for this run, a JSON object of setting -> value (blank keeps the
         # cluster's), e.g. to compare code generation or write settings on one cluster.
         - name: spark_conf
