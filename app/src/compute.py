@@ -1,38 +1,29 @@
 """What a job runs on, as the job Edit view shows it: every task's compute, read from the job's settings (the Jobs API
-``settings`` as a dict), each value with where it comes from and, for the ingestion cluster, the value our tests ran.
+``settings`` as a dict), each value with where it comes from.
 
 The ingestion cluster is set in the bundle (resources/lakefed_ingest.yml, from databricks.yml variables), so a value's
 "source" names the bundle variable or file that sets it; an app job with its own cluster runs a copy of the ingestion
 job whose types and workers that app job sets (cluster_copies)."""
-from typing import Dict, List, Optional
+from typing import List, Optional
 
 BUNDLE_FILE = "resources/lakefed_ingest.yml"
 OUTSIDE_BUNDLE = "the job's cluster, set outside the bundle variables"
 OWN_CLUSTER = "this job's own cluster (Ingestion cluster, above)"
-TESTED_IN = "the 100,000-table lab runs"
-
-# Cluster settings the bundle takes from a databricks.yml variable, and the value our 100k lab runs used.
-BUNDLE_VARIABLES: Dict[str, tuple] = {
-    "driver_node_type_id": ("driver_node_type_id", "Standard_D16ds_v5"),
-    "node_type_id": ("node_type_id", "Standard_D8ds_v5"),
-    "num_workers": ("num_workers", "1"),
-}
 
 
-def _field(name: str, value: str, source: str, tested: Optional[str] = None) -> dict:
-    return {"name": name, "value": value, "source": source, "tested": tested}
+def _field(name: str, value: str, source: str) -> dict:
+    return {"name": name, "value": value, "source": source}
 
 
 def _from_variable(name: str, key: str, value: str, cluster: dict, own_cluster: bool = False) -> dict:
     """A cluster setting the bundle sets from a variable; once the cluster no longer carries the key (an
     autoscale cluster has no num_workers), its value was set some other way. On a job's own copy of the ingestion
     job, the job's own cluster sets it."""
-    variable, tested = BUNDLE_VARIABLES[key]
     if own_cluster:
-        return _field(name, value, OWN_CLUSTER, f"{tested} ({TESTED_IN})")
+        return _field(name, value, OWN_CLUSTER)
     if key not in cluster:
         return _field(name, value, OUTSIDE_BUNDLE)
-    return _field(name, value, f"bundle variable {variable} (databricks.yml)", f"{tested} ({TESTED_IN})")
+    return _field(name, value, f"bundle variable {key} (databricks.yml)")
 
 
 def _workers(cluster: dict) -> str:
@@ -63,8 +54,8 @@ def _cluster_fields(cluster: dict, own_cluster: bool = False) -> List[dict]:
 
 def describe(settings: dict, own_cluster: bool = False) -> List[dict]:
     """One entry per task of a job: its kind of compute (job cluster, serverless or an existing cluster) and the
-    fields to show, each {name, value, source, tested}. ``own_cluster``: the job is an app job's copy of the
-    ingestion job, whose cluster types and workers that app job sets."""
+    fields to show, each {name, value, source}. ``own_cluster``: the job is an app job's copy of the ingestion job,
+    whose cluster types and workers that app job sets."""
     clusters = {c["job_cluster_key"]: c.get("new_cluster") or {} for c in settings.get("job_clusters") or []}
     environments = {e["environment_key"]: e.get("spec") or {} for e in settings.get("environments") or []}
     out = []
