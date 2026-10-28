@@ -270,6 +270,14 @@ export default function JobEdit() {
   // The settings form as it loaded, so "unsaved" means the user changed something, not that a default differs.
   const [loaded, setLoaded] = useState("");
   const locked: Locked = usePermissions().data?.jobs[id]?.change ?? null;
+  const clusterInfo = useQuery({
+    queryKey: ["job-cluster", id], queryFn: () => api.get<Row>(`/ingestion-jobs/${id}/cluster`),
+    refetchInterval: (query) => (query.state.data?.applying ? 5000 : false),
+  });
+  const [cluster, setCluster] = useState<Row | null>(null);
+  useEffect(() => {
+    if (clusterInfo.data && cluster === null) setCluster({ ...clusterInfo.data.defaults, ...(clusterInfo.data.cluster ?? {}) });
+  }, [clusterInfo.data, cluster]);
 
   useEffect(() => {
     if (!s) return;
@@ -316,10 +324,14 @@ export default function JobEdit() {
       }
       if (schedule) {
         const cadence = Number(run.cadence_minutes);
+        const { cluster: stored, ...kept } = schedule.options ?? {};
+        // Until the cluster is read, keep what's stored; at the Databricks job's own values, the job has no cluster of its own.
+        const own = !clusterInfo.data || !cluster ? stored : ownCluster(cluster, clusterInfo.data.defaults);
         await api.post(`/schedules/${schedule.id}`, {
           name: name.trim() || schedule.name, cadence_minutes: cadence, timezone: cadence <= 60 ? "UTC" : run.timezone || "Europe/London",
           stagger: schedule.stagger, paused: run.paused, notify_emails: run.notify_emails || null, job_variant: schedule.job_variant,
-          options: { ...(schedule.options ?? {}), ...(cadence > 60 ? { start_minute: startMinute(run.start) } : { start_minute: undefined }) },
+          options: { ...kept, ...(own ? { cluster: own } : {}),
+            ...(cadence > 60 ? { start_minute: startMinute(run.start) } : { start_minute: undefined }) },
           members: (schedule.members as Row[]).map((m) => m.task_collection),
           parameters: Object.fromEntries(Object.entries(params).filter(([, v]) => v.trim() !== "").map(([k, v]) => [k, v.trim()])),
         }).catch((e: Error) => {
@@ -329,12 +341,16 @@ export default function JobEdit() {
       return result;
     },
     onSuccess: () => { qc.invalidateQueries({ queryKey: ["job-settings", id] }); qc.invalidateQueries({ queryKey: ["schedules"] });
-      qc.invalidateQueries({ queryKey: ["job-tree", id] }); qc.invalidateQueries({ queryKey: ["ingestion-job", id] }); },
+      qc.invalidateQueries({ queryKey: ["job-tree", id] }); qc.invalidateQueries({ queryKey: ["ingestion-job", id] });
+      qc.invalidateQueries({ queryKey: ["job-cluster", id] }); qc.invalidateQueries({ queryKey: ["job-compute", id] }); },
   });
 
   // As the Databricks editors do: Save only with something to save, a sign of unsaved changes, and a question before
   // leaving with them (a link in the app, or closing the tab).
-  const dirty = !!s && (JSON.stringify({ w, identity, differing }) !== loaded
+  const info = clusterInfo.data;
+  const clusterChanged = !!info && !!cluster && JSON.stringify(ownCluster(cluster, info.defaults))
+    !== JSON.stringify(info.cluster ? ownCluster({ ...info.defaults, ...info.cluster }, info.defaults) : null);
+  const dirty = !!s && (JSON.stringify({ w, identity, differing }) !== loaded || clusterChanged
     || (!!baseline && JSON.stringify({ run, params, name }) !== JSON.stringify(baseline)));
   const confirm = useConfirm();
   const leave = (to: string) => {
@@ -482,19 +498,66 @@ export default function JobEdit() {
             </label>
           ))}
         </div>
+        <ClusterFields info={clusterInfo.data} error={clusterInfo.error} cluster={cluster} setCluster={setCluster} locked={locked} />
         <Compute jobId={id} />
       </details>}
     </>
   );
 }
 
-// What the job's runs execute on, read live from the Jobs API. Compute is set in the bundle, so it is shown, not edited.
+const CLUSTER_KEYS = ["driver_node_type_id", "node_type_id", "num_workers"];
+
+/** The cluster to save as the job's own, or null when it is the Databricks job's (so the job runs that job itself). */
+function ownCluster(cluster: Row, defaults: Row): Row | null {
+  if (CLUSTER_KEYS.every((k) => String(cluster[k] ?? "") === String(defaults[k] ?? ""))) return null;
+  return { driver_node_type_id: cluster.driver_node_type_id || null, node_type_id: cluster.node_type_id || null,
+    num_workers: cluster.num_workers === "" || cluster.num_workers == null ? null : Number(cluster.num_workers) };
+}
+
+// The job's ingestion cluster, set like a Databricks job cluster. A change gives the job its own copy of the Databricks
+// job (made by the cluster copies job after Save), since a run of that job can't change its cluster.
+function ClusterFields({ info, error, cluster, setCluster, locked }: { info?: Row; error: unknown; cluster: Row | null;
+                        setCluster: (c: Row) => void; locked: Locked }) {
+  if (!info || !cluster) return <ErrorBox error={error} />;
+  const d = info.defaults ?? {};
+  const off = !!locked || !info.configured;
+  return (
+    <div className="compute">
+      <h3>Ingestion cluster</h3>
+      <p className="muted">The job cluster each run of this job uses: the driver and worker types and the number of workers. The defaults
+        are the Databricks job's own ({d.driver_node_type_id} driver, {d.node_type_id} workers, {d.num_workers}), the shape our
+        100,000-table lab runs used. A change gives this job its own copy of the Databricks job, made a minute or so after Save.</p>
+      <div className="form-grid">
+        <label>Driver type<input list="node-types" value={cluster.driver_node_type_id ?? ""} disabled={off}
+          onChange={(e) => setCluster({ ...cluster, driver_node_type_id: e.target.value })} /></label>
+        <label>Worker type<input list="node-types" value={cluster.node_type_id ?? ""} disabled={off}
+          onChange={(e) => setCluster({ ...cluster, node_type_id: e.target.value })} /></label>
+        <label>Workers<input type="number" min={0} max={info.max_workers} value={cluster.num_workers ?? ""} disabled={off}
+          onChange={(e) => setCluster({ ...cluster, num_workers: e.target.value })} />
+          <span className="help">0 to {info.max_workers}; 0 runs on the driver alone</span></label>
+      </div>
+      <datalist id="node-types">{(info.node_types ?? []).map((n: string) => <option key={n} value={n} />)}</datalist>
+      <div className="toolbar">
+        <button className="ghost" disabled={off} onClick={() => setCluster({ ...d })}>Use the defaults</button>
+        <span className="muted">{info.applying ? <>Applying: the cluster copies job is making this job's copy (<a href={info.applying.url}
+          target="_blank" rel="noreferrer">run {info.applying.run_id}</a>).</>
+          : info.copy_job_id ? <>Runs its own copy of the Databricks job, <a href={info.copy_url} target="_blank" rel="noreferrer">job {info.copy_job_id}</a>.</>
+          : info.cluster ? "Saved; its copy of the Databricks job is not made yet." : "Runs the Databricks job's own cluster."}</span>
+      </div>
+      {!info.configured && <p className="muted small">This app has no cluster copies job, so the cluster can't be changed here.</p>}
+      {info.error && <Notice tone="warn">{info.error}.</Notice>}
+    </div>
+  );
+}
+
+// What the job's runs execute on, read live from the Jobs API.
 function Compute({ jobId }: { jobId: string }) {
   const compute = useQuery({ queryKey: ["job-compute", jobId], queryFn: () => api.get<Row>(`/ingestion-jobs/${jobId}/compute`) });
   return (
     <div className="compute">
       <h3>Compute</h3>
-      <p className="muted">What this job's runs execute on, read from the Databricks jobs now. It is set in the bundle that deploys them, not here.</p>
+      <p className="muted">What this job's runs execute on, read from the Databricks jobs now. The ingestion cluster's types and
+        workers are set above; the rest comes from the bundle that deploys the jobs.</p>
       <ErrorBox error={compute.error} />
       {(compute.data?.jobs ?? []).map((job: Row) => (
         <Fragment key={job.role}>

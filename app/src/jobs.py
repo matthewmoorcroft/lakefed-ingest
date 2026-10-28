@@ -15,6 +15,10 @@ SETUP_JOB_ID = os.environ.get("SETUP_JOB_ID")
 DISCOVER_JOB_ID = os.environ.get("DISCOVER_JOB_ID")
 # The check job (lakefed_ingest_check): a schedule of the check variant starts it with all its members.
 CHECK_JOB_ID = os.environ.get("CHECK_JOB_ID")
+# The copies job (lakefed_ingest_cluster_copies): makes the copies of the ingestion job that app jobs with their own
+# cluster run. The app passes its own service principal (DATABRICKS_CLIENT_ID, set by Databricks Apps) for Can Manage.
+CLUSTER_COPIES_JOB_ID = os.environ.get("CLUSTER_COPIES_JOB_ID")
+APP_PRINCIPAL = os.environ.get("DATABRICKS_CLIENT_ID")
 # Group given CAN_VIEW on the wrapper jobs the app creates for schedules (blank = owner and admins only).
 SCHEDULE_JOB_VIEW_GROUP = os.environ.get("SCHEDULE_JOB_VIEW_GROUP", "users") or None
 
@@ -162,6 +166,23 @@ def run_now(job_id, job_parameters: dict) -> int:
     waiter = workspace().jobs.run_now(job_id=int(job_id), job_parameters=job_parameters)
     resp = getattr(waiter, "response", waiter)
     return int(resp.run_id)
+
+
+def start_cluster_copies(schedule_id) -> int:
+    """Start the copies job for one schedule: it makes, updates or deletes that job's copy of the ingestion job."""
+    return run_now(CLUSTER_COPIES_JOB_ID, {"schedule_id": str(int(schedule_id)), "app_service_principal": APP_PRINCIPAL or ""})
+
+
+_node_types: dict = {}
+
+
+def node_types() -> List[str]:
+    """The workspace's node types a job cluster can use (not deprecated), read once an hour."""
+    now = time.monotonic()
+    if not _node_types or now - _node_types["at"] > 3600:
+        found = workspace().clusters.list_node_types().node_types or []
+        _node_types.update(at=now, names=sorted(n.node_type_id for n in found if not getattr(n, "is_deprecated", False)))
+    return _node_types["names"]
 
 
 def run_state(run_id) -> dict:

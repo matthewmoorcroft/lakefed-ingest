@@ -561,7 +561,8 @@ def _started_job(job: dict) -> Optional[str]:
     ingestion job. Every action on the ingestion job follows the signed-in user's permission on it."""
     if (job.get("job_variant") or "default") == sch.CHECK_VARIANT:
         return jobs.CHECK_JOB_ID
-    return jobs.ingest_variants().get(job.get("job_variant") or "default")
+    copy = sch.copy_job_id(job)
+    return str(copy) if copy else jobs.ingest_variants().get(job.get("job_variant") or "default")
 
 
 def _permission_refusals(job: dict, user: str) -> dict:
@@ -658,10 +659,8 @@ def ingestion_job_compute(job_id: int):
     ingestion job it starts, each task's compute with where every value comes from (compute.describe)."""
     job = _load_schedule(job_id)[0]
     variant = job.get("job_variant") or "default"
-    if variant == sch.CHECK_VARIANT:
-        started = [("check", jobs.CHECK_JOB_ID), ("ingestion", jobs.ingest_variants().get("default"))]
-    else:
-        started = [("ingestion", jobs.ingest_variants().get(variant))]
+    ingestion = sch.copy_job_id(job) or jobs.ingest_variants().get("default" if variant == sch.CHECK_VARIANT else variant)
+    started = ([("check", jobs.CHECK_JOB_ID)] if variant == sch.CHECK_VARIANT else []) + [("ingestion", ingestion)]
     out = []
     for role, started_job_id in started:
         entry = {"role": role, "job_id": started_job_id, "name": None, "compute": [], "error": None}
@@ -670,11 +669,49 @@ def ingestion_job_compute(job_id: int):
         else:
             try:
                 settings = jobs.job_settings(started_job_id)
-                entry.update(name=settings.get("name"), compute=compute.describe(settings))
+                entry.update(name=settings.get("name"), compute=compute.describe(
+                    settings, own_cluster=role == "ingestion" and bool(sch.copy_job_id(job))))
             except Exception as e:  # shown on the page; the rest of the job's settings still load
                 entry["error"] = f"can't read job {started_job_id}: {e}"
         out.append(entry)
     return {"jobs": out}
+
+
+@app.get("/api/ingestion-jobs/{job_id}/cluster")
+def ingestion_job_cluster(job_id: int, request: Request):
+    """A job's own cluster for the Edit view: what it asks for (None = the ingestion job's own), the ingestion job's
+    values as the defaults, the workspace's node types, the copy it runs, and the copies job's run applying a change.
+    Once that run has ended, the job's wrapper jobs are synced to start the copy (or the ingestion job again)."""
+    s = _load_schedule(job_id)[0]
+    applying, error = None, None
+    run_id = sch.options_of(s).get("cluster_copy_run_id")
+    if run_id:
+        state = jobs.run_state(run_id)
+        applying = {"run_id": run_id, "state": state["state"], "result": state["result"], "url": state["url"]}
+        if state["state"] in ("TERMINATED", "SKIPPED", "INTERNAL_ERROR"):
+            with db.transaction() as cur:
+                cur.execute(q.clear_schedule_option_sql(), ("cluster_copy_run_id", int(job_id)))
+            if state["result"] == "SUCCESS":
+                _sync(job_id, _user(request))
+                s = _load_schedule(job_id)[0]
+            else:
+                error = f"the cluster copies run ended {state['result'] or state['state']}: {state['message'] or ''}".strip()
+            applying = None
+    try:
+        bundle_cluster = ((jobs.job_settings(jobs.ingest_variants().get("default")).get("job_clusters") or [{}])[0]
+                          .get("new_cluster") or {})
+        defaults = {k: bundle_cluster.get(k) for k in sch.CLUSTER_KEYS}
+    except Exception as e:
+        defaults, error = {}, error or f"can't read the ingestion job's cluster: {str(e).split('. ')[0]}"
+    try:
+        node_types = jobs.node_types()
+    except Exception:
+        node_types = []
+    copy = sch.copy_job_id(s)
+    host = db.workspace().config.host.rstrip("/")
+    return {"cluster": sch.own_cluster(s), "defaults": defaults, "node_types": node_types,
+            "max_workers": sch.MAX_WORKERS, "copy_job_id": copy, "copy_url": f"{host}/jobs/{copy}" if copy else None,
+            "applying": applying, "error": error, "configured": bool(jobs.CLUSTER_COPIES_JOB_ID)}
 
 
 class JobSettingsRequest(BaseModel):
@@ -1542,6 +1579,14 @@ def _ingest_job_id(variant: str) -> Optional[int]:
     return int(jid) if jid else None
 
 
+def _wrapper_target(schedule: dict) -> Optional[int]:
+    """The job a schedule's wrappers start: its own copy of the ingestion job when it has its own cluster (a check
+    schedule's wrapper still starts the check job, and passes the copy on), else its variant's job."""
+    variant = schedule.get("job_variant") or "default"
+    copy = sch.copy_job_id(schedule)
+    return copy if copy and variant != sch.CHECK_VARIANT else _ingest_job_id(variant)
+
+
 def _variant_job_id(variant: str) -> int:
     jid = _ingest_job_id(variant)
     if jid is None:
@@ -1570,12 +1615,42 @@ def _validate_schedule(body: ScheduleBody):
         raise HTTPException(422, {"errors": errs})
 
 
-# Options only the app's own steps write (who last changed the job): a request's value is ignored, the stored kept.
-MANAGED_OPTIONS = ("updated_by",)
+# Options only the app's own steps write: who last changed the job, the copies job's copy and the app's run
+# applying it. A request's values for them are ignored, and the stored ones kept.
+MANAGED_OPTIONS = ("updated_by", sch.COPY_OPTION, "cluster_copy_run_id")
 
 
 def _requested_options(body: "ScheduleBody") -> dict:
     return {k: v for k, v in (body.options or {}).items() if k not in MANAGED_OPTIONS}
+
+
+def _refuse_unknown_node_types(cluster: Optional[dict]) -> None:
+    """A job's own cluster may only name node types this workspace has."""
+    wanted = [cluster.get(k) for k in ("driver_node_type_id", "node_type_id")] if cluster else []
+    wanted = [n for n in wanted if n]
+    if not wanted:
+        return
+    try:
+        known = set(jobs.node_types())
+    except Exception as e:  # without the list, nothing is checked: refuse rather than start an unknown cluster
+        raise HTTPException(503, f"can't read this workspace's node types: {str(e).split('. ')[0]}")
+    unknown = [n for n in wanted if n not in known]
+    if unknown:
+        raise HTTPException(422, {"errors": [f"options.cluster: {unknown[0]} is not a node type in this workspace"]})
+
+
+def _apply_cluster(sid: int) -> Optional[str]:
+    """Start the copies job for a schedule (it makes, updates or deletes the schedule's copy of the ingestion job)
+    and record its run, which the cluster endpoint follows. Returns why it couldn't start, or None."""
+    if not jobs.CLUSTER_COPIES_JOB_ID:
+        return "no cluster copies job is configured for this app, so the job keeps the ingestion job's cluster"
+    try:
+        run_id = jobs.start_cluster_copies(sid)
+    except Exception as e:
+        return f"the cluster copies job didn't start: {str(e).split('. ')[0]}"
+    with db.transaction() as cur:
+        cur.execute(q.set_schedule_option_sql(), (["cluster_copy_run_id"], run_id, int(sid)))
+    return None
 
 
 def _sync(sid: int, user: str) -> List[dict]:
@@ -1588,7 +1663,7 @@ def _sync(sid: int, user: str) -> List[dict]:
         s, members = _load_schedule(sid, cur)
         active = [m for m in members if m["removed_at"] is None]
         removed = [m for m in members if m["delete_pending"]]
-        results = sch.sync(s, active, removed, jobs.schedule_client(), _ingest_job_id(s["job_variant"]),
+        results = sch.sync(s, active, removed, jobs.schedule_client(), _wrapper_target(s),
                            jobs.SCHEDULE_JOB_VIEW_GROUP, _owner())
         for r in results:
             if r.member_id is not None:
@@ -1694,6 +1769,7 @@ def create_schedule(body: ScheduleBody, request: Request):
     import psycopg
     body.options = _requested_options(body)
     _validate_schedule(body)
+    _refuse_unknown_node_types(sch.own_cluster(body.model_dump()))
     user = _user(request)
     # A check schedule's one wrapper fires every member at once.
     body.stagger = body.stagger and body.job_variant != sch.CHECK_VARIANT
@@ -1715,15 +1791,19 @@ def create_schedule(body: ScheduleBody, request: Request):
                      f"{body.name} ({sch.describe(body.cadence_minutes, offs[c], body.timezone)})", batch=batch)
     except psycopg.errors.UniqueViolation:
         raise HTTPException(409, f"a schedule named '{body.name}' already exists")
-    return {"id": sid, "sync": _sync(sid, user)}
+    synced = _sync(sid, user)
+    cluster = _apply_cluster(sid) if sch.own_cluster(body.model_dump()) else None
+    return {"id": sid, "sync": synced, "cluster_error": cluster}
 
 
 @app.post("/api/schedules/{sid}")
 def update_schedule(sid: int, body: ScheduleBody, request: Request):
-    """Edit a schedule: fields, and members added or removed. Offsets are recomputed; jobs are synced."""
+    """Edit a schedule: fields, and members added or removed. Offsets are recomputed; jobs are synced. A change to its
+    own cluster starts the copies job, which makes, updates or deletes its copy of the ingestion job."""
     import psycopg
     body.options = _requested_options(body)
     _validate_schedule(body)
+    _refuse_unknown_node_types(sch.own_cluster(body.model_dump()))
     user = _user(request)
     s, members = _load_schedule(sid)
     if s["deleted_at"] is not None:
@@ -1738,9 +1818,11 @@ def update_schedule(sid: int, body: ScheduleBody, request: Request):
     # A body without options (an older page) keeps the stored ones; an explicit {} clears them.
     new["options"] = (new["options"] or None) if "options" in body.model_fields_set else s.get("options")
     stored = sch.options_of(s)
-    if "updated_by" in stored:
-        new["options"] = {**(new["options"] or {}), "updated_by": stored["updated_by"]}
+    kept = {k: stored[k] for k in MANAGED_OPTIONS if k in stored}
+    if kept:
+        new["options"] = {**(new["options"] or {}), **kept}
     as_json = lambda v: json.loads(v) if isinstance(v, str) else (v or {})
+    cluster_changed = sch.own_cluster(new) != sch.own_cluster(s)
     changed = [f for f in q.SCHEDULE_FIELDS if (s[f] or None) != (new[f] or None) and not
                (f in q.JSON_SCHEDULE_FIELDS and as_json(s[f]) == as_json(new[f]))]
     active = {m["task_collection"]: m for m in members if m["removed_at"] is None}
@@ -1772,7 +1854,9 @@ def update_schedule(sid: int, body: ScheduleBody, request: Request):
                 _touch(cur, user, [sid])
     except psycopg.errors.UniqueViolation:
         raise HTTPException(409, f"a schedule named '{body.name}' already exists")
-    return {"id": sid, "changed": changed, "added": added, "removed": gone, "sync": _sync(sid, user)}
+    synced = _sync(sid, user)
+    cluster = _apply_cluster(sid) if cluster_changed else None
+    return {"id": sid, "changed": changed, "added": added, "removed": gone, "sync": synced, "cluster_error": cluster}
 
 
 def _set_paused(sid: int, paused: bool, request: Request):
@@ -1813,14 +1897,19 @@ def delete_schedule(sid: int, request: Request):
         if active:
             cur.execute(q.remove_members_sql(), (active,))   # their jobs are deleted by the sync below
         _log(cur, user, "schedule_delete", None, None, s["name"], None, None)
-    return {"id": sid, "deleted": True, "sync": _sync(sid, user)}
+    synced = _sync(sid, user)
+    if sch.options_of(s).get(sch.COPY_OPTION):     # its copy of the ingestion job goes too
+        _apply_cluster(sid)
+    return {"id": sid, "deleted": True, "sync": synced}
 
 
 @app.post("/api/schedules/{sid}/sync")
 def sync_schedule(sid: int, request: Request):
     """Re-sync the wrapper jobs (recreates missing ones and undoes edits made outside the app)."""
-    _refuse_job(_load_schedule(sid)[0], request, "change")
-    return {"id": sid, "sync": _sync(sid, _user(request))}
+    s = _load_schedule(sid)[0]
+    _refuse_job(s, request, "change")
+    cluster = _apply_cluster(sid) if sch.own_cluster(s) else None     # copies the ingestion job again
+    return {"id": sid, "sync": _sync(sid, _user(request)), "cluster_error": cluster}
 
 
 @app.get("/api/schedules/{sid}/check")
@@ -1828,7 +1917,10 @@ def check_schedule(sid: int):
     """Drift report for the schedule's wrapper jobs; changes nothing."""
     s, members = _load_schedule(sid)
     active = [m for m in members if m["removed_at"] is None]
-    return sch.check(s, active, jobs.schedule_client(), _variant_job_id(s["job_variant"]), _owner())
+    target = _wrapper_target(s)
+    if target is None:
+        raise HTTPException(503, f"no Databricks ingestion job configured for variant '{s['job_variant']}'")
+    return sch.check(s, active, jobs.schedule_client(), target, _owner())
 
 
 @app.get("/api/timeline")

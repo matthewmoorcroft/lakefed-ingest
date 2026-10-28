@@ -110,6 +110,10 @@ secret). See `README.md`, `docs/deploy.md`, `docs/monitoring.md`, `docs/lakebase
   `lakefed_ingest` once per collection with work by run-now (`work_id`; `launcher.py`), watches the
   runs for `confirm_s` (a run Databricks skips fails the check) and ends. No For each. Its own schedule
   (paused) is the fallback cadence; an app schedule in group mode starts it with its members.
+- `lakefed_ingest_cluster_copies` → `cluster_copies.ipynb` (serverless, runs as the deployer): one copy of
+  `lakefed_ingest` per app schedule with its own cluster (`options.cluster`), only the cluster's types and workers
+  changed (`cluster_copies.py`); records the copy in `options.ingest_copy_job_id`. The check job takes the job to
+  start as its `ingest_job_id` job parameter.
 - `lakefed_ingest_discover` → `discover_tables.ipynb`: table discovery for bulk onboarding (params
   `discovery_id`, `spec` JSON); writes `discovery` / `discovered_table`. Runs on the bundle's
   single-node all-purpose cluster `lakefed_ingest utility` (`resources.clusters.lakefed_ingest_utility`,

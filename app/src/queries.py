@@ -1626,6 +1626,17 @@ def schedules_sql() -> str:
             f"from {SCHEMA}.schedule where deleted_at is null order by lower(name)")
 
 
+def set_schedule_option_sql() -> str:
+    """Set one key of a schedule's options to a number. Params: key (as a one-element text array), value, id."""
+    return (f"update {SCHEMA}.schedule set options = jsonb_set(coalesce(options, '{{}}'::jsonb), %s::text[], "
+            f"to_jsonb(%s::bigint)) where id = %s")
+
+
+def clear_schedule_option_sql() -> str:
+    """Remove one key from a schedule's options. Params: key, id."""
+    return f"update {SCHEMA}.schedule set options = options - %s where id = %s"
+
+
 def schedule_sql() -> str:
     """One schedule (deleted or not). Param: id."""
     return (f"select id, {', '.join(SCHEDULE_FIELDS)}, created_by, created_at, updated_at, deleted_at "

@@ -35,6 +35,11 @@ variables:
     description: Id of the check job (schedules of the check variant; looked up by name, like ingest_job_id).
     lookup:
       job: lakefed_ingest_check
+  cluster_copies_job_id:
+    description: Id of the cluster copies job, which makes the ingestion job's copies for app jobs with their own
+      cluster (looked up by name, like ingest_job_id).
+    lookup:
+      job: lakefed_ingest_cluster_copies
 
 targets:
   dev:

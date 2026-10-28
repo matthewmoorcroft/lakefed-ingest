@@ -31,7 +31,7 @@ resources:
             notebook_path: ../src/lakefed_ingest/check_launch.ipynb
             base_parameters:
               task_collections: "{{job.parameters.task_collections}}"
-              ingest_job_id: ${resources.jobs.lakefed_ingest.id}
+              ingest_job_id: "{{job.parameters.ingest_job_id}}"
               launch_id: "{{task.run_id}}"
               db_instance: "{{job.parameters.db_instance}}"
               db_name: "{{job.parameters.db_name}}"
@@ -63,6 +63,9 @@ resources:
         # The group: comma-separated collections; blank = every collection with an enabled control row.
         - name: task_collections
           default: ""
+        # The ingestion job to start: the bundle's, or an app job's copy with its own cluster (cluster_copies.ipynb).
+        - name: ingest_job_id
+          default: ${resources.jobs.lakefed_ingest.id}
         - name: db_instance
           default: ${var.lakebase_instance}
         - name: db_name

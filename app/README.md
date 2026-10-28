@@ -78,6 +78,18 @@ it and when: an edit, pause or resume of the job, or any change to its groups' t
 `updated_at`). The job page shows them under its title; the Ingestion jobs list has them as Created and Last updated,
 sortable by time. A job never changed since it was created shows its creator as Last updated by, as the Jobs list does; jobs last changed before the app recorded it show "unknown" for who.
 
+**Its own cluster.** The job Edit view's Advanced configuration sets the job's ingestion cluster, like a
+Databricks job cluster: driver type, worker type and 0 to 8 workers, defaulting to the ingestion job's own. A run of
+the ingestion job can't change its cluster, so a job with its own cluster runs its own copy of the ingestion job:
+- on Save, the app starts `lakefed_ingest_cluster_copies`, which runs as the deployer and makes or updates the copy
+  (the same tasks and grants, only those cluster settings changed), and records its id in the schedule's options;
+- the app then syncs the job's wrappers to start the copy (on `check`, the check job is given the copy as
+  `ingest_job_id`);
+- back at the defaults, the job runs the ingestion job again and the copy is deleted;
+- Sync jobs copies the ingestion job again, so a redeploy reaches the copies.
+
+Changing the cluster needs Can Manage on the job's Databricks job, like any change.
+
 ## Guard rails for edits
 
 Data integrity comes first, so edits go through the server's rules, not the browser's:
@@ -156,7 +168,8 @@ Prerequisites: the ingestion bundle is deployed and its setup job has run (Lakeb
 1. Add a target to `app/databricks.yml` for your workspace (the committed `dev` / `prod` hosts are
    placeholders). Set the variables that differ from the defaults:
    - `lakebase_instance`, `lakebase_database`: the ingestion bundle's values.
-   - `ingest_job_id`, `setup_job_id`, `discover_job_id`: looked up by job name. In development mode the ingestion
+   - `ingest_job_id`, `setup_job_id`, `discover_job_id`, `check_job_id`, `cluster_copies_job_id`: looked up by job
+     name. In development mode the ingestion
      bundle prefixes job names (`[dev your_name] lakefed_ingest`), so set the ids or the prefixed
      names for dev targets.
    - `app_name`: 30 characters max.

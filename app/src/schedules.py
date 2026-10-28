@@ -50,8 +50,16 @@ PARAMETERS = {
     "fail_on_table_errors": _flag,
 }
 FLAGS = [k for k, check in PARAMETERS.items() if check is _flag]
-# Keys of schedule.options: start_minute = a set start time for daily and every 2 to 12 hours schedules.
-OPTIONS = ("start_minute",)
+# Keys of schedule.options the app sets: start_minute = a set start time for daily and every 2 to 12 hours
+# schedules; cluster = the job's own cluster ({driver_node_type_id, node_type_id, num_workers}, run by a copy of the
+# ingestion job); cluster_copy_run_id = the copies job's run applying it. ingest_copy_job_id (that copy) is written
+# only by the copies job (cluster_copies.ipynb), never taken from a request.
+OPTIONS = ("start_minute", "cluster", "cluster_copy_run_id")
+COPY_OPTION = "ingest_copy_job_id"
+CLUSTER_KEYS = ("driver_node_type_id", "node_type_id", "num_workers")
+# Workers an app job may ask for: enough for the largest tested shape, small enough to bound a mistake's cost.
+MAX_WORKERS = 8
+_NODE_TYPE = re.compile(r"[A-Za-z0-9_.-]{1,64}")
 TAG_SCHEDULE = "lakefed_ingest_schedule"
 TAG_COLLECTION = "lakefed_ingest_collection"
 TAG_OWNER = "lakefed_ingest_app"     # instance/database: apps of other deployments in the workspace keep out
@@ -119,7 +127,49 @@ def validate(body: dict, known_collections: Iterable[str], variants: Iterable[st
                 errs.append("options.start_minute: a minute of the day, 0 to 1439")
             elif int(body.get("cadence_minutes") or 0) <= 60:
                 errs.append("options.start_minute: only daily and every 2 to 12 hours schedules start at a set time")
+        errs += cluster_problems(options.get("cluster"), body.get("job_variant") or "default")
     return errs
+
+
+def cluster_problems(cluster, variant: str) -> List[str]:
+    """What's wrong with a job's own cluster (options.cluster), if anything. Only the default and check variants
+    run the bundle's ingestion job, so only they can have a copy of it with another cluster."""
+    if not cluster:
+        return []
+    if not isinstance(cluster, dict):
+        return ["options.cluster must be an object"]
+    errs = [f"options.cluster: unknown key {k}" for k in cluster if k not in CLUSTER_KEYS]
+    if variant not in ("default", CHECK_VARIANT):
+        errs.append(f"options.cluster: the {variant} variant runs its own Databricks job, whose cluster is set there")
+    for key in ("driver_node_type_id", "node_type_id"):
+        value = cluster.get(key)
+        if value not in (None, "") and not (isinstance(value, str) and _NODE_TYPE.fullmatch(value)):
+            errs.append(f"options.cluster.{key}: a node type name, such as Standard_D16ds_v5")
+    workers = cluster.get("num_workers")
+    if workers not in (None, "") and (not isinstance(workers, int) or isinstance(workers, bool)
+                                      or not 0 <= workers <= MAX_WORKERS):
+        errs.append(f"options.cluster.num_workers: 0 to {MAX_WORKERS} workers")
+    return errs
+
+
+def options_of(schedule: dict) -> dict:
+    """A schedule's options as a dict (stored as JSON)."""
+    options = schedule.get("options") or {}
+    return json.loads(options) if isinstance(options, str) else options
+
+
+def own_cluster(schedule: dict) -> Optional[dict]:
+    """The cluster a job asks for, without blanks (None: the bundle's ingestion job's own)."""
+    cluster = options_of(schedule).get("cluster") or {}
+    found = {k: cluster[k] for k in CLUSTER_KEYS if cluster.get(k) not in (None, "")}
+    return found or None
+
+
+def copy_job_id(schedule: dict) -> Optional[int]:
+    """The copy of the ingestion job this job runs (made by the copies job for its own cluster), or None for the
+    bundle's job: no own cluster, or its copy isn't made yet."""
+    recorded = options_of(schedule).get(COPY_OPTION)
+    return int(recorded) if recorded and own_cluster(schedule) else None
 
 
 # ---- cadence, offsets, cron, next runs ----------------------------------------------------------
@@ -438,6 +488,8 @@ def group_job_settings(schedule: dict, collections: Iterable[str], check_job_id:
                      view_group, owner)
     params = {"task_collections": ",".join(sorted(collections)),
               **{k: str(v) for k, v in sorted((schedule.get("parameters") or {}).items())}}
+    if copy_job_id(schedule):     # the check starts the job's own copy of the ingestion job
+        params["ingest_job_id"] = str(copy_job_id(schedule))
     s["name"] = group_job_name(schedule["name"])
     s["tasks"] = [{"task_key": "check", "run_job_task": {"job_id": int(check_job_id), "job_parameters": params}}]
     s["tags"][TAG_COLLECTION] = GROUP_TAG

@@ -34,6 +34,16 @@ class Store:
                 row = self.schedules[sid]
                 row.update(updated_at=self.now(), options=json.dumps({**sch.options_of(row), "updated_by": user}))
             return []
+        if sql in (q.set_schedule_option_sql(), q.clear_schedule_option_sql()):
+            import json
+            row = self.schedules[params[-1]]
+            options = sch.options_of(row)
+            if sql == q.set_schedule_option_sql():
+                options[params[0][0]] = params[1]
+            else:
+                options.pop(params[0], None)
+            row["options"] = json.dumps(options)
+            return []
         if sql.startswith(f"insert into {q.SCHEMA}.schedule ("):
             if self.unique:
                 import psycopg
@@ -400,3 +410,90 @@ def test_a_job_records_who_created_it_and_who_last_changed_it_and_a_sent_name_is
     assert r.status_code == 200 and sch.updated_by(api.store.schedules[sid]) == "second@example.com"
     other.post(f"/api/schedules/{sid}/resume")
     assert sch.updated_by(api.store.schedules[sid]) == "second@example.com"
+
+
+BIG = {"driver_node_type_id": "Standard_D32ds_v5", "node_type_id": "Standard_D16ds_v5", "num_workers": 4}
+
+
+def _cluster_setup(monkeypatch):
+    started = []
+    monkeypatch.setattr(main.jobs, "CLUSTER_COPIES_JOB_ID", "700")
+    monkeypatch.setattr(main.jobs, "node_types", lambda: ["Standard_D16ds_v5", "Standard_D32ds_v5", "Standard_D8ds_v5"])
+    monkeypatch.setattr(main.jobs, "start_cluster_copies", lambda sid: started.append(sid) or 8000 + len(started))
+    return started
+
+
+def test_a_cluster_of_its_own_starts_the_copies_job_and_a_forged_copy_id_is_ignored(api, monkeypatch):
+    started = _cluster_setup(monkeypatch)
+    sid = api.post("/api/schedules", json=BODY).json()["id"]
+    assert started == []
+    body = dict(BODY, options={"cluster": BIG, "ingest_copy_job_id": 1})
+    r = api.post(f"/api/schedules/{sid}", json=body)
+    assert r.status_code == 200 and r.json()["cluster_error"] is None and started == [sid]
+    options = sch.options_of(api.store.schedules[sid])
+    assert options == {"cluster": BIG, "cluster_copy_run_id": 8001, "updated_by": "op@example.com"}
+    # Saving again with the same cluster starts nothing; the wrappers keep the bundle's job until the copy exists.
+    assert api.post(f"/api/schedules/{sid}", json=body).status_code == 200 and started == [sid]
+    assert main._wrapper_target(api.store.schedules[sid]) == 555
+
+
+def test_a_cluster_must_name_this_workspaces_node_types_and_at_most_eight_workers(api, monkeypatch):
+    _cluster_setup(monkeypatch)
+    sid = api.post("/api/schedules", json=BODY).json()["id"]
+    r = api.post(f"/api/schedules/{sid}", json=dict(BODY, options={"cluster": dict(BIG, node_type_id="Standard_X9")}))
+    assert r.status_code == 422 and "Standard_X9 is not a node type" in r.text
+    r = api.post(f"/api/schedules/{sid}", json=dict(BODY, options={"cluster": dict(BIG, num_workers=9)}))
+    assert r.status_code == 422 and "0 to 8 workers" in r.text
+
+
+def test_once_its_copy_exists_a_job_runs_it_and_its_permissions_are_the_copys(api, monkeypatch):
+    sid = api.post("/api/schedules", json=BODY).json()["id"]
+    api.store.schedules[sid]["options"] = '{"cluster": {"num_workers": 4}, "ingest_copy_job_id": 4242}'
+    assert main._wrapper_target(api.store.schedules[sid]) == 4242
+    asked = []
+    monkeypatch.setattr(main.jobs, "user_job_permission", lambda job_id, user: asked.append(str(job_id)) or "CAN_MANAGE")
+    main._permission_refusals(api.store.schedules[sid], "op@example.com")
+    assert asked == ["4242"]
+    # Back at the defaults, the recorded copy is no longer used, before the copies job deletes it.
+    api.store.schedules[sid]["options"] = '{"ingest_copy_job_id": 4242}'
+    assert main._wrapper_target(api.store.schedules[sid]) == 555
+
+
+def test_a_check_schedule_with_its_own_cluster_passes_its_copy_to_the_check_job():
+    schedule = dict(id=3, name="Check", cadence_minutes=60, timezone="UTC", parameters={}, job_variant="check",
+                    paused=False, options={"cluster": {"num_workers": 2}, "ingest_copy_job_id": 4242})
+    settings = sch.group_job_settings(schedule, ["c1", "c2"], 777)
+    task = settings["tasks"][0]["run_job_task"]
+    assert task["job_id"] == 777 and task["job_parameters"]["ingest_job_id"] == "4242"
+    assert "ingest_job_id" not in sch.group_job_settings(dict(schedule, options={}), ["c1"], 777)["tasks"][0][
+        "run_job_task"]["job_parameters"]
+
+
+def test_other_variants_cant_have_a_cluster_of_their_own():
+    assert sch.cluster_problems({"num_workers": 2}, "large") == [
+        "options.cluster: the large variant runs its own Databricks job, whose cluster is set there"]
+    assert sch.cluster_problems({"num_workers": 2, "spark_version": "x"}, "default") == [
+        "options.cluster: unknown key spark_version"]
+
+
+def test_the_edit_view_follows_the_copies_run_and_syncs_the_wrappers_once_it_has_ended(api, monkeypatch):
+    _cluster_setup(monkeypatch)
+    sid = api.post("/api/schedules", json=BODY).json()["id"]
+    api.store.schedules[sid]["options"] = '{"cluster": {"num_workers": 4}, "cluster_copy_run_id": 8001}'
+    state = {"state": "RUNNING", "result": None, "message": "", "url": "https://h/run/8001"}
+    monkeypatch.setattr(main.jobs, "run_state", lambda run_id: dict(state, run_id=run_id))
+    monkeypatch.setattr(main.jobs, "job_settings", lambda job_id: {"job_clusters": [{"new_cluster": {
+        "driver_node_type_id": "Standard_D16ds_v5", "node_type_id": "Standard_D8ds_v5", "num_workers": 1}}]})
+    synced = []
+    monkeypatch.setattr(main, "_sync", lambda job_id, user: synced.append(job_id) or [])
+    body = api.get(f"/api/ingestion-jobs/{sid}/cluster").json()
+    assert body["applying"]["state"] == "RUNNING" and synced == []
+    assert body["defaults"] == {"driver_node_type_id": "Standard_D16ds_v5", "node_type_id": "Standard_D8ds_v5",
+                                "num_workers": 1} and body["max_workers"] == 8
+    # The copies job records the copy, then its run ends: the next read syncs the wrappers to it.
+    api.store.schedules[sid]["options"] = ('{"cluster": {"num_workers": 4}, "cluster_copy_run_id": 8001, '
+                                           '"ingest_copy_job_id": 4242}')
+    state.update(state="TERMINATED", result="SUCCESS")
+    body = api.get(f"/api/ingestion-jobs/{sid}/cluster").json()
+    assert body["applying"] is None and body["copy_job_id"] == 4242 and synced == [sid]
+    assert "cluster_copy_run_id" not in sch.options_of(api.store.schedules[sid])
