@@ -139,7 +139,7 @@ function ScheduleCard({ s, onEdit }: { s: Row; onEdit: () => void }) {
   }));
   const warned = rows.filter((r) => r.warnings).length;
   return (
-    <Section title={`${s.name}: ${s.description}`} actions={<>
+    <Section title={s.name} note={s.description} actions={<>
       {s.paused ? <Badge value="paused" /> : <Badge value="ok" />}
       {/* As a Databricks job page: the less common actions and Delete in the more-actions menu. */}
       <Menu label="⋮" title="More actions">
