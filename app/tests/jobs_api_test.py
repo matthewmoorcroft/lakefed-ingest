@@ -104,7 +104,7 @@ def test_the_overview_lists_jobs_not_in_any_job_and_attention_without_a_paused_l
     body = client.get("/api/overview").json()
     assert [j["name"] for j in body["jobs"]] == ["East hourly", "Nightly"] and body["jobs_total"] == 2
     east = body["jobs"][0]
-    assert east["last_job_run"]["outcome"]["label"] == "Completed with failures"
+    assert east["last_job_run"]["outcome"]["label"] == "Succeeded with failures"
     assert east["status"]["label"] == "Running" and "2 tables failing" in east["status"]["detail"]     # c2 starts at 14:30
     assert east["status"]["cause"] == "Could not connect to the source database"
     assert body["running_total"] == 1 and body["running_job_runs"][0]["waiting"] == 2     # c1 starting, c2 at 14:30
@@ -116,7 +116,7 @@ def test_the_overview_lists_jobs_not_in_any_job_and_attention_without_a_paused_l
 def test_a_jobs_runs_page_by_slot_and_mark_extra_runs(client):
     body = client.get("/api/ingestion-jobs/1/runs?limit=3").json()
     slots = [(r["slot"][11:16], r["outcome"]["label"], r["extra"]) for r in body["job_runs"]]
-    assert slots[:2] == [("14:00", "Running", 0), ("13:00", "Completed with failures", 1)]
+    assert slots[:2] == [("14:00", "Running", 0), ("13:00", "Succeeded with failures", 1)]
     assert body["job_runs"][1]["clusters"] == 3 and body["job_runs"][1]["parallelism"] == [32]
 
 
@@ -150,8 +150,8 @@ def test_a_job_run_finds_a_group_run_that_started_near_the_end_of_its_slot(clien
 def test_runs_across_jobs_pin_the_running_job_runs_and_count_outcomes(client):
     body = client.get("/api/job-runs").json()
     labels = [(r["job_name"], r["slot"][11:16], r["outcome"]["label"]) for r in body["job_runs"]][:3]
-    assert labels[0] == ("East hourly", "14:00", "Running") and ("East hourly", "13:00", "Completed with failures") in labels
-    assert body["counts"]["Completed with failures"] == 1
+    assert labels[0] == ("East hourly", "14:00", "Running") and ("East hourly", "13:00", "Succeeded with failures") in labels
+    assert body["counts"]["Succeeded with failures"] == 1
     none = client.get("/api/job-runs?job=none").json()
     assert none["job_runs"] == [] and "group_runs" in none
 
@@ -197,7 +197,7 @@ def test_one_database_lists_its_tables_with_the_group_and_its_job(client, monkey
 def test_an_outcome_filter_reads_older_windows_until_it_finds_matches(client):
     RUNS.append(group_run(13, "c1", datetime(2026, 10, 26, 9, 1, tzinfo=UTC), status="failed", failed=4))
     try:
-        body = client.get("/api/job-runs", params={"outcome": "Completed with failures", "limit": 1,
+        body = client.get("/api/job-runs", params={"outcome": "Succeeded with failures", "limit": 1,
                                                     "before": "2026-10-26T12:00:00+00:00"}).json()
     finally:
         RUNS.pop()
@@ -220,7 +220,7 @@ def test_runs_of_groups_in_no_job_are_read_from_the_database_before_a_time(clien
 def test_a_jobs_last_job_run_is_its_last_real_one_however_long_ago_and_never_a_missed_trigger(client):
     jobs = {j["name"]: j for j in client.get("/api/overview").json()["jobs"]}
     nightly = jobs["Nightly"]["last_job_run"]
-    assert (nightly["slot"], nightly["outcome"]["label"]) == ("2026-10-16T00:00:00+00:00", "Completed")
+    assert (nightly["slot"], nightly["outcome"]["label"]) == ("2026-10-16T00:00:00+00:00", "Succeeded")
     assert client.window_reads == [1]       # one read, of the windows around every such job's slot
     assert client.get("/api/ingestion-jobs/2").json()["last_job_run"]["slot"] == "2026-10-16T00:00:00+00:00"
     listed = {j["name"]: j for j in client.get("/api/ingestion-jobs").json()["jobs"]}

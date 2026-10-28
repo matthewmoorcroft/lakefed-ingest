@@ -56,14 +56,14 @@ def test_jobs_come_failing_first_with_their_status_and_last_job_run():
     assert east["status"]["cause"] == "Could not connect to the source database"
     last = east["last_job_run"]
     assert (last["slot"], last["outcome"]["label"], last["failed_tables"]) == ("2026-10-26T13:00:00+00:00",
-                                                                               "Completed with failures", 2)
+                                                                               "Succeeded with failures", 2)
     assert last["took_s"] == 2390 and last["loaded"] == 2 + 0 and last["ran"] == 2
     assert (nightly["status"]["label"], nightly["status"]["detail"]) == ("Late: 4 tables", ["paused"])
 
 
 def test_a_running_job_run_counts_every_tables_of_the_job_and_its_waiting_groups():
     current = view()["jobs"][0]["running_job_run"]
-    assert current["progress"] == {"total": 15, "unchanged": 2, "loaded": 2, "in_flight": 1, "failed": 0}
+    assert current["progress"] == {"total": 15, "unchanged": 2, "loaded": 2, "in_flight": 1, "failed": 0, "not_run": 0}
     assert (current["waiting"], current["running_group_runs"]) == (1, 1)
     assert current["expected_end"] == "2026-10-26T14:35:00+00:00"     # c2 starts at 14:30 and typically takes 5 min
     assert current["typical_s"] == 30 * 60 + 300
@@ -80,10 +80,10 @@ def test_a_paused_job_with_late_tables_needs_no_attention_and_a_group_in_no_job_
 
 def test_a_jobs_runs_in_a_row_with_failed_tables():
     assert ij.consecutive_failed([dict(outcome={"label": "Running"}, failed_tables=0),
-                                  dict(outcome={"label": "Completed with failures"}, failed_tables=3),
-                                  dict(outcome={"label": "Completed with failures"}, failed_tables=1),
-                                  dict(outcome={"label": "Completed"}, failed_tables=0),
-                                  dict(outcome={"label": "Completed with failures"}, failed_tables=1)]) == 2
+                                  dict(outcome={"label": "Succeeded with failures"}, failed_tables=3),
+                                  dict(outcome={"label": "Succeeded with failures"}, failed_tables=1),
+                                  dict(outcome={"label": "Succeeded"}, failed_tables=0),
+                                  dict(outcome={"label": "Succeeded with failures"}, failed_tables=1)]) == 2
 
 
 def test_a_group_run_knows_its_job_runs():
@@ -156,7 +156,7 @@ def test_an_extra_run_counts_in_the_outcome_but_not_as_a_member():
              run=run(9, "c1", datetime(2026, 10, 26, 13, 0, 20, tzinfo=UTC), ok=10, skipped=10),
              extra=[run(12, "c1", datetime(2026, 10, 26, 13, 40, tzinfo=UTC), status="failed", failed=1, ok=9, skipped=9)])]}
     s = ij.summarize(SCHEDULES[0], jr, {}, {"c1": 10}, {}, NOW)
-    assert (s["outcome"]["label"], s["ran"], s["members"], s["extra"]) == ("Completed with failures", 1, 1, 1)
+    assert (s["outcome"]["label"], s["ran"], s["members"], s["extra"]) == ("Succeeded with failures", 1, 1, 1)
     live = dict(jr, members=[dict(jr["members"][0], extra=[run(12, "c1", datetime(2026, 10, 26, 13, 40, tzinfo=UTC), status="running")])])
     running = ij.summarize(SCHEDULES[0], live, {}, {"c1": 10}, {}, NOW)
     assert running["outcome"]["label"] == "Running"
@@ -165,7 +165,8 @@ def test_an_extra_run_counts_in_the_outcome_but_not_as_a_member():
 
 def test_a_finished_group_runs_reseeds_queued_are_not_loaded_in_its_progress():
     member = dict(task_collection="c1", state="run", run=dict(status="completed", total=10, ok=10, skipped=4, reseeded=3, failed=0))
-    assert ij._progress(member, {}, 10) == {"total": 10, "unchanged": 7, "loaded": 3, "in_flight": 0, "failed": 0}
+    assert ij._progress(member, {}, 10) == {"total": 10, "unchanged": 7, "loaded": 3, "in_flight": 0, "failed": 0,
+                                            "not_run": 0}
 
 
 def test_a_paused_jobs_triggers_never_wait_or_start():
@@ -192,7 +193,7 @@ def test_a_paused_jobs_last_job_run_is_its_last_real_one_not_a_missed_trigger():
     paused = [dict(SCHEDULES[0], paused=True)]
     job = ij.jobs_view(paused, MEMBERS[:2], STATES, [], [r for r in RUNS if r["run_id"] != 10], STATS, NOW)["jobs"][0]
     assert (job["last_job_run"]["slot"], job["last_job_run"]["outcome"]["label"]) == (
-        "2026-10-26T13:00:00+00:00", "Completed with failures")
+        "2026-10-26T13:00:00+00:00", "Succeeded with failures")
     assert job["failed_in_a_row"] == 1
     never = ij.jobs_view(paused, MEMBERS[:2], STATES, [], [], STATS, NOW)["jobs"][0]
     assert never["last_job_run"] is None
@@ -227,7 +228,7 @@ def test_a_last_job_run_older_than_the_window_is_the_one_found_before_it():
     """Paused overnight: the window holds only triggers that did not run, so the last real job run comes from
     before it (main reads it), never a missed trigger."""
     paused = [dict(SCHEDULES[0], paused=True)]
-    earlier = {"slot": "2026-10-25T21:00:00+00:00", "outcome": {"label": "Completed", "tone": "ok", "note": None},
+    earlier = {"slot": "2026-10-25T21:00:00+00:00", "outcome": {"label": "Succeeded", "tone": "ok", "note": None},
                "failed_tables": 0, "took_s": 300}
     job = ij.jobs_view(paused, MEMBERS[:2], STATES, [], [], STATS, NOW, earlier_last_by_job={1: earlier})["jobs"][0]
     assert job["last_job_run"] == earlier
@@ -243,6 +244,16 @@ def test_the_last_job_run_before_the_window_is_the_newest_slot_not_the_newest_st
     found = ij.newest_slots([late_older, newer], job, MEMBERS)
     assert found == [datetime(2026, 10, 26, 13, tzinfo=UTC), datetime(2026, 10, 26, 12, tzinfo=UTC)]
     # Found that way, only its newest job run is read: its failures in a row are at least that one.
-    found = ij.earlier_last([{"outcome": {"label": "Completed with failures"}, "failed_tables": 2}])
+    found = ij.earlier_last([{"outcome": {"label": "Succeeded with failures"}, "failed_tables": 2}])
     assert (found["failed_in_a_row"], found["failed_in_a_row_at_least"]) == (1, True)
     assert ij.earlier_last([{"outcome": {"label": "Not run"}, "failed_tables": 0}]) is None
+
+
+def test_a_check_started_run_counts_the_tables_its_check_found_unchanged_and_a_group_that_did_not_run_is_not_run():
+    # The check listed one database (3 tables) of a 13-table group: the run read 3, the check vouched for the other 10.
+    member = {"state": "run", "run": {"status": "completed", "total": 3, "ok": 3, "failed": 0, "work_id": "9:c1",
+                                      "reseeded": 0, "loaded": 1}}
+    got = ij._progress(member, {}, 13)
+    assert (got["total"], got["unchanged"] + got["loaded"], got["not_run"]) == (13, 13, 0)
+    assert ij._progress({"state": "no run"}, {}, 13) == {"total": 13, "unchanged": 0, "loaded": 0, "in_flight": 0,
+                                                         "failed": 0, "not_run": 13}

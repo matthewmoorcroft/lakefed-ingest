@@ -1,4 +1,4 @@
-import { Fragment, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { Fragment, useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { AgGridReact } from "ag-grid-react";
 import { themeQuartz, type ColDef, type GridApi, type GridOptions } from "ag-grid-community";
@@ -33,12 +33,38 @@ export function fmtTime(v: unknown): string {
   return isNaN(d.getTime()) ? String(v) : d.toLocaleString();
 }
 
+/** "28 Oct, 16:01": a short date and time for a table cell, the full one on hover (fmtTime). */
+export function fmtShort(v: unknown): string {
+  if (!v) return "";
+  const d = new Date(String(v));
+  return isNaN(d.getTime()) ? String(v) : d.toLocaleString([], { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" });
+}
+
+// Headings in words for the state database's column names, as the Databricks lists and Catalog Explorer show them.
+const HEADINGS: Record<string, string> = {
+  id: "Table ID", control_id: "Table ID", task_enabled: "Enabled", task_collection: "Ingestion group", src_type: "Source type",
+  load_type: "Load type", src_database: "Source database", src_schema: "Source schema", src_table: "Source table",
+  src_host: "Server", src_port: "Port", src_connection: "UC connection", sink_catalog: "Target catalog",
+  sink_schema: "Target schema", sink_table: "Target table", sink_fqn: "Target table", primary_key: "Primary key",
+  changed_at: "Changed at", changed_by: "Changed by", action: "Action", old_value: "Old value", new_value: "New value",
+  run_id: "Run ID", state: "Status", result: "Result", url: "Link", started: "Started", ended: "Ended", trigger: "Trigger",
+  schedule: "Schedule", freshness_sla_minutes: "Freshness target (minutes)", last_success_at: "Last loaded",
+  status: "Status", phase: "Phase", created_at: "Created", updated_at: "Last updated", client_id: "Client ID",
+  write_mode: "Write mode", cursor_column: "Cursor column", select_list: "Columns", secret_key: "Secret key",
+  use_remote_query: "Read through UC connection", error: "Error", stage: "Stage", position: "Position",
+};
+
+/** A column name in words: its heading, else the name with spaces and a capital ("rows_merged" -> "Rows merged"). */
+export function heading(key: string): string {
+  return HEADINGS[key] ?? (key.replace(/_/g, " ").replace(/^./, (c) => c.toUpperCase()) || " ");
+}
+
 /** Column defs from the first row's keys (with per-column overrides), so pages stay short. */
 export function autoColumns(rows: Row[], overrides: Record<string, Partial<ColDef>> = {}, hide: string[] = []): ColDef[] {
   const keys = rows.length ? Object.keys(rows[0]) : Object.keys(overrides);
   return keys.filter((k) => !hide.includes(k)).map((k) => ({
     field: k,
-    headerName: k,
+    headerName: heading(k),
     ...(/(_at|started|finished|ended)$/.test(k)
       ? { valueFormatter: (p: any) => fmtTime(p.value) } : {}),
     ...overrides[k],
@@ -140,12 +166,29 @@ export function Metric({ label, value, tone }: { label: string; value: ReactNode
   );
 }
 
-export function Badge({ value }: { value: unknown }) {
+// Status names as the Databricks Jobs UI has them, in sentence case and the same on every page, for the engine's and
+// the Jobs API's values alike.
+const STATUS_NAMES: Record<string, string> = {
+  completed: "Succeeded", success: "Succeeded", succeeded: "Succeeded", failed: "Failed", internal_error: "Failed",
+  running: "Running", pending: "Pending", queued: "Queued", blocked: "Blocked", skipped: "Skipped", terminated: "Terminated",
+  terminating: "Terminating", canceled: "Canceled", cancelled: "Canceled", timedout: "Timed out", timed_out: "Timed out",
+  paused: "Paused", unpaused: "Active", ok: "Active", abandoned: "Ended without finishing", "no run": "Not run",
+  success_with_failures: "Succeeded with failures", synced: "Synced", in_sync: "In sync", drifted: "Changed outside the app",
+};
+
+/** A status value in the Databricks UI's words ("SUCCESS" and "completed" -> "Succeeded"); other values capitalized. */
+export function statusName(value: unknown): string {
   const v = String(value ?? "");
-  const tone = ["failed", "FAILED", "invalid", "INTERNAL_ERROR"].includes(v) ? "bad"
-    : ["running", "RUNNING", "PENDING", "seeding", "skipped", "breached"].includes(v) ? "warn"
-    : ["ok", "completed", "SUCCESS", "registered", "valid", "incremental", "loaded"].includes(v) ? "ok" : "";
-  return <span className={`badge ${tone}`}>{v}</span>;
+  return STATUS_NAMES[v.toLowerCase()] ?? (v ? v[0].toUpperCase() + v.slice(1) : "");
+}
+
+export function Badge({ value }: { value: unknown }) {
+  const v = String(value ?? "").toLowerCase();
+  const tone = ["failed", "invalid", "internal_error", "timedout"].includes(v) ? "bad"
+    : ["running", "pending", "queued", "seeding"].includes(v) ? "run"
+    : ["skipped", "breached", "drifted"].includes(v) ? "warn"
+    : ["completed", "success", "succeeded", "registered", "valid", "incremental", "loaded", "synced", "in_sync"].includes(v) ? "ok" : "";
+  return <span className={`badge ${tone}`}>{statusName(value)}</span>;
 }
 
 // ---- monitoring views --------------------------------------------------------------------------
@@ -279,7 +322,7 @@ export function RunStatus({ status, outcome }: { status: unknown; outcome?: Outc
   const v = String(status ?? "");
   const tone: Tone = v === "completed" ? "ok" : v === "running" ? "run" : v === "failed" || v === "abandoned" ? "bad"
     : v === "skipped" ? "warn" : "";
-  return <Tag tone={tone}>{v ? v[0].toUpperCase() + v.slice(1) : "Unknown"}</Tag>;
+  return <Tag tone={tone}>{statusName(v) || "Unknown"}</Tag>;
 }
 
 /** Tables a minute -> "12", "2.5", "0.4". */
@@ -324,7 +367,7 @@ export function StateKey() {
   );
 }
 
-export interface Progress { unchanged: number; loaded: number; inFlight: number; failed: number; total: number }
+export interface Progress { unchanged: number; loaded: number; inFlight: number; failed: number; total: number; notRun?: number }
 
 /** A run's progress over its collection: checked (unchanged + loaded), in flight, failed, to go. */
 export function progressOf(run: Row): Progress {
@@ -337,27 +380,31 @@ export function progressOf(run: Row): Progress {
 
 export function ProgressBar({ p, big }: { p: Progress; big?: boolean }) {
   const pct = (n: number) => `${p.total ? (100 * n) / p.total : 0}%`;
-  const left = Math.max(0, p.total - p.unchanged - p.loaded - p.inFlight - p.failed);
+  const notRun = p.notRun ?? 0;
+  const left = Math.max(0, p.total - p.unchanged - p.loaded - p.inFlight - p.failed - notRun);
   const title = `${fmtInt(p.unchanged)} unchanged, ${fmtInt(p.loaded)} loaded, ${fmtInt(p.inFlight)} in flight, `
-    + `${fmtInt(p.failed)} failed, ${fmtInt(left)} to go`;
+    + `${fmtInt(p.failed)} failed${notRun ? `, ${fmtInt(notRun)} not run` : ""}${left ? `, ${fmtInt(left)} to go` : ""}`;
   return (
     <div className={`bar${big ? " big" : ""}`} title={title} role="img" aria-label={title}>
       {p.unchanged > 0 && <span className="seg-unchanged" style={{ width: pct(p.unchanged) }} />}
       {p.loaded > 0 && <span className="seg-loaded" style={{ width: pct(p.loaded) }} />}
       {p.inFlight > 0 && <span className="seg-flight" style={{ width: pct(p.inFlight) }} />}
       {p.failed > 0 && <span className="seg-failing" style={{ width: pct(p.failed) }} />}
+      {notRun > 0 && <span className="seg-notrun" style={{ width: pct(notRun) }} />}
     </div>
   );
 }
 
-export function ProgressKey({ p }: { p?: Progress }) {
-  const left = p ? Math.max(0, p.total - p.unchanged - p.loaded - p.inFlight - p.failed) : undefined;
+/** The bar's key; a finished run has nothing to go, so it shows what did not run instead. */
+export function ProgressKey({ p, finished }: { p?: Progress; finished?: boolean }) {
+  const left = p ? Math.max(0, p.total - p.unchanged - p.loaded - p.inFlight - p.failed - (p.notRun ?? 0)) : undefined;
   const n = (v?: number) => (v === undefined ? null : <> <b>{fmtInt(v)}</b></>);
   return (
     <div className="key">
       <span><i className="seg-unchanged" />Unchanged{n(p?.unchanged)}</span><span><i className="seg-loaded" />Loaded{n(p?.loaded)}</span>
-      <span><i className="seg-flight" />In flight{n(p?.inFlight)}</span><span><i className="seg-failing" />Failed{n(p?.failed)}</span>
-      <span><i className="seg-track" />{p ? "To go" : "Not checked yet"}{n(left)}</span>
+      {!finished && <span><i className="seg-flight" />In flight{n(p?.inFlight)}</span>}<span><i className="seg-failing" />Failed{n(p?.failed)}</span>
+      {finished ? <span><i className="seg-notrun" />Not run{n(p?.notRun ?? 0)}</span>
+        : <span><i className="seg-track" />{p ? "To go" : "Not checked yet"}{n(left)}</span>}
     </div>
   );
 }
@@ -403,36 +450,67 @@ export function Notice({ tone = "info", children }: { tone?: "info" | "ok" | "wa
   return <div className={`alert ${tone}`}>{children}</div>;
 }
 
-/** A button that asks for a second click before running a write. */
+/** A dialog as the Databricks UI asks before a change: a title, what it does, then Cancel and the action at the right,
+ * red when it destroys or disables something. Escape, a click outside and Cancel all cancel. */
+export function Modal({ title, action, danger, onClose, children }: { title: string; action: string; danger?: boolean;
+                        onClose: (confirmed: boolean) => void; children?: ReactNode }) {
+  const id = useId();
+  useEffect(() => {
+    const key = (e: KeyboardEvent) => { if (e.key === "Escape") onClose(false); };
+    document.addEventListener("keydown", key);
+    return () => document.removeEventListener("keydown", key);
+  }, [onClose]);
+  return createPortal(
+    <div className="modal-backdrop" onMouseDown={(e) => { if (e.target === e.currentTarget) onClose(false); }}>
+      <div className="modal" role="dialog" aria-modal="true" aria-labelledby={id}>
+        <h2 id={id}>{title}</h2>
+        {children && <div className="modal-body">{children}</div>}
+        <div className="modal-actions">
+          <button autoFocus onClick={() => onClose(false)}>Cancel</button>
+          <button className={danger ? "danger" : "primary"} onClick={() => onClose(true)}>{action}</button>
+        </div>
+      </div>
+    </div>, document.body);
+}
+
+export interface ConfirmRequest { title: string; body?: ReactNode; action: string; danger?: boolean }
+
+/** Ask with a Modal from an event handler: `confirm.ask({...}).then((ok) => ok && act())`, with `confirm.dialog` rendered
+ * on the page. */
+export function useConfirm(): { ask: (request: ConfirmRequest) => Promise<boolean>; dialog: ReactNode } {
+  const [request, setRequest] = useState<(ConfirmRequest & { resolve: (ok: boolean) => void }) | null>(null);
+  const ask = useCallback((r: ConfirmRequest) => new Promise<boolean>((resolve) => setRequest({ ...r, resolve })), []);
+  const close = useCallback((ok: boolean) => { setRequest((r) => { r?.resolve(ok); return null; }); }, []);
+  return { ask, dialog: request && <Modal title={request.title} action={request.action} danger={request.danger}
+    onClose={close}>{request.body}</Modal> };
+}
+
+/** A button that asks in a Modal before running a write: its title (default "<label>?"), what it does and its action. */
 export function ConfirmButton(props: {
   label: string;
   confirmLabel?: string;
+  title?: string;
+  message?: ReactNode;
   onConfirm: () => unknown;
   disabled?: boolean;
   danger?: boolean;
+  plain?: boolean;
 }) {
-  const [armed, setArmed] = useState(false);
+  const confirm = useConfirm();
   const [busy, setBusy] = useState(false);
-  if (!armed)
-    return (
-      <button className={props.danger ? "danger" : "primary"} disabled={props.disabled || busy} onClick={() => setArmed(true)}>
-        {props.label}
-      </button>
-    );
+  const run = async () => {
+    if (!(await confirm.ask({ title: props.title ?? `${props.label}?`, body: props.message,
+                              action: props.confirmLabel ?? props.label, danger: props.danger }))) return;
+    setBusy(true);
+    try { await props.onConfirm(); } finally { setBusy(false); }
+  };
   return (
-    <span className="confirm">
-      <button
-        className={props.danger ? "danger" : "primary"}
-        disabled={busy}
-        onClick={async () => {
-          setBusy(true);
-          try { await props.onConfirm(); } finally { setBusy(false); setArmed(false); }
-        }}
-      >
-        {busy ? "Working…" : props.confirmLabel ?? `Confirm: ${props.label}`}
+    <>
+      <button className={props.danger ? "danger" : props.plain ? "" : "primary"} disabled={props.disabled || busy} onClick={run}>
+        {busy ? "Working…" : props.label}
       </button>
-      <button className="ghost" disabled={busy} onClick={() => setArmed(false)}>Cancel</button>
-    </span>
+      {confirm.dialog}
+    </>
   );
 }
 
@@ -452,7 +530,7 @@ export function Section({ title, actions, note, children }: { title: ReactNode; 
 /** The server's progress shape (ingestion_jobs._progress) as the progress bar's. */
 export function progressFrom(p?: Row | null): Progress {
   return { total: Number(p?.total || 0), unchanged: Number(p?.unchanged || 0), loaded: Number(p?.loaded || 0),
-           inFlight: Number(p?.in_flight || 0), failed: Number(p?.failed || 0) };
+           inFlight: Number(p?.in_flight || 0), failed: Number(p?.failed || 0), notRun: Number(p?.not_run || 0) };
 }
 
 /** A job run's name: its job and its slot's start, "East hourly, 14:00 job run" (with the day when not today). */

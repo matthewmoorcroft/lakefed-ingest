@@ -677,7 +677,7 @@ def run_outcome(run: dict, progress: Optional[dict] = None) -> dict:
     changes until its first table is checked or loaded, then loading changed tables."""
     status, failed = run.get("status"), _count(run, "failed")
     if status == "completed" and not failed:
-        return {"label": "Completed", "tone": "ok", "note": None}
+        return {"label": "Succeeded", "tone": "ok", "note": None}
     if status == "skipped":
         return {"label": "Skipped: already running", "tone": "neutral", "note": None}
     if status == "running":
@@ -689,7 +689,7 @@ def run_outcome(run: dict, progress: Optional[dict] = None) -> dict:
     if closed_by is not None:
         return {"label": "Ended without finishing", "tone": "bad", "note": f"closed by run {closed_by}"}
     if status in ("failed", "completed") and failed:
-        return {"label": "Completed with failures", "tone": "warn", "note": f"{failed:,} {'table' if failed == 1 else 'tables'} failed"}
+        return {"label": "Succeeded with failures", "tone": "warn", "note": f"{failed:,} {'table' if failed == 1 else 'tables'} failed"}
     return {"label": "Failed", "tone": "bad", "note": None}
 
 
@@ -729,7 +729,7 @@ def work_speed(run: dict) -> Optional[float]:
 
 
 # A finished job run's outcome is the worst of its group runs', in this order.
-JOB_RUN_ORDER = ("Ended without finishing", "Failed", "Completed with failures", "Completed")
+JOB_RUN_ORDER = ("Ended without finishing", "Failed", "Succeeded with failures", "Succeeded")
 
 
 def job_run_outcome(members: List[dict]) -> dict:
@@ -752,16 +752,16 @@ def job_run_outcome(members: List[dict]) -> dict:
                          + ([f"{starting} starting"] if starting else [])
                          + ([f"{unchanged} unchanged"] if unchanged else [])
                          + ([f"{check_failed} check failed"] if check_failed else [])
-                         + ([f"{no_run} no run"] if no_run else []))
+                         + ([f"{no_run} not run"] if no_run else []))
     if (any(m["state"] in ("waiting", "starting", "checking") for m in members)
             or any(r.get("status") == "running" for r in runs + extras)):
         return {"label": "Running", "tone": "run", "note": note}
     if not ran and not extras and not unchanged and not check_failed:
         return {"label": "Not run", "tone": "neutral", "note": note}
     # A member its check found unchanged completed with nothing to load; one whose check failed failed.
-    labels = [run_outcome(r)["label"] for r in ran + extras] + ["Completed"] * unchanged + ["Failed"] * check_failed
+    labels = [run_outcome(r)["label"] for r in ran + extras] + ["Succeeded"] * unchanged + ["Failed"] * check_failed
     worst = min(labels, key=lambda label: JOB_RUN_ORDER.index(label) if label in JOB_RUN_ORDER else len(JOB_RUN_ORDER))
-    tone = {"Completed": "ok", "Completed with failures": "warn"}.get(worst, "bad")
+    tone = {"Succeeded": "ok", "Succeeded with failures": "warn"}.get(worst, "bad")
     return {"label": worst, "tone": tone, "note": note}
 
 

@@ -1,19 +1,35 @@
-import { Fragment, useEffect, useState } from "react";
+import { Fragment, useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import { api, qs, type Row } from "../api";
-import { ConfirmButton, ErrorBox, Notice, PageHead, Pager, Section, StateBar, fmtInt, plural } from "../components";
+import { ConfirmButton, ErrorBox, Notice, PageHead, Pager, Section, StateBar, fmtInt, plural, useConfirm } from "../components";
 import { usePermissions } from "../permissions";
 
 // Edit an ingestion job: what it ingests (a tree from its servers), how it writes, its identity columns, when it
-// runs and its advanced configuration. Changes in the tree apply at once; the rest is saved with Save.
+// runs and its advanced configuration. A change in the tree applies once its dialog is confirmed, as Catalog Explorer
+// asks before a change to data; the rest is saved with Save.
 
 const TAGS = "{server} {database} {schema} {table}";
 const CADENCE_LABEL = (m: number) => (m < 60 ? `${m} minutes` : m === 60 ? "hour" : m === 1440 ? "day" : `${m / 60} hours`);
 const PAGE = 25;
+const LOAD_TYPES: Record<string, string> = { ct: "Change tracking", cursor: "Cursor column", full: "Full reload" };
 
 /** Why the signed-in user may not change this job (their Databricks permission), or null when they may. */
 type Locked = string | null;
+
+/** When it runs, its parameters and its name as the form shows them for a stored schedule: the baseline Save compares with. */
+function scheduleForm(schedule: Row) {
+  // A set-time schedule keeps its stored zone; Europe/London is only the default offered when a minute or
+  // hourly schedule (always UTC) becomes a set-time one.
+  const start = Number(schedule.options?.start_minute ?? 0);
+  return {
+    run: { cadence_minutes: schedule.cadence_minutes, start: `${String(Math.floor(start / 60)).padStart(2, "0")}:${String(start % 60).padStart(2, "0")}`,
+           timezone: Number(schedule.cadence_minutes) > 60 ? schedule.timezone : "Europe/London",
+           paused: schedule.paused, notify_emails: schedule.notify_emails ?? "" } as Row,
+    params: Object.fromEntries(Object.entries(schedule.parameters ?? {}).map(([k, v]) => [k, String(v)])) as Record<string, string>,
+    name: String(schedule.name),
+  };
+}
 
 const startMinute = (hhmm: string) => { const [h, m] = String(hhmm || "00:00").split(":").map(Number); return (h || 0) * 60 + (m || 0); };
 const value = (s?: Row) => (s && "value" in s ? s.value : undefined);
@@ -30,14 +46,28 @@ function TableRows({ jobId, server, database, locked }: { jobId: string; server:
     queryKey: ["job-tree", jobId, server, database, offset],
     queryFn: () => api.get<Row>(`/ingestion-jobs/${jobId}/tree${qs({ server, database, offset, limit: PAGE })}`),
   });
+  const confirm = useConfirm();
+  // A load type is the same in every database of the job: the preview counts the tables it changes and reloads.
   const edit = useMutation({
-    mutationFn: (t: Row) => api.post(`/ingestion-jobs/${jobId}/tables/edit`,
-      { schema: t.schema, table: t.table, changes: { load_type: t.load_type }, dry_run: false }),
+    mutationFn: async ({ t, load_type }: { t: Row; load_type: string }) => {
+      const body = { schema: t.schema, table: t.table, changes: { load_type } };
+      const preview = (await api.post<Row>(`/ingestion-jobs/${jobId}/tables/edit`, { ...body, dry_run: true })).summary;
+      const ok = await confirm.ask({ title: `Change the load type of ${t.schema}.${t.table}?`, action: "Change load type",
+        body: <><p>It becomes {LOAD_TYPES[load_type] ?? load_type} in all {fmtInt(preview.changed)} {plural(preview.changed, "table")} of
+          this name in the job's databases.</p>
+          {Number(preview.reseed) > 0 && <p>The next run loads {fmtInt(preview.reseed)} of them again from their sources.</p>}</> });
+      return ok ? api.post(`/ingestion-jobs/${jobId}/tables/edit`, { ...body, dry_run: false }) : null;
+    },
     onSuccess: () => qc.invalidateQueries({ queryKey: ["job-tree", jobId] }),
   });
   const enable = useMutation({
-    mutationFn: (t: Row) => api.post(`/ingestion-jobs/${jobId}/enable`,
-      { server, database, schema: t.schema, table: t.table, enabled: !t.enabled }),
+    mutationFn: async (t: Row) => {
+      const ok = await confirm.ask(t.enabled
+        ? { title: `Disable ${t.schema}.${t.table} in ${database}?`, action: "Disable", danger: true,
+            body: "Runs stop loading it. Its target table, checkpoint and history stay." }
+        : { title: `Enable ${t.schema}.${t.table} in ${database}?`, action: "Enable", body: "Its group's next run loads it." });
+      return ok ? api.post(`/ingestion-jobs/${jobId}/enable`, { server, database, schema: t.schema, table: t.table, enabled: !t.enabled }) : null;
+    },
     onSuccess: () => qc.invalidateQueries({ queryKey: ["job-tree", jobId] }),
   });
   return (
@@ -46,7 +76,7 @@ function TableRows({ jobId, server, database, locked }: { jobId: string; server:
         <tr key={t.id} className="l3">
           <td className="name">{t.schema}.{t.table}</td>
           <td><select value={t.load_type} disabled={edit.isPending || !!locked} title={locked ?? "Changes this table in every database of the job"}
-            onChange={(e) => edit.mutate({ ...t, load_type: e.target.value })}>
+            onChange={(e) => edit.mutate({ t, load_type: e.target.value })}>
             <option value="ct">Change tracking</option><option value="cursor">Cursor column</option>
             <option value="full">Full reload</option></select></td>
           <td className="mono">{t.primary_key}</td>
@@ -61,6 +91,7 @@ function TableRows({ jobId, server, database, locked }: { jobId: string; server:
         <tr className="l3"><td colSpan={7}><Pager offset={offset} limit={PAGE} total={tables.data!.total} noun="table" onPage={setOffset} /></td></tr>
       )}
       {(edit.error || enable.error || tables.error) && <tr className="l3"><td colSpan={7}><ErrorBox error={edit.error || enable.error || tables.error} /></td></tr>}
+      {confirm.dialog}
     </>
   );
 }
@@ -74,9 +105,17 @@ function DatabaseRows({ jobId, server, locked }: { jobId: string; server: string
     queryKey: ["job-tree", jobId, server, "", search, offset],
     queryFn: () => api.get<Row>(`/ingestion-jobs/${jobId}/tree${qs({ server, search, offset, limit: PAGE })}`),
   });
+  const confirm = useConfirm();
   const enable = useMutation({
-    mutationFn: (d: Row) => api.post(`/ingestion-jobs/${jobId}/enable`,
-      { server, database: d.database, enabled: Number(d.enabled_tables) === 0 }),
+    mutationFn: async (d: Row) => {
+      const on = Number(d.enabled_tables) === 0;
+      const ok = await confirm.ask(on
+        ? { title: `Enable all ${fmtInt(d.tables)} ${plural(d.tables, "table")} of ${d.database}?`, action: "Enable",
+            body: "Its group's next run loads them." }
+        : { title: `Disable all ${fmtInt(d.enabled_tables)} enabled ${plural(d.enabled_tables, "table")} of ${d.database}?`,
+            action: "Disable", danger: true, body: "Runs stop loading them. Their target tables, checkpoints and history stay." });
+      return ok ? api.post(`/ingestion-jobs/${jobId}/enable`, { server, database: d.database, enabled: on }) : null;
+    },
     onSuccess: () => qc.invalidateQueries({ queryKey: ["job-tree", jobId] }),
   });
   return (
@@ -103,6 +142,7 @@ function DatabaseRows({ jobId, server, locked }: { jobId: string; server: string
         <tr className="l2"><td colSpan={7}><Pager offset={offset} limit={PAGE} total={dbs.data!.total} noun="database" onPage={setOffset} /></td></tr>
       )}
       {(dbs.error || enable.error) && <tr className="l2"><td colSpan={7}><ErrorBox error={dbs.error || enable.error} /></td></tr>}
+      {confirm.dialog}
     </>
   );
 }
@@ -238,17 +278,11 @@ export default function JobEdit() {
     setIdentity(Object.entries((value(s.identity) as Record<string, string>) ?? {}));
     setDiffering(Object.fromEntries((settings.data?.identity_differs ?? []).map((name: string) => [name, ""])));
   }, [settings.data]);
+  const baseline = useMemo(() => (schedule ? scheduleForm(schedule) : null), [schedule?.id, schedule?.updated_at]);
   useEffect(() => {
-    if (!schedule) return;
-    // A set-time schedule keeps its stored zone; Europe/London is only the default offered when a minute or
-    // hourly schedule (always UTC) becomes a set-time one.
-    const start = Number(schedule.options?.start_minute ?? 0);
-    setRun({ cadence_minutes: schedule.cadence_minutes, start: `${String(Math.floor(start / 60)).padStart(2, "0")}:${String(start % 60).padStart(2, "0")}`,
-      timezone: Number(schedule.cadence_minutes) > 60 ? schedule.timezone : "Europe/London",
-      paused: schedule.paused, notify_emails: schedule.notify_emails ?? "" });
-    setParams(Object.fromEntries(Object.entries(schedule.parameters ?? {}).map(([k, v]) => [k, String(v)])));
-    setName(schedule.name);
-  }, [schedule?.id, schedule?.updated_at]);
+    if (!baseline) return;
+    setRun(baseline.run); setParams(baseline.params); setName(baseline.name);
+  }, [baseline]);
 
   // Only what differs from the job's rows is sent, so an untouched setting never rewrites a mixed one.
   const changed = (): Row => {
@@ -294,6 +328,31 @@ export default function JobEdit() {
       qc.invalidateQueries({ queryKey: ["job-tree", id] }); qc.invalidateQueries({ queryKey: ["ingestion-job", id] }); },
   });
 
+  // As the Databricks editors do: Save only with something to save, a sign of unsaved changes, and a question before
+  // leaving with them (a link in the app, or closing the tab).
+  const dirty = !!s && (Object.keys(changed()).length > 0
+    || (!!baseline && JSON.stringify({ run, params, name }) !== JSON.stringify(baseline)));
+  const confirm = useConfirm();
+  const leave = (to: string) => {
+    if (!dirty) return navigate(to);
+    confirm.ask({ title: "Leave without saving?", action: "Leave", danger: true,
+                  body: "Your changes to this job's settings are not saved. Changes you confirmed in What it ingests are already applied." })
+      .then((ok) => ok && navigate(to));
+  };
+  useEffect(() => {
+    if (!dirty) return;
+    const unload = (e: BeforeUnloadEvent) => { e.preventDefault(); };
+    const click = (e: MouseEvent) => {
+      const link = (e.target as HTMLElement).closest?.("a[href]") as HTMLAnchorElement | null;
+      if (!link || link.target === "_blank" || link.origin !== window.location.origin || e.defaultPrevented) return;
+      e.preventDefault(); e.stopPropagation();
+      leave(link.pathname + link.search);
+    };
+    window.addEventListener("beforeunload", unload);
+    document.addEventListener("click", click, true);
+    return () => { window.removeEventListener("beforeunload", unload); document.removeEventListener("click", click, true); };
+  });
+
   const cadences: number[] = options.data?.cadences ?? [5, 10, 15, 20, 30, 60, 120, 180, 240, 360, 720, 1440];
   const paramNames: string[] = (options.data?.parameters ?? []).filter((k: string) => k !== "fail_on_table_errors");
   const atSetTimes = Number(run.cadence_minutes) > 60;
@@ -304,10 +363,12 @@ export default function JobEdit() {
           <Link to={`/ingestion-jobs/${id}`}>{schedule?.name ?? "Ingestion job"}</Link></span>}
         title={`Edit ${schedule?.name ?? "ingestion job"}`}
         lead={settings.data && <><strong>{fmtInt(settings.data.tables)}</strong> {plural(settings.data.tables, "table")} in{" "}
-          <strong>{fmtInt(settings.data.groups.length)}</strong> {plural(settings.data.groups.length, "group")}. Changes in What it ingests
-          apply at once; everything else is saved when you press Save.</>}
-        right={<span className="card-actions"><button className="ghost" onClick={() => navigate(`/ingestion-jobs/${id}`)}>Cancel</button>
-          <button className="primary" disabled={save.isPending || !s || !!locked} title={locked ?? undefined} onClick={() => save.mutate()}>{save.isPending ? "Saving…" : "Save"}</button></span>} />
+          <strong>{fmtInt(settings.data.groups.length)}</strong> {plural(settings.data.groups.length, "group")}.</>}
+        right={<span className="card-actions">{dirty && <span className="muted">Unsaved changes</span>}
+          <button onClick={() => leave(`/ingestion-jobs/${id}`)}>Cancel</button>
+          <button className="primary" disabled={save.isPending || !s || !!locked || !dirty} title={locked ?? (!dirty ? "Nothing to save yet" : undefined)}
+            onClick={() => save.mutate()}>{save.isPending ? "Saving…" : "Save"}</button></span>} />
+      {confirm.dialog}
       {locked && <Notice tone="info">You can see this job's settings but not change them: {locked}.</Notice>}
       <ErrorBox error={settings.error || save.error} />
       {save.isSuccess && <Notice tone="ok">Saved{save.data ? `: ${fmtInt(save.data.summary.changed)} ${plural(save.data.summary.changed, "table")} changed${save.data.summary.reseed ? `, ${fmtInt(save.data.summary.reseed)} to load again` : ""}` : ""}.</Notice>}
@@ -319,6 +380,7 @@ export default function JobEdit() {
 
       <Section title="What it ingests" note="Open a server to see its databases, and a database to see its tables. A table's load type is the same in every database: change it and it changes in all of them."
         actions={<button className="ghost" disabled={!!locked} title={locked ?? undefined} onClick={() => setAddOpen(!addOpen)}>{addOpen ? "Close" : "Add databases"}</button>}>
+        <p className="impact">Changes here apply as soon as you confirm them; Save does not cover them.</p>
         {addOpen && <AddDatabases jobId={id} servers={(servers.data?.items ?? []).map((x: Row) => x.server)} />}
         <Tree jobId={id} locked={locked} />
       </Section>

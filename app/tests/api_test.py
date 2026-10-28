@@ -364,7 +364,7 @@ def test_runs_carry_their_outcome_and_speed_and_a_closed_run_has_no_duration(mon
     monkeypatch.setattr(main.db, "query", query)
     got = {r["run_id"]: r for r in TestClient(main.app).get("/api/runs").json()}
     assert got[8]["outcome"]["label"] == "Ended without finishing" and got[8]["duration_s"] is None
-    assert got[7]["outcome"]["label"] == "Completed with failures" and got[7]["duration_s"] == 600
+    assert got[7]["outcome"]["label"] == "Succeeded with failures" and got[7]["duration_s"] == 600
     assert got[7]["speed_tables_per_min"] == 10.0 and got[8]["speed_tables_per_min"] is None
 
 

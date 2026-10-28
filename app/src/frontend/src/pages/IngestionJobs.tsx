@@ -39,7 +39,7 @@ export default function IngestionJobs() {
             </button>
           ))}
         </span>
-        <input type="search" placeholder="Search jobs and groups" value={search}
+        <input type="search" className="search-wide" placeholder="Search jobs and groups" value={search}
           onChange={(e) => { setOffset(0); setSearch(e.target.value); }} />
       </div>
       <Section title="Jobs" actions={<StateKey />}>

@@ -8,9 +8,9 @@ NOW = datetime(2026, 10, 26, 14, 0, tzinfo=timezone.utc)
 
 
 def test_outcomes_name_what_the_engine_recorded():
-    assert q.run_outcome(dict(status="completed", failed=0))["label"] == "Completed"
+    assert q.run_outcome(dict(status="completed", failed=0))["label"] == "Succeeded"
     with_failures = q.run_outcome(dict(status="failed", failed=3, detail=json.dumps({"batch_rows": 0})))
-    assert (with_failures["label"], with_failures["tone"], with_failures["note"]) == ("Completed with failures", "warn",
+    assert (with_failures["label"], with_failures["tone"], with_failures["note"]) == ("Succeeded with failures", "warn",
                                                                                        "3 tables failed")
     ended = q.run_outcome(dict(status="failed", failed=0, detail=json.dumps({"closed_by_run": 41, "reason": "x"})))
     assert (ended["label"], ended["tone"], ended["note"]) == ("Ended without finishing", "bad", "closed by run 41")
@@ -62,7 +62,7 @@ def test_speed_and_time_left_read_timestamps_as_the_database_layer_sends_them():
 
 
 def test_a_completed_record_with_failed_tables_never_reads_as_a_clean_completion():
-    assert q.run_outcome(dict(status="completed", failed=2))["label"] == "Completed with failures"
+    assert q.run_outcome(dict(status="completed", failed=2))["label"] == "Succeeded with failures"
 
 
 def test_finished_speed_counts_only_tables_actually_loaded():
@@ -85,12 +85,12 @@ def test_a_job_run_is_the_worst_of_its_group_runs_and_running_while_a_member_wai
     done = _member("run", dict(status="completed", failed=0))
     with_failures = _member("run", dict(status="failed", failed=2))
     closed = _member("run", dict(status="failed", failed=0, detail=json.dumps({"closed_by_run": 5})))
-    assert q.job_run_outcome([done, with_failures])["label"] == "Completed with failures"
+    assert q.job_run_outcome([done, with_failures])["label"] == "Succeeded with failures"
     assert q.job_run_outcome([done, with_failures, closed])["label"] == "Ended without finishing"
     assert q.job_run_outcome([done, _member("waiting")])["label"] == "Running"
     assert q.job_run_outcome([done, _member("run", dict(status="running"))])["label"] == "Running"
     counted = q.job_run_outcome([done, _member("skipped"), _member("run", dict(status="skipped")), _member("no run")])
-    assert (counted["label"], counted["note"]) == ("Completed", "1 of 4 group runs, 2 skipped, 1 no run")
+    assert (counted["label"], counted["note"]) == ("Succeeded", "1 of 4 group runs, 2 skipped, 1 not run")
     assert q.job_run_outcome([_member("no run"), _member("no run")])["label"] == "Not run"
 
 
@@ -122,6 +122,6 @@ def test_a_member_its_check_found_unchanged_completes_and_a_check_going_keeps_th
     done = _member("run", dict(status="completed", failed=0))
     unchanged = _member("unchanged", group="b")
     outcome = q.job_run_outcome([done, unchanged])
-    assert (outcome["label"], outcome["note"]) == ("Completed", "1 of 2 group runs, 1 unchanged")
-    assert q.job_run_outcome([unchanged, _member("unchanged", group="c")])["label"] == "Completed"
+    assert (outcome["label"], outcome["note"]) == ("Succeeded", "1 of 2 group runs, 1 unchanged")
+    assert q.job_run_outcome([unchanged, _member("unchanged", group="c")])["label"] == "Succeeded"
     assert q.job_run_outcome([done, _member("checking", group="b")])["label"] == "Running"

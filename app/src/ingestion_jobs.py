@@ -54,24 +54,30 @@ def current_and_past(job: dict, members: List[dict], runs: List[dict], start: da
 def _progress(member: dict, running_by_run: dict, group_tables: int) -> dict:
     """One member's part of its job run's progress bar, in the shape of RunDetail's Progress: a running
     group run from the running pass, a finished one from its totals (its ok counts its unchanged tables),
-    one whose check found nothing to load as all unchanged, and one not started yet as all to go."""
+    one whose check found nothing to load as all unchanged, one that did not run as not run, and one not
+    started yet as all to go."""
     run = member.get("run")
     if run and run.get("status") == "running":
         p = running_by_run.get(run.get("run_id")) or {}
         loaded = q._count(p, "tables_ok")
         return {"total": q._count(p, "enabled_tables") or group_tables, "loaded": loaded,
                 "unchanged": max(q._count(p, "tables_checked") - loaded, 0),
-                "in_flight": q._count(p, "tables_running"), "failed": q._count(p, "tables_failed")}
+                "in_flight": q._count(p, "tables_running"), "failed": q._count(p, "tables_failed"), "not_run": 0}
     if run and run.get("status") != "skipped" and run.get("total") is not None:
         loaded = q.loaded_tables(run)     # its unchanged tables and reseeds queued count as checked, not loaded
-        return {"total": q._count(run, "total"), "unchanged": max(q._count(run, "ok") - loaded, 0),
-                "loaded": loaded, "in_flight": 0, "failed": q._count(run, "failed")}
+        total, unchanged = q._count(run, "total"), max(q._count(run, "ok") - loaded, 0)
+        if run.get("work_id") and group_tables > total:
+            # A run the check job started read only the databases the check listed; the check found the rest unchanged.
+            unchanged, total = unchanged + group_tables - total, group_tables
+        return {"total": total, "unchanged": unchanged, "loaded": loaded, "in_flight": 0, "failed": q._count(run, "failed"),
+                "not_run": 0}
     unchanged = group_tables if member.get("state") == "unchanged" else 0
-    return {"total": group_tables, "unchanged": unchanged, "loaded": 0, "in_flight": 0, "failed": 0}
+    not_run = group_tables if member.get("state") in ("no run", "skipped", "check failed") else 0
+    return {"total": group_tables, "unchanged": unchanged, "loaded": 0, "in_flight": 0, "failed": 0, "not_run": not_run}
 
 
 def _sum(parts: Iterable[dict]) -> dict:
-    out = {"total": 0, "unchanged": 0, "loaded": 0, "in_flight": 0, "failed": 0}
+    out = {"total": 0, "unchanged": 0, "loaded": 0, "in_flight": 0, "failed": 0, "not_run": 0}
     for p in parts:
         for k in out:
             out[k] += p[k]
@@ -91,7 +97,7 @@ def summarize(job: dict, job_run: dict, running_by_run: dict, group_tables: Dict
     members_ran = sum(1 for m in members if m.get("run") and m["run"].get("status") != "skipped")
     outcome = q.job_run_outcome(members)
     if outcome["label"] == "Not run" and job.get("paused"):
-        outcome = dict(outcome, note="the job is paused")
+        outcome = dict(outcome, note="the job is paused", paused=True)
     starts = [_when(r["started_at"]) for r in ran if r.get("started_at")]
     finishes = [_when(r["finished_at"]) for r in ran if r.get("finished_at")]
     work_starts = [_when(r["work_started_at"]) for r in ran if r.get("work_started_at")]
@@ -196,7 +202,7 @@ def member_views(job_run: dict, running_by_run: dict, group_tables: Dict[str, in
             elif m["state"] == "skipped":
                 status = {"label": "Skipped: still running", "tone": "neutral", "note": "the previous group run was still going"}
             else:
-                status = {"label": "No run", "tone": "neutral", "note": None}
+                status = {"label": "Not run", "tone": "neutral", "note": None}
             live = run and run.get("status") == "running"
             rows.append({
                 "task_collection": m["task_collection"], "offset_minutes": m["offset_minutes"],

@@ -31,6 +31,14 @@ export default function JobRun() {
   const checkedPct = p.total ? Math.floor((100 * (p.unchanged + p.loaded)) / p.total) : 0;
   const notStarted = (r?.group_runs ?? []).filter((g: Row) => g.state === "waiting" || g.state === "starting")
     .reduce((a: number, g: Row) => a + Number(g.progress?.total || 0), 0);
+  // A finished run says what it checked in the groups that ran, and which groups did not run; nothing is "to go".
+  const groups: Row[] = (r?.group_runs ?? []).filter((g: Row) => !g.check);
+  const notRunGroups = groups.filter((g) => Number(g.progress?.not_run || 0) > 0);
+  const finishedText = `${fmtInt(p.unchanged + p.loaded)} ${plural(p.unchanged + p.loaded, "table")} checked in the `
+    + `${fmtInt(groups.length - notRunGroups.length)} ${plural(groups.length - notRunGroups.length, "group")} that ran`
+    + (notRunGroups.length ? `; ${fmtInt(notRunGroups.length)} ${plural(notRunGroups.length, "group")} `
+      + `(${fmtInt(p.notRun)} ${plural(p.notRun, "table")}) did not run` : "")
+    + (p.failed ? `; ${fmtInt(p.failed)} failed` : "");
   const dbs: Row[] = r?.databases ?? [];
   const manyServers = new Set(dbs.map((d) => d.server)).size > 1;
   return (
@@ -46,8 +54,8 @@ export default function JobRun() {
         <>
           <Section title={live ? "Progress now" : "What the job run did"}
             note={notStarted ? `${fmtInt(notStarted)} of the tables to go belong to groups that have not started yet.` : undefined}>
-            <div className="count">{progressText(p)}</div>
-            <ProgressBar p={p} big /><ProgressKey p={p} />
+            <div className="count">{live ? progressText(p) : finishedText}</div>
+            <ProgressBar p={p} big /><ProgressKey p={p} finished={!live} />
           </Section>
           <div className="metrics">
             {live ? <>
@@ -75,7 +83,7 @@ export default function JobRun() {
                   return (
                     <tr key={`${g.task_collection}-${g.check ? "check-" : ""}${g.run_id ?? g.state}`}>
                       <td className="name"><Link to={`/collections/${encodeURIComponent(g.task_collection)}`}><b>{g.task_collection}</b></Link>
-                        {g.extra && <span className="sub">extra run, started by hand?</span>}
+                        {g.extra && <span className="sub">extra run, likely started by hand</span>}
                         {g.check && <span className="sub">check</span>}</td>
                       <td>{waiting ? <Tag tone={"" as Tone}>Waiting, starts {fmtClock(g.fire_at)}</Tag>
                         : g.state === "starting" ? <Tag tone="run">Starting, triggered {fmtClock(g.fire_at)}</Tag>

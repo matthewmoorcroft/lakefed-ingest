@@ -4,7 +4,7 @@ import { Link } from "react-router-dom";
 import { api, qs, type Row } from "../api";
 import {
   ErrorBox, FillBox, JobStatus, Name, Notice, PageHead, Pager, ProgressBar, RunStatus, Section, Stamp, StateBar, StateKey,
-  fmtClock, fmtDuration, fmtInt, fmtSlot, fmtSpeed, fmtTime, jobRunName, jobRunPath, plural, progressFrom, progressText
+  fmtClock, fmtDuration, fmtInt, fmtShort, fmtSlot, fmtSpeed, fmtTime, jobRunName, jobRunPath, plural, progressFrom, progressText
 } from "../components";
 
 interface Overview {
@@ -45,19 +45,19 @@ export function JobsTable({ jobs, notInJob, total, offset, limit, onPage, link, 
   };
   // The user name before the @, the full address on hover, so both columns fit as the Jobs list's Created by does.
   const who = (by: unknown, at: unknown) => <>{by ? <span title={String(by)}>{String(by).split("@")[0]}</span> : <span className="muted">unknown</span>}
-    {at ? <span className="sub">{fmtTime(at)}</span> : null}</>;
+    {at ? <span className="sub" title={fmtTime(at)}>{fmtShort(at)}</span> : null}</>;
   const table = (
       <div className="table-wrap"><table className="data">
-        <thead><tr><th>Ingestion job</th><th className="num">Groups</th><th className="num">Databases</th>
+        <thead><tr><th>Ingestion job</th><th className="num">Groups</th>{!audit && <th className="num">Databases</th>}
           <th className="num">Tables</th><th>State now</th><th className="num">Failing</th><th className="num">Late</th>
           <th>Last job run</th><th>Status</th>
           {audit && <>{sortHead("created_at", "Created")}{sortHead("updated_at", "Last updated")}</>}</tr></thead>
         <tbody>
           {jobs.map((j) => (
             <tr key={j.id ?? "none"}>
-              <td className="name">{j.id != null ? <Link to={jobPath(j.id)}><b><Name>{j.name}</Name></b></Link> : <b><Name>{j.name}</Name></b>}
+              <td className={audit ? "name capped" : "name"}>{j.id != null ? <Link to={jobPath(j.id)}><b><Name>{j.name}</Name></b></Link> : <b><Name>{j.name}</Name></b>}
                 <span className="sub">{j.id != null ? j.description : `${fmtInt(j.groups?.length)} ${plural(j.groups?.length, "group")}`}</span></td>
-              <td className="num">{fmtInt(j.groups?.length)}</td><td className="num">{fmtInt(j.databases)}</td>
+              <td className="num">{fmtInt(j.groups?.length)}</td>{!audit && <td className="num">{fmtInt(j.databases)}</td>}
               <td className="num">{fmtInt(j.enabled_tables)}</td><td><StateBar row={j} /></td>
               <td className="num" style={{ color: Number(j.state_failing) ? "var(--bad)" : undefined }}>{fmtInt(j.state_failing)}</td>
               <td className="num">{fmtInt(j.state_late)}</td>
@@ -69,7 +69,7 @@ export function JobsTable({ jobs, notInJob, total, offset, limit, onPage, link, 
           {notInJob && (
             <tr className="total">
               <td className="name"><Link to="/ingestion-jobs/not-in-job"><b>Not in any job</b></Link><span className="sub">{notInJob.groups.join(", ")}</span></td>
-              <td className="num">{fmtInt(notInJob.groups.length)}</td><td className="num">{fmtInt(notInJob.databases)}</td>
+              <td className="num">{fmtInt(notInJob.groups.length)}</td>{!audit && <td className="num">{fmtInt(notInJob.databases)}</td>}
               <td className="num">{fmtInt(notInJob.enabled_tables)}</td><td><StateBar row={notInJob} /></td>
               <td className="num" style={{ color: Number(notInJob.state_failing) ? "var(--bad)" : undefined }}>{fmtInt(notInJob.state_failing)}</td>
               <td className="num">{fmtInt(notInJob.state_late)}</td>
@@ -77,7 +77,7 @@ export function JobsTable({ jobs, notInJob, total, offset, limit, onPage, link, 
               {audit && <><td></td><td></td></>}
             </tr>
           )}
-          {!jobs.length && !notInJob && <tr><td colSpan={audit ? 11 : 9} className="muted">No ingestion jobs here.</td></tr>}
+          {!jobs.length && !notInJob && <tr><td colSpan={audit ? 10 : 9} className="muted">No ingestion jobs here.</td></tr>}
         </tbody>
       </table></div>
   );
@@ -163,13 +163,10 @@ export default function OverviewPage() {
   const enabled = Number(t.enabled_tables || 0);
   const pct = enabled ? ((100 * Number(t.state_current || 0)) / enabled).toFixed(1) : "0.0";
   const jobs = Number(t.jobs || 0);
-  const title = !d ? "Overview"
-    : `${fmtInt(jobs)} ${plural(jobs, "ingestion job")}: ${fmtInt(t.running_jobs)} running, ${fmtInt(t.failing_jobs)} with failing tables, `
-      + `${fmtInt(t.late_jobs)} with late data`;
   const unscheduled = d?.not_in_job?.groups?.length ?? 0;
   return (
     <>
-      <PageHead crumb={<span className="eyebrow">Overview</span>} title={title}
+      <PageHead title="Overview"
         lead={d && (enabled ? <>{pct}% of <strong>{fmtInt(enabled)}</strong> enabled {plural(enabled, "table")} {enabled === 1 ? "is" : "are"} current,
           in <strong>{fmtInt(t.groups)}</strong> {plural(t.groups, "ingestion group")} and <strong>{fmtInt(t.databases)}</strong>{" "}
           {plural(t.databases, "database")} on <strong>{fmtInt(t.servers)}</strong> {plural(t.servers, "server")}

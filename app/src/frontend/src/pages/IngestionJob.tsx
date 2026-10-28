@@ -5,7 +5,7 @@ import { api, qs, type Row } from "../api";
 import { Refused } from "../permissions";
 import {
   Badge, ErrorBox, Menu, Name, Notice, PageHead, RunStatus, Section, StateBar, StateKey, fmtClock, fmtDuration, fmtInt, fmtSlot, fmtSpeed,
-  fmtTime, jobRunPath, plural
+  fmtTime, jobRunPath, plural, useConfirm, type ConfirmRequest
 } from "../components";
 
 const PAGE = 25;
@@ -13,8 +13,23 @@ const PAGE = 25;
 /** A job run's rows written: "at least" when some loads recorded no count. */
 export const rowsText = (r: Row) => (r.rows_partial ? `at least ${fmtInt(r.rows_written)}` : fmtInt(r.rows_written));
 
+/** A trigger that did not run because its job is paused: the Databricks Runs list shows no row for it. */
+export const pausedNotRun = (r: Row) => r.outcome?.label === "Not run" && !!r.outcome?.paused;
+
+/** The runs as table rows, each stretch of a paused job's triggers that did not run folded into one quiet line. */
+function foldPaused(runs: Row[]): (Row | { folded: Row[] })[] {
+  const out: (Row | { folded: Row[] })[] = [];
+  for (const r of runs) {
+    const last = out[out.length - 1] as { folded?: Row[] } | undefined;
+    if (pausedNotRun(r) && last?.folded && last.folded[0].job_id === r.job_id) last.folded.push(r);
+    else out.push(pausedNotRun(r) ? { folded: [r] } : r);
+  }
+  return out;
+}
+
 /** One row per job run: outcome, group runs, took, tables loaded, speed, rows written, parallelism, clusters, failed. */
 export function JobRunsTable({ runs, showJob }: { runs: Row[]; showJob?: boolean }) {
+  const columns = showJob ? 11 : 10;
   return (
     <div className="table-wrap"><table className="data dense">
       <thead><tr><th>Job run</th>{showJob && <th>Ingestion job</th>}<th>Outcome</th><th className="num">Group runs</th>
@@ -22,7 +37,13 @@ export function JobRunsTable({ runs, showJob }: { runs: Row[]; showJob?: boolean
         <th className="num">Rows written</th><th className="num">Parallelism</th><th className="num">Clusters</th>
         <th className="num">Failed</th></tr></thead>
       <tbody>
-        {runs.map((r) => (
+        {foldPaused(runs).map((r) => "folded" in r ? (
+          <tr key={`paused-${r.folded[0].job_id}-${r.folded[0].slot}`}>
+            <td colSpan={columns} className="muted">Paused: {fmtInt(r.folded.length)} {plural(r.folded.length, "trigger")} did not run,{" "}
+              {r.folded.length > 1 ? `${fmtSlot(r.folded[r.folded.length - 1].slot)} to ${fmtSlot(r.folded[0].slot)}` : fmtSlot(r.folded[0].slot)}
+              {showJob && <>{" "}(<Link to={`/ingestion-jobs/${r.folded[0].job_id}`}>{r.folded[0].job_name}</Link>)</>}</td>
+          </tr>
+        ) : (
           <tr key={`${r.job_id}-${r.slot}`}>
             <td className="name"><Link to={jobRunPath(r.job_id, r.slot)}>{new Date(r.slot).toLocaleString([], { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" })}</Link></td>
             {showJob && <td className="name"><Link to={`/ingestion-jobs/${r.job_id}`}><Name>{r.job_name}</Name></Link></td>}
@@ -36,7 +57,7 @@ export function JobRunsTable({ runs, showJob }: { runs: Row[]; showJob?: boolean
             <td className="num" style={{ color: Number(r.failed_tables) ? "var(--bad)" : undefined }}>{fmtInt(r.failed_tables)}</td>
           </tr>
         ))}
-        {!runs.length && <tr><td colSpan={showJob ? 11 : 10} className="muted">No job runs in this window.</td></tr>}
+        {!runs.length && <tr><td colSpan={columns} className="muted">No job runs in this window.</td></tr>}
       </tbody>
     </table></div>
   );
@@ -48,6 +69,7 @@ export default function IngestionJob() {
   const [pages, setPages] = useState<string[]>([]);
   const before = pages[pages.length - 1];
   const qc = useQueryClient();
+  const confirm = useConfirm();
   const runNow = useMutation({
     mutationFn: () => api.post<Row>(`/ingestion-jobs/${encodeURIComponent(id)}/run`, {}),
     onSuccess: () => qc.invalidateQueries({ queryKey: ["ingestion-job", id] }),
@@ -80,14 +102,15 @@ export default function IngestionJob() {
           {/* As a Databricks job page: Delete in the more-actions menu, Edit beside Run now, Run now the primary action. */}
           <Menu label="⋮" title="More actions">
             <button className="danger-text" disabled={!!j.delete_blocked || remove.isPending} title={j.delete_blocked ?? undefined}
-              onClick={() => window.confirm(deleteMessage(j)) && remove.mutate()}>{remove.isPending ? "Deleting…" : "Delete job"}</button>
+              onClick={() => confirm.ask(deleteJobRequest(j.name, j.groups?.length, j.enabled_tables)).then((ok) => ok && remove.mutate())}>{remove.isPending ? "Deleting…" : "Delete job"}</button>
           </Menu>
           <button disabled={!!j.change_blocked} title={j.change_blocked ?? undefined}
             onClick={() => navigate(`/ingestion-jobs/${id}/edit`)}>Edit</button>
           <button className="primary" disabled={!!j.run_now?.blocked || runNow.isPending} title={j.run_now?.blocked ?? undefined}
-            onClick={() => window.confirm(runNowMessage(j)) && runNow.mutate()}>{runNow.isPending ? "Starting…" : "Run now"}</button></span>} />
+            onClick={() => confirm.ask(runNowRequest(j)).then((ok) => ok && runNow.mutate())}>{runNow.isPending ? "Starting…" : "Run now"}</button></span>} />
       {j && <p className="muted small">Created by {j.created_by ?? "unknown"}{j.created_at ? `, ${fmtTime(j.created_at)}` : ""} ·
         Last updated by {j.updated_by ?? "unknown"}{j.updated_at ? `, ${fmtTime(j.updated_at)}` : ""}</p>}
+      {confirm.dialog}
       <Refused action="Run now" refusal={j?.run_now?.blocked} />
       <Refused action="Edit and Delete" refusal={j?.change_blocked} />
       <ErrorBox error={remove.error} />
@@ -147,19 +170,22 @@ export default function IngestionJob() {
   );
 }
 
-// What Run now starts, for its confirm dialog: one run of every group, each on its own cluster, which costs money.
-function runNowMessage(j: Row): string {
+// What Run now starts, for its dialog: one run of every group, each on its own cluster, which costs money.
+function runNowRequest(j: Row): ConfirmRequest {
   const groups = Number(j.run_now?.groups ?? 0);
   const starts = j.run_now?.check
     ? `the check job over its ${fmtInt(groups)} ${plural(groups, "group")}, which starts an ingest run, each on its own job cluster, for every group with changes (up to ${fmtInt(groups)} ${plural(groups, "cluster")})`
     : `an ingest run for each of its ${fmtInt(groups)} ${plural(groups, "group")}, each on its own job cluster (${fmtInt(groups)} ${plural(groups, "cluster")})`;
-  return `Start a run of ${j.name} now?\n\nThis starts ${starts}, over its ${fmtInt(j.enabled_tables)} ${plural(j.enabled_tables, "table")}. ` +
-    "Clusters and the sources' load cost money while they run.";
+  return { title: `Run ${j.name} now?`, action: "Run now",
+    body: <><p>This starts {starts}, over its {fmtInt(j.enabled_tables)} {plural(j.enabled_tables, "table")}.</p>
+      <p>Clusters and the sources' load cost money while they run.</p></> };
 }
 
-// What deleting a job does, for its confirm dialog: the job goes, everything it loaded stays.
-function deleteMessage(j: Row): string {
-  return `Delete ${j.name}?\n\nIts schedule and its Databricks jobs are deleted. Its ` +
-    `${fmtInt(j.groups?.length)} ${plural(j.groups?.length, "group")} move to Not in any job, and their ` +
-    `${fmtInt(j.enabled_tables)} ${plural(j.enabled_tables, "table")}, target tables, checkpoints and run history all stay.`;
+/** What deleting a job does, for its dialog (the job page and the Schedules card): the job goes, everything it
+ * loaded stays. */
+export function deleteJobRequest(name: unknown, groups: unknown, tables: unknown): ConfirmRequest {
+  return { title: `Delete ${name}?`, action: "Delete", danger: true,
+    body: <><p>Its schedule and its Databricks jobs are deleted.</p>
+      <p>Its {fmtInt(groups)} {plural(groups, "group")} move to Not in any job, and their {fmtInt(tables)} {plural(tables, "table")},
+        target tables, checkpoints and run history all stay.</p></> };
 }

@@ -3,8 +3,8 @@ import { Link, useSearchParams } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
 import { type ColDef } from "ag-grid-community";
 import { api, qs, type Row } from "../api";
-import { ErrorBox, Grid, PageHead, RunStatus, Section, fmtDuration, fmtInt, fmtSpeed } from "../components";
-import { JobRunsTable } from "./IngestionJob";
+import { ErrorBox, Grid, PageHead, RunStatus, Section, fmtDuration, fmtInt, fmtSpeed, plural } from "../components";
+import { JobRunsTable, pausedNotRun } from "./IngestionJob";
 
 /** Tables that needed a read: the run's total less those found unchanged. */
 const worked = (r: Row) => (r.total === null || r.total === undefined ? null : Number(r.total) - Number(r.skipped || 0));
@@ -50,16 +50,19 @@ export default function Runs() {
   const d = runs.data;
   const list: Row[] = d?.job_runs ?? [];
   const running = list.filter((r) => r.outcome?.label === "Running");
-  const finished = list.filter((r) => r.outcome?.label !== "Running");
+  // As the Databricks Runs list: a paused job's triggers that did not run are not finished runs; they show as one line.
+  const pausedSlots = list.filter(pausedNotRun);
+  const finished = list.filter((r) => r.outcome?.label !== "Running" && !pausedNotRun(r));
   const withFailed = finished.filter((r) => Number(r.failed_tables) > 0);
   const oldest = finished.length ? finished[finished.length - 1].slot : null;
   const choose = (value: string) => { setPages([]); setOutcome(""); setParams(value ? { job: value } : {}); };
   return (
     <>
-      <PageHead crumb={<span className="eyebrow">Runs · What ran, and how fast?</span>}
-        title={job === "none" ? "Runs: groups in no job"
-          : d ? `Runs: ${fmtInt(running.length)} running; ${fmtInt(withFailed.length)} finished with failed tables${oldest ? ` since ${fmtWhen(oldest)}` : ""}` : "Runs"}
-        lead="A job run is one trigger of an ingestion job, with one group run per ingestion group. Group runs the check job started together are one job run; others are placed by each job's current schedule."
+      <PageHead title="Runs"
+        lead={job === "none" ? "Group runs of the ingestion groups in no job."
+          : d ? `${fmtInt(running.length)} running; ${fmtInt(withFailed.length)} finished with failed tables${oldest ? ` since ${fmtWhen(oldest)}` : ""}. `
+            + "A job run is one trigger of an ingestion job, with one group run per ingestion group."
+          : "A job run is one trigger of an ingestion job, with one group run per ingestion group."}
         right={<label className="toolbar" style={{ margin: 0 }}>Ingestion job
           <select value={job} onChange={(e) => choose(e.target.value)}>
             <option value="">(all jobs)</option>
@@ -94,6 +97,8 @@ export default function Runs() {
               <button className="ghost" disabled={!d?.next_before} onClick={() => setPages([...pages, d!.next_before])}>Older</button>
             </span>}>
             {d && <JobRunsTable runs={finished} showJob />}
+            {pausedSlots.length > 0 && <p className="muted small">Not listed: {fmtInt(pausedSlots.length)}{" "}
+              {plural(pausedSlots.length, "trigger")} of paused jobs that did not run.</p>}
           </Section>
         </>
       )}

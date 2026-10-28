@@ -17,6 +17,8 @@ function targetAfterEnabled(columns: ColDef[]): ColDef[] {
 }
 
 const FILTERS = ["all", "failing", "sla_breached", "no_sla", "seeding", "disabled"];
+const FILTER_LABELS: Record<string, string> = { all: "All tables", failing: "Failing", sla_breached: "Past freshness target",
+  no_sla: "No freshness target", seeding: "Waiting for a first load", disabled: "Disabled" };
 
 export default function Tables() {
   const [params, setParams] = useSearchParams();
@@ -55,10 +57,10 @@ export default function Tables() {
           </select>
         </label>
         <label className="grow">Search
-          <input placeholder="database, table, sink or client_id" value={search} onChange={(e) => { setPages([]); setSearch(e.target.value); }} />
+          <input placeholder="Database, table, target or client ID" value={search} onChange={(e) => { setPages([]); setSearch(e.target.value); }} />
         </label>
         <label>Show
-          <select value={status} onChange={(e) => { setPages([]); setStatus(e.target.value); }}>{FILTERS.map((f) => <option key={f}>{f}</option>)}</select>
+          <select value={status} onChange={(e) => { setPages([]); setStatus(e.target.value); }}>{FILTERS.map((f) => <option key={f} value={f}>{FILTER_LABELS[f]}</option>)}</select>
         </label>
         {database !== undefined && <span className="tag">database {database || "(none)"}
           <button className="ghost" onClick={() => { setPages([]); setParams(collection ? { collection } : {}); }}>clear</button></span>}
@@ -74,10 +76,14 @@ export default function Tables() {
           <button className="primary" disabled={!!locked} title={locked ?? undefined} onClick={() => setEditing(ids.length === 1 ? "one" : "bulk")}>
             {ids.length === 1 ? "Edit" : "Bulk edit"}
           </button>
-          <ConfirmButton label="Enable" disabled={!!locked} onConfirm={() => act.mutateAsync({ path: "/tables/enable", body: { ids, enabled: true } })} />
-          <ConfirmButton label="Disable" disabled={!!locked} onConfirm={() => act.mutateAsync({ path: "/tables/enable", body: { ids, enabled: false } })} />
-          <ConfirmButton label="Force reseed" danger disabled={!!locked}
-            onConfirm={() => act.mutateAsync({ path: "/tables/reseed", body: { ids } })} />
+          <ConfirmButton label="Enable" plain disabled={!!locked} title={`Enable ${fmtInt(ids.length)} ${plural(ids.length, "table")}?`}
+            message="Their ingestion groups' next runs load them." onConfirm={() => act.mutateAsync({ path: "/tables/enable", body: { ids, enabled: true } })} />
+          <ConfirmButton label="Disable" danger disabled={!!locked} title={`Disable ${fmtInt(ids.length)} ${plural(ids.length, "table")}?`}
+            message="Runs stop loading them. Their target tables, checkpoints and history stay, so enabling them again carries on from where they were."
+            onConfirm={() => act.mutateAsync({ path: "/tables/enable", body: { ids, enabled: false } })} />
+          <ConfirmButton label="Force reseed" danger disabled={!!locked} title={`Reseed ${fmtInt(ids.length)} ${plural(ids.length, "table")}?`}
+            message="The next run of each table's ingestion group copies the whole table again from its source. Large tables take a while and load the source."
+            confirmLabel="Reseed" onConfirm={() => act.mutateAsync({ path: "/tables/reseed", body: { ids } })} />
           </>}
         </>}>
         <p className="muted small">Select one row to edit it, or several to bulk edit, enable, disable, or force a reseed

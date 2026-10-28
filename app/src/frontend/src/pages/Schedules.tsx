@@ -2,7 +2,8 @@ import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, type Row } from "../api";
 import { usePermissions } from "../permissions";
-import { Badge, ErrorBox, Grid, Menu, Notice, Section, fmtTime, plural } from "../components";
+import { Badge, ErrorBox, Grid, Menu, Notice, Section, fmtTime, plural, useConfirm } from "../components";
+import { deleteJobRequest } from "./IngestionJob";
 
 // A schedule runs one or more collections at a cadence. The app turns each (schedule, collection)
 // into a small Databricks job that starts the Databricks ingestion job; editing here keeps those jobs in sync.
@@ -126,6 +127,7 @@ function ScheduleCard({ s, onEdit }: { s: Row; onEdit: () => void }) {
     onSuccess: () => qc.invalidateQueries({ queryKey: ["schedules"] }),
   });
   const check = useMutation({ mutationFn: () => api.get<Row>(`/schedules/${s.id}/check`), onSuccess: setDrift });
+  const confirm = useConfirm();
   const refusals = usePermissions().data?.jobs[String(s.id)];
   const locked = refusals?.change ?? null;
   const rows = (s.members as Row[]).map((m) => ({
@@ -144,13 +146,14 @@ function ScheduleCard({ s, onEdit }: { s: Row; onEdit: () => void }) {
         <button onClick={() => check.mutate()} disabled={check.isPending}>Check jobs</button>
         <button onClick={() => act.mutate("sync")} disabled={act.isPending || !!locked} title={locked ?? undefined}>Sync jobs</button>
         <button className="danger-text" disabled={!!refusals?.delete} title={refusals?.delete ?? undefined}
-          onClick={() => window.confirm(`Delete ${s.name}?\n\nIts schedule and its Databricks jobs are deleted. Its groups move to Not in any job, and their tables, target tables, checkpoints and run history all stay.`)
-            && act.mutate("delete")}>Delete job</button>
+          onClick={() => confirm.ask(deleteJobRequest(s.name, s.members.length,
+            (s.members as Row[]).reduce((sum, m) => sum + Number(m.enabled_tables || 0), 0))).then((ok) => ok && act.mutate("delete"))}>Delete job</button>
       </Menu>
       <button onClick={() => act.mutate(s.paused ? "resume" : "pause")} disabled={act.isPending || !!locked}
         title={locked ?? undefined}>{s.paused ? "Resume" : "Pause"}</button>
       <button onClick={onEdit} disabled={!!locked} title={locked ?? undefined}>Edit</button>
     </>}>
+      {confirm.dialog}
       {locked && <p className="muted small">Edit, {s.paused ? "Resume" : "Pause"}, Sync jobs and Delete: {locked}.</p>}
       <p className="muted small">Time zone {s.timezone}{paramsText(s.parameters) ? ` · ${paramsText(s.parameters)}` : ""}
         {s.notify_emails ? ` · failure emails to ${s.notify_emails}` : ""} · settings last changed {fmtTime(s.updated_at)}{s.created_by ? ` · created by ${s.created_by}` : ""}</p>
@@ -167,8 +170,8 @@ function ScheduleCard({ s, onEdit }: { s: Row; onEdit: () => void }) {
         { field: "failed_24h", headerName: "Failed (24 h)" }, { field: "skipped_24h", headerName: "Skipped triggers (24 h)" },
         { field: "strictest_sla", headerName: "Strictest freshness target" },
         { field: "job", headerName: "Job", cellRenderer: (p: any) => (p.value ? <a href={p.value} target="_blank" rel="noreferrer">open</a> : null) },
-        { field: "sync", headerName: "Sync", cellRenderer: (p: any) => <Badge value={p.value === "ok" ? "ok" : "failed"} /> },
-        { field: "sync_drift", headerName: "Check", cellRenderer: (p: any) => (p.value ? <Badge value={p.value === "in_sync" ? "ok" : "failed"} /> : null) },
+        { field: "sync", headerName: "Sync", cellRenderer: (p: any) => <Badge value={p.value === "ok" ? "synced" : p.value === "error" ? "failed" : "not synced"} /> },
+        { field: "sync_drift", headerName: "Check", cellRenderer: (p: any) => (p.value ? <Badge value={p.value === "in_sync" ? "in_sync" : "drifted"} /> : null) },
         { field: "warnings", headerName: "Warnings", minWidth: 160, tooltipField: "warnings" },
       ]} />
     </Section>
