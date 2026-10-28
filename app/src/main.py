@@ -22,7 +22,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Iterable, List, Optional
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, JSONResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -142,10 +142,23 @@ def _locked_rows(cur, ids):
 
 # ---- context / overview -----------------------------------------------------------------------------
 
+@app.get("/api/databricks-runs/{run_id}/open")
+def open_databricks_run(run_id: int):
+    """Open a Databricks job run's own page (a group run's job_run_id), as its run page link in the Jobs UI does."""
+    try:
+        url = jobs.run_state(run_id)["url"]
+    except Exception as e:
+        raise HTTPException(404, f"can't find Databricks job run {run_id}: {str(e).split('. ')[0]}")
+    if not url:
+        raise HTTPException(404, f"Databricks job run {run_id} has no page")
+    return RedirectResponse(url)
+
+
 @app.get("/api/config")
 def config(request: Request):
     return {"lakebase_instance": db.INSTANCE, "lakebase_database": db.DATABASE, "user": _user(request),
             "jobs": {"ingest": jobs.INGEST_JOB_ID, "setup": jobs.SETUP_JOB_ID, "discover": jobs.DISCOVER_JOB_ID},
+            "workspace_url": jobs.workspace_url(),
             "defaults": {"partition_threshold_mb": q.DEFAULT_PARTITION_THRESHOLD_MB,
                          "partition_size_mb": q.DEFAULT_PARTITION_SIZE_MB}}
 

@@ -1,10 +1,12 @@
 import { type ReactNode, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { Link, useParams } from "react-router-dom";
+import { useSettings } from "../App";
 import { api, type Row } from "../api";
-import {
+import { OutLink, clusterUrl, databricksRunUrl,
+  Crumbs, fmtSlot,
   Badge, BigCount, ErrorBox, FillBox, Grid, Notice, PageHead, ProgressBar, ProgressKey, RunStatus, Section, Stamp, autoColumns,
-  databasePath, fmtDuration, fmtInt, fmtLeft, fmtSpeed, jobRunName, jobRunPath, plural, progressOf, progressText, type Progress
+  databasePath, fmtDuration, fmtInt, fmtLeft, fmtSpeed, jobRunPath, plural, progressOf, progressText, type Progress
 } from "../components";
 
 /** A finished run's totals in the same shape as a live run's progress, so both read the same way. The run's "ok"
@@ -82,6 +84,7 @@ const fmtWhen = (v: unknown) => (v ? new Date(String(v)).toLocaleString([], { da
   minute: "2-digit", second: "2-digit" }) : "");
 
 export default function RunDetail() {
+  const { config } = useSettings();
   const { id = "" } = useParams();
   const [showEvents, setShowEvents] = useState(false);
   const run = useQuery({
@@ -117,17 +120,17 @@ export default function RunDetail() {
   const rows = r ? <>{r.rows_partial ? "at least " : ""}<BigCount value={r.rows_written} /></> : "";
   return (
     <>
-      <PageHead crumb={<span className="eyebrow"><Link to="/overview">Overview</Link> ·{" "}
-        {r?.job_runs?.length ? r.job_runs.map((j: Row, i: number) => <span key={j.job_id}>{i > 0 && ", "}
-          <Link to={`/ingestion-jobs/${j.job_id}`}>{j.job_name}</Link> · <Link to={jobRunPath(j.job_id, j.slot)}>{jobRunName(j.job_name, j.slot)}</Link></span>)
-          : <Link to="/runs?job=none">Runs</Link>} · {r?.check ? "Check" : "Group run"}</span>}
+      <PageHead crumb={<Crumbs steps={r?.job_runs?.length === 1
+          ? [["Ingestion jobs", "/ingestion-jobs"], [r.job_runs[0].job_name, `/ingestion-jobs/${r.job_runs[0].job_id}`],
+             [`${fmtSlot(r.job_runs[0].slot)} job run`, jobRunPath(r.job_runs[0].job_id, r.job_runs[0].slot)], [r.check ? "Check" : "Group run"]]
+          : [["Runs", r?.job_runs?.length ? "/runs" : "/runs?job=none"], [r?.check ? "Check" : "Group run"]]} />}
         title={title(id, r, p, live)}
         lead={r && <>Ingestion group <Link to={`/collections/${encodeURIComponent(r.task_collection)}`}><strong>{r.task_collection}</strong></Link>
           {dbs.length ? <>, <strong>{fmtInt(dbs.length)}</strong> {plural(dbs.length, "database")}</> : null}
           {p ? <>, <strong>{fmtInt(p.total)}</strong> {plural(p.total, "table")}</> : null}
           , started {fmtWhen(r.started_at)}
-          {r.job_run_id ? <>, Databricks job run <strong>{r.job_run_id}</strong></> : null}
-          {r.cluster_id ? <>, cluster <strong>{r.cluster_id}</strong></> : null}
+          {r.job_run_id ? <>, <OutLink href={databricksRunUrl(r.job_run_id)}>Databricks job run {r.job_run_id}</OutLink></> : null}
+          {r.cluster_id ? <>, <OutLink href={clusterUrl(config?.workspace_url, r.cluster_id)}>cluster {r.cluster_id}</OutLink></> : null}
           {r.parallelism ? <>, parallelism <strong>{fmtInt(r.parallelism)}</strong></> : null}.
           {!live && r.outcome?.note ? <> {r.outcome.label}: {r.outcome.note}.</> : null}
           {r.check ? <> The check job's own record of checking this group, not a group run: {r.check.found}.</> : null}</>}

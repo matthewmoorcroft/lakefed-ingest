@@ -3,8 +3,8 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import { api, qs, type Row } from "../api";
 import { Refused } from "../permissions";
-import {
-  Badge, ErrorBox, Menu, Name, Notice, PageHead, RunStatus, Section, StateBar, StateKey, fmtClock, fmtDuration, fmtInt, fmtSlot, fmtSpeed,
+import { OutLink,
+  Crumbs, Badge, ErrorBox, Menu, Name, Notice, PageHead, RunStatus, Section, StateBar, StateKey, fmtClock, fmtDuration, fmtInt, fmtSlot, fmtSpeed,
   fmtTime, jobRunPath, plural, useConfirm, type ConfirmRequest
 } from "../components";
 
@@ -89,14 +89,15 @@ export default function IngestionJob() {
   const last = j?.last_job_run;
   return (
     <>
-      <PageHead crumb={<span className="eyebrow"><Link to="/overview">Overview</Link> · <Link to="/ingestion-jobs">Ingestion jobs</Link></span>}
+      <PageHead crumb={<Crumbs steps={[["Ingestion jobs", "/ingestion-jobs"]]} />} tab={j?.name}
         title={j ? <>{j.name} {j.paused && <Badge value="Paused" />}</> : "Ingestion job"}
-        lead={j && <>{j.description}{j.stagger_to ? `, its groups starting up to ${j.stagger_to} minutes after that` : ""};{" "}
+        lead={!j ? (job.error ? undefined : <span className="muted">Loading…</span>) : <>{j.description}{j.stagger_to ? `, its groups starting up to ${j.stagger_to} minutes after that` : ""};{" "}
           <strong>{fmtInt(j.groups?.length)}</strong> {plural(j.groups?.length, "ingestion group")}, <strong>{fmtInt(j.databases)}</strong>{" "}
           {plural(j.databases, "database")}, <strong>{fmtInt(j.enabled_tables)}</strong> {plural(j.enabled_tables, "table")} on{" "}
           <strong>{fmtInt(j.servers)}</strong> {plural(j.servers, "server")}
           {j.parameters?.parallelism && <>, parallelism <strong>{j.parameters.parallelism}</strong></>}
-          {j.job_variant && j.job_variant !== "default" && <>, Databricks job variant <strong>{j.job_variant}</strong></>}
+          {j.job_variant === "check" ? <>; each run checks its sources for changes first</>
+            : j.job_variant && j.job_variant !== "default" ? <>, Databricks job variant <strong>{j.job_variant}</strong></> : null}
 .</>}
         right={j && <span className="card-actions">
           {/* As a Databricks job page: Delete in the more-actions menu, Edit beside Run now, Run now the primary action. */}
@@ -136,7 +137,7 @@ export default function IngestionJob() {
             <div className="metric-sub">p95 over 7 days</div></div>
         </div>
       )}
-      <Section title="Schedule" note="Every trigger, newest first: the ones that ran, are waiting or starting, were skipped, or did not run. Group runs the check job started together are one job run; other group runs are placed by the job's current schedule, and one started by hand inside a slot is an extra run."
+      <Section title="Job runs" note="Newest first; one row per trigger."
         actions={<span className="pager-buttons">
           <button className="ghost" disabled={!pages.length} onClick={() => setPages(pages.slice(0, -1))}>Newer</button>
           <button className="ghost" disabled={!runs.data?.next_before} onClick={() => setPages([...pages, runs.data!.next_before])}>Older</button>
@@ -159,7 +160,7 @@ export default function IngestionJob() {
                   <td>{g.last_run ? <><Link to={`/runs/${g.last_run.run_id}`}><RunStatus status={g.last_run.status} outcome={g.last_run.outcome} /></Link>
                     <span className="sub">group run {fmtInt(g.last_run.run_id)} at {fmtClock(g.last_run.started_at)}</span></> : <span className="muted">never run</span>}</td>
                   <td className="num">{g.p95_s != null ? fmtDuration(g.p95_s) : ""}</td>
-                  <td>{g.job_url ? <a href={g.job_url} target="_blank" rel="noreferrer">open</a> : <span className="muted">not synced</span>}</td>
+                  <td>{g.job_url ? <OutLink href={g.job_url}>View job</OutLink> : <span className="muted">not synced</span>}</td>
                 </tr>
               ))}
             </tbody>

@@ -54,6 +54,14 @@ def ts(ms) -> Optional[str]:
     return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).isoformat() if ms else None
 
 
+def workspace_url() -> str:
+    """The workspace's address, for links out of the app to a run or a cluster; empty when it can't be read."""
+    try:
+        return workspace().config.host.rstrip("/")
+    except Exception:
+        return ""
+
+
 def job_summary(job_id) -> dict:
     """Name, schedule and default parameters of a job."""
     j = workspace().jobs.get(int(job_id))
@@ -68,7 +76,7 @@ def job_summary(job_id) -> dict:
         "schedule_status": (sched.pause_status.value if sched and sched.pause_status else None),
         "default_task_collection": params.get("task_collection"),
         "parameters": params,
-        "url": f"{workspace().config.host.rstrip('/')}/jobs/{j.job_id}",
+        "url": f"{workspace_url()}/jobs/{j.job_id}",
     }
 
 

@@ -11,10 +11,10 @@ const SETTINGS: { key: string; label: string; options?: string[]; type?: "number
   { key: "use_remote_query", label: "Read through the UC connection", type: "checkbox", help: "else Spark JDBC with a secret" },
   { key: "load_type", label: "Load type", options: ["ct", "cursor", "full"] },
   { key: "write_mode", label: "Write mode", options: ["merge", "append"] },
-  { key: "fan_in", label: "Fan in to shared tables", type: "checkbox", help: "each line gives its client_id" },
-  { key: "sink_catalog", label: "Sink catalog", help: "{database}, {schema} and {table} are filled per line" },
-  { key: "sink_schema", label: "Sink schema" },
-  { key: "sink_table", label: "Sink table" },
+  { key: "fan_in", label: "Fan-in to shared tables", type: "checkbox", help: "each line gives its client_id" },
+  { key: "sink_catalog", label: "Target catalog", help: "{database}, {schema} and {table} are filled per line" },
+  { key: "sink_schema", label: "Target schema" },
+  { key: "sink_table", label: "Target table" },
   { key: "freshness_sla_minutes", label: "Freshness target (minutes)", type: "number", help: "blank = none" },
   { key: "jdbc_options", label: "Read options", help: "JSON object; blank = none" },
 ];
@@ -58,7 +58,7 @@ export default function ImportCsv() {
   const isNew = settings.data && !settings.data.tables;
   return (
     <>
-      <PageHead crumb={<span className="eyebrow">Manage · Import CSV</span>} title="Import a CSV of tables"
+      <PageHead title="Import a CSV of tables"
         lead={<>Each line says where a table is; the ingestion group's settings say how to ingest it. Columns:
           src_connection (or src_host and secret_key), src_database, src_schema, src_table, select_list, primary_key,
           cursor_column, client_id and attr:&lt;column&gt; for a fan-in. An ingestion group's page exports the same CSV.</>} />

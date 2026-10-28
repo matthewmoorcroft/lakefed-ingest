@@ -3,7 +3,7 @@ import { useSearchParams } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { type ColDef } from "ag-grid-community";
 import { api, qs, type Row } from "../api";
-import { Badge, ConfirmButton, ErrorBox, Grid, Notice, Section, autoColumns, fmtInt, plural } from "../components";
+import { PageHead, Badge, ConfirmButton, ErrorBox, Grid, Notice, Section, autoColumns, fmtInt, plural } from "../components";
 import { EditBulk, EditOne } from "./EditTables";
 import { groupsRefusal, usePermissions } from "../permissions";
 
@@ -48,7 +48,7 @@ export default function Tables() {
   const locked = groupsRefusal(usePermissions().data, selected.map((r) => r.task_collection));
   return (
     <>
-      <h1>Tables</h1>
+      <PageHead title="Tables" lead="Every table of every ingestion group: select tables to edit, enable, disable or reseed them." />
       <div className="toolbar">
         <label>Ingestion group
           <select value={collection} onChange={(e) => { setPages([]); setParams(e.target.value ? { collection: e.target.value } : {}); }}>
@@ -90,7 +90,7 @@ export default function Tables() {
           (the next run copies them again). Changes are refused while the table's ingestion group is running. 100 tables a page,
           by ingestion group, database and table; selections are per page.</p>
         {locked && <p className="muted small">Edit, Enable, Disable and Force reseed: {locked}.</p>}
-        <Grid rows={tables.data?.tables} selection="multiple" onSelect={setSelected} getRowId={(r) => String(r.id)}
+        <Grid rows={tables.data?.tables} filters={false} selection="multiple" onSelect={setSelected} getRowId={(r) => String(r.id)}
           columns={targetAfterEnabled(autoColumns(tables.data?.tables ?? [], {
             task_collection: { headerName: "Ingestion group" },
             sla_min: { headerName: "Freshness target (min)", minWidth: 180, type: "rightAligned", valueFormatter: (p) => fmtInt(p.value) },

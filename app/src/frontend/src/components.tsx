@@ -1,5 +1,6 @@
 import { Fragment, useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { createPortal } from "react-dom";
+import { Link } from "react-router-dom";
 import { AgGridReact } from "ag-grid-react";
 import { themeQuartz, type ColDef, type GridApi, type GridOptions } from "ag-grid-community";
 import { ApiError, type Row } from "./api";
@@ -47,12 +48,27 @@ const HEADINGS: Record<string, string> = {
   src_host: "Server", src_port: "Port", src_connection: "UC connection", sink_catalog: "Target catalog",
   sink_schema: "Target schema", sink_table: "Target table", sink_fqn: "Target table", primary_key: "Primary key",
   changed_at: "Changed at", changed_by: "Changed by", action: "Action", old_value: "Old value", new_value: "New value",
-  run_id: "Run ID", state: "Status", result: "Result", url: "Link", started: "Started", ended: "Ended", trigger: "Trigger",
+  run_id: "Run ID", job_id: "Job ID", state: "Status", result: "Result", url: "Link", started: "Started", ended: "Ended", trigger: "Trigger",
   schedule: "Schedule", freshness_sla_minutes: "Freshness target (minutes)", last_success_at: "Last loaded",
   status: "Status", phase: "Phase", created_at: "Created", updated_at: "Last updated", client_id: "Client ID",
   write_mode: "Write mode", cursor_column: "Cursor column", select_list: "Columns", secret_key: "Secret key",
   use_remote_query: "Read through UC connection", error: "Error", stage: "Stage", position: "Position",
 };
+
+// Coded values in words, the same on every page, as the Edit view names them and the Runs list names triggers.
+const VALUE_WORDS: Record<string, Record<string, string>> = {
+  load_type: { ct: "Change tracking", cursor: "Cursor column", full: "Full reload", cdc: "Change data capture" },
+  write_mode: { merge: "Merge: current state", append: "Append: change log" },
+  src_type: { sqlserver: "SQL Server", oracle: "Oracle", postgresql: "PostgreSQL", mysql: "MySQL" },
+  trigger: { ONE_TIME: "Manual", PERIODIC: "Scheduled", RETRY: "Retry", RUN_JOB_TASK: "Started by a job",
+             FILE_ARRIVAL: "File arrival", TABLE: "Table update", CONTINUOUS: "Continuous" },
+};
+
+/** A coded value in words for its column ("ct" in load_type -> "Change tracking"); other values as they are. */
+export function valueName(key: string, value: unknown): string {
+  const v = value === null || value === undefined ? "" : String(value);
+  return VALUE_WORDS[key]?.[v] ?? v;
+}
 
 /** A column name in words: its heading, else the name with spaces and a capital ("rows_merged" -> "Rows merged"). */
 export function heading(key: string): string {
@@ -66,7 +82,8 @@ export function autoColumns(rows: Row[], overrides: Record<string, Partial<ColDe
     field: k,
     headerName: heading(k),
     ...(/(_at|started|finished|ended)$/.test(k)
-      ? { valueFormatter: (p: any) => fmtTime(p.value) } : {}),
+      ? { valueFormatter: (p: any) => fmtShort(p.value), tooltipValueGetter: (p: any) => fmtTime(p.value) }
+      : VALUE_WORDS[k] ? { valueFormatter: (p: any) => valueName(k, p.value) } : {}),
     ...overrides[k],
   }));
 }
@@ -99,10 +116,12 @@ export function useFillHeight<T extends HTMLElement>(min = 280, share = 1, reser
 }
 
 /** A box for a plain table that fills the window's height and scrolls inside, with its header kept in view. */
-export function FillBox({ children, min, share }: { children: ReactNode; min?: number; share?: number }) {
-  const [ref, height] = useFillHeight<HTMLDivElement>(min, share);
+export function FillBox({ children, min, share, reserve }: { children: ReactNode; min?: number; share?: number; reserve?: number }) {
+  const [ref, height] = useFillHeight<HTMLDivElement>(min, share, reserve);
   return <div ref={ref} className="table-wrap fill" style={{ maxHeight: height }}>{children}</div>;
 }
+
+const ROW_HEIGHT = 34, HEADER_HEIGHT = 38;
 
 export function Grid(props: {
   rows: Row[] | undefined;
@@ -119,11 +138,14 @@ export function Grid(props: {
   onSelect?: (rows: Row[]) => void;
   options?: GridOptions;
   getRowId?: (r: Row) => string;
+  /** Per-column filter menus; off on pages with their own search or a short list, as the Databricks lists keep one search. */
+  filters?: boolean;
 }) {
   const cols = useMemo(() => props.columns ?? autoColumns(props.rows ?? []), [props.columns, props.rows]);
   const box = useRef<HTMLDivElement>(null);
   const [fillRef, fillHeight] = useFillHeight<HTMLDivElement>(props.fitRows ? 140 : 280, props.fillShare ?? 1, props.fillReserve ?? 0);
-  const rowsHeight = 52 + (props.rows?.length ?? 0) * 42 + 4;
+  // Rows and header at fixed heights, so a short list's box fits its rows with no blank space below them.
+  const rowsHeight = HEADER_HEIGHT + (props.rows?.length ?? 0) * ROW_HEIGHT + 4;
   const height = props.height ?? (props.fitRows ? Math.min(rowsHeight, fillHeight) : fillHeight);
   const byContent = (props.options?.autoSizeStrategy?.type ?? "fitCellContents") === "fitCellContents";
   /** Columns sized to their content, then stretched when they leave the grid's width unused (wide screens). */
@@ -140,7 +162,8 @@ export function Grid(props: {
         theme={theme}
         rowData={props.rows ?? []}
         columnDefs={cols}
-        defaultColDef={{ sortable: true, filter: true, resizable: true, minWidth: 90 }}
+        defaultColDef={{ sortable: true, filter: props.filters ?? true, resizable: true, minWidth: 90 }}
+        rowHeight={ROW_HEIGHT} headerHeight={HEADER_HEIGHT}
         autoSizeStrategy={{ type: "fitCellContents" }}
         rowSelection={props.selection
           ? { mode: props.selection === "single" ? "singleRow" : "multiRow", enableClickSelection: props.selection === "single" }
@@ -417,6 +440,9 @@ export function progressText(p: Progress): string {
   return `${fmtInt(checked)} of ${fmtInt(p.total)} tables checked (${pct}%), ${fmtInt(p.inFlight)} in flight, ${fmtInt(left)} to go`;
 }
 
+/** When a query's data was read, for a Stamp: undefined until it has data. */
+export const readAt = (query: { dataUpdatedAt: number }) => (query.dataUpdatedAt ? new Date(query.dataUpdatedAt).toISOString() : undefined);
+
 /** When the shown data was read, and how often it refreshes. When the latest refresh failed, it says the page
  * shows older data and why, so a broken read never looks calm. */
 export function Stamp({ at, every, error }: { at?: string; every?: number; error?: unknown }) {
@@ -426,7 +452,21 @@ export function Stamp({ at, every, error }: { at?: string; every?: number; error
   return <span className="stamp">Updated {fmtAgo(at)}{every ? `, every ${every} s` : ""}</span>;
 }
 
-export function PageHead({ title, lead, crumb, right }: { title: ReactNode; lead?: ReactNode; crumb?: ReactNode; right?: ReactNode }) {
+/** The browser tab's title, as the workspace's "<page or object> - Databricks": the page or object first. */
+export function useTabTitle(title?: string) {
+  useEffect(() => { document.title = title ? `${title} · Lakefed Ingest` : "Lakefed Ingest"; }, [title]);
+}
+
+/** The steps above a page, as the workspace shows them: "Ingestion jobs › East hourly › Job run". */
+export function Crumbs({ steps }: { steps: [ReactNode, string?][] }) {
+  return <span className="eyebrow">{steps.map(([label, to], i) => <Fragment key={i}>{i > 0 && " › "}
+    {to ? <Link to={to}>{label}</Link> : label}</Fragment>)}</span>;
+}
+
+/** A page's header: its crumbs, title (also the browser tab's, or ``tab`` when the title is not text), lead and actions. */
+export function PageHead({ title, lead, crumb, right, tab }: { title: ReactNode; lead?: ReactNode; crumb?: ReactNode; right?: ReactNode;
+                           tab?: string }) {
+  useTabTitle(tab ?? (typeof title === "string" ? title : undefined));
   return (
     <div className="page-head">
       <div>{crumb && <div className="crumb">{crumb}</div>}<h1>{title}</h1>{lead && <p className="lead">{lead}</p>}</div>
@@ -455,14 +495,27 @@ export function Notice({ tone = "info", children }: { tone?: "info" | "ok" | "wa
 export function Modal({ title, action, danger, onClose, children }: { title: string; action: string; danger?: boolean;
                         onClose: (confirmed: boolean) => void; children?: ReactNode }) {
   const id = useId();
+  const box = useRef<HTMLDivElement>(null);
+  // As Databricks dialogs: Tab and Shift+Tab stay inside it, and focus goes back to what opened it when it closes.
   useEffect(() => {
-    const key = (e: KeyboardEvent) => { if (e.key === "Escape") onClose(false); };
+    const opener = document.activeElement as HTMLElement | null;
+    const key = (e: KeyboardEvent) => {
+      if (e.key === "Escape") return onClose(false);
+      if (e.key !== "Tab" || !box.current) return;
+      const stops = [...box.current.querySelectorAll<HTMLElement>("button, a[href], input, select, textarea, [tabindex]")]
+        .filter((el) => !el.hasAttribute("disabled") && el.tabIndex >= 0);
+      if (!stops.length) return;
+      const first = stops[0], last = stops[stops.length - 1];
+      const inside = box.current.contains(document.activeElement);
+      if (e.shiftKey && (document.activeElement === first || !inside)) { e.preventDefault(); last.focus(); }
+      else if (!e.shiftKey && (document.activeElement === last || !inside)) { e.preventDefault(); first.focus(); }
+    };
     document.addEventListener("keydown", key);
-    return () => document.removeEventListener("keydown", key);
+    return () => { document.removeEventListener("keydown", key); opener?.focus?.(); };
   }, [onClose]);
   return createPortal(
     <div className="modal-backdrop" onMouseDown={(e) => { if (e.target === e.currentTarget) onClose(false); }}>
-      <div className="modal" role="dialog" aria-modal="true" aria-labelledby={id}>
+      <div className="modal" role="dialog" aria-modal="true" aria-labelledby={id} ref={box}>
         <h2 id={id}>{title}</h2>
         {children && <div className="modal-body">{children}</div>}
         <div className="modal-actions">
@@ -519,7 +572,7 @@ export function Section({ title, actions, note, children }: { title: ReactNode; 
   return (
     <section className="card">
       <div className="card-head">
-        <div><h2>{title}</h2>{note && <p>{note}</p>}</div>
+        <div>{title ? <h2>{title}</h2> : null}{note && <p>{note}</p>}</div>
         <div className="card-actions">{actions}</div>
       </div>
       {children}
@@ -565,6 +618,18 @@ export function JobStatus({ status }: { status?: Row | null }) {
     </div>
   );
 }
+
+/** A link out to Databricks, named for what it opens and marked as leaving the app, as links out of a workspace page read. */
+export function OutLink({ href, children }: { href?: string; children: ReactNode }) {
+  return href ? <a href={href} target="_blank" rel="noreferrer">{children} ↗</a> : <>{children}</>;
+}
+
+/** A cluster's page in the workspace, or undefined without the workspace's address or an id. */
+export const clusterUrl = (workspace: string | undefined, id: unknown) =>
+  workspace && id ? `${workspace}/#setting/clusters/${encodeURIComponent(String(id))}/configuration` : undefined;
+
+/** A Databricks job run's page, through the app, which asks the Jobs API where it is. */
+export const databricksRunUrl = (runId: unknown) => `/api/databricks-runs/${encodeURIComponent(String(runId))}/open`;
 
 /** "1 to 25 of 40 ingestion jobs", with previous and next. */
 export function Pager({ offset, limit, total, noun, onPage }: { offset: number; limit: number; total: number; noun: string;

@@ -2,7 +2,7 @@ import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, type Row } from "../api";
 import { usePermissions } from "../permissions";
-import { Badge, ErrorBox, Grid, Menu, Notice, Section, fmtTime, plural, useConfirm } from "../components";
+import { OutLink, PageHead, Stamp, Tip, readAt, Badge, ErrorBox, Grid, Menu, Notice, Section, fmtTime, plural, useConfirm } from "../components";
 import { deleteJobRequest } from "./IngestionJob";
 
 // A schedule runs one or more collections at a cadence. The app turns each (schedule, collection)
@@ -161,7 +161,7 @@ function ScheduleCard({ s, onEdit }: { s: Row; onEdit: () => void }) {
       <ErrorBox error={act.error || check.error} />
       <SyncResult result={act.data} />
       {/* The group and its next run stay pinned on the left, so they always show; the other columns scroll. */}
-      <Grid rows={rows} fitRows columns={[
+      <Grid rows={rows} fitRows filters={false} columns={[
         { field: "collection", headerName: "Ingestion group", pinned: "left" },
         { field: "next_run", headerName: "Next run", pinned: "left" }, { field: "starts", headerName: "Starts" },
         { field: "last_run", headerName: "Last run", cellRenderer: (p: any) => <Badge value={p.value} /> },
@@ -169,7 +169,7 @@ function ScheduleCard({ s, onEdit }: { s: Row; onEdit: () => void }) {
         { field: "p95_7d", headerName: "p95 (7 days)" }, { field: "runs_24h", headerName: "Runs (24 h)" },
         { field: "failed_24h", headerName: "Failed (24 h)" }, { field: "skipped_24h", headerName: "Skipped triggers (24 h)" },
         { field: "strictest_sla", headerName: "Strictest freshness target" },
-        { field: "job", headerName: "Job", cellRenderer: (p: any) => (p.value ? <a href={p.value} target="_blank" rel="noreferrer">open</a> : null) },
+        { field: "job", headerName: "Job", cellRenderer: (p: any) => (p.value ? <OutLink href={p.value}>View job</OutLink> : null) },
         { field: "sync", headerName: "Sync", cellRenderer: (p: any) => <Badge value={p.value === "ok" ? "synced" : p.value === "error" ? "failed" : "not synced"} /> },
         { field: "sync_drift", headerName: "Check", cellRenderer: (p: any) => (p.value ? <Badge value={p.value === "in_sync" ? "in_sync" : "drifted"} /> : null) },
         { field: "warnings", headerName: "Warnings", minWidth: 160, tooltipField: "warnings" },
@@ -186,12 +186,13 @@ export default function Schedules() {
   const close = () => { setEditing(null); qc.invalidateQueries({ queryKey: ["schedule-options"] }); };
   return (
     <>
-      <h1>Schedules</h1>
-      <p className="muted">Each schedule is an ingestion job: a cadence and its ingestion groups, named on the Overview by the
-        schedule's name. Each ingestion group in it gets its own small wrapper job that starts the Databricks job at the
-        schedule's cadence. A run still going at the next trigger makes Databricks skip that trigger (shown as skipped), so a
-        slow ingestion group never piles up runs. Edit schedules here: changes made in the Jobs UI are reported by "Check jobs" and
-        undone by the next sync.</p>
+      <PageHead title="Schedules"
+        lead={<>Each schedule is an ingestion job: its cadence and its ingestion groups.{" "}
+          <Tip focusable text={"Each ingestion group gets its own small wrapper job that starts the Databricks job at the schedule's cadence. "
+            + "A run still going at the next trigger makes Databricks skip that trigger (shown as skipped), so a slow group never piles up runs. "
+            + "Edit schedules here: changes made in the Jobs UI are reported by Check jobs and undone by the next sync."}>
+            <span className="info" aria-label="How schedules run">ⓘ</span></Tip></>}
+        right={<Stamp at={readAt(list)} every={30} error={list.error} />} />
       <ErrorBox error={list.error || options.error} />
       <div className="toolbar"><button className="primary" disabled={!options.data} onClick={() => setEditing("new")}>New schedule</button></div>
       {list.data && list.data.length === 0 && <Notice>No schedules yet.</Notice>}

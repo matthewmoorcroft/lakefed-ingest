@@ -3,7 +3,7 @@ import { useQuery } from "@tanstack/react-query";
 import { Link, useParams } from "react-router-dom";
 import { api, qs, type Row } from "../api";
 import {
-  ErrorBox, FillBox, PageHead, Pager, Section, Stamp, StateBar, StateKey, Tag, fmtAgo, fmtDuration, fmtInt, plural, type Tone
+  Crumbs, ErrorBox, FillBox, PageHead, Pager, Section, Stamp, StateBar, StateKey, Tag, fmtAgo, fmtDuration, fmtInt, plural, type Tone
 } from "../components";
 
 const STATE_TONE: Record<string, Tone> = { failing: "bad", "first load": "first", late: "warn", current: "ok", disabled: "" };
@@ -33,9 +33,9 @@ export default function Database() {
   const running = !!d?.running;
   return (
     <>
-      <PageHead crumb={<span className="eyebrow"><Link to="/overview">Overview</Link> ·{" "}
-        {(d?.jobs ?? []).map((j: Row) => <span key={j.id}><Link to={`/ingestion-jobs/${j.id}`}>{j.name}</Link> · </span>)}
-        <Link to={`/collections/${encodeURIComponent(name)}`}>{name}</Link> · Database</span>}
+      <PageHead crumb={<Crumbs steps={[["Ingestion jobs", "/ingestion-jobs"],
+          ...(d?.jobs ?? []).map((j: Row): [string, string] => [j.name, `/ingestion-jobs/${j.id}`]),
+          [name, `/collections/${encodeURIComponent(name)}`], ["Database"]]} />}
         title={database || "(none)"}
         lead={d && <>On <strong>{d.server || "(no server)"}</strong>, in ingestion group <Link to={`/collections/${encodeURIComponent(name)}`}><strong>{name}</strong></Link>
           {d.jobs.length ? <> ({d.jobs.map((j: Row) => j.name).join(", ")})</> : <> (in no job)</>}: <strong>{fmtInt(d.enabled_tables)}</strong> enabled{" "}
