@@ -78,7 +78,7 @@ it and when: an edit, pause or resume of the job, or any change to its groups' t
 `updated_at`). The job page shows them under its title; the Ingestion jobs list has them as Created and Last updated,
 sortable by time. A job never changed since it was created shows its creator as Last updated by, as the Jobs list does; jobs last changed before the app recorded it show "unknown" for who.
 
-**Its own cluster.** The job Edit view's Advanced configuration sets the job's ingestion cluster, like a
+**Its own cluster.** The job Edit view's Compute section sets the job's ingestion cluster, like a
 Databricks job cluster: driver type, worker type and 0 to 8 workers, defaulting to the ingestion job's own. A run of
 the ingestion job can't change its cluster, so a job with its own cluster runs its own copy of the ingestion job:
 - on Save, the app starts `lakefed_ingest_cluster_copies`, which runs as the deployer and makes or updates the copy

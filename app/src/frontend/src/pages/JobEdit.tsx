@@ -503,6 +503,12 @@ export default function JobEdit() {
         </div>
       </Section>}
 
+      {/* As a Databricks job's Compute: the job cluster first, editable; the rest of what its runs use under it. */}
+      {schedule && <Section title="Compute" note="What each run of this job runs on.">
+        <ClusterFields info={clusterInfo.data} error={clusterInfo.error} cluster={cluster} setCluster={setCluster} locked={locked} />
+        <Compute jobId={id} />
+      </Section>}
+
       {schedule && <details className="card advanced">
         <summary><b>Advanced configuration</b> <span className="muted">{Object.entries(params).filter(([k, v]) => v && k !== "fail_on_table_errors")
           .map(([k, v]) => `${k.replace(/_/g, " ")} ${v}`).join(" · ") || "every key at its default"}</span></summary>
@@ -517,8 +523,6 @@ export default function JobEdit() {
             </label>
           ))}
         </div>
-        <ClusterFields info={clusterInfo.data} error={clusterInfo.error} cluster={cluster} setCluster={setCluster} locked={locked} />
-        <Compute jobId={id} />
       </details>}
     </>
   );
@@ -540,24 +544,35 @@ function ClusterFields({ info, error, cluster, setCluster, locked }: { info?: Ro
   if (!info || !cluster) return <ErrorBox error={error} />;
   const d = info.defaults ?? {};
   const off = !!locked || !info.configured;
+  const types: Row[] = info.node_types ?? [];
+  // As the job cluster form's Driver type and Worker type: the workspace's node types with their memory and cores,
+  // the Databricks job's own first and marked as the default.
+  const typeSelect = (key: "driver_node_type_id" | "node_type_id") => {
+    const value = String(cluster[key] ?? "");
+    const label = (t: Row) => `${t.id}, ${t.memory_gb} GB memory, ${t.cores} cores${t.id === d[key] ? " (default)" : ""}`;
+    const ordered = [...types.filter((t) => t.id === d[key]), ...types.filter((t) => t.id !== d[key])];
+    return (
+      <select value={value} disabled={off} onChange={(e) => setCluster({ ...cluster, [key]: e.target.value })}>
+        {value && !types.some((t) => t.id === value) && <option value={value}>{value}</option>}
+        {ordered.map((t) => <option key={t.id} value={t.id}>{label(t)}</option>)}
+      </select>
+    );
+  };
   return (
     <div className="compute">
-      <h3>Ingestion cluster</h3>
-      <p className="muted">The job cluster each run of this job uses: the driver and worker types and the number of workers. The defaults
-        are the Databricks job's own ({d.driver_node_type_id} driver, {d.node_type_id} workers, {d.num_workers}), the shape our
-        100,000-table lab runs used. A change gives this job its own copy of the Databricks job, made a minute or so after Save.</p>
+      <h3>Job cluster</h3>
+      <p className="muted">The driver and worker types and the number of workers each run uses. The defaults are the Databricks
+        job's own: {d.driver_node_type_id} driver, {d.node_type_id} workers, {d.num_workers} {Number(d.num_workers) === 1 ? "worker" : "workers"}.
+        A change gives this job its own copy of the Databricks job, made a minute or so after Save.</p>
       <div className="form-grid">
-        <label>Driver type<input list="node-types" value={cluster.driver_node_type_id ?? ""} disabled={off}
-          onChange={(e) => setCluster({ ...cluster, driver_node_type_id: e.target.value })} /></label>
-        <label>Worker type<input list="node-types" value={cluster.node_type_id ?? ""} disabled={off}
-          onChange={(e) => setCluster({ ...cluster, node_type_id: e.target.value })} /></label>
+        <label>Driver type{typeSelect("driver_node_type_id")}</label>
+        <label>Worker type{typeSelect("node_type_id")}</label>
         <label>Workers<input type="number" min={0} max={info.max_workers} value={cluster.num_workers ?? ""} disabled={off}
           onChange={(e) => setCluster({ ...cluster, num_workers: e.target.value })} />
           <span className="help">0 to {info.max_workers}; 0 runs on the driver alone</span></label>
       </div>
-      <datalist id="node-types">{(info.node_types ?? []).map((n: string) => <option key={n} value={n} />)}</datalist>
       <div className="toolbar">
-        <button className="ghost" disabled={off} onClick={() => setCluster({ ...d })}>Use the defaults</button>
+        <button disabled={off} onClick={() => setCluster({ ...d })}>Use the defaults</button>
         <span className="muted">{info.applying ? <>Applying: the cluster copies job is making this job's copy (<a href={info.applying.url}
           target="_blank" rel="noreferrer">run {info.applying.run_id}</a>).</>
           : info.copy_job_id ? <>Runs its own copy of the Databricks job, <a href={info.copy_url} target="_blank" rel="noreferrer">job {info.copy_job_id}</a>.</>
@@ -570,13 +585,15 @@ function ClusterFields({ info, error, cluster, setCluster, locked }: { info?: Ro
 }
 
 // What the job's runs execute on, read live from the Jobs API.
+// The job cluster's own settings, shown once: in Job cluster above, not again in the bundle's table.
+const CLUSTER_FIELDS = ["Driver node type", "Worker node type", "Workers"];
+
 function Compute({ jobId }: { jobId: string }) {
   const compute = useQuery({ queryKey: ["job-compute", jobId], queryFn: () => api.get<Row>(`/ingestion-jobs/${jobId}/compute`) });
   return (
     <div className="compute">
-      <h3>Compute</h3>
-      <p className="muted">What this job's runs execute on, read from the Databricks jobs now. The ingestion cluster's types and
-        workers are set above; the rest comes from the bundle that deploys the jobs.</p>
+      <h3>Everything else its runs use</h3>
+      <p className="muted">Read from the Databricks jobs now, and set by the bundle that deploys them.</p>
       <ErrorBox error={compute.error} />
       {(compute.data?.jobs ?? []).map((job: Row) => (
         <Fragment key={job.role}>
@@ -585,7 +602,8 @@ function Compute({ jobId }: { jobId: string }) {
           <table className="data">
             <thead><tr><th>Task</th><th>Setting</th><th>Value</th><th>Set by</th></tr></thead>
             <tbody>
-              {job.compute.map((task: Row) => task.fields.map((f: Row, i: number) => (
+              {job.compute.map((task: Row) => task.fields.filter((f: Row) => !(job.role !== "check" && CLUSTER_FIELDS.includes(f.name)))
+                .map((f: Row, i: number) => (
                 <tr key={`${task.task}-${f.name}`}>
                   <td>{i === 0 ? <><b>{task.task}</b> <span className="muted">{task.kind}</span></> : ""}</td>
                   <td>{f.name}</td><td className="mono">{f.value}</td>

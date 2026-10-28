@@ -418,7 +418,10 @@ BIG = {"driver_node_type_id": "Standard_D32ds_v5", "node_type_id": "Standard_D16
 def _cluster_setup(monkeypatch):
     started = []
     monkeypatch.setattr(main.jobs, "CLUSTER_COPIES_JOB_ID", "700")
-    monkeypatch.setattr(main.jobs, "node_types", lambda: ["Standard_D16ds_v5", "Standard_D32ds_v5", "Standard_D8ds_v5"])
+    details = [{"id": n, "memory_gb": gb, "cores": cores} for n, gb, cores in
+               (("Standard_D16ds_v5", 64, 16), ("Standard_D32ds_v5", 128, 32), ("Standard_D8ds_v5", 32, 8))]
+    monkeypatch.setattr(main.jobs, "node_type_details", lambda: details)
+    monkeypatch.setattr(main.jobs, "node_types", lambda: [d["id"] for d in details])
     monkeypatch.setattr(main.jobs, "start_cluster_copies", lambda sid: started.append(sid) or 8000 + len(started))
     return started
 
@@ -490,6 +493,7 @@ def test_the_edit_view_follows_the_copies_run_and_syncs_the_wrappers_once_it_has
     assert body["applying"]["state"] == "RUNNING" and synced == []
     assert body["defaults"] == {"driver_node_type_id": "Standard_D16ds_v5", "node_type_id": "Standard_D8ds_v5",
                                 "num_workers": 1} and body["max_workers"] == 8
+    assert body["node_types"][0] == {"id": "Standard_D16ds_v5", "memory_gb": 64, "cores": 16}
     # The copies job records the copy, then its run ends: the next read syncs the wrappers to it.
     api.store.schedules[sid]["options"] = ('{"cluster": {"num_workers": 4}, "cluster_copy_run_id": 8001, '
                                            '"ingest_copy_job_id": 4242}')

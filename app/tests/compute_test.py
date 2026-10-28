@@ -64,5 +64,5 @@ def test_an_empty_setting_shows_as_the_cluster_default_rather_than_blank():
 
 def test_on_a_jobs_own_copy_the_types_and_workers_are_that_jobs_own():
     fields = _fields(compute.describe(INGEST, own_cluster=True)[0])
-    assert fields["Driver node type"]["source"] == "this job's own cluster (Ingestion cluster, above)"
+    assert fields["Driver node type"]["source"] == "this job's own cluster (Job cluster, above)"
     assert fields["Runtime"]["source"] == "resources/lakefed_ingest.yml"

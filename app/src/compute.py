@@ -8,7 +8,7 @@ from typing import List, Optional
 
 BUNDLE_FILE = "resources/lakefed_ingest.yml"
 OUTSIDE_BUNDLE = "the job's cluster, set outside the bundle variables"
-OWN_CLUSTER = "this job's own cluster (Ingestion cluster, above)"
+OWN_CLUSTER = "this job's own cluster (Job cluster, above)"
 
 
 def _field(name: str, value: str, source: str) -> dict:

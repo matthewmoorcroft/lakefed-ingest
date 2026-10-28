@@ -717,7 +717,7 @@ def ingestion_job_cluster(job_id: int, request: Request):
     except Exception as e:
         defaults, error = {}, error or f"can't read the ingestion job's cluster: {str(e).split('. ')[0]}"
     try:
-        node_types = jobs.node_types()
+        node_types = jobs.node_type_details()
     except Exception:
         node_types = []
     copy = sch.copy_job_id(s)

@@ -184,13 +184,21 @@ def start_cluster_copies(schedule_id) -> int:
 _node_types: dict = {}
 
 
-def node_types() -> List[str]:
-    """The workspace's node types a job cluster can use (not deprecated), read once an hour."""
+def node_type_details() -> List[dict]:
+    """The workspace's node types a job cluster can use (not deprecated), each with its memory and cores, as the job
+    cluster form lists them; read once an hour."""
     now = time.monotonic()
     if not _node_types or now - _node_types["at"] > 3600:
         found = workspace().clusters.list_node_types().node_types or []
-        _node_types.update(at=now, names=sorted(n.node_type_id for n in found if not getattr(n, "is_deprecated", False)))
-    return _node_types["names"]
+        _node_types.update(at=now, details=sorted(
+            ({"id": n.node_type_id, "memory_gb": round((n.memory_mb or 0) / 1024), "cores": int(n.num_cores or 0)}
+             for n in found if not getattr(n, "is_deprecated", False)), key=lambda d: d["id"]))
+    return _node_types["details"]
+
+
+def node_types() -> List[str]:
+    """The workspace's node type ids a job cluster can use."""
+    return [d["id"] for d in node_type_details()]
 
 
 def run_state(run_id) -> dict:
