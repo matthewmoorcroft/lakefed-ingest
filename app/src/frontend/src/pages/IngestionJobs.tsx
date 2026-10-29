@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useQuery } from "@tanstack/react-query";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { api, qs, type Row } from "../api";
 import { ErrorBox, OutLink, PageHead, RunStatus, Section, Stamp, StateKey, fmtInt, fmtShort, fmtTime, type Outcome } from "../components";
@@ -54,23 +54,18 @@ export default function IngestionJobs() {
   );
 }
 
-/** The latest deleted jobs and their delete job runs: going, done, or failed with why, and Run again for one whose
- * tables are still there. Shown only when there is one. */
+/** The latest deleted jobs whose Delete finished: history only. A job whose Delete is still pending, or failed, stays in
+ * the jobs list (with its Deleting or Delete failed state and Run again on its own page). Shown only when there is one. */
 function Deletions() {
-  const qc = useQueryClient();
   const page = useQuery({ queryKey: ["ingestion-job-deletions"], queryFn: () => api.get<Row>("/ingestion-jobs/deletions"),
-    refetchInterval: (q) => (((q.state.data as Row | undefined)?.deletions ?? []).some((d: Row) => deletionOutcome(d).tone === "run") ? 5_000 : 60_000) });
-  const again = useMutation({
-    mutationFn: (d: Row) => api.post<Row>(`/schedules/${encodeURIComponent(d.id)}/delete`, { drop_targets: !!d.drop_targets }),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["ingestion-job-deletions"] }),
-  });
+    refetchInterval: 60_000 });
   const rows: Row[] = page.data?.deletions ?? [];
   if (!rows.length && !page.error) return null;
   return (
-    <Section title="Deleted jobs" note="Delete starts the delete job, which deletes the job's tables and their state, and the target tables when ticked. Run history stays.">
-      <ErrorBox error={page.error ?? again.error} />
+    <Section title="Deleted jobs" note="History of finished deletes: the job's tables and their state are gone, and the target tables too when ticked. Run history stays.">
+      <ErrorBox error={page.error} />
       <div className="table-wrap"><table className="data">
-        <thead><tr><th>Ingestion job</th><th>Deleted</th><th>Target tables</th><th>Delete job</th><th className="num">Tables left</th><th /></tr></thead>
+        <thead><tr><th>Ingestion job</th><th>Deleted</th><th>Target tables</th><th>Delete job</th><th className="num">Tables left</th></tr></thead>
         <tbody>
           {rows.map((d) => {
             const outcome = deletionOutcome(d);
@@ -82,8 +77,6 @@ function Deletions() {
                 <td><OutLink href={d.run?.url}><RunStatus status={null} outcome={outcome} /></OutLink>
                   {outcome.note && outcome.tone === "bad" && <span className="sub">{outcome.note}</span>}</td>
                 <td className="num">{fmtInt(d.tables_left)}</td>
-                <td>{outcome.tone !== "run" && Number(d.tables_left) > 0 &&
-                  <button className="ghost" disabled={again.isPending} onClick={() => again.mutate(d)}>Run again</button>}</td>
               </tr>
             );
           })}
