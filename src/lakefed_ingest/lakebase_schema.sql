@@ -520,3 +520,26 @@ create unique index if not exists schedule_member_uq
     on lakefed_ingest.schedule_member (schedule_id, task_collection) where removed_at is null;
 create index if not exists schedule_member_collection_idx
     on lakefed_ingest.schedule_member (task_collection);
+
+-- A long write the operations app runs off the request: a large New ingestion job, Add tables or a databases file.
+-- The request records it and answers at once; a background thread in the app writes it in one transaction and moves
+-- done and heartbeat_at as it goes; the page reads it. A request sent again with the same request_id finds the same
+-- task, so a retry never writes twice. A task whose heartbeat stops (the app restarted) reads as failed, and its
+-- transaction was rolled back with it.
+create table if not exists lakefed_ingest.app_task (
+    id            bigserial   primary key,
+    kind          text        not null,                    -- create, tables or databases
+    request_id    text        not null,
+    job_id        bigint,                                  -- the ingestion job (schedule id), once known
+    status        text        not null default 'running',  -- running, succeeded or failed
+    done          int         not null default 0,          -- tables written so far
+    total         int         not null default 0,
+    result        jsonb,                                   -- what the request would have answered
+    error         text,
+    created_by    text,
+    created_at    timestamptz not null default now(),
+    heartbeat_at  timestamptz not null default now(),
+    finished_at   timestamptz
+);
+create unique index if not exists app_task_request_uq on lakefed_ingest.app_task (request_id);
+create index if not exists app_task_job_idx on lakefed_ingest.app_task (job_id, created_at);

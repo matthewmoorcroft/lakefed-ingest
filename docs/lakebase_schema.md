@@ -336,6 +336,21 @@ Written by the operations app (see "Schedules" in `app/README.md`); the ingestio
   cadence: the schedule's start time plus the member's stagger), `job_id` (the wrapper job the app created), `synced_at`, `sync_error`, and `removed_at`
   (soft remove; the next sync deletes the wrapper job).
 
+## `app_task`: the app's background writes
+
+Written by the operations app (schema version 9). A New ingestion job, Add tables or databases file of more than
+5,000 tables is written off the request, so the browser never waits on it: the request records a task and answers
+at once, and a thread in the app writes the tables in one transaction, 1,000 to a statement. Columns:
+- `kind` (`create`, `tables` or `databases`), `job_id` (the ingestion job, once known), `created_by`;
+- `request_id`: unique; the page sends one per Create or Add, so the same request sent again (a retry after a
+  timeout) finds the same task instead of writing twice;
+- `status` (`running`, `succeeded` or `failed`), `done` of `total` tables, `result` (what the request would have
+  answered), `error`;
+- `created_at`, `heartbeat_at` (moved after every statement), `finished_at`.
+
+A running task whose heartbeat stopped (the app restarted) reads as failed: its transaction was rolled back with
+the app, so nothing of it was written and it can be sent again.
+
 Telemetry tables grow with every run. To keep long-term history cheaply, snapshot them to Delta
 (see [monitoring.md](monitoring.md)) and prune old rows from Lakebase.
 

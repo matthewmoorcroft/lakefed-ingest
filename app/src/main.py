@@ -160,6 +160,47 @@ def _log(cur, user, action, control_id, collection, field=None, old=None, new=No
                                      as_text(new), reseed, batch))
 
 
+def _log_lines(cur, lines):
+    """Many change log lines, each the values _log takes after cur, written q.CONTROL_BATCH to a statement."""
+    as_text = lambda v: None if v is None else str(v)
+    lines = [(user or None, action, control_id, collection, field, as_text(old), as_text(new), reseed, batch)
+             for user, action, control_id, collection, field, old, new, reseed, batch in lines]
+    for at in range(0, len(lines), q.CONTROL_BATCH):
+        chunk = lines[at:at + q.CONTROL_BATCH]
+        cur.execute(q.log_changes_sql(len(chunk)), tuple(v for line in chunk for v in line))
+
+
+def _taken_target(row: dict) -> str:
+    return (f"another table already writes {row['sink_catalog']}.{row['sink_schema']}.{row['sink_table']}"
+            + (f" for {row['client_id']}" if row.get("client_id") else ""))
+
+
+def _insert_controls(cur, rows, user, batch, skip_taken=False, progress=None) -> List[tuple]:
+    """Insert new control rows q.CONTROL_BATCH to a statement, each with its "import" change log line, inside the
+    caller's transaction. A row whose target another table writes refuses the lot (409), or with skip_taken is left
+    out. Returns (row, id) for each row written; progress(n) is told how many rows are done after each statement."""
+    written = []
+    for at in range(0, len(rows), q.CONTROL_BATCH):
+        chunk = rows[at:at + q.CONTROL_BATCH]
+        params = [q.control_params(row) for row in chunk]
+        cur.execute(q.insert_controls_sql(len(chunk)), tuple(v for p in params for v in p))
+        ids = {tuple(found[1:]): found[0] for found in cur.fetchall()}
+        now = []
+        for row, p in zip(chunk, params):
+            control_id = ids.get(q.control_sink_key(p))
+            if control_id is not None:
+                now.append((row, control_id))
+            elif not skip_taken:
+                raise HTTPException(409, _taken_target(row))
+        if now:
+            _log_lines(cur, [(user, "import", control_id, row["task_collection"], None, None, None, None, batch)
+                             for row, control_id in now])
+        written += now
+        if progress:
+            progress(at + len(chunk))
+    return written
+
+
 def _touch(cur, user, jobs_changed=(), groups=()):
     """Record who last changed these ingestion jobs (or the jobs holding these groups, whose tables changed), and
     when: the job page and the Ingestion jobs list show it as Last updated."""
@@ -279,6 +320,118 @@ def _write():
     with db.transaction() as cur:
         yield cur
     _forget_shared_reads()
+
+
+# ---- background writes ---------------------------------------------------------------------------------------------
+# A write of more than BACKGROUND_ROWS tables (New's Create, Add tables, a databases file) takes longer than the Apps
+# proxy waits (a 100,000-table Create took 7 minutes one row at a time; batched it is under a minute, still too long to
+# hold a request on). The request checks what it can, records a task (app_task) and answers 202 at once; a thread
+# writes the tables in the one transaction the request would have, and the pages follow the task's progress.
+BACKGROUND_ROWS = int(os.environ.get("BACKGROUND_ROWS", "5000"))
+TASK_BEAT_S = float(os.environ.get("TASK_BEAT_S", "2"))
+# A running task's heartbeat older than this means its thread is gone: the app restarted while it wrote.
+TASK_STALE_S = int(os.environ.get("TASK_STALE_S", "120"))
+TASK_ROLLED_BACK = ("the app restarted while writing these tables; its transaction was rolled back with it, so none "
+                    "of them was written: send it again")
+TASK_UNSYNCED = ("the tables were written, but the app restarted before the job's Databricks jobs were synced: "
+                 "open the job and save it once to sync them")
+
+
+def _start_background(work) -> None:
+    """Run work on its own thread (tests run it inline instead)."""
+    threading.Thread(target=work, daemon=True, name="lakefed-app-task").start()
+
+
+def _error_text(e: BaseException) -> str:
+    """What a failed task says: an HTTPException's detail as the request would have answered it, its errors joined."""
+    if isinstance(e, HTTPException):
+        detail = e.detail
+        if isinstance(detail, dict) and detail.get("errors"):
+            return "; ".join(str(x) for x in detail["errors"][:20])[:4000]
+        return str(detail)[:4000]
+    return (str(e) or type(e).__name__)[:4000]
+
+
+def _task(task_id: int) -> dict:
+    """A task as GET /api/tasks/{id} shows it, a stale one first ended (TASK_STALE_S)."""
+    db.execute(q.stale_tasks_sql(), (TASK_ROLLED_BACK, TASK_UNSYNCED, TASK_STALE_S, int(task_id), None))
+    rows = db.query(q.task_sql(), (int(task_id),))
+    if not rows:
+        raise HTTPException(404, f"task {task_id} not found")
+    return rows[0]
+
+
+def _task_written(cur, task_id: Optional[int], result: dict, job_id=None, done=0) -> None:
+    """The write's last statement, in its transaction: the task's result commits with the tables, so a task whose
+    app restarted is known to have written them (a result) or not (none)."""
+    if task_id is not None:
+        cur.execute(q.task_written_sql(), (json.dumps(result, default=str), job_id, done, task_id))
+
+
+def _run_task(task_id: int, write, after) -> None:
+    """A task's thread: write(progress, task_id) in its transaction, then after(result) (syncing the Databricks jobs)
+    once it has committed. A beat thread records progress and the heartbeat every TASK_BEAT_S, also while one long
+    statement runs. A failed write ends the task failed with what the request would have answered; a failure after
+    the commit keeps it succeeded, with why in the result."""
+    state = {"done": 0}
+    stop = threading.Event()
+
+    def beat():
+        while not stop.wait(TASK_BEAT_S):
+            try:
+                db.execute(q.task_progress_sql(), (state["done"], task_id))
+            except Exception:
+                pass     # a missed beat is caught up by the next; TASK_STALE_S allows for many
+
+    def progress(n: int) -> None:
+        state["done"] = n
+
+    beating = threading.Thread(target=beat, daemon=True, name="lakefed-app-task-beat")
+    beating.start()
+    result, status, error = None, "failed", None
+    try:
+        result = write(progress, task_id)
+        status = "succeeded"
+        try:
+            result = after(result)
+        except Exception as e:
+            result = {**result, "after_error": _error_text(e)}
+    except BaseException as e:
+        error = _error_text(e)
+    finally:
+        stop.set()
+    db.execute(q.finish_task_sql(), (status, (result or {}).get("id"), json.dumps(result, default=str) if result else None,
+                                     error, task_id))
+
+
+def _in_background(kind: str, request_id: Optional[str], job_id: Optional[int], total: int, user: str, write, after):
+    """Record a task and start its thread, answering 202 with the task. The same request id again (a retry after a
+    timeout) answers with the task it made the first time and starts nothing, so a job is never written twice."""
+    made = db.query(q.insert_task_sql(), (kind, request_id or uuid.uuid4().hex, job_id, int(total), None, user or None))[0]
+    if made["made"]:
+        _start_background(lambda: _run_task(made["id"], write, after))
+    return JSONResponse(status_code=202, content={"task": _task(made["id"]), "created": False, "applied": False})
+
+
+def _write_now_or_later(kind, request_id, job_id, total, user, write, after):
+    """Write in the request when it is small (as before tasks, no task), else in the background (_in_background)."""
+    if total <= BACKGROUND_ROWS:
+        return after(write(None, None))
+    return _in_background(kind, request_id, job_id, total, user, write, after)
+
+
+@app.get("/api/tasks/{task_id}")
+def task(task_id: int):
+    """A background write: its status (running, succeeded, failed), done of total tables, its result (what the
+    request would have answered) or error."""
+    return _task(task_id)
+
+
+@app.get("/api/ingestion-jobs/{job_id}/tasks")
+def job_tasks(job_id: int):
+    """A job's background writes of the last day, newest first, so its page shows one still running."""
+    db.execute(q.stale_tasks_sql(), (TASK_ROLLED_BACK, TASK_UNSYNCED, TASK_STALE_S, None, int(job_id)))
+    return db.query(q.job_tasks_sql(), (int(job_id),))
 
 
 # Table states change at run cadence, so the one per-database scan they come from is shared for longer
@@ -1159,6 +1312,7 @@ class JobDatabasesRequest(BaseModel):
     groups_per_server: int = Field(1, ge=1, le=64)
     full_list: bool = False
     dry_run: bool = True
+    request_id: Optional[str] = Field(None, max_length=80)
 
 
 @app.post("/api/ingestion-jobs/{job_id}/databases")
@@ -1193,40 +1347,43 @@ def add_job_databases(job_id: int, body: JobDatabasesRequest, request: Request):
         return {"summary": summary}
     _refuse_job_tables(job, groups + plan["new_groups"], request)
     user, batch = _user(request), uuid.uuid4().hex[:12]
-    with _write() as cur:
-        groups = _lock_job(cur, job_id)
-        rows = db.fetch(cur, q.groups_control_rows_sql(for_update=True), (groups,)) if groups else []
-        plan, summary = planned(rows)
-        _lock_collections(cur, groups + plan["new_groups"])
-        inserted = 0
-        for row in plan["new"]:
-            cur.execute(q.insert_control_if_absent_sql(), q.control_params(row))
-            res = cur.fetchone()
-            if res:
-                inserted += 1
-                if not row["task_enabled"]:
-                    cur.execute(q.set_enabled_sql(), (False, [res[0]]))
-                _log(cur, user, "import", res[0], row["task_collection"], batch=batch)
-        for enabled, ids in ((True, plan["enable"]), (False, plan["disable"])):
-            if ids:
-                cur.execute(q.set_enabled_sql(), (enabled, ids))
-                for i in ids:
-                    _log(cur, user, "enable" if enabled else "disable", i, None, "task_enabled", not enabled, enabled,
-                         batch=batch)
-        _refuse_mixed_sinks(cur, plan["new"])
-        _refuse_split_databases(cur, plan["new"])
-        if plan["new_groups"]:
-            _, members = _load_schedule(job_id, cur)
-            active = [m for m in members if m["removed_at"] is None]
-            offs = sch.offsets([m["task_collection"] for m in active] + plan["new_groups"],
-                               int(job["cadence_minutes"]), bool(job.get("stagger")), sch.start_minute(job))
-            for g in plan["new_groups"]:
-                cur.execute(q.insert_member_sql(), (job_id, g, offs[g]))
-        _touch(cur, user, [job_id])
-        summary.update(applied=True, new_tables=inserted, skipped=len(plan["new"]) - inserted)
-    if plan["new_groups"]:
-        _sync(job_id, user)
-    return {"summary": summary}
+
+    def write(progress, task_id):
+        with _write() as cur:
+            groups = _lock_job(cur, job_id)
+            rows = db.fetch(cur, q.groups_control_rows_sql(for_update=True), (groups,)) if groups else []
+            plan, summary = planned(rows)
+            _lock_collections(cur, groups + plan["new_groups"])
+            written = _insert_controls(cur, plan["new"], user, batch, skip_taken=True, progress=progress)
+            off = [control_id for row, control_id in written if not row["task_enabled"]]
+            if off:
+                cur.execute(q.set_enabled_sql(), (False, off))
+            for enabled, ids in ((True, plan["enable"]), (False, plan["disable"])):
+                if ids:
+                    cur.execute(q.set_enabled_sql(), (enabled, ids))
+                    _log_lines(cur, [(user, "enable" if enabled else "disable", i, None, "task_enabled", not enabled,
+                                      enabled, None, batch) for i in ids])
+            _refuse_mixed_sinks(cur, plan["new"])
+            _refuse_split_databases(cur, plan["new"])
+            if plan["new_groups"]:
+                _, members = _load_schedule(job_id, cur)
+                active = [m for m in members if m["removed_at"] is None]
+                offs = sch.offsets([m["task_collection"] for m in active] + plan["new_groups"],
+                                   int(job["cadence_minutes"]), bool(job.get("stagger")), sch.start_minute(job))
+                for g in plan["new_groups"]:
+                    cur.execute(q.insert_member_sql(), (job_id, g, offs[g]))
+            _touch(cur, user, [job_id])
+            summary.update(applied=True, new_tables=len(written), skipped=len(plan["new"]) - len(written))
+            result = {"summary": summary}
+            _task_written(cur, task_id, result, job_id, len(plan["new"]))
+        return {**result, "new_groups": plan["new_groups"]}
+
+    def after(result):
+        if result.pop("new_groups"):
+            _sync(job_id, user)
+        return result
+
+    return _write_now_or_later("databases", body.request_id, job_id, len(plan["new"]), user, write, after)
 
 
 class JobTablesRequest(BaseModel):
@@ -1234,6 +1391,7 @@ class JobTablesRequest(BaseModel):
     load_type: str = "ct"
     groups_per_server: int = nj.DEFAULT_GROUPS_PER_SERVER
     dry_run: bool = True
+    request_id: Optional[str] = Field(None, max_length=80)
 
 
 @app.post("/api/ingestion-jobs/{job_id}/tables")
@@ -1257,34 +1415,38 @@ def add_job_tables(job_id: int, body: JobTablesRequest, request: Request):
         return {"summary": nj.summary(plan), "applied": False}
     _refuse_job_tables(job, groups + plan["groups"], request)
     user, batch = _user(request), uuid.uuid4().hex[:12]
-    with _write() as cur:
-        groups = _lock_job(cur, job_id)
-        plan = planned(db.fetch(cur, q.groups_control_rows_sql(for_update=True), (groups,)) if groups else [])
-        summary = nj.summary(plan)
-        if summary["invalid"]:
-            return {"summary": summary, "applied": False}
-        _lock_collections(cur, plan["groups"])
-        rows = [line["row"] for line in plan["lines"] if line["status"] == "valid"]
-        for row in rows:
-            cur.execute(q.insert_control_if_absent_sql(), q.control_params(row))
-            res = cur.fetchone()
-            if not res:
-                raise HTTPException(409, f"another table already writes {row['sink_catalog']}.{row['sink_schema']}."
-                                         f"{row['sink_table']}" + (f" for {row['client_id']}" if row.get("client_id") else ""))
-            _log(cur, user, "import", res[0], row["task_collection"], batch=batch)
-        _refuse_mixed_sinks(cur, rows)
-        _refuse_split_databases(cur, rows)
-        if plan["new_groups"]:
-            _, members = _load_schedule(job_id, cur)
-            active = [m for m in members if m["removed_at"] is None]
-            offs = sch.offsets([m["task_collection"] for m in active] + plan["new_groups"],
-                               int(job["cadence_minutes"]), bool(job.get("stagger")), sch.start_minute(job))
-            for g in plan["new_groups"]:
-                cur.execute(q.insert_member_sql(), (job_id, g, offs[g]))
-        _touch(cur, user, [job_id])
-    if plan["new_groups"]:
-        _sync(job_id, user)
-    return {"summary": summary, "applied": True}
+
+    def write(progress, task_id):
+        with _write() as cur:
+            groups = _lock_job(cur, job_id)
+            plan = planned(db.fetch(cur, q.groups_control_rows_sql(for_update=True), (groups,)) if groups else [])
+            summary = nj.summary(plan)
+            if summary["invalid"]:
+                return {"summary": summary, "applied": False, "new_groups": []}
+            _lock_collections(cur, plan["groups"])
+            rows = [line["row"] for line in plan["lines"] if line["status"] == "valid"]
+            _insert_controls(cur, rows, user, batch, progress=progress)
+            _refuse_mixed_sinks(cur, rows)
+            _refuse_split_databases(cur, rows)
+            if plan["new_groups"]:
+                _, members = _load_schedule(job_id, cur)
+                active = [m for m in members if m["removed_at"] is None]
+                offs = sch.offsets([m["task_collection"] for m in active] + plan["new_groups"],
+                                   int(job["cadence_minutes"]), bool(job.get("stagger")), sch.start_minute(job))
+                for g in plan["new_groups"]:
+                    cur.execute(q.insert_member_sql(), (job_id, g, offs[g]))
+            _touch(cur, user, [job_id])
+            result = {"summary": summary, "applied": True}
+            _task_written(cur, task_id, result, job_id, len(rows))
+        return {**result, "new_groups": plan["new_groups"]}
+
+    def after(result):
+        if result.pop("new_groups"):
+            _sync(job_id, user)
+        return result
+
+    valid = sum(line["status"] == "valid" for line in plan["lines"])
+    return _write_now_or_later("tables", body.request_id, job_id, valid, user, write, after)
 
 
 def _instant(value: str, name: str) -> datetime:
@@ -2221,6 +2383,8 @@ class NewJobRequest(BaseModel):
     groups_per_server: int = nj.DEFAULT_GROUPS_PER_SERVER
     run: NewJobRun = NewJobRun()
     dry_run: bool = True
+    # Made when the page opens the Create, so a retry of the same Create finds the task the first one made.
+    request_id: Optional[str] = Field(None, max_length=80)
 
 
 @app.post("/api/ingestion-jobs")
@@ -2258,35 +2422,39 @@ def create_ingestion_job(body: NewJobRequest, request: Request):
     timezone_ = sch.timezone_for(run.cadence_minutes, run.timezone)
     offs = sch.offsets(plan["groups"], run.cadence_minutes, run.stagger, sch.start_minute({"options": options, "cadence_minutes": run.cadence_minutes}))
     batch = uuid.uuid4().hex[:12]
-    try:
-        with _write() as cur:
-            _lock_collections(cur, plan["groups"])
-            cur.execute(q.insert_schedule_sql(), (name, run.cadence_minutes, timezone_, json.dumps(run.parameters),
-                                                  run.job_variant or "default", run.stagger, run.paused,
-                                                  run.notify_emails or None, json.dumps(options) if options else None,
-                                                  user or None))
-            sid = cur.fetchone()[0]
-            rows = [line["row"] for line in plan["lines"]]
-            for row in rows:
-                cur.execute(q.insert_control_if_absent_sql(), q.control_params(row))
-                res = cur.fetchone()
-                if not res:
-                    raise HTTPException(409, f"another table already writes {row['sink_catalog']}.{row['sink_schema']}."
-                                             f"{row['sink_table']}" + (f" for {row['client_id']}" if row.get("client_id") else ""))
-                _log(cur, user, "import", res[0], row["task_collection"], batch=batch)
-            _refuse_mixed_sinks(cur, rows)
-            _refuse_split_databases(cur, rows)
-            for group in plan["groups"]:
-                cur.execute(q.insert_member_sql(), (sid, group, offs[group]))
-                _log(cur, user, "schedule_create", None, group, "schedule", None,
-                     f"{name} ({sch.describe(run.cadence_minutes, offs[group], timezone_)})", batch=batch)
-            _touch(cur, user, [sid])
-    except psycopg.errors.UniqueViolation:
-        raise HTTPException(409, f"an ingestion job named '{name}' already exists")
-    synced = _sync(sid, user)
-    cluster = _apply_cluster(sid) if sch.own_cluster({"options": options}) else None
-    return {"id": sid, "summary": summary, "settings": plan["settings"], "created": True, "sync": synced,
-            "cluster_error": cluster}
+    rows = [line["row"] for line in plan["lines"]]
+
+    def write(progress, task_id):
+        try:
+            with _write() as cur:
+                _lock_collections(cur, plan["groups"])
+                cur.execute(q.insert_schedule_sql(), (name, run.cadence_minutes, timezone_, json.dumps(run.parameters),
+                                                      run.job_variant or "default", run.stagger, run.paused,
+                                                      run.notify_emails or None, json.dumps(options) if options else None,
+                                                      user or None))
+                sid = cur.fetchone()[0]
+                _insert_controls(cur, rows, user, batch, progress=progress)
+                _refuse_mixed_sinks(cur, rows)
+                _refuse_split_databases(cur, rows)
+                for group in plan["groups"]:
+                    cur.execute(q.insert_member_sql(), (sid, group, offs[group]))
+                _log_lines(cur, [(user, "schedule_create", None, group, "schedule", None,
+                                  f"{name} ({sch.describe(run.cadence_minutes, offs[group], timezone_)})", None, batch)
+                                 for group in plan["groups"]])
+                _touch(cur, user, [sid])
+                result = {"id": sid, "summary": summary, "settings": plan["settings"], "created": True}
+                _task_written(cur, task_id, result, sid, len(rows))
+        except psycopg.errors.UniqueViolation:
+            raise HTTPException(409, f"an ingestion job named '{name}' already exists")
+        return result
+
+    def after(result):
+        sid = result["id"]
+        synced = _sync(sid, user)
+        cluster = _apply_cluster(sid) if sch.own_cluster({"options": options}) else None
+        return {**result, "sync": synced, "cluster_error": cluster}
+
+    return _write_now_or_later("create", body.request_id, None, len(rows), user, write, after)
 
 
 @app.post("/api/schedules/{sid}")

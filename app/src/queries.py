@@ -1303,6 +1303,91 @@ def insert_control_if_absent_sql() -> str:
     return insert_control_sql().replace(" returning id", " on conflict do nothing returning id")
 
 
+# Control rows written by one statement: 25 columns each, so 1,000 rows is 25,000 parameters, well under Postgres'
+# 65,535. A large job's tables go in a few dozen statements instead of one round trip per table.
+CONTROL_BATCH = 1000
+
+
+def insert_controls_sql(n: int) -> str:
+    """insert_control_if_absent_sql for n rows in one statement: a row whose sink (or sink + client_id) is taken
+    is skipped. It returns each written row's id with its sink key (control_sink_key), so the caller can tell
+    which rows were skipped. Params: control_params of each row in turn, flattened."""
+    row = "(" + ", ".join(["%s"] * len(CONTROL_INSERT_COLUMNS)) + ")"
+    return (f"insert into {SCHEMA}.control ({', '.join(CONTROL_INSERT_COLUMNS)}) values {', '.join([row] * n)} "
+            f"on conflict do nothing returning id, lower(sink_catalog), lower(sink_schema), lower(sink_table), "
+            f"coalesce(client_id, '')")
+
+
+def control_sink_key(params: tuple) -> tuple:
+    """A row's sink key as the unique index control_sink_client_uq reads it, from its control_params."""
+    at = {c: params[CONTROL_INSERT_COLUMNS.index(c)] for c in ("sink_catalog", "sink_schema", "sink_table", "client_id")}
+    return (str(at["sink_catalog"] or "").lower(), str(at["sink_schema"] or "").lower(),
+            str(at["sink_table"] or "").lower(), at["client_id"] or "")
+
+
+def log_changes_sql(n: int) -> str:
+    """log_change_sql for n change log lines in one statement. Params: each line's 9 values in turn, flattened."""
+    one = "(" + ", ".join(["%s"] * 9) + ")"
+    return log_change_sql().split(" values ")[0] + " values " + ", ".join([one] * n)
+
+
+# ---- background writes (app_task) -----------------------------------------------------------------
+
+APP_TASK_FIELDS = ("id", "kind", "request_id", "job_id", "status", "done", "total", "result", "error", "created_by",
+                   "created_at", "heartbeat_at", "finished_at")
+
+
+def insert_task_sql() -> str:
+    """Record a background write, or find the one a request id already made (the same request sent again).
+    Params: kind, request_id, job_id, total, result (JSON text), created_by. Returns the task's id and whether this
+    call made it."""
+    return (f"insert into {SCHEMA}.app_task (kind, request_id, job_id, total, result, created_by) "
+            f"values (%s, %s, %s, %s, %s::jsonb, %s) on conflict (request_id) do update set request_id = excluded.request_id "
+            f"returning id, (xmax = 0) as made")
+
+
+def task_sql() -> str:
+    """One task. Param: id."""
+    return f"select {', '.join(APP_TASK_FIELDS)} from {SCHEMA}.app_task where id = %s"
+
+
+def job_tasks_sql() -> str:
+    """A job's tasks of the last day, newest first. Param: job_id."""
+    return (f"select {', '.join(APP_TASK_FIELDS)} from {SCHEMA}.app_task where job_id = %s "
+            f"and created_at > now() - interval '1 day' order by created_at desc limit 10")
+
+
+def task_progress_sql() -> str:
+    """A running task's progress and heartbeat. Params: done, id."""
+    return f"update {SCHEMA}.app_task set done = %s, heartbeat_at = now() where id = %s and status = 'running'"
+
+
+def finish_task_sql() -> str:
+    """A task's end. Params: status ('succeeded' or 'failed'), job_id (or null to keep it), result (JSON text, or null
+    to keep it), error, id. Only a running task is finished, so a late finish can't undo a stale one's verdict."""
+    return (f"update {SCHEMA}.app_task set status = %s, job_id = coalesce(%s, job_id), "
+            f"result = coalesce(%s::jsonb, result), error = %s, finished_at = now() "
+            f"where id = %s and status = 'running'")
+
+
+def task_written_sql() -> str:
+    """Inside the write's own transaction, its last statement: what it wrote, so the task's result commits with the
+    tables or not at all. Params: result (JSON text), job_id (or null to keep it), done, id."""
+    return (f"update {SCHEMA}.app_task set result = %s::jsonb, job_id = coalesce(%s, job_id), done = %s, "
+            f"heartbeat_at = now() where id = %s")
+
+
+def stale_tasks_sql() -> str:
+    """End the running tasks whose heartbeat stopped (the app restarted while writing): one with a result had
+    committed its tables and only missed what follows (failed_note is kept as its error), the rest were rolled back
+    with the app (failed, with rolled_back as the error). Params: rolled_back, failed_note, seconds, id (or null),
+    job_id (or null)."""
+    return (f"update {SCHEMA}.app_task set status = case when result is null then 'failed' else 'succeeded' end, "
+            f"error = case when result is null then %s else %s end, finished_at = now() "
+            f"where status = 'running' and heartbeat_at < now() - make_interval(secs => %s) "
+            f"and (id = %s or job_id = %s)")
+
+
 EDITABLE_REVIEW_FIELDS = ("include", "load_type", "primary_key", "cursor_column", "load_partitioned",
                           "partition_col", "partition_size_mb", "sink_catalog", "sink_schema", "sink_table",
                           "client_id", "freshness_sla_minutes")

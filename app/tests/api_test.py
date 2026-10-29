@@ -43,8 +43,23 @@ class FakeCursor:
         self.connection = type("C", (), {"rollback": lambda s: db.rolled_back.append(True)})()
 
     def execute(self, sql, params=()):
-        self.db.statements.append((sql, params))
+        self._execute(sql, params)
+
+    def _execute(self, sql, params, row_of_batch=False):
         self._rows, self.description = [], None
+        # A batched insert (several rows in one statement) is recorded as one statement per row, as it was written
+        # before batching, so the tests read each row's params alike.
+        width = (len(q.CONTROL_INSERT_COLUMNS) if sql.startswith("insert into lakefed_ingest.control (")
+                 else 9 if sql.startswith("insert into lakefed_ingest.control_change") else 0)
+        if width and len(params) > width:
+            self.db.batch_rows.clear()
+            for at in range(0, len(params), width):
+                self._execute(sql, params[at:at + width], row_of_batch=True)
+            self._rows = list(self.db.batch_rows)
+            return
+        if not row_of_batch:
+            self.db.batch_rows.clear()
+        self.db.statements.append((sql, params))
         if "for update" in sql:
             ids = params[0]
             rows = [CONTROL[i] for i in sorted(ids) if i in CONTROL]
@@ -62,7 +77,12 @@ class FakeCursor:
                 import psycopg
                 raise psycopg.errors.UniqueViolation("duplicate")
             table = params[q.CONTROL_INSERT_COLUMNS.index("src_table")]
-            self._rows = [] if table == "lines" else [(100 + len(self.db.statements),)]
+            control_id = 100 + len(self.db.statements)
+            if "returning id, lower(" in sql:     # q.insert_controls_sql: the id with the row's sink key
+                self._rows = [] if table == "lines" else [(control_id, *q.control_sink_key(params))]
+                self.db.batch_rows += self._rows
+            else:
+                self._rows = [] if table == "lines" else [(control_id,)]
         elif sql.startswith("update lakefed_ingest.control set") and self.db.unique_violation:
             import psycopg
             raise psycopg.errors.UniqueViolation("duplicate")
@@ -84,6 +104,7 @@ class FakeCursor:
 class FakeDB:
     def __init__(self):
         self.statements, self.rolled_back, self.running, self.unique_violation = [], [], set(), False
+        self.batch_rows = []        # what a batched insert's rows return, gathered row by row
         self.mixed = set()          # sinks the mixed-sink check reports
         self.split = set()          # databases (q.database_key) the one-collection check reports split
 

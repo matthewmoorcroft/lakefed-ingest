@@ -1,0 +1,282 @@
+"""Large writes: control rows batched q.CONTROL_BATCH to a statement, and a write of more than main.BACKGROUND_ROWS
+tables run as a background task (app_task) that the request answers 202 with at once. Fake database; the thread is
+run inline when a test asks for it."""
+import contextlib
+import time
+
+import pytest
+
+import queries as q
+
+pytest.importorskip("fastapi")
+pytest.importorskip("httpx")
+from fastapi.testclient import TestClient  # noqa: E402
+
+import main  # noqa: E402
+from api_test import FakeCursor, FakeDB  # noqa: E402
+from new_job_test import FAN_IN  # noqa: E402
+
+HEAD = "src_connection,src_database,src_schema,src_table,select_list,primary_key\n"
+
+
+def _csv(n: int, taken_at: int = -1) -> str:
+    """n tables over 10 databases; the one at taken_at is named lines, whose target the fake says is taken."""
+    return HEAD + "".join(f"sql_a,eng_{i % 10:03d},gen,{'lines' if i == taken_at else f't{i:05d}'},\"id, a\",id\n"
+                          for i in range(n))
+
+
+def _row(i: int) -> dict:
+    row = {c: None for c in q.CONTROL_INSERT_COLUMNS}
+    row.update(task_collection="g1", src_database="db", src_schema="dbo", src_table=f"t{i}", sink_catalog="main",
+               sink_schema="s", sink_table=f"t{i}", client_id=None)
+    return row
+
+
+# ---- the batched statements ----------------------------------------------------------------------------------------
+
+def test_a_batched_insert_takes_every_column_of_each_row_and_returns_each_rows_sink_key():
+    sql = q.insert_controls_sql(3)
+    assert sql.count("%s") == 3 * len(q.CONTROL_INSERT_COLUMNS) == 75
+    assert sql.endswith("on conflict do nothing returning id, lower(sink_catalog), lower(sink_schema), "
+                        "lower(sink_table), coalesce(client_id, '')")
+    # The most parameters one statement carries stays well under Postgres' 65,535.
+    assert q.CONTROL_BATCH * len(q.CONTROL_INSERT_COLUMNS) < 65_535
+    assert q.log_changes_sql(2).count("%s") == 18 and q.log_changes_sql(2).startswith(q.log_change_sql().split(" values ")[0])
+    params = q.control_params({**_row(1), "sink_catalog": "Main", "sink_table": "T1", "client_id": "c1"})
+    assert q.control_sink_key(params) == ("main", "s", "t1", "c1")
+
+
+def test_2500_rows_go_in_three_statements_with_their_change_log_lines_and_progress():
+    fake, done = FakeDB(), []
+    cur = FakeCursor(fake)
+    start = time.perf_counter()
+    written = main._insert_controls(cur, [_row(i) for i in range(2500)], "op@example.com", "b1", progress=done.append)
+    took = time.perf_counter() - start
+    inserts = [p for sql, p in fake.statements if sql.startswith("insert into lakefed_ingest.control (")]
+    assert len(written) == 2500 and len(inserts) == 2500 and done == [1000, 2000, 2500]
+    logs = fake.of("insert into lakefed_ingest.control_change")
+    assert len(logs) == 2500 and {p[1] for p in logs} == {"import"} and {p[8] for p in logs} == {"b1"}
+    assert [control_id for _, control_id in written] == [p[2] for p in logs]
+    print(f"planned and batched 2,500 rows in {took * 1000:.0f} ms")
+
+
+def test_a_taken_target_refuses_the_lot_or_is_skipped():
+    fake = FakeDB()
+    rows = [_row(1), {**_row(2), "src_table": "lines"}, _row(3)]
+    with pytest.raises(main.HTTPException) as refused:
+        main._insert_controls(FakeCursor(fake), rows, "op", "b")
+    assert refused.value.status_code == 409 and "another table already writes main.s.t2" in refused.value.detail
+    written = main._insert_controls(FakeCursor(FakeDB()), rows, "op", "b", skip_taken=True)
+    assert [row["src_table"] for row, _ in written] == ["t1", "t3"]
+
+
+# ---- the background task -------------------------------------------------------------------------------------------
+
+class Tasks:
+    """app_task, faked: what the endpoints record, read, beat and finish."""
+    def __init__(self):
+        self.rows, self.started, self.executed = {}, [], []
+
+    def query(self, sql, params=()):
+        if sql == q.collections_sql():
+            return [{"task_collection": "other"}]
+        if sql == q.insert_task_sql():
+            kind, request_id, job_id, total, result, user = params
+            for row in self.rows.values():
+                if row["request_id"] == request_id:
+                    return [{"id": row["id"], "made": False}]
+            task_id = len(self.rows) + 1
+            self.rows[task_id] = dict(id=task_id, kind=kind, request_id=request_id, job_id=job_id, status="running",
+                                      done=0, total=total, result=None, error=None, created_by=user)
+            return [{"id": task_id, "made": True}]
+        if sql == q.task_sql():
+            return [dict(self.rows[params[0]])] if params[0] in self.rows else []
+        return []
+
+    def execute(self, sql, params=()):
+        self.executed.append((sql, params))
+        if sql == q.finish_task_sql():
+            status, job_id, result, error, task_id = params
+            import json
+            row = self.rows[task_id]
+            if row["status"] == "running":
+                row.update(status=status, job_id=job_id or row["job_id"], error=error,
+                           result=json.loads(result) if result else row["result"])
+        elif sql == q.task_progress_sql():
+            self.rows[params[1]]["done"] = params[0]
+
+    def run(self):
+        for work in self.started:
+            work()
+        self.started.clear()
+
+
+@pytest.fixture
+def client(monkeypatch):
+    fake, tasks = FakeDB(), Tasks()
+
+    class Cursor(FakeCursor):
+        def execute(self, sql, params=()):
+            super().execute(sql, params)
+            if sql == q.insert_schedule_sql():
+                self._rows = [(7,)]
+
+    monkeypatch.setattr(main.db, "query", tasks.query)
+    monkeypatch.setattr(main.db, "execute", tasks.execute)
+    monkeypatch.setattr(main.db, "transaction", contextlib.contextmanager(lambda: (yield Cursor(fake))))
+    monkeypatch.setattr(main.jobs, "schedule_variants", lambda: {"default": "1", "check": "2"})
+    monkeypatch.setattr(main, "_start_background", tasks.started.append)
+    monkeypatch.setattr(main, "BACKGROUND_ROWS", 50)
+    monkeypatch.setattr(main, "TASK_BEAT_S", 3600)
+    synced = []
+    monkeypatch.setattr(main, "_sync", lambda sid, user: synced.append(sid) or [])
+    c = TestClient(main.app, headers={"X-Forwarded-Email": "op@example.com"})
+    c.db, c.tasks, c.synced = fake, tasks, synced
+    return c
+
+
+def _create(client, n, request_id="r1", **extra):
+    return client.post("/api/ingestion-jobs", json={"name": "Big job", "csv": _csv(n, **extra), "settings": FAN_IN,
+                                                    "dry_run": False, "request_id": request_id})
+
+
+def test_a_small_create_is_written_in_the_request_with_no_task(client):
+    r = _create(client, 20)
+    assert r.status_code == 200 and r.json()["created"] is True and r.json()["id"] == 7
+    assert client.tasks.rows == {} and client.synced == [7]
+
+
+def test_a_large_create_answers_202_with_its_task_then_writes_in_the_background(client):
+    r = _create(client, 120)
+    assert r.status_code == 202
+    task = r.json()["task"]
+    assert task["status"] == "running" and task["total"] == 120 and task["kind"] == "create" and task["created_by"] == "op@example.com"
+    assert client.db.statements == [] and client.synced == []      # nothing is written before the thread runs
+    client.tasks.run()
+    done = client.get(f"/api/tasks/{task['id']}").json()
+    assert done["status"] == "succeeded" and done["job_id"] == 7 and done["result"]["id"] == 7
+    assert done["result"]["created"] is True and done["result"]["summary"]["tables"] == 120
+    assert len(client.db.of("insert into lakefed_ingest.control (")) == 120 and client.synced == [7]
+    # The task's result is written in the job's own transaction, as its last statement, so they commit together.
+    written = [p for sql, p in client.db.statements if sql == q.task_written_sql()]
+    assert len(written) == 1 and written[0][1:] == (7, 120, task["id"])
+    assert client.db.statements[-1][0] == q.task_written_sql()
+
+
+def test_the_same_request_id_again_answers_with_the_same_task_and_writes_nothing_more(client):
+    first = _create(client, 120).json()["task"]
+    again = _create(client, 120)
+    assert again.status_code == 202 and again.json()["task"]["id"] == first["id"]
+    assert len(client.tasks.started) == 1        # only the first started a thread
+    client.tasks.run()
+    third = _create(client, 120).json()["task"]
+    assert third["id"] == first["id"] and third["status"] == "succeeded" and client.tasks.started == []
+    assert len(client.db.of("insert into lakefed_ingest.schedule (")) == 1
+
+
+def test_a_failed_write_ends_its_task_failed_with_what_the_request_would_have_said(client):
+    task = _create(client, 120, taken_at=60).json()["task"]
+    client.tasks.run()
+    failed = client.get(f"/api/tasks/{task['id']}").json()
+    assert failed["status"] == "failed" and "another table already writes" in failed["error"]
+    assert failed["result"] is None and client.synced == [] and client.db.rolled_back == []
+
+
+def test_a_sync_that_fails_after_the_commit_keeps_the_task_succeeded_and_says_why(client, monkeypatch):
+    monkeypatch.setattr(main, "_sync", lambda sid, user: (_ for _ in ()).throw(RuntimeError("jobs API down")))
+    task = _create(client, 120).json()["task"]
+    client.tasks.run()
+    done = client.get(f"/api/tasks/{task['id']}").json()
+    assert done["status"] == "succeeded" and done["result"]["after_error"] == "jobs API down"
+
+
+def test_progress_is_recorded_by_the_beat_while_the_write_runs(monkeypatch):
+    beats, gate = [], []
+    monkeypatch.setattr(main, "TASK_BEAT_S", 0.01)
+    monkeypatch.setattr(main.db, "execute", lambda sql, params=(): beats.append((sql, params)))
+
+    def write(progress, task_id):
+        progress(1000)
+        deadline = time.time() + 2
+        while not any(sql == q.task_progress_sql() and p == (1000, 5) for sql, p in beats) and time.time() < deadline:
+            time.sleep(0.01)
+        progress(2000)
+        gate.append(task_id)
+        return {"summary": {}}
+
+    main._run_task(5, write, lambda result: result)
+    assert gate == [5] and (q.task_progress_sql(), (1000, 5)) in beats
+    assert beats[-1][0] == q.finish_task_sql() and beats[-1][1][0] == "succeeded"
+
+
+def test_reading_a_task_first_ends_it_when_its_heartbeat_stopped(client):
+    task = _create(client, 120).json()["task"]
+    client.tasks.executed.clear()
+    client.get(f"/api/tasks/{task['id']}")
+    stale = [p for sql, p in client.tasks.executed if sql == q.stale_tasks_sql()]
+    assert stale == [(main.TASK_ROLLED_BACK, main.TASK_UNSYNCED, main.TASK_STALE_S, task["id"], None)]
+    assert client.get("/api/tasks/999").status_code == 404
+
+
+def test_the_stale_rule_tells_a_rolled_back_write_from_one_that_committed():
+    sql = q.stale_tasks_sql()
+    assert "status = 'running' and heartbeat_at < now() - make_interval(secs => %s)" in sql
+    assert "case when result is null then 'failed' else 'succeeded' end" in sql
+    # A late finish can't undo a stale task's verdict, nor a stale read undo a finish.
+    assert q.finish_task_sql().endswith("where id = %s and status = 'running'")
+    assert q.insert_task_sql().count("%s") == 6 and "on conflict (request_id)" in q.insert_task_sql()
+
+
+# ---- Add tables and the databases file -----------------------------------------------------------------------------
+
+@pytest.fixture
+def job_client(monkeypatch):
+    from new_job_test import _job_rows
+    rows, tasks = _job_rows(), Tasks()
+    schedule = dict(id=7, name="Engagement extraction", cadence_minutes=60, timezone="UTC", stagger=True, paused=True,
+                    options=None, job_variant="default", parameters={}, notify_emails=None)
+    members = [dict(id=i, schedule_id=7, task_collection=g, offset_minutes=0, job_id=None, removed_at=None,
+                    delete_pending=False) for i, g in enumerate(sorted({r["task_collection"] for r in rows}))]
+
+    def answer(sql, params=()):
+        if sql == q.schedule_sql():
+            return [dict(schedule)]
+        if sql == q.schedule_members_sql():
+            return [dict(m) for m in members]
+        if sql.startswith(q.groups_control_rows_sql().split(" for update")[0][:60]):
+            return [dict(r) for r in rows]
+        if sql == q.collections_sql():
+            return [{"task_collection": m["task_collection"]} for m in members]
+        return tasks.query(sql, params)
+
+    fake = FakeDB()
+    monkeypatch.setattr(main.db, "query", answer)
+    monkeypatch.setattr(main.db, "execute", tasks.execute)
+    monkeypatch.setattr(main.db, "fetch", lambda cur, sql, params=(): answer(sql, params))
+    monkeypatch.setattr(main.db, "transaction", contextlib.contextmanager(lambda: (yield FakeCursor(fake))))
+    monkeypatch.setattr(main, "_refuse_job", lambda job, request, action: None)
+    monkeypatch.setattr(main, "_start_background", tasks.started.append)
+    monkeypatch.setattr(main, "BACKGROUND_ROWS", 50)
+    monkeypatch.setattr(main, "TASK_BEAT_S", 3600)
+    synced = []
+    monkeypatch.setattr(main, "_sync", lambda sid, user: synced.append(sid) or [])
+    c = TestClient(main.app, headers={"X-Forwarded-Email": "op@example.com"})
+    c.db, c.tasks, c.synced = fake, tasks, synced
+    return c
+
+
+def test_adding_many_tables_runs_as_a_task_of_the_job(job_client):
+    text = HEAD + "".join(f"sql_b,ops_{i % 5:02d},gen,t{i:04d},\"id, a\",id\n" for i in range(80))
+    r = job_client.post("/api/ingestion-jobs/7/tables", json={"csv": text, "dry_run": False, "request_id": "add-1"})
+    assert r.status_code == 202 and r.json()["task"]["job_id"] == 7 and r.json()["task"]["kind"] == "tables"
+    job_client.tasks.run()
+    done = job_client.get(f"/api/tasks/{r.json()['task']['id']}").json()
+    assert done["status"] == "succeeded" and done["result"]["applied"] is True and done["result"]["summary"]["tables"] == 80
+    assert len(job_client.db.of("insert into lakefed_ingest.control (")) == 80 and job_client.synced == [7]
+
+
+def test_the_job_page_reads_its_tasks_after_ending_stale_ones(job_client):
+    job_client.tasks.executed.clear()
+    assert job_client.get("/api/ingestion-jobs/7/tasks").status_code == 200
+    assert [p for sql, p in job_client.tasks.executed if sql == q.stale_tasks_sql()] == [
+        (main.TASK_ROLLED_BACK, main.TASK_UNSYNCED, main.TASK_STALE_S, None, 7)]
