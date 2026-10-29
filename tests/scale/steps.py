@@ -1,6 +1,6 @@
 """The scale steps. Each one runs the code the app or the discover job runs, against the fakes in simulation.py and
-lakebase_fake.py, and reports what it sent (calls, rows, statements) and how long the Python took. Server times come from
-the ledger (see simulation.py): they are simulated from the latency given, not measured.
+lakebase_fake.py, and reports what it sent (calls, rows, statements) and how long the Python took.
+Server times come from the ledger (see simulation.py): they are simulated from the latency given, not measured.
 """
 from __future__ import annotations
 
@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional
 
 import paths  # noqa: F401  (sys.path)
+import lakebase_fake
 import server_catalog
 import simulation as sim
 
@@ -19,6 +20,7 @@ NOTEBOOK_WORKERS = 8
 DESIGN_WORKERS = 32
 
 FoundCallback = Callable[[str, List[dict]], None]
+RefusalCallback = Callable[[str, str], None]
 
 
 @dataclass
@@ -48,11 +50,12 @@ class DiscoveryRun:
 
 
 def discover(catalog: server_catalog.ServerCatalog, pattern: str = "", via_azure: bool = False,
-             limit: Optional[int] = None, on_found: Optional[FoundCallback] = None) -> DiscoveryRun:
+             limit: Optional[int] = None, on_found: Optional[FoundCallback] = None,
+             on_refused: Optional[RefusalCallback] = None) -> DiscoveryRun:
     """Run the discover job's reads over ``catalog``: list its databases (through master, or through Azure's list), then
     discover each one in listing order, as discover_tables.ipynb does. ``on_found(database, rows)`` gets each database's
-    rows as they are read, so a whole server is never held in memory. ``limit`` takes the first databases of the
-    listing (for the small runs)."""
+    rows as they are read, so a whole server is never held in memory; ``on_refused(database, message)`` gets each
+    database the server refuses. ``limit`` takes the first databases of the listing (for the small runs)."""
     server = sim.SimulatedServer(catalog)
     spec = sim.connection_spec(pattern=pattern)
     started = time.perf_counter()
@@ -67,8 +70,10 @@ def discover(catalog: server_catalog.ServerCatalog, pattern: str = "", via_azure
             waits_before = server.ledger[name].waits_s if name in server.ledger else 0.0
             try:
                 found = sim.discover_one(server, spec, name)
-            except RuntimeError:
+            except RuntimeError as error:
                 refused.append(name)
+                if on_refused is not None:
+                    on_refused(name, str(error))
                 continue
             if server.ledger[name].waits_s > waits_before:
                 retried.append(name)
@@ -80,3 +85,64 @@ def discover(catalog: server_catalog.ServerCatalog, pattern: str = "", via_azure
                         ledger=server.ledger, calls_by_kind=server.calls_by_kind, rows_by_kind=server.rows_by_kind,
                         retry_waits_s=sum(server.waits_by_kind.values()), cpu_s=time.perf_counter() - started,
                         azure=via_azure, order=list(listed))
+
+
+# The columns discover_tables.ipynb writes to lakefed_ingest.discovered_table, in its order;
+# scale_test.py checks that the two lists agree.
+TABLE_COLS = ["discovery_id", "src_database", "src_schema", "src_table", "row_count", "size_mb", "ct_enabled",
+              "primary_key", "select_list", "excluded_columns", "rowversion_column", "identity_column",
+              "load_type", "cursor_column", "partition_candidate", "notes"]
+DISCOVERY_ID = "scale-discovery"
+START_SQL = ("insert into lakefed_ingest.discovery (discovery_id, src_type, src_connection, src_host, src_port, "
+             "src_database, secret_key, requested_by, status, finished_at) values (%s, %s, %s, %s, %s, %s, %s, %s, %s, "
+             "case when %s = 'running' then null else now() end) on conflict (discovery_id, src_database) "
+             "do update set status = excluded.status, error = null, started_at = now(), "
+             "finished_at = excluded.finished_at")
+FINISH_SQL = ("update lakefed_ingest.discovery set status = %s, tables = %s, error = %s, finished_at = now() "
+              "where discovery_id = %s and src_database = %s")
+DELETE_SQL = "delete from lakefed_ingest.discovered_table where discovery_id = %s and src_database = %s"
+INSERT_SQL = (f"insert into lakefed_ingest.discovered_table ({', '.join(TABLE_COLS)}) "
+              f"values ({', '.join(['%s'] * len(TABLE_COLS))})")
+
+
+class DiscoveryWriter:
+    """The Lakebase writes discover_tables.ipynb makes for each database: start it, replace its tables, finish it. The
+    notebook starts a database before it reads it; the writer makes the same statements after each database is read,
+    and the counts come out the same."""
+
+    def __init__(self, connection: lakebase_fake.RecordingConnection, discovery_id: str = DISCOVERY_ID,
+                 spec: Optional[dict] = None):
+        self.connection = connection
+        self.discovery_id = discovery_id
+        self.spec = spec or sim.connection_spec()
+
+    def start(self, database: str, status: str = "running") -> None:
+        with self.connection.cursor() as cursor:
+            cursor.execute(START_SQL, (self.discovery_id, self.spec["src_type"], self.spec["src_connection"],
+                                       None, None, database, None, None, status, status))
+
+    def finish(self, database: str, status: str, tables: Optional[int] = None, error: Optional[str] = None) -> None:
+        with self.connection.cursor() as cursor:
+            cursor.execute(FINISH_SQL, (status, tables, error, self.discovery_id, database))
+
+    def found(self, database: str, found_rows: List[dict]) -> None:
+        self.start(database)
+        rows = [tuple({**t, "discovery_id": self.discovery_id, "src_database": database}.get(c) for c in TABLE_COLS)
+                for t in found_rows]
+        with self.connection.cursor() as cursor:
+            cursor.execute(DELETE_SQL, (self.discovery_id, database))
+            cursor.executemany(INSERT_SQL, rows)
+        self.finish(database, "ok", tables=len(rows))
+
+    def refused(self, database: str, message: str) -> None:
+        self.start(database)
+        self.finish(database, "failed", error=message[:2000])
+
+
+def discover_writes(catalog: server_catalog.ServerCatalog, pattern: str = "", limit: Optional[int] = None):
+    """The discover job over ``catalog`` with its Lakebase writes recorded: the same run as discover(), and the
+    connection that holds what it wrote (statements and rows, by kind)."""
+    connection = lakebase_fake.RecordingConnection()
+    writer = DiscoveryWriter(connection)
+    run = discover(catalog, pattern=pattern, limit=limit, on_found=writer.found, on_refused=writer.refused)
+    return run, connection

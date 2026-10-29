@@ -1,6 +1,6 @@
 """Puts the directories the scale harness needs on sys.path: the discovery and ingestion modules (src/lakefed_ingest),
-the synthetic server (tests/synthetic) and the operations app's modules (app/src). Every module in this directory imports
-it first."""
+the synthetic server (tests/synthetic) and the operations app's modules (app/src). Every module in this directory
+imports it first."""
 import sys
 from pathlib import Path
 

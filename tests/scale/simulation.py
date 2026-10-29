@@ -5,8 +5,8 @@ discovery.py reads a source through ct_engine: ``_spark()`` and ``_read(spark, r
 listing through master, the three catalog queries of each database, and the Azure Resource Manager list, from a
 synthetic server (tests/synthetic/server_catalog.py). Nothing sleeps and nothing connects: each call is booked to the
 database it reads (or to master), as a count of calls and rows, and the waits discovery takes between retries are booked
-the same way. Latency is applied afterwards, so one run gives the wall time for any per-call latency: ``Latency`` turns a
-database's ledger into seconds, and ``pool_makespan`` lays the databases out on a pool of workers in the order a
+the same way. Latency is applied afterwards, so one run gives the wall time for any per-call latency: ``Latency`` turns
+a database's ledger into seconds, and ``pool_makespan`` lays the databases out on a pool of workers in the order a
 ThreadPoolExecutor takes them, which is how the discover job runs them.
 """
 from __future__ import annotations
@@ -51,7 +51,7 @@ class Latency:
 
 @dataclass
 class Ledger:
-    """What one database (or master) cost the server: calls, rows sent back, and the waits discovery took before a retry."""
+    """What one database (or master) cost the server: calls, rows sent back, and waits taken before a retry."""
     calls: int = 0
     rows: int = 0
     waits_s: float = 0.0
