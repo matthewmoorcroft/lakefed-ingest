@@ -3380,7 +3380,7 @@ def _create_by_database(body: NewJobRequest, request: Request, selection: Select
     run.stagger = run.stagger and run.job_variant != sch.CHECK_VARIANT
     user = _user(request)
     settings = nj.settings_of(body.settings)
-    errors = nj.given_errors(body.settings) + nj.setting_errors(settings)
+    errors = nj.given_errors(body.settings) + nj.setting_errors(settings, require_target=not body.dry_run)
     if not name:
         errors.insert(0, "name the job")
     servers = db.query(q.selected_servers_sql(kind), (param, *rest))
@@ -3396,7 +3396,7 @@ def _create_by_database(body: NewJobRequest, request: Request, selection: Select
         raise HTTPException(422, {"errors": errors})
     summary = by_database.summary_of(name, servers, settings["load_type"])
     if body.dry_run:
-        return {"summary": summary, "settings": settings, "created": False}
+        return {"summary": summary, "settings": settings, "created": False, "target_missing": _target_missing(settings)}
     if not run.paused:     # anyone may set up a job, but one that runs needs the right to run what it starts
         _refuse(_permission_refusals({"job_variant": run.job_variant}, user)["run"])
     options = {k: v for k, v in (run.options or {}).items() if k not in MANAGED_OPTIONS}
@@ -3618,6 +3618,11 @@ def create_ingestion_job(body: NewJobRequest, request: Request):
     return _create_job(body, request)
 
 
+def _target_missing(settings: dict) -> List[str]:
+    """The target fields a preview's settings leave blank, by name, for the page to say what Create needs."""
+    return [label for key, label in js.TARGET_SETTINGS if not str(settings.get(key) or "").strip()]
+
+
 def _create_job(body: NewJobRequest, request: Request, inline: bool = False, progress=None, task_id=None):
     """The Create itself. A file with database-only lines is first discovered by name in a background task
     (_create_after_discovery), which runs this again with inline=True, so the write happens in that task."""
@@ -3640,7 +3645,8 @@ def _create_job(body: NewJobRequest, request: Request, inline: bool = False, pro
         return {"discovering": True, "summary": None, "settings": {}, "created": False, "databases": selected["databases"]}
 
     def planned():
-        plan = _file_lines(nj.plan(name, text, body.settings, body.groups_per_server, taken), selected)
+        plan = _file_lines(nj.plan(name, text, body.settings, body.groups_per_server, taken,
+                                   require_target=not body.dry_run), selected)
         errors = list(plan["errors"])
         if not errors and plan["groups"]:
             schedule = {**run.model_dump(), "name": name, "members": plan["groups"],
@@ -3653,7 +3659,8 @@ def _create_job(body: NewJobRequest, request: Request, inline: bool = False, pro
     plan = planned()
     summary = nj.summary(plan)
     if body.dry_run or summary["invalid"]:
-        return {"summary": summary, "settings": plan["settings"], "created": False}
+        return {"summary": summary, "settings": plan["settings"], "created": False,
+                "target_missing": _target_missing(plan["settings"])}
     if not run.paused:     # anyone may set up a job, but one that runs needs the right to run what it starts
         _refuse(_permission_refusals({"job_variant": run.job_variant}, user)["run"])
     options = create_options

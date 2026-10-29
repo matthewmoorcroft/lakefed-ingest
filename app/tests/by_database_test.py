@@ -703,3 +703,29 @@ def _job_for_a_big_add(client, monkeypatch) -> set:
 def _add(client, request_id: str):
     return client.post("/api/ingestion-jobs/7/tables", json={"source": {"upload_id": "u1", "whole_server": True},
                                                              "dry_run": False, "request_id": request_id})
+
+
+def test_a_preview_with_no_target_still_shows_the_selection_and_names_what_create_needs(big):
+    settings = {**FAN_IN, "sink_catalog": "", "sink_schema": ""}
+    answer = big.post("/api/ingestion-jobs", json={"name": "Big job", "settings": settings, "dry_run": True,
+                                                   "source": {"upload_id": "u1", "whole_server": True}})
+    assert answer.status_code == 200
+    body = answer.json()
+    assert body["summary"]["tables"] == 150 and body["summary"]["servers"]
+    assert body["target_missing"] == ["target catalog", "target schema"]
+
+
+def test_create_with_no_target_is_refused_naming_the_missing_fields(big):
+    settings = {**FAN_IN, "sink_catalog": "", "sink_schema": ""}
+    answer = big.post("/api/ingestion-jobs", json={"name": "Big job", "settings": settings, "dry_run": False,
+                                                   "request_id": "no-target",
+                                                   "source": {"upload_id": "u1", "whole_server": True}})
+    assert answer.status_code == 422
+    assert answer.json()["detail"]["errors"] == ["set the target catalog", "set the target schema"]
+    assert big.store.controls == [] and big.store.schedules == []
+
+
+def test_a_preview_with_its_target_set_names_nothing_missing(big):
+    answer = big.post("/api/ingestion-jobs", json={"name": "Big job", "settings": FAN_IN, "dry_run": True,
+                                                   "source": {"upload_id": "u1", "whole_server": True}})
+    assert answer.status_code == 200 and answer.json()["target_missing"] == []

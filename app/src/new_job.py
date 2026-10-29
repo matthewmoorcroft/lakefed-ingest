@@ -64,13 +64,19 @@ def group_names(job_name: str, server: str, groups_per_server: int) -> List[str]
     return [f"{q.identifier(job_name)}_{q.identifier(server)}_c{number:02d}" for number in range(1, groups_per_server + 1)]
 
 
-def setting_errors(settings: dict) -> List[str]:
+def target_errors(settings: dict) -> List[str]:
+    """The target fields left blank: needed to create the job, never to preview what it would take."""
+    return [f"set the {label}" for key, label in js.TARGET_SETTINGS if not str(settings[key] or "").strip()]
+
+
+def setting_errors(settings: dict, require_target: bool = True) -> List[str]:
+    """What is wrong with the job's settings. A preview passes require_target False: a blank target is a check on
+    Create, so the preview still shows what the selection takes."""
     errors = []
     if settings["load_type"] not in LOAD_TYPES:
         errors.append(f"load type must be one of {', '.join(LOAD_TYPES)}")
-    for key, label in js.TARGET_SETTINGS:
-        if not str(settings[key] or "").strip():
-            errors.append(f"set the {label}")
+    if require_target:
+        errors += target_errors(settings)
     return errors + js.check_templates(settings, bool(settings["fan_in"]))
 
 
@@ -96,7 +102,7 @@ def _line_load_types(text: str):
 
 def plan(job_name: str, text: str, given: dict, groups_per_server: int = DEFAULT_GROUPS_PER_SERVER,
          taken_groups: Optional[set] = None, group_of: Optional[Callable[[str, str], str]] = None,
-         have: Optional[set] = None) -> dict:
+         have: Optional[set] = None, require_target: bool = True) -> dict:
     """What creating the job writes: {"errors": problems with the file or the settings (nothing is written while there
     are any), "lines": one per CSV line with its control row, status (valid, invalid, or in_job for a table the job
     already has) and errors, "groups": the groups its lines go to, "settings": the job's settings}. taken_groups are
@@ -104,7 +110,8 @@ def plan(job_name: str, text: str, given: dict, groups_per_server: int = DEFAULT
     groups); have holds the (target, client_id) pairs a job already writes."""
     settings = settings_of(given)
     group_of = group_of or (lambda server, database: group_name(job_name, server, database, groups_per_server))
-    out = {"errors": given_errors(given) + setting_errors(settings), "lines": [], "groups": [], "settings": settings}
+    out = {"errors": given_errors(given) + setting_errors(settings, require_target), "lines": [], "groups": [],
+           "settings": settings}
     if not str(job_name or "").strip():
         out["errors"].insert(0, "name the job")
     if group_of is None and not 1 <= int(groups_per_server or 0) <= MAX_GROUPS_PER_SERVER:

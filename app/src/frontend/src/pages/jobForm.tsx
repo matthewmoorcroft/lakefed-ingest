@@ -18,6 +18,11 @@ export function Mixed({ s }: { s?: Row }) {
 }
 
 /** How it writes: fan-in, the write modes, the freshness target and the target names. */
+/** Beside a blank target field on a new job: Create waits on it (the preview of the tables doesn't). */
+function Needed({ shown }: { shown: boolean }) {
+  return shown ? <span className="help needed">Needed to create the job</span> : null;
+}
+
 export function WritesFields({ w, setW, stored, modeNote, targetsNote }: { w: Row; setW: (w: Row) => void; stored?: Row;
                               modeNote?: ReactNode; targetsNote?: ReactNode }) {
   return (
@@ -39,10 +44,13 @@ export function WritesFields({ w, setW, stored, modeNote, targetsNote }: { w: Ro
       </div>
       {modeNote}
       <div className="form-grid">
-        <label>Target catalog<input value={w.sink_catalog ?? ""} placeholder="catalog" onChange={(e) => setW({ ...w, sink_catalog: e.target.value })} /><Mixed s={stored?.sink_catalog} /></label>
+        <label>Target catalog<input value={w.sink_catalog ?? ""} placeholder="catalog" onChange={(e) => setW({ ...w, sink_catalog: e.target.value })} /><Mixed s={stored?.sink_catalog} />
+          <Needed shown={!stored && !String(w.sink_catalog ?? "").trim()} /></label>
         <label>Target schema<input value={w.sink_schema ?? ""} placeholder="schema" onChange={(e) => setW({ ...w, sink_schema: e.target.value })} /><Mixed s={stored?.sink_schema} />
+          <Needed shown={!stored && !String(w.sink_schema ?? "").trim()} />
           <span className="help">A new schema is made by the first run, owned by the identity the runs use, which needs CREATE SCHEMA on the catalog.</span></label>
-        <label>Target table<input value={w.sink_table ?? ""} onChange={(e) => setW({ ...w, sink_table: e.target.value })} /><Mixed s={stored?.sink_table} /></label>
+        <label>Target table<input value={w.sink_table ?? ""} onChange={(e) => setW({ ...w, sink_table: e.target.value })} /><Mixed s={stored?.sink_table} />
+          <Needed shown={!stored && !String(w.sink_table ?? "").trim()} /></label>
         <label className="checkbox"><input type="checkbox" checked={!!w.lowercase} onChange={(e) => setW({ ...w, lowercase: e.target.checked })} /> Lower-case names</label>
       </div>
       <p className="help"><span className="info" aria-hidden>ⓘ</span> Valid tags: <span className="mono">{TAGS}</span>, with any text between them.

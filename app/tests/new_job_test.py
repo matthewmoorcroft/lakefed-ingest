@@ -313,8 +313,11 @@ def test_a_target_another_table_writes_refuses_the_whole_job(client):
 
 
 def test_settings_or_a_schedule_it_cannot_take_are_422(client):
-    r = _create(client, settings={**FAN_IN, "sink_catalog": ""})
+    r = _create(client, dry_run=False, settings={**FAN_IN, "sink_catalog": ""})
     assert r.status_code == 422 and "set the target catalog" in r.json()["detail"]["errors"]
+    # A preview isn't refused for a blank target: it shows the tables and names what Create needs.
+    r = _create(client, settings={**FAN_IN, "sink_catalog": ""})
+    assert r.status_code == 200 and r.json()["target_missing"] == ["target catalog"] and r.json()["summary"]["tables"]
     r = _create(client, run={"cadence_minutes": 7})
     assert r.status_code == 422 and any("cadence" in e for e in r.json()["detail"]["errors"])
 
@@ -424,3 +427,13 @@ def test_a_line_may_give_its_own_load_type_as_discovery_recommends_it():
         ("cursor", "merge"), ("full", "append"), ("ct", "merge")]
     assert lines[0]["row"]["cursor_column"] == "rv" and lines[3]["status"] == "invalid"
     assert "load_type must be one of" in " ".join(lines[3]["errors"])
+
+
+def test_the_target_is_needed_to_create_but_not_to_preview_the_lines():
+    text = HEAD + "sql_a,db1,dbo,t1,\"id, a\",id\n"
+    no_target = {**PLAIN, "sink_catalog": "", "sink_schema": ""}
+    assert nj.target_errors(nj.settings_of(no_target)) == ["set the target catalog", "set the target schema"]
+    assert "set the target catalog" in nj.plan("Job", text, no_target)["errors"]
+    previewed = nj.plan("Job", text, no_target, require_target=False)
+    assert previewed["errors"] == [] and len(previewed["lines"]) == 1
+    assert nj.setting_errors(nj.settings_of(no_target), require_target=False) == []

@@ -3,7 +3,7 @@
 // (src/frontend/src/errorBoundary.ts). frontend_pending_test.py runs this file from pytest.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { serverRowCells } from "../../src/frontend/src/pages/previewRows.ts";
+import { serverRowCells, targetBlock } from "../../src/frontend/src/pages/previewRows.ts";
 import { PageErrorBoundary } from "../../src/frontend/src/errorBoundary.ts";
 
 const LABELS = [["ct", "Change tracking"], ["cursor", "Cursor column"], ["full", "Full reload"]];
@@ -46,4 +46,14 @@ test("a page that throws while drawing shows what happened and what to do, never
   assert.match(shown, /TypeError: Cannot convert undefined or null to object/);
   assert.match(shown, /Reload the page/);
   assert.match(shown, /Go back/);
+});
+
+test("Create names the target fields still blank, and a preview is never what waits on them", () => {
+  assert.equal(targetBlock({ sink_catalog: "", sink_schema: "", sink_table: "{table}" }),
+               "Set the target catalog and schema to create the job");
+  assert.equal(targetBlock({ sink_catalog: "main", sink_schema: " ", sink_table: "{table}" }),
+               "Set the target schema to create the job");
+  assert.equal(targetBlock({ sink_catalog: "", sink_schema: "s", sink_table: "" }),
+               "Set the target catalog and table to create the job");
+  assert.equal(targetBlock({ sink_catalog: "main", sink_schema: "s", sink_table: "{table}" }), null);
 });

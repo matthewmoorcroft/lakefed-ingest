@@ -5,7 +5,7 @@ import { api, type Row } from "../api";
 import { Crumbs, ErrorBox, Menu, Modal, Notice, PageHead, Section, fmtInt, plural, useConfirm } from "../components";
 import { CADENCES, IdentityFields, ParameterFields, RunFields, WritesFields, paramsSummary } from "./jobForm";
 import { DiscoverDialog } from "./Discover";
-import { serverRowCells } from "./previewRows";
+import { serverRowCells, targetBlock } from "./previewRows";
 import { ClusterFields, clusterSummary, ownCluster } from "./JobEdit";
 import { SourcePick, nothingPicked, pickedAny, pickedText, type Picked } from "./SourcePick";
 import { TaskProgress, finished, newRequestId, resumableWrite } from "./tasks";
@@ -104,7 +104,7 @@ export default function NewJob() {
   const blocked = !name.trim() ? "Name the job first" : !chosen ? "Add its tables first"
     : discoveringDatabases !== null ? `Discovering the tables of ${fmtInt(discoveringDatabases)} ${plural(discoveringDatabases, "database")}`
     : preview.isFetching || settled !== current ? "Checking the tables" : preview.error ? "Fix what the check found first"
-    : summary?.invalid?.length ? "Fix the invalid lines first" : null;
+    : summary?.invalid?.length ? "Fix the invalid lines first" : targetBlock(w);
   const confirm = useConfirm();
   const cancel = () => {
     if (!name && !chosen) return navigate("/ingestion-jobs");

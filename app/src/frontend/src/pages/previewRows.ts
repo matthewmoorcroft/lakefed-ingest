@@ -19,3 +19,14 @@ export function serverRowCells(server: Row, labels: [string, string][]) {
     groups: count(groups),
   };
 }
+
+const TARGET_FIELDS: [string, string][] = [["sink_catalog", "catalog"], ["sink_schema", "schema"], ["sink_table", "table"]];
+
+/** Why Create is off while target fields are blank ("Set the target catalog and schema to create the job"), or null.
+ *  Only Create waits on them: the preview of what the job takes shows whatever they are. */
+export function targetBlock(settings: Row): string | null {
+  const blank = TARGET_FIELDS.filter(([key]) => !String(settings[key] ?? "").trim()).map(([, word]) => word);
+  if (!blank.length) return null;
+  const words = blank.length === 1 ? blank[0] : `${blank.slice(0, -1).join(", ")} and ${blank[blank.length - 1]}`;
+  return `Set the target ${words} to create the job`;
+}
