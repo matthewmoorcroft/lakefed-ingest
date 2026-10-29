@@ -11,7 +11,7 @@ import { PageHead, Stamp, readAt, ErrorBox, Notice, fmtDuration, fmtTime, jobRun
 interface Lane { job_id: number; name: string; description: string; paused: boolean; runs: Row[]; planned: string[]; skipped: string[] }
 interface Timeline { start: string; end: string; jobs: Lane[]; not_in_job: { groups: string[]; group_runs: Row[] } | null }
 
-const LABEL_W = 260, MIN_CHART_W = 600, ROW_H = 40, AXIS_H = 26;
+const LABEL_W = 260, MIN_CHART_W = 600, ROW_H = 40, AXIS_H = 26, MIN_TICK_W = 64;
 const TONE: Record<string, string> = { ok: "var(--s-current)", warn: "var(--s-late)", bad: "var(--s-failing)", run: "var(--s-flight)" };
 const GROUP_RUN: Record<string, string> = { completed: TONE.ok, failed: TONE.bad, running: TONE.run, skipped: TONE.warn };
 
@@ -38,12 +38,20 @@ export default function TimelinePage() {
   const lanes = d?.jobs ?? [];
   const rows = lanes.length + (d?.not_in_job ? 1 : 0);
   const height = AXIS_H + rows * ROW_H + 8;
-  const step = hours <= 6 ? 1 : hours <= 24 ? 2 : 6;
+  // The fewest hours between gridlines that leaves room for each label; over a day or more they fall on local
+  // midnights, labelled with the day.
+  const step = [1, 2, 3, 6, 12, 24].find((h) => (CHART_W * h) / hours >= MIN_TICK_W) ?? 24;
   const ticks: number[] = [];
   if (d) {
-    const first = new Date(t0); first.setMinutes(0, 0, 0);
-    for (let ms = first.getTime() + 3600_000; ms < t1; ms += step * 3600_000) ticks.push(ms);
+    const tick = new Date(t0); tick.setMinutes(0, 0, 0);
+    do tick.setHours(tick.getHours() + 1); while (tick.getHours() % step);
+    for (; tick.getTime() < t1; tick.setHours(tick.getHours() + step)) ticks.push(tick.getTime());
   }
+  const tickLabel = (ms: number) => {
+    const at = new Date(ms);
+    return at.getHours() === 0 && step >= 6 ? at.toLocaleDateString([], { weekday: "short", day: "numeric" })
+      : at.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  };
   const runs = lanes.flatMap((l) => l.runs);
   const failed = runs.filter((r) => r.outcome.tone === "bad").length;
   const skipped = lanes.reduce((n, l) => n + l.skipped.length, 0);
@@ -77,7 +85,7 @@ export default function TimelinePage() {
               <g key={ms}>
                 <line x1={x(ms)} x2={x(ms)} y1={AXIS_H - 4} y2={height} style={{ stroke: "var(--border)" }} />
                 <text x={x(ms)} y={14} fontSize={11} textAnchor="middle" style={{ fill: "var(--muted)" }}>
-                  {new Date(ms).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
+                  {tickLabel(ms)}
                 </text>
               </g>
             ))}
