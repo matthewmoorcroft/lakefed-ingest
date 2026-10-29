@@ -91,7 +91,9 @@ function Step1({ chosen, setChosen, tested, setTested }: { chosen: string; setCh
                   <td className="name"><b>{c.name}</b></td><td>{c.connection_type}</td><td className="mono">{c.host}</td><td>{c.owner}</td>
                 </tr>
               ))}
-              {list.data && !found.length && <tr><td colSpan={5} className="muted">No SQL Server connection {search ? "matches" : "the app can see"}.</td></tr>}
+              {list.data && !found.length && <tr><td colSpan={5} className="muted">No SQL Server connection {search ? "matches" : "the app can see"}.
+                {!search && <> The app sees only connections its service principal{config?.app_principal ? <> (<span className="mono">{config.app_principal}</span>)</> : ""} has
+                  USE CONNECTION on: the connection's owner grants it in Catalog Explorer, Connections, the connection, Permissions. Then Refresh.</>}</td></tr>}
             </tbody>
           </table></div>
           <div className="toolbar">

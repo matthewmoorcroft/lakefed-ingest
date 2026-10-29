@@ -218,7 +218,7 @@ def open_databricks_run(run_id: int):
 def config(request: Request):
     return {"lakebase_instance": db.INSTANCE, "lakebase_database": db.DATABASE, "user": _user(request),
             "jobs": {"ingest": jobs.INGEST_JOB_ID, "setup": jobs.SETUP_JOB_ID, "discover": jobs.DISCOVER_JOB_ID},
-            "workspace_url": jobs.workspace_url(),
+            "workspace_url": jobs.workspace_url(), "app_principal": jobs.APP_PRINCIPAL,
             "defaults": {"partition_threshold_mb": q.DEFAULT_PARTITION_THRESHOLD_MB,
                          "partition_size_mb": q.DEFAULT_PARTITION_SIZE_MB}}
 
@@ -1647,14 +1647,25 @@ class SourceDiscoverRequest(BaseModel):
     whole_server: bool = False
 
 
+def _connection_unseen(name: str, listing_error: Optional[str]) -> str:
+    """Why the app can't use a connection, naming the grant it lacks: the app lists connections as its own service
+    principal, which sees only those it has USE CONNECTION on (the connection is not the bundle's, so its owner
+    grants it)."""
+    who = f"its service principal ({jobs.APP_PRINCIPAL})" if jobs.APP_PRINCIPAL else "its service principal"
+    why = f"the app can't list connections ({listing_error.split('. ')[0]})" if listing_error else \
+        f"the app can't see the connection '{name}'"
+    return (f"{why}: {who} needs USE CONNECTION on '{name}'. Its owner grants it in Catalog Explorer: Connections, "
+            f"{name}, Permissions, Grant, USE CONNECTION to the app; then Refresh the list.")
+
+
 @app.post("/api/discoveries/source")
 def start_source_discovery(body: SourceDiscoverRequest, request: Request):
     names = list(dict.fromkeys(d.strip() for d in body.databases if d.strip()))
     if body.kind == "tables" and not body.whole_server and not names:
         raise HTTPException(422, "choose the whole server or at least one database")
-    known = {c["name"] for c in connections()["connections"]}
-    if body.src_connection not in known:
-        raise HTTPException(404, f"connection '{body.src_connection}' not found, or the app can't see it")
+    listed = connections()
+    if body.src_connection not in {c["name"] for c in listed["connections"]}:
+        raise HTTPException(404, _connection_unseen(body.src_connection, listed.get("error")))
     job_id = _require(jobs.DISCOVER_JOB_ID, "discovery")
     _refuse_run_of(job_id, request)
     did = uuid.uuid4().hex[:12]

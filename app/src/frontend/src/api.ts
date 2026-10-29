@@ -49,5 +49,7 @@ export interface Config {
   jobs: { ingest?: string; setup?: string; discover?: string };
   /** The workspace's address, for links to a run or a cluster; empty when unknown. */
   workspace_url?: string;
+  /** The app's service principal (its client id), which needs USE CONNECTION on a connection to see it. */
+  app_principal?: string | null;
   defaults: { partition_threshold_mb: number; partition_size_mb: number };
 }

@@ -58,3 +58,14 @@ def test_nothing_chosen_or_an_unknown_connection_is_refused(client):
 def test_a_discoverys_tables_keep_only_what_add_tables_needs(client):
     tables = client.get("/api/discoveries/d1/tables").json()
     assert tables[0]["select_list"] == "id, a" and "secret_key" not in tables[0] and "registered_id" not in tables[0]
+
+
+def test_a_connection_the_app_cant_see_names_the_grant_it_needs(client, monkeypatch):
+    monkeypatch.setattr(main.jobs, "APP_PRINCIPAL", "6f1c-app")
+    r = client.post("/api/discoveries/source", json={"src_connection": "sql_hidden", "kind": "list"})
+    assert r.status_code == 404
+    assert "can't see the connection 'sql_hidden'" in r.text and "(6f1c-app) needs USE CONNECTION on 'sql_hidden'" in r.text
+    monkeypatch.setattr(main, "connections", lambda: {"connections": [], "error": "PERMISSION_DENIED: no access. More"})
+    r = client.post("/api/discoveries/source", json={"src_connection": "sql_a", "kind": "list"})
+    assert r.status_code == 404 and "can't list connections (PERMISSION_DENIED: no access)" in r.text
+    assert client.started == []
