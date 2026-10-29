@@ -4,6 +4,7 @@ import { api, type Row } from "../api";
 import { Tip, OutLink, PageHead, Stamp, readAt, Badge, ConfirmButton, ErrorBox, Grid, Metric, Notice, Section, autoColumns, statusName } from "../components";
 import { usePermissions } from "../permissions";
 import { useSettings } from "../App";
+import { setupRunBlocks, setupRunNotice, type SetupRunOutcome } from "../pending";
 
 interface IngestJob { job: Row; active: Row[]; recent: Row[] }
 
@@ -35,6 +36,23 @@ export default function Jobs({ embedded }: { embedded?: boolean }) {
       qc.invalidateQueries({ queryKey: ["ingest-job"] });
     },
   });
+  const [setupRunId, setSetupRunId] = useState<number | null>(null);
+  const runSetup = useMutation({
+    mutationFn: () => api.post<Row>("/jobs/setup/run"),
+    onSuccess: (r) => setSetupRunId(Number(r.run_id)),
+  });
+  const setupRun = useQuery({
+    queryKey: ["setup-run", setupRunId],
+    queryFn: () => api.get<{ run_id: number; outcome: SetupRunOutcome }>(`/jobs/setup/runs/${setupRunId}`),
+    enabled: setupRunId != null,
+    refetchInterval: (q) => {
+      const state = (q.state.data as { outcome?: SetupRunOutcome } | undefined)?.outcome?.state;
+      return state === "pending" ? 5_000 : state === "timeout" ? 30_000 : false;
+    },
+  });
+  const setupOutcome = setupRun.data?.outcome;
+  const setupStarting = runSetup.isPending || (setupRunId != null && setupRun.isPending);
+  const setupNote = setupRunNotice(setupOutcome, { starting: setupStarting, error: runSetup.error });
   const j = job.data?.job;
   const refusals = usePermissions().data?.run;
   const { config } = useSettings();
@@ -104,9 +122,12 @@ export default function Jobs({ embedded }: { embedded?: boolean }) {
           <span className="mono">{config.lakebase_database}</span>.</p>}
         <p className="muted small">Creates or migrates the Lakebase schema. Safe to re-run; upgrades also migrate on the next
           ingestion run.</p>
-        <ConfirmButton label="Run setup job" plain disabled={!!refusals?.setup} title="Run the setup job?"
-          message="It creates or migrates the state database's schema. It is safe to run again." confirmLabel="Run setup job" onConfirm={() => post.mutateAsync({ path: "/jobs/setup/run" })} />
+        <ConfirmButton label="Run setup job" plain disabled={!!refusals?.setup || setupRunBlocks(setupOutcome, setupStarting)}
+          title="Run the setup job?" message="It creates or migrates the state database's schema. It is safe to run again."
+          confirmLabel="Run setup job" onConfirm={() => runSetup.mutateAsync()} />
         {refusals?.setup && <p className="muted small">Run setup job: {refusals.setup}.</p>}
+        {setupNote && <Notice tone={setupNote.tone}>{setupNote.text}{setupOutcome?.url && <> <OutLink href={setupOutcome.url}>View run</OutLink></>}</Notice>}
+        <ErrorBox error={setupRun.error} />
       </Section>
     </>
   );

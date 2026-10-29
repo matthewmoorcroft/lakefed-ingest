@@ -2418,6 +2418,25 @@ def run_setup(request: Request):
     return {"run_id": jobs.run_now(_require(jobs.SETUP_JOB_ID, "setup"), {})}
 
 
+# Where Databricks has not reported a setup run ended by this long after its start, the page says so, and it is not done.
+SETUP_LIMIT_S = 30 * 60
+
+
+@app.get("/api/jobs/setup/runs/{run_id}")
+def setup_run(run_id: int):
+    """A setup run's outcome for the Schema setup section: pending while Databricks lists it going (the run poller's
+    table), a timeout past SETUP_LIMIT_S, then succeeded, or failed with Databricks' message. Only the setup job's runs."""
+    try:
+        state = run_poller.run_state_of(run_id)
+    except Exception as e:
+        if jobs.is_not_found(e):
+            raise HTTPException(404, f"setup run {run_id} not found")
+        raise
+    if str(state.get("job_id")) != str(_require(jobs.SETUP_JOB_ID, "setup")):
+        raise HTTPException(404, f"setup run {run_id} not found")
+    return {"run_id": int(run_id), "outcome": action_states.run_outcome(state, datetime.now(timezone.utc), SETUP_LIMIT_S)}
+
+
 def _bundle_job_ids() -> list:
     return [*jobs.ingest_variants().values(), jobs.CHECK_JOB_ID, jobs.SETUP_JOB_ID, jobs.DISCOVER_JOB_ID]
 

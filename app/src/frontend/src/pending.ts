@@ -103,3 +103,45 @@ export function requestWriteNotice(what: string, state: { pending: boolean; erro
   }
   return null;
 }
+
+/** A setup run as the server reports it (GET /api/jobs/setup/runs/{id}): pending until Databricks ends the run. */
+export interface SetupRunOutcome {
+  state: "pending" | "succeeded" | "failed" | "timeout";
+  reason?: string | null;
+  url?: string | null;
+}
+
+/** Whether Run setup job stays off: while its start is in flight, while Databricks lists the run going, and after a
+ * timeout, since Databricks has not confirmed the run ended. */
+export function setupRunBlocks(outcome: SetupRunOutcome | null | undefined, starting: boolean): boolean {
+  return starting || outcome?.state === "pending" || outcome?.state === "timeout";
+}
+
+/** The Schema setup section's line for its run: the start in flight, a start that failed or was not confirmed, then the
+ * run's own state. Null when there is nothing to say yet. */
+export function setupRunNotice(outcome: SetupRunOutcome | null | undefined, start: { starting: boolean; error: unknown }):
+  { tone: "info" | "ok" | "warn" | "bad"; text: string } | null {
+  if (start.starting) {
+    return { tone: "info", text: "Starting the setup job. It shows as done once Databricks reports its run ended." };
+  }
+  if (start.error) {
+    if (isUnconfirmed(start.error)) {
+      return { tone: "warn", text: "Setup job start not confirmed. The app did not answer in time, so the run may have started. "
+               + "Check the setup job in Databricks before running it again." };
+    }
+    const message = start.error instanceof Error ? start.error.message : String(start.error);
+    return { tone: "bad", text: `Setup job did not start: ${message}.` };
+  }
+  if (!outcome) return null;
+  switch (outcome.state) {
+    case "pending":
+      return { tone: "info", text: "Setup job running. It shows as done once Databricks reports its run ended." };
+    case "succeeded":
+      return { tone: "ok", text: "Setup job succeeded." };
+    case "failed":
+      return { tone: "bad", text: `Setup job failed: ${outcome.reason || "Databricks gave no reason"}.` };
+    case "timeout":
+      return { tone: "warn", text: `Setup job not confirmed: ${outcome.reason || "Databricks has not reported it ended"}. `
+               + "Run setup job stays off until Databricks reports it ended." };
+  }
+}
