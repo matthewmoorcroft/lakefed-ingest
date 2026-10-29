@@ -1483,6 +1483,12 @@ def control_rows_for_update_sql() -> str:
     return f"select {cols} from {SCHEMA}.control where id = any(%s) order by id for update"
 
 
+def control_groups_sql() -> str:
+    """The groups of some control rows, read without locking them (for the permission check before the locks).
+    Param: ids (list)."""
+    return f"select distinct task_collection from {SCHEMA}.control where id = any(%s)"
+
+
 def control_row_sql() -> str:
     cols = ", ".join(("id",) + CONTROL_EDIT_COLUMNS)
     return f"select {cols} from {SCHEMA}.control where id = %s"

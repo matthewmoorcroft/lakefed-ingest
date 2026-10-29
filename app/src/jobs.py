@@ -3,6 +3,7 @@ ingestion, setup and discovery jobs through the app's `job` resources: view, run
 
 from __future__ import annotations
 
+import json
 import os
 import time
 from datetime import datetime, timezone
@@ -92,12 +93,16 @@ PERMISSION_LABEL = {"CAN_VIEW": "Can View", "CAN_MANAGE_RUN": "Can Manage Run", 
 
 def highest_permission(acl: List[dict], user: str, groups: List[str]) -> Optional[str]:
     """The user's highest level on a job from its access list (Permissions API entries as dicts), counting entries
-    for the user and for any of their groups; a workspace admin manages every job."""
+    for the user and for any of their groups; a workspace admin manages every job. Without a user there is no level
+    at all: entries for groups and service principals have no user name, and must never match a blank one."""
+    email = (user or "").strip().lower()
+    if not email:
+        return None
     if "admins" in groups:
         return "CAN_MANAGE"
-    email, member_of = (user or "").strip().lower(), set(groups) | {"users"}
+    member_of = set(groups) | {"users"}
     levels = [p["permission_level"] for entry in acl
-              if (entry.get("user_name") or "").lower() == email or entry.get("group_name") in member_of
+              if (entry.get("user_name") or "").strip().lower() == email or entry.get("group_name") in member_of
               for p in entry.get("all_permissions") or []]
     return max(levels, key=lambda level: PERMISSION_RANK.get(level, 0), default=None)
 
@@ -127,11 +132,50 @@ def _cached(key, read):
     return value
 
 
+def scim_string(value: str) -> str:
+    """A value as a SCIM filter string literal (RFC 7644: a JSON string), so quotes or backslashes in it can't change
+    the filter."""
+    return json.dumps(str(value))
+
+
+# Nested groups: a user in team-x, which is in data-eng, gets data-eng's grants in Databricks. SCIM lists a user's
+# direct groups only, so the app follows each group's own memberships, this deep and this many groups at most. A
+# lookup that fails or runs past the caps keeps what was found, so it can only refuse, never grant, too much.
+NESTED_GROUP_DEPTH = 5
+NESTED_GROUP_LIMIT = 200
+
+
 def user_groups(user: str) -> List[str]:
-    """The workspace groups of a user, by the email the Apps proxy forwards."""
+    """The workspace groups of a user, by the email the Apps proxy forwards: their direct groups and the groups those
+    are in. No user, no groups."""
+    user = (user or "").strip()
+    if not user:
+        return []
+
     def read():
-        found = workspace().users.list(filter=f'userName eq "{user}"', attributes="groups")
-        return [g.display for u in found for g in (u.groups or []) if g.display]
+        found = workspace().users.list(filter=f"userName eq {scim_string(user)}", attributes="groups")
+        direct = [g for u in found for g in (u.groups or [])]
+        names = {g.display for g in direct if g.display}
+        frontier, seen = [g.value for g in direct if g.value], set()
+        for _ in range(NESTED_GROUP_DEPTH):
+            parents = []
+            for group_id in frontier:
+                if group_id in seen or len(seen) >= NESTED_GROUP_LIMIT:
+                    continue
+                seen.add(group_id)
+                try:
+                    group = workspace().groups.get(group_id)
+                except Exception:
+                    continue
+                for parent in group.groups or []:
+                    if parent.display:
+                        names.add(parent.display)
+                    if parent.value:
+                        parents.append(parent.value)
+            frontier = parents
+            if not frontier:
+                break
+        return sorted(names)
     return _cached(("groups", user), read)
 
 

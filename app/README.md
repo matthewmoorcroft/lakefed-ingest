@@ -139,7 +139,9 @@ Databricks Apps builds the frontend at deploy time (`npm install`, then `npm run
 The app runs as its own service principal (created with the app):
 
 - **Jobs:** `CAN_MANAGE` on the ingestion, check, setup and discovery jobs, through app resources, so it can
-  read their access lists. The app never edits or deletes them.
+  read their access lists. This is a trade-off for the per-user checks below: starting runs needs only
+  `CAN_MANAGE_RUN`, but the Permissions API returns a job's access list only to those who manage it, so the
+  service principal could also edit or delete these jobs. The app never edits or deletes them.
 - **Lakebase:** granted by the `lakefed_ingest_app_grants` job:
   - `CAN_USE` on the instance (to mint its own short-lived credential);
   - a Postgres role;
@@ -150,7 +152,15 @@ The app runs as its own service principal (created with the app):
   - running it (Run now), or a new job that isn't paused: `CAN_MANAGE_RUN`;
   - changing it (Edit and Save, Pause, Resume, Sync jobs), its groups' tables (edit, enable, disable, reseed,
     Add table, Import CSV, Bulk import's register), or deleting it: `CAN_MANAGE` or owner;
+  - a change to tables needs `CAN_MANAGE` on every ingestion job that runs one of their groups, since a group
+    can be in more than one job and its tables change for all of them;
   - workspace admins may do all of these.
+
+  Who the user is comes from the `X-Forwarded-Email` header the Databricks Apps proxy adds. Without it the app
+  refuses every write and every action (403), so an unknown caller never passes a check. A user's groups are
+  read from SCIM (their direct groups), and the groups those are in are followed up to 5 levels and 200 groups,
+  so a grant to `data-eng` counts for a member of `team-x` inside it. A lookup that fails or passes those caps
+  keeps the groups found so far: it can refuse something Databricks would allow, never the reverse.
 
   Running the setup or discovery job, or cancelling a run, needs `CAN_MANAGE_RUN` on that job. Groups in no
   ingestion job, and new paused jobs, are open to everyone with `CAN_USE` on the app. The server checks every

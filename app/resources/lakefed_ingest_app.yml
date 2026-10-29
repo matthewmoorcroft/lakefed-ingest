@@ -1,9 +1,11 @@
 # The operations app and its one-time grant job.
 #
-# The app runs as its own service principal, with least privilege:
+# The app runs as its own service principal, with the least privilege its checks allow:
 #   - ingestion, check, setup and discovery jobs: CAN_MANAGE through app resources, so the app can read their
 #     access lists: every action that runs, changes or deletes a job follows the signed-in user's own permission
-#     on these jobs (jobs.user_job_permission). The app never edits them;
+#     on these jobs (jobs.user_job_permission). Reading an access list needs CAN_MANAGE, so this is more than the
+#     CAN_MANAGE_RUN that starting runs needs, and would let the app edit or delete these jobs: it never does
+#     (app/README.md, Security model);
 #   - cluster copies job: CAN_MANAGE_RUN, to start it when an app job's own cluster changes. It runs as the
 #     deployer and makes the copies of the ingestion job (each gives the app CAN_MANAGE on it);
 #   - Lakebase: granted by the lakefed_ingest_app_grants job below (run once after the first deploy,

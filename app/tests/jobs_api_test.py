@@ -246,14 +246,19 @@ def test_the_groups_in_no_job_have_a_page_of_their_own(client):
 def test_the_job_page_says_why_run_now_or_delete_cannot_start(client, monkeypatch):
     monkeypatch.setattr(main.jobs, "ingest_variants", lambda: {"default": "555"})
     monkeypatch.setattr(main.jobs, "user_job_permission", lambda job_id, user: "CAN_MANAGE_RUN")
-    body = client.get("/api/ingestion-jobs/1").json()
+    signed_in = {"X-Forwarded-Email": "op@example.com"}
+    body = client.get("/api/ingestion-jobs/1", headers=signed_in).json()
     assert body["run_now"] == {"blocked": "the job's Databricks jobs are not synced yet", "groups": 2, "check": False}
     assert body["delete_blocked"] == "deleting needs Can Manage on the Databricks job 555; you have Can Manage Run"
+    # With no user from the Apps proxy, nothing is allowed, whatever the job's access list says.
+    anonymous = client.get("/api/ingestion-jobs/1").json()
+    assert anonymous["run_now"]["blocked"] == anonymous["delete_blocked"] == main.NO_IDENTITY
 
     def unreadable(job_id, user):
         raise RuntimeError("403")
     monkeypatch.setattr(main.jobs, "user_job_permission", unreadable)
-    assert client.get("/api/ingestion-jobs/1").json()["run_now"]["blocked"].startswith("can't read your permission")
+    assert client.get("/api/ingestion-jobs/1", headers=signed_in).json()["run_now"]["blocked"].startswith(
+        "can't read your permission")
 
 
 def test_a_jobs_target_tables_come_with_their_sources_and_a_catalog_explorer_link(monkeypatch):

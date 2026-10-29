@@ -102,7 +102,16 @@ async def _errors(request: Request, exc: Exception):
 
 
 def _user(request: Request) -> str:
-    return request.headers.get("X-Forwarded-Email") or request.headers.get("X-Forwarded-User") or ""
+    return (request.headers.get("X-Forwarded-Email") or request.headers.get("X-Forwarded-User") or "").strip()
+
+
+@app.middleware("http")
+async def _writes_need_a_user(request: Request, call_next):
+    """Every change through the API needs to know who makes it: a write with no user from the Apps proxy is refused,
+    so no permission check or change log ever runs for an unknown caller. Reads stay open to anyone the proxy admits."""
+    if request.method not in ("GET", "HEAD", "OPTIONS") and request.url.path.startswith("/api/") and not _user(request):
+        return JSONResponse(status_code=403, content={"detail": NO_IDENTITY})
+    return await call_next(request)
 
 
 def _lock_collections(cur, collections):
@@ -648,9 +657,16 @@ def _started_job(job: dict) -> Optional[str]:
     return str(copy) if copy else jobs.ingest_variants().get(job.get("job_variant") or "default")
 
 
+# Who the user is comes from the Apps proxy's X-Forwarded-Email. Without it nothing can be checked, so every
+# permission check refuses.
+NO_IDENTITY = "the app can't tell who you are (the Databricks Apps proxy sent no user), so it refuses this"
+
+
 def _permission_refusals(job: dict, user: str) -> dict:
     """{action: why the user may not take it, or None} for each action on an ingestion job (run, change, delete),
     from their Databricks permission on the job its runs execute as."""
+    if not (user or "").strip():
+        return {action: NO_IDENTITY for action in jobs.ACTION_NEEDS}
     started = _started_job(job)
     if not started:
         # An orphaned job (its variant no longer configured) has no Databricks job to ask; admins may clean it up.
@@ -667,6 +683,8 @@ def _permission_refusals(job: dict, user: str) -> dict:
 
 def _databricks_job_refusals(job_id, user: str) -> dict:
     """{action: why the user may not take it on this Databricks job, or None}."""
+    if not (user or "").strip():
+        return {action: NO_IDENTITY for action in jobs.ACTION_NEEDS}
     label = f"the Databricks job {job_id}"
     try:
         level = jobs.user_job_permission(job_id, user)
@@ -697,6 +715,8 @@ def _groups_refusal(groups: Iterable[str], user: str) -> Optional[str]:
     wanted = {g for g in groups if g}
     if not wanted:
         return None
+    if not (user or "").strip():
+        return NO_IDENTITY
     schedules = db.query(q.schedules_sql())
     members = db.query(q.schedule_members_sql(), ([s["id"] for s in schedules],)) if schedules else []
     holding = {m["schedule_id"] for m in members if m["removed_at"] is None and m["task_collection"] in wanted}
@@ -710,6 +730,30 @@ def _groups_refusal(groups: Iterable[str], user: str) -> Optional[str]:
 
 def _refuse_groups(groups: Iterable[str], request: Request) -> None:
     _refuse(_groups_refusal(groups, _user(request)))
+
+
+def _refuse_rows_groups(ids: List[int], request: Request, also: Iterable[Optional[str]] = ()) -> set:
+    """Refuse a change to these control rows unless the user may change every job running their groups (and the
+    groups in `also`). Read and checked before the rows are locked, since the Permissions and SCIM calls can take a
+    while and edits of those rows would wait on them; returns the groups checked, for _recheck_locked_rows."""
+    groups = {r["task_collection"] for r in db.query(q.control_groups_sql(), (list(ids),))} | {g for g in also if g}
+    _refuse_groups(groups, request)
+    return groups
+
+
+def _recheck_locked_rows(rows: List[dict], checked: set, request: Request) -> None:
+    """A row moved to another group between the check and its lock is checked again, now under the lock."""
+    moved = {r["task_collection"] for r in rows} - checked
+    if moved:
+        _refuse_groups(moved, request)
+
+
+def _refuse_job_tables(job: dict, groups: Iterable[str], request: Request) -> None:
+    """Refuse a change to a job's tables unless the user may change the job and every other job that runs one of
+    the groups it touches: a group can be in more than one job, and its tables change for all of them. Checked
+    before any lock is taken, as the Permissions and SCIM calls can be slow."""
+    _refuse_job(job, request, "change")
+    _refuse_groups(groups, request)
 
 
 OUTSIDE_A_JOB = ("every ingestion group belongs to an ingestion job, and {groups} is in none: add tables through a "
@@ -869,7 +913,7 @@ def edit_ingestion_job_settings(job_id: int, body: JobSettingsRequest, request: 
     if body.dry_run:
         with _snapshot() as fetch:
             return checked(fetch, groups)[1]
-    _refuse_job(_load_schedule(job_id)[0], request, "change")
+    _refuse_job_tables(_load_schedule(job_id)[0], groups, request)
     try:
         with db.transaction() as cur:
             groups = _lock_job(cur, job_id)
@@ -974,8 +1018,7 @@ def _job_row_ids(cur, groups, scope: JobScope) -> List[int]:
 @app.post("/api/ingestion-jobs/{job_id}/enable")
 def enable_job_tables(job_id: int, body: JobEnableRequest, request: Request):
     """Enable or disable a job's tables on a server, in a database, or one table in every database."""
-    _job_groups(job_id)
-    _refuse_job(_load_schedule(job_id)[0], request, "change")
+    _refuse_job_tables(_load_schedule(job_id)[0], _job_groups(job_id), request)
     batch = uuid.uuid4().hex[:12]
     with db.transaction() as cur:
         groups = _lock_job(cur, job_id)
@@ -1010,9 +1053,9 @@ def edit_job_table(job_id: int, body: JobTableEditRequest, request: Request):
     if bad or not body.schema_name or not body.table:
         raise HTTPException(400, f"give schema and table, and change only {', '.join(JOB_TABLE_FIELDS)}"
                                  + (f" (not {', '.join(bad)})" if bad else ""))
-    _job_groups(job_id)
+    groups = _job_groups(job_id)
     if not body.dry_run:
-        _refuse_job(_load_schedule(job_id)[0], request, "change")
+        _refuse_job_tables(_load_schedule(job_id)[0], groups, request)
     with db.transaction() as cur:
         groups = _lock_job(cur, job_id)
         ids = _job_row_ids(cur, groups, body) if groups else []
@@ -1067,10 +1110,10 @@ def add_job_databases(job_id: int, body: JobDatabasesRequest, request: Request):
         return plan, summary
 
     groups = _job_groups(job_id)
+    plan, summary = planned(db.query(q.groups_control_rows_sql(), (groups,)) if groups else [])
     if body.dry_run:
-        plan, summary = planned(db.query(q.groups_control_rows_sql(), (groups,)) if groups else [])
         return {"summary": summary}
-    _refuse_job(job, request, "change")
+    _refuse_job_tables(job, groups + plan["new_groups"], request)
     user, batch = _user(request), uuid.uuid4().hex[:12]
     with db.transaction() as cur:
         groups = _lock_job(cur, job_id)
@@ -1131,10 +1174,10 @@ def add_job_tables(job_id: int, body: JobTablesRequest, request: Request):
         return plan
 
     groups = _job_groups(job_id)
+    plan = planned(db.query(q.groups_control_rows_sql(), (groups,)) if groups else [])
     if body.dry_run:
-        plan = planned(db.query(q.groups_control_rows_sql(), (groups,)) if groups else [])
         return {"summary": nj.summary(plan), "applied": False}
-    _refuse_job(job, request, "change")
+    _refuse_job_tables(job, groups + plan["groups"], request)
     user, batch = _user(request), uuid.uuid4().hex[:12]
     with db.transaction() as cur:
         groups = _lock_job(cur, job_id)
@@ -1410,9 +1453,10 @@ class EnableRequest(Ids):
 @app.post("/api/tables/enable")
 def set_enabled(body: EnableRequest, request: Request):
     batch = uuid.uuid4().hex[:12]
+    checked = _refuse_rows_groups(body.ids, request)
     with db.transaction() as cur:
         rows = _locked_rows(cur, body.ids)
-        _refuse_groups([r["task_collection"] for r in rows], request)
+        _recheck_locked_rows(rows, checked, request)
         _lock_collections(cur, [r["task_collection"] for r in rows])
         cur.execute(q.set_enabled_sql(), (body.enabled, body.ids))
         for r in rows:
@@ -1426,9 +1470,10 @@ def set_enabled(body: EnableRequest, request: Request):
 @app.post("/api/tables/reseed")
 def reseed(body: Ids, request: Request):
     batch = uuid.uuid4().hex[:12]
+    checked = _refuse_rows_groups(body.ids, request)
     with db.transaction() as cur:
         rows = _locked_rows(cur, body.ids)
-        _refuse_groups([r["task_collection"] for r in rows], request)
+        _recheck_locked_rows(rows, checked, request)
         _lock_collections(cur, [r["task_collection"] for r in rows])
         cur.execute(q.force_reseed_sql(), (body.ids,))
         n = cur.rowcount
@@ -1481,6 +1526,11 @@ def edit_tables(body: EditRequest, request: Request):
     import psycopg
     bulk = len(body.ids) > 1
     batch = uuid.uuid4().hex[:12]
+    new_coll = body.changes.get("task_collection")
+    checked = set()
+    if not body.dry_run:
+        _refuse_groups_outside_jobs([new_coll])
+        checked = _refuse_rows_groups(body.ids, request, also=[new_coll])
     try:
         with db.transaction() as cur:
             rows = _locked_rows(cur, body.ids)
@@ -1491,9 +1541,7 @@ def edit_tables(body: EditRequest, request: Request):
             if body.dry_run or summary["errors"] or not summary["changed"]:
                 cur.connection.rollback()
                 return {"summary": summary, "plans": plans}
-            new_coll = body.changes.get("task_collection")
-            _refuse_groups_outside_jobs([new_coll])
-            _refuse_groups([r["task_collection"] for r in rows] + [new_coll], request)
+            _recheck_locked_rows(rows, checked, request)
             _lock_collections(cur, [r["task_collection"] for r in rows] + ([new_coll] if new_coll else []))
             _apply_plans(cur, rows, plans, _user(request), batch)
             _touch(cur, _user(request), groups=[r["task_collection"] for r in rows] + [new_coll])
