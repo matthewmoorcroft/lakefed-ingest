@@ -2050,13 +2050,13 @@ def add_job_tables(job_id: int, body: JobTablesRequest, request: Request):
             _synced(_sync(job_id, user))
         return {k: v for k, v in result.items() if k != "new_groups"}
 
-    if (made := _made_already(body, after)) is not None:
-        return made
     if body.source is not None:
         kind, param, source_id, rest = _selection_params(body.source)
         counted = db.query(q.selected_count_sql(kind), (param, *rest))
         if counted and counted[0]["n"] > BACKGROUND_ROWS:
             return _add_by_database(job_id, body, request, kind, param, source_id, rest, int(counted[0]["n"]))
+    if (made := _made_already(body, after)) is not None:
+        return made
     job = _load_schedule(job_id)[0]
     taken = {r["task_collection"] for r in db.query(q.collections_sql())}
     text, selected = body.text()
@@ -3122,16 +3122,12 @@ def _units_of(kind: str, param, selection: "Selection"):
     return by_database.selection_units(selection, keys)
 
 
-def _unit_rows(kind: str, param, unit) -> List[dict]:
-    """One database's table rows from the source, the ones the unit takes."""
-    return [r for r in db.query(q.database_rows_sql(kind), (param, unit.server, unit.database)) if unit.keeps(r)]
-
-
 @dataclass(slots=True, kw_only=True)
 class ChunkJob:
     """The job a by-database write puts its databases into: its schedule, who asked and the batch their log lines carry,
-    the schedule's cadence and time zone (for the create lines' text), each group's offset, and the task whose
-    progress each transaction records."""
+    the schedule's cadence and time zone (for the create lines' text), each group's offset, the task whose progress each
+    transaction records, and whether a member it adds is logged (Create logs them as schedule_create; Add tables never
+    has)."""
     sid: int
     name: str
     user: str
@@ -3140,16 +3136,25 @@ class ChunkJob:
     timezone: str
     offsets: dict
     task_id: int
+    log_members: bool = True
+
+
+def _schedule_create_line(job: ChunkJob, group: str) -> tuple:
+    """The change log line for a member a by-database write added to the job's schedule: the group, and the schedule's
+    cadence and start in words."""
+    described = sch.describe(job.cadence_minutes, job.offsets.get(group, 0), job.timezone)
+    return (job.user, "schedule_create", None, group, "schedule", None, f"{job.name} ({described})", None, job.batch)
 
 
 def _write_chunk(cur, plans: List[dict], job: ChunkJob, state: dict) -> None:
     """The writes of one transaction, for the databases of a chunk (their plans), in the caller's transaction: each
-    group's run lock once, the control rows the chunk's databases do not have yet (a resumed write skips the rows a
-    committed transaction wrote) with their change log lines in one statement, the mixed and split checks once, the
-    members its groups are missing (a schedule_create line for each one added), and the task's progress."""
+    group's run lock once, the valid lines the chunk's databases do not have yet (a resumed write skips the rows a
+    committed transaction wrote; a table the job already writes is left) with their change log lines in one statement,
+    the mixed and split checks once, the members its groups are missing, and the task's progress. The tables counted
+    are the valid lines reached, so a resumed write reports the whole."""
     groups = sorted({group for plan in plans for group in plan["groups"]})
     _lock_collections_together(cur, groups)
-    lines = [(line, line["row"]) for plan in plans for line in plan["lines"]]
+    lines = [(line, line["row"]) for plan in plans for line in plan["lines"] if line["status"] == "valid"]
     names = {str(row.get("src_database") or "") for _, row in lines}
     databases = sorted(names | {name.lower() for name in names})
     have = set()
@@ -3167,11 +3172,10 @@ def _write_chunk(cur, plans: List[dict], job: ChunkJob, state: dict) -> None:
         cur.execute(q.insert_members_if_absent_sql(),
                     (job.sid, groups, [job.offsets.get(group, 0) for group in groups]))
         created = sorted(found[0] for found in cur.fetchall())
-        _log_lines(cur, [(job.user, "schedule_create", None, group, "schedule", None,
-                          f"{job.name} ({sch.describe(job.cadence_minutes, job.offsets.get(group, 0), job.timezone)})",
-                          None, job.batch) for group in created])
+        if job.log_members:
+            _log_lines(cur, [_schedule_create_line(job, group) for group in created])
     state["databases_written"] += len(plans)
-    state["tables_written"] += sum(len(plan["lines"]) for plan in plans)
+    state["tables_written"] += len(lines)
     cur.execute(q.task_progress_json_sql(), (json.dumps(state), state["tables_written"], job.task_id))
 
 
@@ -3309,12 +3313,12 @@ def _create_by_database(body: NewJobRequest, request: Request, selection: Select
 
 
 def _add_by_database(job_id: int, body: "JobTablesRequest", request: Request, kind, param, source_id, rest, total: int):
-    """Add tables to a job by reference when the source has more than BACKGROUND_ROWS of them: written one database at a
-    time in a background task, like _create_by_database, each database's rows in its own transaction under the job's
-    schedule lock and its groups' run locks, with its groups' members and the task's progress committed with them. The
-    job's settings, groups and tables (new_job.job_inputs, read once when the request arrives) place each database; a
-    table the job already writes is left. Every database is checked first (nothing written), and the job's Databricks
-    jobs are synced once at the end. The same request id after a stop finishes the job, skipping the rows already in."""
+    """Add tables to a job by reference when the source has more than BACKGROUND_ROWS of them: written in a background
+    task, like _create_by_database, its databases read in batches and packed into transactions under the job's schedule
+    lock and their groups' run locks, with the groups' members and the task's progress committed with them. The job's
+    settings, groups and tables (new_job.job_inputs, read once when the request arrives) place each database; a table
+    the job already writes is left. Every database is checked first (nothing written), and the job's Databricks jobs
+    are synced once at the end. The same request id after a stop finishes the job, skipping the rows already in."""
     job = _load_schedule(job_id)[0]
     selection = body.source
     groups = _job_groups(job_id)
@@ -3336,58 +3340,48 @@ def _add_by_database(job_id: int, body: "JobTablesRequest", request: Request, ki
                                          group_of=inputs["group_of"], have=inputs["have"])
 
     def check():
-        """Every database planned, nothing written: the lines that cannot be taken, and the groups the job would add."""
-        invalid, tables, in_job, new_groups = [], 0, 0, set()
-        for unit in _units_of(kind, param, selection):
-            rows = _unit_rows(kind, param, unit)
-            if not rows:
-                continue
-            plan = plan_of(rows)
-            if plan["errors"]:
-                raise HTTPException(422, {"errors": plan["errors"][:20]})
-            for line in plan["lines"]:
-                if line["status"] == "invalid":
-                    invalid.append(f"{unit.database} {line['table']}: {'; '.join(line['errors'])}")
-                elif line["status"] == "in_job":
-                    in_job += 1
-                else:
-                    tables += 1
-            new_groups |= set(plan["groups"]) - set(groups)
+        """Every database planned, nothing written: the lines that cannot be taken, and the groups the job would add.
+        Returns those totals, and each database with its table count, in order, for the write to pack into
+        transactions."""
+        invalid, tables, in_job, new_groups, counted = [], 0, 0, set(), []
+        for read_batch in by_database.read_batches(list(_units_of(kind, param, selection))):
+            for unit, rows in _rows_of_units(kind, param, read_batch):
+                if not rows:
+                    continue
+                plan = plan_of(rows)
+                if plan["errors"]:
+                    raise HTTPException(422, {"errors": plan["errors"][:20]})
+                for line in plan["lines"]:
+                    if line["status"] == "invalid":
+                        invalid.append(f"{unit.database} {line['table']}: {'; '.join(line['errors'])}")
+                    elif line["status"] == "in_job":
+                        in_job += 1
+                    else:
+                        tables += 1
+                new_groups |= set(plan["groups"]) - set(groups)
+                counted.append((unit, len(rows)))
         if invalid:
             raise HTTPException(422, {"errors": invalid[:20] + (
                 [f"{len(invalid)} lines cannot be taken"] if len(invalid) > 20 else [])})
-        return {"tables": tables, "in_job": in_job, "new_groups": sorted(new_groups)}
+        return {"tables": tables, "in_job": in_job, "new_groups": sorted(new_groups)}, counted
 
     def write(progress, task_id):
         state = {"stage": "checking", "databases_total": databases_total, "databases_written": 0, "tables_written": 0}
         db.execute(q.task_progress_json_sql(), (json.dumps(state), 0, task_id))
-        found = check()
+        found, counted = check()
         active = [m for m in _load_schedule(job_id)[1] if m["removed_at"] is None]
         offs = sch.offsets([m["task_collection"] for m in active] + found["new_groups"], int(job["cadence_minutes"]),
                            bool(job.get("stagger")), sch.start_minute(job))
         state["stage"] = "writing"
-        for unit in _units_of(kind, param, selection):
-            rows = _unit_rows(kind, param, unit)
-            if not rows:
-                continue
-            plan = plan_of(rows)
-            with _write() as cur:
-                _lock_job(cur, job_id)
-                plan_groups = sorted(plan["groups"])
-                _lock_collections(cur, plan_groups)
-                have_sinks = {(r["sink"], r["client_id"])
-                              for r in db.fetch(cur, q.job_database_sinks_sql(), (plan_groups, unit.database))}
-                todo = [line["row"] for line in plan["lines"]
-                        if line["status"] == "valid" and (line["sink"], str(line["row"].get("client_id") or "")) not in have_sinks]
-                if todo:
-                    _insert_controls(cur, todo, user, batch)
-                    _refuse_mixed_sinks(cur, todo)
-                    _refuse_split_databases(cur, todo)
-                for group in plan_groups:
-                    cur.execute(q.insert_member_if_absent_sql(), (job_id, group, offs.get(group, 0)))
-                state["databases_written"] += 1
-                state["tables_written"] += len(todo)
-                cur.execute(q.task_progress_json_sql(), (json.dumps(state), state["tables_written"], task_id))
+        chunk_job = ChunkJob(sid=job_id, name=job["name"], user=user, batch=batch,
+                             cadence_minutes=int(job["cadence_minutes"]), timezone=job["timezone"], offsets=offs,
+                             task_id=task_id, log_members=False)
+        for chunk in by_database.transactions_of(counted):
+            plans = [plan_of(rows) for _, rows in _rows_of_units(kind, param, chunk) if rows]
+            if plans:
+                with _write() as cur:
+                    _lock_job(cur, job_id)
+                    _write_chunk(cur, plans, chunk_job, state)
         result = {"summary": {**found, "tables": state["tables_written"], "by_database": True, "checked": True},
                   "applied": True, "databases": state["databases_written"]}
         with _write() as cur:

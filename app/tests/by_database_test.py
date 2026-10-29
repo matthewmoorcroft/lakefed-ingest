@@ -298,8 +298,6 @@ def big(monkeypatch):
             return list(servers.values())
         if sql == q.source_databases_after_sql("upload"):
             return source.keys_after(tuple(params[2:5]), params[1], params[5])
-        if sql == q.database_rows_sql("upload"):
-            return source.rows(params[1], params[2])
         if sql == q.database_rows_chunk_sql("upload"):
             return _rows_for_keys(source, params[1])
         if sql == q.database_rows_exact_sql():
@@ -317,11 +315,6 @@ def big(monkeypatch):
     def fetch(cur, sql, params=()):
         if sql == q.schedule_members_sql():
             return query(sql, params)
-        if sql == q.job_database_sinks_sql():
-            groups, database = params
-            return [{"sink": ".".join(key[:3]), "client_id": key[3]} for key in
-                    (row["sink_key"] for row in store.controls
-                     if row["task_collection"] in groups and row["src_database"].lower() == database.lower())]
         raise AssertionError(sql)
 
     @contextlib.contextmanager
@@ -434,8 +427,6 @@ def test_a_line_that_cannot_be_taken_stops_the_job_before_anything_is_written(bi
     original = main.db.query
 
     def query(sql, params=()):
-        if sql == q.database_rows_sql("upload"):
-            return source.rows(params[1], params[2])
         if sql == q.database_rows_chunk_sql("upload"):
             return _rows_for_keys(source, params[1])
         if sql == q.database_rows_exact_sql():
@@ -474,7 +465,7 @@ def test_a_beat_just_before_the_task_ends_keeps_the_written_count(big, monkeypat
     assert big.tasks.rows[1]["done"] == 150 and big.store.lowered == []
 
 
-def test_adding_tables_by_reference_to_a_job_writes_each_database_as_its_own_task(big, monkeypatch):
+def test_adding_tables_by_reference_to_a_job_is_a_task_that_writes_its_databases_in_transactions(big, monkeypatch):
     own = _job_for_a_big_add(big, monkeypatch)
     dry = big.post("/api/ingestion-jobs/7/tables", json={"source": {"upload_id": "u1", "whole_server": True}})
     assert dry.status_code == 200 and dry.json()["summary"]["by_database"] is True and dry.json()["summary"]["tables"] == 150
@@ -497,6 +488,71 @@ def test_a_heartbeat_after_a_commit_never_lowers_a_big_add_progress(big, monkeyp
     _add(big, "add-beat")
     big.tasks.run()
     assert big.tasks.rows[1]["status"] == "succeeded" and big.store.beats > 1 and big.store.lowered == []
+
+
+def test_a_big_add_reads_its_databases_in_batches_and_packs_them_into_transactions(big, monkeypatch):
+    _job_for_a_big_add(big, monkeypatch)
+    monkeypatch.setattr(bd, "TABLES_PER_TRANSACTION", 50)
+    seen = []
+    read = main.db.query
+
+    def recording(sql, params=()):
+        seen.append(sql)
+        return read(sql, params)
+
+    monkeypatch.setattr(main.db, "query", recording)
+    r = _add(big, "add-packed")
+    big.tasks.run()
+    assert big.get(f"/api/tasks/{r.json()['task']['id']}").json()["status"] == "succeeded"
+    assert len(big.store.controls) == 150
+    assert q.database_rows_chunk_sql("upload") not in seen
+    assert seen.count(q.database_rows_exact_sql()) == 1 + 3     # the check's batch, then each transaction's
+    assert big.store.transactions == 3 + 1                      # three transactions of ten databases, then the result
+
+
+def test_a_failed_big_add_is_finished_by_the_same_request_id(big, monkeypatch):
+    _job_for_a_big_add(big, monkeypatch)
+    monkeypatch.setattr(bd, "TABLES_PER_TRANSACTION", 50)     # ten to a transaction: eng_020 starts the third
+    big.store.fail_on = "eng_020"
+    _add(big, "add-resume")
+    big.tasks.run()
+    failed = big.get("/api/tasks/1").json()
+    assert failed["status"] == "failed" and failed["error"] == "the source went away"
+    assert len(big.store.controls) == 100
+    big.store.fail_on = None
+    before = big.store.control_statements
+    again = _add(big, "add-resume")
+    assert again.status_code == 202 and again.json()["task"]["id"] == 1 and len(big.tasks.started) == 1
+    big.tasks.run()
+    done = big.get("/api/tasks/1").json()
+    assert done["status"] == "succeeded", done.get("error")
+    assert len(big.store.controls) == 150 and big.store.control_statements - before == 1
+    assert done["result"]["summary"]["tables"] == 150
+
+
+def test_the_same_request_id_after_a_big_add_succeeds_answers_the_task_and_starts_nothing(big, monkeypatch):
+    _job_for_a_big_add(big, monkeypatch)
+    _add(big, "add-again")
+    big.tasks.run()
+    again = _add(big, "add-again")
+    assert again.status_code == 202 and again.json()["task"]["status"] == "succeeded"
+    assert big.tasks.started == [] and len(big.store.controls) == 150
+
+
+def test_a_big_add_of_tables_the_job_already_writes_adds_none(big, monkeypatch):
+    _job_for_a_big_add(big, monkeypatch)
+    _add(big, "add-first")
+    big.tasks.run()
+    assert len(big.store.controls) == 150
+    answer = main.db.query
+    monkeypatch.setattr(main.db, "query", lambda sql, params=(): big.store.controls
+                        if sql == q.groups_control_rows_sql() else answer(sql, params))
+    again = _add(big, "add-second")
+    big.tasks.run()
+    done = big.get(f"/api/tasks/{again.json()['task']['id']}").json()
+    assert done["status"] == "succeeded", done.get("error")
+    assert done["result"]["summary"]["in_job"] == 150 and done["result"]["summary"]["tables"] == 0
+    assert len(big.store.controls) == 150
 
 
 def _job_for_a_big_add(client, monkeypatch) -> set:
