@@ -1831,3 +1831,17 @@ left join last l on l.task_collection = c.task_collection
 left join agg a on a.task_collection = c.task_collection
 left join sla s on s.task_collection = c.task_collection
 order by c.task_collection"""
+
+
+def check_work_found_sql() -> str:
+    """What some checks found to load: per group, the databases with changes each check listed for its run.
+    Param: work ids (list)."""
+    return (f"select task_collection, count(*) as databases from {SCHEMA}.check_work where work_id = any(%s) "
+            f"group by task_collection")
+
+
+def database_checks_since_sql() -> str:
+    """How many databases of some groups a check found unchanged and stamped since a time. Params: groups (list),
+    since (timestamptz)."""
+    return (f"select count(*) as databases from {SCHEMA}.database_check where task_collection = any(%s) "
+            f"and checked_at >= %s")

@@ -317,6 +317,9 @@ def _run_now_setup(api, monkeypatch, body):
     started = []
     monkeypatch.setattr(main.jobs, "run_now", lambda job_id, params: started.append(int(job_id)) or 900 + len(started))
     monkeypatch.setattr(main, "_running", lambda: [])
+    api.active_runs = {}                                     # wrapper job id: its runs going now, as the Jobs API lists
+    monkeypatch.setattr(main.jobs, "runs", lambda job_id, active_only=False, limit=25: list(api.active_runs.get(int(job_id), [])))
+    monkeypatch.setattr(main.jobs, "workspace_url", lambda: "https://h")
     sid = api.post("/api/schedules", json=body).json()["id"]
     return sid, started
 
@@ -327,7 +330,24 @@ def test_run_now_starts_each_members_wrapper_as_the_schedule_would(api, monkeypa
     r = api.post(f"/api/ingestion-jobs/{sid}/run")
     assert r.status_code == 200, r.text
     wrappers = {m["job_id"] for m in api.store.members.values()}
-    assert set(started) == wrappers and len(started) == 2 and r.json()["started"] == [901, 902]
+    assert set(started) == wrappers and len(started) == 2
+    assert [(x["run_id"], x["url"]) for x in r.json()["started"]] == [
+        (901 + i, f"https://h/jobs/{w}/runs/{901 + i}") for i, w in enumerate(sorted(wrappers))]
+
+
+def test_run_now_is_refused_while_a_wrapper_run_is_still_starting_and_says_where_it_is(api, monkeypatch):
+    # Its clusters are still coming up, so Lakebase has no run yet; the Jobs API has, and Databricks would skip a
+    # second run of the wrapper without a word.
+    monkeypatch.setattr(main.jobs, "user_job_permission", lambda job_id, user: "CAN_MANAGE")
+    monkeypatch.setattr(main.jobs, "CHECK_JOB_ID", "777")
+    sid, started = _run_now_setup(api, monkeypatch, dict(BODY, job_variant="check"))
+    wrapper = next(m["job_id"] for m in api.store.members.values())
+    api.active_runs[int(wrapper)] = [{"run_id": 650503851272052, "state": "RUNNING", "started": "2026-10-29T14:09:42+00:00",
+                                      "url": f"https://h/jobs/{wrapper}/runs/650503851272052", "parameters": {}}]
+    r = api.post(f"/api/ingestion-jobs/{sid}/run")
+    assert r.status_code == 409 and started == []
+    detail = r.json()["detail"]
+    assert "already going" in detail["message"] and detail["run_url"].endswith("/runs/650503851272052")
 
 
 def test_run_now_on_a_check_schedule_starts_its_one_wrapper(api, monkeypatch):

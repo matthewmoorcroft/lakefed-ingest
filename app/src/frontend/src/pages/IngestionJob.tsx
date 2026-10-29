@@ -1,13 +1,13 @@
-import { useState } from "react";
+import { Fragment, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link, useNavigate, useParams } from "react-router-dom";
-import { api, qs, type Row } from "../api";
+import { api, qs, type ApiError, type Row } from "../api";
 import { Refused } from "../permissions";
 import { Tree } from "./JobEdit";
 import { TargetTables } from "./TargetTables";
 import { OutLink,
-  Crumbs, Badge, ErrorBox, Menu, Name, Notice, PageHead, RunStatus, Section, StateBar, StateKey, fmtClock, fmtDuration, fmtInt, fmtSlot, fmtSpeed,
-  fmtTime, jobRunPath, plural, useConfirm, type ConfirmRequest
+  Crumbs, Badge, ErrorBox, Menu, Name, Notice, PageHead, ProgressBar, RunStatus, Section, StateBar, fmtClock, fmtDuration, fmtInt,
+  fmtSlot, fmtSpeed, fmtTime, jobRunPath, plural, progressFrom, useConfirm, type ConfirmRequest
 } from "../components";
 
 const PAGE = 25;
@@ -32,6 +32,7 @@ function foldPaused(runs: Row[]): (Row | { folded: Row[] })[] {
 /** One row per job run: outcome, group runs, took, tables loaded, speed, rows written, parallelism, clusters, failed. */
 export function JobRunsTable({ runs, showJob }: { runs: Row[]; showJob?: boolean }) {
   const columns = showJob ? 11 : 10;
+  const [open, setOpen] = useState<string | null>(null);
   return (
     <div className="table-wrap"><table className="data dense">
       <thead><tr><th>Job run</th>{showJob && <th>Ingestion job</th>}<th>Outcome</th><th className="num">Group runs</th>
@@ -46,8 +47,10 @@ export function JobRunsTable({ runs, showJob }: { runs: Row[]; showJob?: boolean
               {showJob && <>{" "}(<Link to={`/ingestion-jobs/${r.folded[0].job_id}`}>{r.folded[0].job_name}</Link>)</>}</td>
           </tr>
         ) : (
-          <tr key={`${r.job_id}-${r.slot}`}>
-            <td className="name"><Link to={jobRunPath(r.job_id, r.slot)}>{new Date(r.slot).toLocaleString([], { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" })}</Link>
+          <Fragment key={`${r.job_id}-${r.slot}`}><tr>
+            <td className="name"><button className="twisty" aria-expanded={open === `${r.job_id}-${r.slot}`} title="Its group runs"
+              onClick={() => setOpen(open === `${r.job_id}-${r.slot}` ? null : `${r.job_id}-${r.slot}`)}>{open === `${r.job_id}-${r.slot}` ? "▾" : "▸"}</button>
+              <Link to={jobRunPath(r.job_id, r.slot)}>{new Date(r.slot).toLocaleString([], { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" })}</Link>
               {r.outside && <span className="sub">outside its schedule: Run now or started by hand</span>}</td>
             {showJob && <td className="name"><Link to={`/ingestion-jobs/${r.job_id}`}><Name>{r.job_name}</Name></Link></td>}
             <td><RunStatus status={null} outcome={r.outcome} />{r.outcome?.note && <span className="sub">{r.outcome.note}</span>}</td>
@@ -59,10 +62,101 @@ export function JobRunsTable({ runs, showJob }: { runs: Row[]; showJob?: boolean
             <td className="num">{(r.parallelism ?? []).join(", ")}</td><td className="num">{fmtInt(r.clusters)}</td>
             <td className="num" style={{ color: Number(r.failed_tables) ? "var(--bad)" : undefined }}>{fmtInt(r.failed_tables)}</td>
           </tr>
+          {open === `${r.job_id}-${r.slot}` && <tr className="l2"><td colSpan={columns}><RunGroups jobId={r.job_id} slot={r.slot} /></td></tr>}
+          </Fragment>
         ))}
         {!runs.length && <tr><td colSpan={columns} className="muted">No job runs in this window.</td></tr>}
       </tbody>
     </table></div>
+  );
+}
+
+/** A job run's group runs, as a Databricks job run lists its tasks (a for-each task's iterations): the groups its
+ * check started this run, each with its outcome, start, time, tables and its run. */
+function RunGroups({ jobId, slot }: { jobId: unknown; slot: string }) {
+  const run = useQuery({ queryKey: ["job-run", String(jobId), slot],
+    queryFn: () => api.get<Row>(`/ingestion-jobs/${encodeURIComponent(String(jobId))}/runs/${encodeURIComponent(slot)}`) });
+  if (run.error) return <ErrorBox error={run.error} />;
+  if (!run.data) return <span className="muted">Loading its group runs…</span>;
+  const lines: Row[] = run.data.group_runs ?? [];
+  const groups = lines.filter((g) => !g.check && g.run_id);
+  return (
+    <div className="run-groups">
+      <p className="muted small">{lines.some((g) => g.check) ? `Its check started ${fmtInt(groups.length)} of the job's ${fmtInt(run.data.members)} ${plural(run.data.members, "group")}: those with changes.`
+        : `${fmtInt(groups.length)} of the job's ${fmtInt(run.data.members)} ${plural(run.data.members, "group")} ran.`}</p>
+      <table className="data dense">
+        <thead><tr><th>Ingestion group</th><th>Status</th><th>Started</th><th className="num">Took</th><th>Tables</th><th className="num">Failed</th></tr></thead>
+        <tbody>
+          {lines.filter((g) => g.check || g.run_id).map((g) => (
+            <tr key={`${g.check ? "check-" : ""}${g.task_collection}-${g.run_id ?? g.state}`}>
+              <td className="name">{g.check ? <span className="muted">check</span> : <Link to={`/collections/${encodeURIComponent(g.task_collection)}`}>{g.task_collection}</Link>}</td>
+              <td>{g.run_id ? <Link to={`/runs/${g.run_id}`}><RunStatus status={null} outcome={g.status} /></Link> : <RunStatus status={null} outcome={g.status} />}</td>
+              <td>{g.started_at ? fmtClock(g.started_at) : ""}</td>
+              <td className="num">{g.duration_s != null ? fmtDuration(g.duration_s) : ""}</td>
+              <td style={{ minWidth: 140 }}>{g.check ? "" : <ProgressBar p={progressFrom(g.progress)} />}</td>
+              <td className="num" style={{ color: Number(g.failed) ? "var(--bad)" : undefined }}>{g.check ? "" : fmtInt(g.failed)}</td>
+            </tr>
+          ))}
+          {!lines.some((g) => g.check || g.run_id) && <tr><td colSpan={6} className="muted">No group run started in this job run.</td></tr>}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+/** The job run going now, read from its Databricks runs every few seconds: the run, its check and what the check
+ * found, then the group runs it started, as the Jobs UI's run page shows a run with its tasks and a for-each task's
+ * iterations. Shown only while something is going. */
+function RunningNow({ live }: { live: Row }) {
+  const check: Row | null = live.check;
+  const found: Row | null = live.found;
+  const runs: Row[] = live.group_runs ?? [];
+  const going = runs.filter((g) => g.active).length;
+  return (
+    <Section title="Running now" note={`Read from its Databricks runs every few seconds, so a run shows while its clusters are still starting. ${fmtClock(live.read_at)}.`}>
+      <div className="table-wrap"><table className="data dense">
+        <thead><tr><th>Run</th><th>Status</th><th>Started</th><th>What it did</th><th></th></tr></thead>
+        <tbody>
+          {(live.wrappers ?? []).map((w: Row) => (
+            <tr key={`w-${w.run_id}`}><td className="name"><b>The job's run</b><span className="sub">its Databricks job, which starts {check ? "the check" : "the group run"}</span></td>
+              <td><RunStatus status={null} outcome={w.status} /></td><td>{fmtClock(w.started)}</td><td></td>
+              <td>{w.url && <OutLink href={w.url}>Open run</OutLink>}</td></tr>
+          ))}
+          {check && (
+            <tr><td className="name"><b>Check</b><span className="sub">looks at each database for changes, then starts a group run for each group with work</span></td>
+              <td><RunStatus status={null} outcome={check.status} /></td><td>{fmtClock(check.started)}</td>
+              <td>{found && check.status?.label !== "Running" && check.status?.label !== "Starting"
+                ? <>{fmtInt(found.databases_with_work)} {plural(found.databases_with_work, "database")} changed
+                  {found.unchanged_databases != null && <>, {fmtInt(found.unchanged_databases)} unchanged and stamped</>};{" "}
+                  started {fmtInt(found.started)} of {fmtInt(found.groups)} {plural(found.groups, "group")}</>
+                : <span className="muted">checking the job's databases</span>}</td>
+              <td>{check.url && <OutLink href={check.url}>Open run</OutLink>}</td></tr>
+          )}
+        </tbody>
+      </table></div>
+      <h3>Group runs: {fmtInt(runs.length)}{runs.length ? `, ${fmtInt(going)} going` : ""}</h3>
+      <div className="table-wrap"><table className="data dense">
+        <thead><tr><th>Ingestion group</th><th>Status</th><th>Started</th><th>Progress</th><th className="num">Failed</th><th></th></tr></thead>
+        <tbody>
+          {runs.map((g) => {
+            const p = g.progress;
+            return (
+              <tr key={g.run_id}>
+                <td className="name"><Link to={`/collections/${encodeURIComponent(g.task_collection)}`}>{g.task_collection}</Link></td>
+                <td><RunStatus status={null} outcome={g.status} />{g.status?.note && <span className="sub">{g.status.note}</span>}</td>
+                <td>{fmtClock(g.started)}</td>
+                <td style={{ minWidth: 200 }}>{p ? <><ProgressBar p={progressFrom({ total: p.planned, loaded: p.done, failed: p.failed })} />
+                  <span className="sub">{fmtInt(p.done)} of {fmtInt(p.planned)} {plural(p.planned, "table")}</span></>
+                  : <span className="muted">{g.active ? "shown once the run has started on its cluster" : ""}</span>}</td>
+                <td className="num" style={{ color: Number(p?.failed) ? "var(--bad)" : undefined }}>{p ? fmtInt(p.failed) : ""}</td>
+                <td>{g.url && <OutLink href={g.url}>Open run</OutLink>}</td>
+              </tr>
+            );
+          })}
+          {!runs.length && <tr><td colSpan={6} className="muted">{check ? "No group run yet: the check starts them once it has looked." : "No group run yet."}</td></tr>}
+        </tbody>
+      </table></div>
+    </Section>
   );
 }
 
@@ -75,7 +169,7 @@ export default function IngestionJob() {
   const confirm = useConfirm();
   const runNow = useMutation({
     mutationFn: () => api.post<Row>(`/ingestion-jobs/${encodeURIComponent(id)}/run`, {}),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["ingestion-job", id] }),
+    onSuccess: () => { qc.invalidateQueries({ queryKey: ["ingestion-job", id] }); qc.invalidateQueries({ queryKey: ["ingestion-job-live", id] }); },
   });
   const remove = useMutation({
     mutationFn: () => api.post<Row>(`/schedules/${encodeURIComponent(id)}/delete`, {}),
@@ -83,6 +177,10 @@ export default function IngestionJob() {
   });
   const job = useQuery({ queryKey: ["ingestion-job", id], queryFn: () => api.get<Row>(`/ingestion-jobs/${encodeURIComponent(id)}`),
                          refetchInterval: 60_000 });
+  const live = useQuery({ queryKey: ["ingestion-job-live", id], queryFn: () => api.get<Row>(`/ingestion-jobs/${encodeURIComponent(id)}/live`),
+                          refetchInterval: (q) => ((q.state.data as Row | undefined)?.active ? 5_000 : 30_000) });
+  const going = !!live.data?.active;
+  const refusal = (runNow.error as ApiError | null)?.detail;
   const runs = useQuery({
     queryKey: ["ingestion-job-runs", id, before],
     queryFn: () => api.get<Row>(`/ingestion-jobs/${encodeURIComponent(id)}/runs${qs({ before, limit: PAGE })}`),
@@ -110,7 +208,8 @@ export default function IngestionJob() {
           </Menu>
           <button disabled={!!j.change_blocked} title={j.change_blocked ?? undefined}
             onClick={() => navigate(`/ingestion-jobs/${id}/edit`)}>Edit</button>
-          <button className="primary" disabled={!!j.run_now?.blocked || runNow.isPending} title={j.run_now?.blocked ?? undefined}
+          <button className="primary" disabled={!!j.run_now?.blocked || runNow.isPending || going}
+            title={j.run_now?.blocked ?? (going ? "A run of this job is going: Running now shows it" : undefined)}
             onClick={() => confirm.ask(runNowRequest(j)).then((ok) => ok && runNow.mutate())}>{runNow.isPending ? "Starting…" : "Run now"}</button></span>} />
       {j && <p className="muted small">Created by {j.created_by ?? "unknown"}{j.created_at ? `, ${fmtTime(j.created_at)}` : ""} ·
         Last updated by {j.updated_by ?? "unknown"}{j.updated_at ? `, ${fmtTime(j.updated_at)}` : ""}</p>}
@@ -118,8 +217,12 @@ export default function IngestionJob() {
       <Refused action="Run now" refusal={j?.run_now?.blocked} />
       <Refused action="Edit and Delete" refusal={j?.change_blocked} />
       <ErrorBox error={remove.error} />
-      <ErrorBox error={runNow.error} />
-      {runNow.isSuccess && <Notice tone="ok">Started: {fmtInt(runNow.data.started.length)} {plural(runNow.data.started.length, "Databricks job run")}. The runs show here as they start.</Notice>}
+      {refusal?.run_url ? <Notice tone="warn">Not started: a run of this job is already going (<OutLink href={refusal.run_url}>open it</OutLink>),
+        and Databricks would skip a second one. Running now below follows it; Run now is open again when it ends.</Notice>
+        : <ErrorBox error={runNow.error} />}
+      {runNow.isSuccess && <Notice tone="ok">Started {fmtInt(runNow.data.started.length)} {plural(runNow.data.started.length, "Databricks job run")}:{" "}
+        {runNow.data.started.map((r: Row, i: number) => <Fragment key={r.run_id}>{i ? ", " : ""}{r.url ? <OutLink href={r.url}>run {r.run_id}</OutLink> : `run ${r.run_id}`}</Fragment>)}.
+        Running now follows it below.</Notice>}
       <ErrorBox error={job.error} />
       {j && (
         <div className="metrics">
@@ -140,7 +243,8 @@ export default function IngestionJob() {
             <div className="metric-sub">p95 over 7 days</div></div>
         </div>
       )}
-      <Section title="Job runs" note="Newest first; one row per trigger."
+      {going && <RunningNow live={live.data!} />}
+      <Section title="Job runs" note="Newest first; one row per trigger. Open a run for the groups it ran."
         actions={<span className="pager-buttons">
           <button className="ghost" disabled={!pages.length} onClick={() => setPages(pages.slice(0, -1))}>Newer</button>
           <button className="ghost" disabled={!runs.data?.next_before} onClick={() => setPages([...pages, runs.data!.next_before])}>Older</button>
@@ -149,32 +253,11 @@ export default function IngestionJob() {
         {runs.data && <JobRunsTable runs={runs.data.job_runs} />}
       </Section>
       {j && <Section title={`What it ingests: ${fmtInt(j.enabled_tables)} ${plural(j.enabled_tables, "table")}`}
-        note="From each server, its databases and their tables, for information. Edit changes them.">
+        note={<>From each server, its databases and their tables, for information. Edit changes them. Split into{" "}
+          <b>{fmtInt(j.groups?.length)}</b> {plural(j.groups?.length, "ingestion group")}, which run side by side; each job run lists the groups it started.</>}>
         <Tree jobId={id} locked={null} readOnly />
       </Section>}
       {j && <TargetTables jobId={id} />}
-      {j && (
-        <Section title={`Ingestion groups: ${fmtInt(j.groups_detail.length)}`} actions={<StateKey />}>
-          <div className="table-wrap"><table className="data">
-            <thead><tr><th>Ingestion group</th><th className="num">Starts at</th><th className="num">Databases</th><th className="num">Tables</th>
-              <th>State now</th><th className="num">Failing</th><th>Last group run</th><th className="num">p95 run time</th><th>Wrapper job</th></tr></thead>
-            <tbody>
-              {j.groups_detail.map((g: Row) => (
-                <tr key={g.task_collection}>
-                  <td className="name"><Link to={`/collections/${encodeURIComponent(g.task_collection)}`}><b>{g.task_collection}</b></Link></td>
-                  <td className="num">{g.starts ?? `:${String(g.offset_minutes % 60).padStart(2, "0")}`}</td>
-                  <td className="num">{fmtInt(g.databases)}</td><td className="num">{fmtInt(g.enabled_tables)}</td><td><StateBar row={g} /></td>
-                  <td className="num" style={{ color: Number(g.state_failing) ? "var(--bad)" : undefined }}>{fmtInt(g.state_failing)}</td>
-                  <td>{g.last_run ? <><Link to={`/runs/${g.last_run.run_id}`}><RunStatus status={g.last_run.status} outcome={g.last_run.outcome} /></Link>
-                    <span className="sub">group run {fmtInt(g.last_run.run_id)} at {fmtClock(g.last_run.started_at)}</span></> : <span className="muted">never run</span>}</td>
-                  <td className="num">{g.p95_s != null ? fmtDuration(g.p95_s) : ""}</td>
-                  <td>{g.job_url ? <OutLink href={g.job_url}>View job</OutLink> : <span className="muted">not synced</span>}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table></div>
-        </Section>
-      )}
     </>
   );
 }

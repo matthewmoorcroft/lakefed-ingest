@@ -830,8 +830,51 @@ def run_ingestion_job(job_id: int, request: Request):
     blocker = _run_now_blocker(job, members)
     if blocker:
         raise HTTPException(409, blocker)
+    # Lakebase sees a run only once its cluster is up; the Jobs API sees it at once. Databricks would skip a second
+    # run of a wrapper (max_concurrent_runs 1) without a word, so a Run now while one is going is refused here.
+    going = _active_wrapper_runs(members)
+    if going:
+        raise HTTPException(409, {"message": f"a run of this job is already going, started {going[0].get('started') or 'just now'}: "
+                                             "Databricks would skip a second one, so wait for it to end",
+                                  "run_url": going[0].get("url"), "run_id": going[0].get("run_id")})
     wrappers = sorted({int(m["job_id"]) for m in members})
-    return {"started": [jobs.run_now(wrapper, {}) for wrapper in wrappers]}
+    host = jobs.workspace_url()
+    started = []
+    for wrapper in wrappers:
+        run_id = jobs.run_now(wrapper, {})
+        started.append({"job_id": wrapper, "run_id": run_id, "url": f"{host}/jobs/{wrapper}/runs/{run_id}" if host else None})
+    return {"started": started}
+
+
+def _active_wrapper_runs(members: List[dict]) -> List[dict]:
+    """The job's wrapper jobs' runs going now (Jobs API, active only), newest first."""
+    out = []
+    for wrapper in sorted({int(m["job_id"]) for m in members if m.get("job_id")}):
+        out += [r for r in jobs.runs(wrapper, active_only=True, limit=5) if ij.is_active(r)]
+    return sorted(out, key=lambda r: r.get("started") or "", reverse=True)
+
+
+@app.get("/api/ingestion-jobs/{job_id}/live")
+def ingestion_job_live(job_id: int):
+    """The job run going now, as its Databricks runs are: the wrapper runs, the check run and what it found (check
+    kind), and the group runs it started, with each one's state and, once it has recorded it, its progress. Read
+    from the Jobs API, which sees a run from its start, joined with Lakebase. Nothing is going: active is false."""
+    job, members = _load_schedule(job_id)
+    members = [m for m in members if m.get("removed_at") is None]
+    groups = sorted({m["task_collection"] for m in members})
+    now = datetime.now(timezone.utc)
+    wrappers = _active_wrapper_runs(members)
+    check_kind = (job.get("job_variant") or "default") == sch.CHECK_VARIANT
+    checks = [r for r in jobs.runs(jobs.CHECK_JOB_ID, limit=10) if ij.check_run_of(r, job_id, groups)] \
+        if check_kind and jobs.CHECK_JOB_ID else []
+    target = (sch.copy_job_id(job) or _ingest_job_id("default")) if check_kind else _wrapper_target(job)
+    ingest = jobs.runs(target, limit=max(25, 3 * len(groups))) if target else []
+    check = max(checks, key=lambda r: r.get("started") or "", default=None)
+    work_ids = sorted({(r.get("parameters") or {}).get("work_id") for r in ingest} - {None, ""})
+    found = db.query(q.check_work_found_sql(), (work_ids,)) if check and work_ids else []
+    stamped = db.query(q.database_checks_since_sql(), (groups, check["started"]))[0]["databases"] \
+        if check and check.get("started") and groups else None
+    return ij.live_view(wrappers, checks, ingest, groups, found, stamped, _running(), now)
 
 
 @app.get("/api/ingestion-jobs/{job_id}/compute")

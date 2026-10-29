@@ -388,3 +388,77 @@ def job_runs_of_run(run: dict, schedules: List[dict], members: List[dict],
             out.append({"job_id": s["id"], "job_name": s["name"],
                         "slot": sch.slot_of(fires[-1], sch.stagger_of(offset, cadence, start), tz).isoformat()})
     return out
+
+
+# ---- Running now: a job run as it happens, from the Jobs API ----------------------------------------------------
+# Lakebase records a group run only once its cluster is up and the run has started; until then (and for the check
+# job, which records nothing of its own) only the Jobs API knows it is going. These read the job's runs there.
+
+ACTIVE_STATES = {"QUEUED", "PENDING", "RUNNING", "TERMINATING", "BLOCKED", "WAITING_FOR_RETRY"}
+
+
+def is_active(run: dict) -> bool:
+    return run.get("state") in ACTIVE_STATES
+
+
+def check_run_of(run: dict, schedule_id: int, groups: Iterable[str]) -> bool:
+    """Whether a check job run is this ingestion job's: started with its schedule_id, or with a group list that is
+    its groups (a run over every collection, with no list, belongs to no one job)."""
+    params = run.get("parameters") or {}
+    if str(params.get("schedule_id") or "").strip():
+        return str(params["schedule_id"]).strip() == str(schedule_id)
+    named = {g.strip() for g in str(params.get("task_collections") or "").split(",") if g.strip()}
+    return bool(named) and named <= set(groups)
+
+
+def run_state_label(run: dict) -> dict:
+    """A Databricks run's state in the app's words, as the Jobs UI shows it: Starting while its cluster comes up."""
+    state, result = run.get("state"), run.get("result")
+    if state in ("QUEUED", "BLOCKED", "WAITING_FOR_RETRY"):
+        return {"label": "Queued", "tone": ""}
+    if state == "PENDING":
+        return {"label": "Starting", "tone": "run", "note": "its cluster is starting"}
+    if state in ("RUNNING", "TERMINATING"):
+        return {"label": "Running", "tone": "run"}
+    if result == "SUCCESS":
+        return {"label": "Succeeded", "tone": "ok"}
+    if result in ("CANCELED", "CANCELLED"):
+        return {"label": "Cancelled", "tone": "neutral"}
+    if state == "SKIPPED" or result == "EXCLUDED":
+        return {"label": "Skipped", "tone": "neutral"}
+    return {"label": "Failed", "tone": "bad"} if result else {"label": state or "Unknown", "tone": ""}
+
+
+def live_view(wrappers: List[dict], checks: List[dict], ingest_runs: List[dict], groups: Iterable[str],
+              found: List[dict], stamped: Optional[int], running: List[dict], now: datetime) -> dict:
+    """The job run going now, as the Jobs UI shows a run with its tasks: the wrapper runs, then (check kind) the
+    check and what it found, then the group runs it started, each with its state and, once Lakebase has it, its
+    progress. Nothing when none of them is going. `ingest_runs` are the ingestion job's runs (active and recent);
+    the group runs shown are this job's groups' runs that are going or began since the run being shown did."""
+    groups = set(groups)
+    mine = [r for r in ingest_runs if (r.get("parameters") or {}).get("task_collection") in groups]
+    check = max(checks, key=lambda r: r.get("started") or "", default=None)
+    going = [r for r in wrappers + checks + mine if is_active(r)]
+    if not going:
+        return {"active": False, "wrappers": [], "check": None, "found": None, "group_runs": [], "read_at": now.isoformat()}
+    since = min(r.get("started") or now.isoformat() for r in going + ([check] if check else []))
+    shown = [r for r in mine if is_active(r) or (r.get("started") or "") >= since]
+    progress = {str(p.get("job_run_id")): p for p in running}
+    group_runs = []
+    for r in sorted(shown, key=lambda r: ((r.get("parameters") or {}).get("task_collection") or "", r.get("started") or "")):
+        p = progress.get(str(r["run_id"]))
+        group_runs.append({
+            "task_collection": r["parameters"]["task_collection"], "run_id": r["run_id"], "url": r.get("url"),
+            "started": r.get("started"), "ended": r.get("ended"), "status": run_state_label(r), "active": is_active(r),
+            "work_id": r["parameters"].get("work_id") or None,
+            "progress": {"done": int(p.get("tables_checked") or 0), "planned": int(p.get("enabled_tables") or 0),
+                         "failed": int(p.get("tables_failed") or 0), "group_run_id": p.get("run_id")} if p else None})
+    with_work = {f["task_collection"]: int(f["databases"]) for f in found}
+    return {
+        "active": True,
+        "wrappers": [dict(w, status=run_state_label(w)) for w in wrappers if is_active(w)],
+        "check": dict(check, status=run_state_label(check)) if check else None,
+        "found": None if not check else {
+            "groups_with_work": len(with_work), "databases_with_work": sum(with_work.values()),
+            "unchanged_databases": stamped, "groups": len(groups), "started": len(group_runs)},
+        "group_runs": group_runs, "read_at": now.isoformat()}

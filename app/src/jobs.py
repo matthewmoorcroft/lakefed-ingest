@@ -197,10 +197,14 @@ def runs(job_id, active_only: bool = False, limit: int = 25) -> List[dict]:
     rows = []
     # The Jobs API caps a page at 25 runs; the SDK pages through, and we stop at `limit`.
     for r in workspace().jobs.list_runs(job_id=int(job_id), active_only=active_only, limit=min(limit, 25)):
-        params = {p.name: p.value for p in (getattr(r, "job_parameters", None) or [])}
+        # A parameter the run wasn't given runs with its default (a run of the job's own schedule ingests its
+        # default task_collection), as launcher.SdkJobs.active_runs reads it.
+        params = {p.name: p.value if p.value is not None else p.default for p in (getattr(r, "job_parameters", None) or [])}
         st = r.state
         rows.append({
             "run_id": r.run_id,
+            "job_id": r.job_id,
+            "parameters": params,
             "task_collection": params.get("task_collection"),
             "state": st.life_cycle_state.value if st and st.life_cycle_state else None,
             "result": st.result_state.value if st and st.result_state else None,

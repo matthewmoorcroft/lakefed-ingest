@@ -4,9 +4,12 @@ export type Row = Record<string, any>;
 
 export class ApiError extends Error {
   hint?: string;
-  constructor(message: string, hint?: string) {
+  /** The server's detail as it came, for a refusal that carries more than its words (a link to the run going). */
+  detail?: any;
+  constructor(message: string, hint?: string, detail?: any) {
     super(message);
     this.hint = hint;
+    this.detail = detail;
   }
 }
 
@@ -22,10 +25,11 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
     const detail = data?.detail;
     const message =
       typeof detail === "string" ? detail
+      : typeof detail?.message === "string" ? detail.message
       : detail?.errors ? detail.errors.join("; ")
       : Array.isArray(detail) ? detail.map((d: any) => `${(d.loc || []).slice(1).join(".")}: ${d.msg}`).join("; ")
       : `${res.status} ${res.statusText}`;
-    throw new ApiError(message, data?.hint ?? undefined);
+    throw new ApiError(message, data?.hint ?? undefined, detail);
   }
   return data as T;
 }
