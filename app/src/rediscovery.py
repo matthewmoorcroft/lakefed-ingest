@@ -18,8 +18,11 @@ from typing import List, Optional, Tuple
 
 SETTING = "rediscover_hour"
 RECORD = "rediscovery"
-# A running re-discovery whose start is older than this has no thread left (the app restarted while it ran).
-RUN_STALE_S = 6 * 3600
+# A running re-discovery writes its heartbeat every BEAT_S seconds. One whose heartbeat is older than STALE_S has no
+# thread left (the app restarted while it ran), so the job may run again and the page says it failed.
+BEAT_S = 15
+STALE_S = 120
+RESTARTED = "the app restarted; run it again"
 LISTING_KEYS = ("pattern", "azure_credential", "azure_resource_id")
 REPORT_LIMIT = 20
 # The phases a running re-discovery records: reading a server again (its discovery run goes), then writing the tables.
@@ -36,7 +39,15 @@ def hour_of(options: Optional[dict]) -> Optional[int]:
 
 def running_record(now: datetime) -> dict:
     """The record a re-discovery writes when it starts (its claim on the schedule)."""
-    return {"status": "running", "started_at": now.astimezone(timezone.utc).isoformat()}
+    stamp = now.astimezone(timezone.utc).isoformat()
+    return {"status": "running", "started_at": stamp, "heartbeat_at": stamp}
+
+
+def abandoned(record: Optional[dict], now: datetime) -> bool:
+    """Whether a running re-discovery has no thread left: its heartbeat (its start, before the first beat) is older
+    than STALE_S."""
+    beat = _as_utc((record or {}).get("heartbeat_at") or (record or {}).get("started_at"))
+    return beat is not None and (now.astimezone(timezone.utc) - beat).total_seconds() > STALE_S
 
 
 def is_due(options: Optional[dict], now: datetime, paused: bool = False) -> bool:
@@ -47,9 +58,9 @@ def is_due(options: Optional[dict], now: datetime, paused: bool = False) -> bool
     if hour is None or paused or now.hour < hour:
         return False
     record = (options or {}).get(RECORD) or {}
-    started = _as_utc(record.get("started_at"))
-    if record.get("status") == "running" and started and (now - started).total_seconds() < RUN_STALE_S:
+    if record.get("status") == "running" and not abandoned(record, now):
         return False
+    started = _as_utc(record.get("started_at"))
     return started is None or started.date() < now.date()
 
 
@@ -71,10 +82,8 @@ def progress(last: Optional[dict], now: datetime, discovery_outcome: Optional[di
         return {"state": "done", "found": last.get("found", 0), "added": last.get("added", 0), "note": last.get("note")}
     if status in ("failed", "deferred"):
         return {"state": "failed", "reason": last.get("error") or "no reason was recorded"}
-    started = _as_utc(last.get("started_at"))
-    if started and (now.astimezone(timezone.utc) - started).total_seconds() > RUN_STALE_S:
-        return {"state": "timeout", "reason": "it has gone on for more than 6 hours with no end recorded: the app may "
-                                              "have restarted while it ran"}
+    if status == "running" and abandoned(last, now):
+        return {"state": "failed", "reason": RESTARTED}
     if last.get("phase") == ADDING:
         return {"state": ADDING, "server": None}
     outcome = discovery_outcome or {}

@@ -3,6 +3,7 @@ database, specific tables), the discovery specs that read each server again, and
 with a fake database. No database is needed."""
 import contextlib
 import json
+import time
 from datetime import datetime, timezone
 
 import pytest
@@ -33,11 +34,14 @@ def test_a_job_is_due_from_its_hour_and_once_a_day():
     assert not rd.is_due({"rediscover_hour": 1}, NOW, paused=True)
 
 
-def test_a_running_re_discovery_holds_the_job_until_it_is_stale():
-    running = {"status": "running", "started_at": "2026-10-29T03:30:00+00:00"}
-    assert not rd.is_due({"rediscover_hour": 1, "rediscovery": running}, NOW)
-    long_ago = {"status": "running", "started_at": "2026-10-28T20:00:00+00:00"}
-    assert rd.is_due({"rediscover_hour": 1, "rediscovery": long_ago}, NOW)
+def test_a_running_re_discovery_holds_the_job_while_its_heartbeat_is_fresh():
+    beating = {"status": "running", "started_at": "2026-10-28T20:00:00+00:00", "heartbeat_at": "2026-10-29T03:59:30+00:00"}
+    assert not rd.is_due({"rediscover_hour": 1, "rediscovery": beating}, NOW)
+    # Its thread is gone (no beat for minutes): the job is due again, on the next day as the once-a-day rule has it.
+    stopped = {"status": "running", "started_at": "2026-10-28T20:00:00+00:00", "heartbeat_at": "2026-10-28T20:00:00+00:00"}
+    assert rd.is_due({"rediscover_hour": 1, "rediscovery": stopped}, NOW)
+    stopped_today = {"status": "running", "started_at": "2026-10-29T03:00:00+00:00", "heartbeat_at": "2026-10-29T03:01:00+00:00"}
+    assert not rd.is_due({"rediscover_hour": 1, "rediscovery": stopped_today}, NOW)
 
 
 @pytest.mark.parametrize("value", [None, -1, 24, True, "4", 4.0])
@@ -305,15 +309,15 @@ def test_a_re_discovery_that_has_not_read_a_server_yet_is_pending():
 
 
 def test_while_a_discovery_run_goes_the_page_is_pending_with_its_run_and_server():
-    last = {"status": "running", "started_at": "2026-10-29T03:50:00+00:00", "phase": rd.DISCOVERING, "run_id": 5,
-            "server": "h1"}
+    last = {"status": "running", "started_at": "2026-10-29T03:50:00+00:00", "heartbeat_at": "2026-10-29T03:59:50+00:00",
+            "phase": rd.DISCOVERING, "run_id": 5, "server": "h1"}
     assert rd.progress(last, NOW, {"state": "pending", "url": "https://h/run/5"}) == {
         "state": "pending", "url": "https://h/run/5", "server": "h1"}
 
 
 def test_a_discovery_run_past_its_wait_is_a_timeout_and_not_done():
-    last = {"status": "running", "started_at": "2026-10-29T03:50:00+00:00", "phase": rd.DISCOVERING, "run_id": 5,
-            "server": "h1"}
+    last = {"status": "running", "started_at": "2026-10-29T03:50:00+00:00", "heartbeat_at": "2026-10-29T03:59:50+00:00",
+            "phase": rd.DISCOVERING, "run_id": 5, "server": "h1"}
     outcome = {"state": "timeout", "url": "https://h/run/5",
                "reason": "Databricks has not reported it ended after 360 minutes: it is still listed as running"}
     progress = rd.progress(last, NOW, outcome)
@@ -321,7 +325,8 @@ def test_a_discovery_run_past_its_wait_is_a_timeout_and_not_done():
 
 
 def test_while_the_tables_are_written_the_page_says_adding():
-    last = {"status": "running", "started_at": "2026-10-29T03:50:00+00:00", "phase": rd.ADDING}
+    last = {"status": "running", "started_at": "2026-10-29T03:50:00+00:00", "heartbeat_at": "2026-10-29T03:59:50+00:00",
+            "phase": rd.ADDING}
     assert rd.progress(last, NOW) == {"state": rd.ADDING, "server": None}
 
 
@@ -338,9 +343,26 @@ def test_a_re_discovery_that_failed_or_was_deferred_says_why():
     assert "is running" in rd.progress(deferred, NOW)["reason"]
 
 
-def test_a_run_with_no_end_recorded_for_more_than_six_hours_is_a_timeout():
-    last = {"status": "running", "started_at": "2026-10-28T20:00:00+00:00", "phase": rd.DISCOVERING, "run_id": 5}
-    assert rd.progress(last, NOW, {"state": "pending"})["state"] == "timeout"
+def test_a_running_re_discovery_whose_heartbeat_stopped_failed_because_the_app_restarted():
+    stopped = {"status": "running", "started_at": "2026-10-29T03:00:00+00:00", "heartbeat_at": "2026-10-29T03:01:00+00:00",
+               "phase": rd.DISCOVERING, "run_id": 5, "server": "h1"}
+    assert rd.progress(stopped, NOW, {"state": "pending"}) == {"state": "failed", "reason": "the app restarted; run it again"}
+    adding = {**stopped, "phase": rd.ADDING}
+    assert rd.progress(adding, NOW) == {"state": "failed", "reason": rd.RESTARTED}
+
+
+def test_a_fresh_heartbeat_keeps_a_run_pending_however_long_ago_it_started():
+    beating = {"status": "running", "started_at": "2026-10-28T20:00:00+00:00", "heartbeat_at": "2026-10-29T03:59:30+00:00",
+               "phase": rd.DISCOVERING, "run_id": 5, "server": "h1"}
+    assert rd.progress(beating, NOW, {"state": "pending", "url": None}) == {"state": "pending", "url": None, "server": "h1"}
+
+
+def test_the_claim_and_the_beat_read_the_heartbeat():
+    claim = q.claim_rediscovery_sql()
+    assert "'heartbeat_at'" in claim and "make_interval(secs => %s)" in claim
+    beat = q.beat_rediscovery_sql()
+    assert "jsonb_set(options, '{rediscovery,heartbeat_at}'" in beat and "options->'rediscovery'->>'status' = 'running'" in beat
+    assert rd.STALE_S == 120 and rd.BEAT_S * 4 <= rd.STALE_S
 
 
 def test_no_record_has_no_progress():
@@ -353,8 +375,9 @@ def test_a_run_records_each_phase_as_it_starts_and_its_outcome_last(monkeypatch)
     main._run_rediscovery(7, NOW)
     written = [json.loads(params[0]) for sql, params in records if sql == q.set_rediscovery_sql()]
     assert [w.get("phase") for w in written] == [rd.DISCOVERING, rd.ADDING, None]
-    assert written[0] == {"status": "running", "started_at": NOW.isoformat(), "phase": rd.DISCOVERING,
-                              "run_id": 99, "server": "h1"}
+    assert written[0].items() >= {"status": "running", "started_at": NOW.isoformat(), "phase": rd.DISCOVERING,
+                                  "run_id": 99, "server": "h1"}.items()
+    assert "heartbeat_at" in written[0]
     assert written[-1]["status"] == "done" and "run_id" not in written[-1] and "server" not in written[-1]
 
 
@@ -384,3 +407,28 @@ def test_run_now_is_refused_when_the_job_cannot_change(monkeypatch):
     monkeypatch.setattr(main.db, "query", lambda sql, params=(): claims.append(sql) or [{"id": 7}])
     response = TestClient(main.app, headers={"X-Forwarded-Email": "op@example.com"}).post("/api/ingestion-jobs/7/rediscover")
     assert response.status_code >= 400 and claims == []
+
+
+def test_a_running_re_discovery_beats_its_heartbeat_while_it_goes(monkeypatch):
+    beats, records = [], []
+    monkeypatch.setattr(rd, "BEAT_S", 0.01)
+    monkeypatch.setattr(main, "_forget_shared_reads", lambda: None)
+
+    def execute(sql, params=()):
+        (beats if sql == q.beat_rediscovery_sql() else records).append((sql, params))
+
+    monkeypatch.setattr(main.db, "execute", execute)
+
+    def slow_run(sid, report):
+        deadline = time.time() + 2
+        while len(beats) < 2 and time.time() < deadline:
+            time.sleep(0.01)
+        return {"found": 0, "added": 0}
+
+    monkeypatch.setattr(main, "_rediscover", slow_run)
+    main._run_rediscovery(7, NOW)
+    assert len(beats) >= 2 and all(params[1] == 7 for _, params in beats)
+    assert all(params[0] for _, params in beats)
+    written = [json.loads(params[0]) for sql, params in records if sql == q.set_rediscovery_sql()]
+    assert written[-1]["status"] == "done" and "heartbeat_at" in written[-1]
+

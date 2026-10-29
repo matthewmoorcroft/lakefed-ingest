@@ -68,3 +68,17 @@ def test_a_run_databricks_does_not_have_is_a_404(client, monkeypatch):
     monkeypatch.setattr(run_poller, "run_state_of", missing)
     monkeypatch.setattr(main.jobs, "is_not_found", lambda error: True)
     assert client.get("/api/jobs/setup/runs/41").status_code == 404
+
+
+def test_the_setup_run_databricks_lists_going_is_read_from_the_run_table(client, monkeypatch):
+    asked = []
+    monkeypatch.setattr(run_poller, "runs_of", lambda job_id, active_only=False, limit=25: asked.append(
+        (str(job_id), active_only, limit)) or [{"run_id": 41, "state": "RUNNING"}])
+    assert client.get("/api/jobs/setup/runs/active").json() == {"run_id": 41}
+    assert asked == [(SETUP_JOB, True, 1)]
+
+
+def test_no_setup_run_going_answers_no_run(client, monkeypatch):
+    monkeypatch.setattr(run_poller, "runs_of", lambda job_id, active_only=False, limit=25: [])
+    assert client.get("/api/jobs/setup/runs/active").json() == {"run_id": None}
+

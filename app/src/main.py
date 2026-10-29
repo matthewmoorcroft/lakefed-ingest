@@ -437,11 +437,17 @@ def _task_written(cur, task_id: Optional[int], result: dict, job_id=None, done=0
         cur.execute(q.task_written_sql(), (json.dumps(result, default=str), job_id, done, task_id))
 
 
-def _run_task(task_id: int, write, after) -> None:
-    """A task's thread: write(progress, task_id) in its transaction, then after(result) (syncing the Databricks jobs)
-    once it has committed. A beat thread records progress and the heartbeat every TASK_BEAT_S, also while one long
-    statement runs. A failed write ends the task failed with what the request would have answered; a failure after
-    the commit keeps it succeeded, with why in the result."""
+def _unsynced(e: Exception, result: dict):
+    """The result and error of a write whose sync after its commit failed: the tables stay written, the task is not done."""
+    error = _error_text(e) if isinstance(e, NotSynced) else f"{TASK_WRITTEN_NOT_SYNCED} {_error_text(e)}"
+    return {**result, "after_error": _error_text(e)}, error
+
+
+def _attempt(task_id: int, write, after):
+    """A task's work on the calling thread: write(progress, task_id) in its transaction, then after(result) (syncing the
+    Databricks jobs) once it has committed. A beat thread records progress and the heartbeat every TASK_BEAT_S, also
+    while one long statement runs. Returns (status, result, error, failure): a write that raised has no result; a sync
+    that failed after the commit keeps its result, with what failed."""
     state = {"done": 0}
     stop = threading.Event()
 
@@ -455,48 +461,88 @@ def _run_task(task_id: int, write, after) -> None:
     def progress(n: int) -> None:
         state["done"] = n
 
-    beating = threading.Thread(target=beat, daemon=True, name="lakefed-app-task-beat")
-    beating.start()
-    result, status, error = None, "failed", None
+    threading.Thread(target=beat, daemon=True, name="lakefed-app-task-beat").start()
+    result, status, error, failure = None, "failed", None, None
     try:
         result = write(progress, task_id)
         try:
             result = after(result)
             status = "succeeded"
         except Exception as e:
-            result = {**result, "after_error": _error_text(e)}
-            error = _error_text(e) if isinstance(e, NotSynced) else f"{TASK_WRITTEN_NOT_SYNCED} {_error_text(e)}"
+            result, error = _unsynced(e, result)
+            failure = e
     except BaseException as e:
-        error = _error_text(e)
+        error, failure = _error_text(e), e
     finally:
         stop.set()
+    return status, result, error, failure
+
+
+def _finish(task_id: int, status: str, result, error) -> None:
     db.execute(q.finish_task_sql(), (status, (result or {}).get("id"), json.dumps(result, default=str) if result else None,
                                      error, task_id))
 
 
-def _in_background(kind: str, request_id: Optional[str], job_id: Optional[int], total: int, user: str, write, after):
-    """Record a task and start its thread, answering 202 with the task. The same request id again (a retry after a
-    timeout) answers with the task it made the first time and starts nothing, so a job is never written twice."""
+def _run_task(task_id: int, write, after) -> None:
+    """A background task's thread: the work (_attempt), then the task ends with what it reached."""
+    status, result, error, _ = _attempt(task_id, write, after)
+    _finish(task_id, status, result, error)
+
+
+def _task_answer(task_id: int) -> JSONResponse:
+    return JSONResponse(status_code=202, content={"task": _task(task_id), "created": False, "applied": False})
+
+
+def _run_now(task_id: int, write, after):
+    """A small write, in the request. Its task was recorded first, so the same request id finds it. A write that failed
+    answers as the request always did; one that committed but whose Databricks sync failed answers 202 with its task,
+    not done, so the page can finish it by sending the same request id again (_answer_again)."""
+    status, result, error, failure = _attempt(task_id, write, after)
+    _finish(task_id, status, result, error)
+    if failure is not None and result is None:
+        raise failure
+    return result if status == "succeeded" else _task_answer(task_id)
+
+
+def _finish_sync(task_id: int, stored: dict, after) -> None:
+    """Sync again a write that committed (its stored result) but whose sync failed: nothing is written again."""
+    try:
+        status, result, error = "succeeded", after(dict(stored)), None
+    except Exception as e:
+        status = "failed"
+        result, error = _unsynced(e, stored)
+    _finish(task_id, status, result, error)
+
+
+def _answer_again(task_id: int, after) -> JSONResponse:
+    """The same request id sent again: the task it made answers, and nothing is written again. A task that committed but
+    is not done (its Databricks sync failed, or the app restarted before it) is finished here by syncing again."""
+    task = _task(task_id)
+    if task["status"] == "failed" and task["result"] is not None and after is not None \
+            and db.query(q.resume_synced_task_sql(), (task_id,)):
+        _finish_sync(task_id, task["result"], after)
+    return _task_answer(task_id)
+
+
+def _write_now_or_later(kind, request_id, job_id, total, user, write, after):
+    """Every write is a task: recorded first (the request id is its key), then written in the request when it is small
+    (_run_now), else on a background thread. Sent again with the same request id, it answers with its task (_answer_again)."""
     made = db.query(q.insert_task_sql(), (kind, request_id or uuid.uuid4().hex, job_id, int(total), None, user or None))[0]
-    if made["made"]:
-        _start_background(lambda: _run_task(made["id"], write, after))
-    return JSONResponse(status_code=202, content={"task": _task(made["id"]), "created": False, "applied": False})
+    if not made["made"]:
+        return _answer_again(made["id"], after)
+    if total <= BACKGROUND_ROWS:
+        return _run_now(made["id"], write, after)
+    _start_background(lambda: _run_task(made["id"], write, after))
+    return _task_answer(made["id"])
 
 
-def _made_already(body) -> Optional[JSONResponse]:
+def _made_already(body, after) -> Optional[JSONResponse]:
     """The answer to a write sent again with the request id of one that made a task: that task, before anything is
     planned again (the first write's own tables would now make the plan refuse it)."""
     if body.dry_run or not body.request_id:
         return None
     made = db.query(q.task_of_request_sql(), (body.request_id,))
-    return JSONResponse(status_code=202, content={"task": _task(made[0]["id"]), "created": False, "applied": False}) if made else None
-
-
-def _write_now_or_later(kind, request_id, job_id, total, user, write, after):
-    """Write in the request when it is small (as before tasks, no task), else in the background (_in_background)."""
-    if total <= BACKGROUND_ROWS:
-        return after(write(None, None))
-    return _in_background(kind, request_id, job_id, total, user, write, after)
+    return _answer_again(made[0]["id"], after) if made else None
 
 
 @app.get("/api/tasks/{task_id}")
@@ -1835,7 +1881,14 @@ def add_job_databases(job_id: int, body: JobDatabasesRequest, request: Request):
     to server, database and enabled) or a list picked by hand (job_settings.plan_databases). Applying is one
     transaction under every group's run lock: new tables inserted (a taken target is skipped), enabled flags
     set, new groups added to the job; then the job's wrapper jobs are synced."""
-    if (made := _made_already(body)) is not None:
+    user = _user(request)
+
+    def after(result):
+        if result.get("new_groups"):
+            _synced(_sync(job_id, user))
+        return {k: v for k, v in result.items() if k != "new_groups"}
+
+    if (made := _made_already(body, after)) is not None:
         return made
     if body.csv is not None:
         entries, errors = js.read_databases(body.csv, body.columns)
@@ -1862,7 +1915,7 @@ def add_job_databases(job_id: int, body: JobDatabasesRequest, request: Request):
     if body.dry_run:
         return {"summary": summary}
     _refuse_job_tables(job, groups + plan["new_groups"], request)
-    user, batch = _user(request), uuid.uuid4().hex[:12]
+    batch = uuid.uuid4().hex[:12]
 
     def write(progress, task_id):
         with _write() as cur:
@@ -1893,13 +1946,8 @@ def add_job_databases(job_id: int, body: JobDatabasesRequest, request: Request):
             _touch(cur, user, [job_id])
             summary.update(applied=True, new_tables=len(written), skipped=len(plan["new"]) - len(written))
             result = {"summary": summary}
-            _task_written(cur, task_id, result, job_id, len(plan["new"]))
+            _task_written(cur, task_id, {**result, "new_groups": plan["new_groups"]}, job_id, len(plan["new"]))
         return {**result, "new_groups": plan["new_groups"]}
-
-    def after(result):
-        if result.pop("new_groups"):
-            _synced(_sync(job_id, user))
-        return result
 
     return _write_now_or_later("databases", body.request_id, job_id, len(plan["new"]), user, write, after)
 
@@ -1959,7 +2007,14 @@ def add_job_tables(job_id: int, body: JobTablesRequest, request: Request):
     its group, a new one joins its server's groups, a new server gets new groups. Applying is one transaction under
     the job's lock and its groups' run locks; tables the job already writes are left; then new groups are synced. The
     tables come as CSV lines (csv) or by reference to an upload or discovery (source), which is kept with the job."""
-    if (made := _made_already(body)) is not None:
+    user = _user(request)
+
+    def after(result):
+        if result.get("new_groups"):
+            _synced(_sync(job_id, user))
+        return {k: v for k, v in result.items() if k != "new_groups"}
+
+    if (made := _made_already(body, after)) is not None:
         return made
     if body.source is not None:
         kind, param, source_id, rest = _selection_params(body.source)
@@ -1982,7 +2037,7 @@ def add_job_tables(job_id: int, body: JobTablesRequest, request: Request):
     if body.dry_run:
         return {"summary": nj.summary(plan), "applied": False}
     _refuse_job_tables(job, groups + plan["groups"], request)
-    user, batch = _user(request), uuid.uuid4().hex[:12]
+    batch = uuid.uuid4().hex[:12]
 
     def write(progress, task_id):
         with _write() as cur:
@@ -1995,13 +2050,8 @@ def add_job_tables(job_id: int, body: JobTablesRequest, request: Request):
             _keep_selection(cur, job_id, selected, user)
             _touch(cur, user, [job_id])
             result = {"summary": summary, "applied": True}
-            _task_written(cur, task_id, result, job_id, len(written))
+            _task_written(cur, task_id, {**result, "new_groups": plan["new_groups"]}, job_id, len(written))
         return {**result, "new_groups": plan["new_groups"]}
-
-    def after(result):
-        if result.pop("new_groups"):
-            _synced(_sync(job_id, user))
-        return result
 
     valid = sum(line["status"] == "valid" for line in plan["lines"])
     return _write_now_or_later("tables", body.request_id, job_id, valid, user, write, after)
@@ -2429,6 +2479,14 @@ def run_setup(request: Request):
 
 # Where Databricks has not reported a setup run ended by this long after its start, the page says so, and it is not done.
 SETUP_LIMIT_S = 30 * 60
+
+
+@app.get("/api/jobs/setup/runs/active")
+def setup_run_active():
+    """The setup run Databricks lists going, if any (the run poller's table), so a page opened during a run keeps its
+    button off. Its outcome is read from GET /api/jobs/setup/runs/{run_id}."""
+    runs = run_poller.runs_of(_require(jobs.SETUP_JOB_ID, "setup"), active_only=True, limit=1)
+    return {"run_id": int(runs[0]["run_id"]) if runs else None}
 
 
 @app.get("/api/jobs/setup/runs/{run_id}")
@@ -3159,7 +3217,8 @@ def _create_by_database(body: NewJobRequest, request: Request, selection: Select
                                           summary["tables"], None, user or None))[0]
     if made["made"] or db.query(q.resume_task_sql(), (made["id"],)):
         _start_background(lambda: _run_task(made["id"], write, after))
-    return JSONResponse(status_code=202, content={"task": _task(made["id"]), "created": False, "applied": False})
+        return _task_answer(made["id"])
+    return _answer_again(made["id"], after)
 
 
 def _add_by_database(job_id: int, body: "JobTablesRequest", request: Request, kind, param, source_id, rest, total: int):
@@ -3247,13 +3306,13 @@ def _add_by_database(job_id: int, body: "JobTablesRequest", request: Request, ki
         with _write() as cur:
             _keep_selection(cur, job_id, {"parts": parts, "kind": kind, "source_id": source_id}, user)
             _touch(cur, user, [job_id])
-            _task_written(cur, task_id, result, job_id, state["tables_written"])
+            _task_written(cur, task_id, {**result, "new_groups": found["new_groups"]}, job_id, state["tables_written"])
         return {**result, "new_groups": found["new_groups"]}
 
     def after(result):
-        if result.pop("new_groups"):
+        if result.get("new_groups"):
             _synced(_sync(job_id, user))
-        return result
+        return {k: v for k, v in result.items() if k != "new_groups"}
 
     if body.dry_run:
         return {"summary": {"tables": total, "by_database": True, "checked": False, "new_groups": []},
@@ -3262,7 +3321,8 @@ def _add_by_database(job_id: int, body: "JobTablesRequest", request: Request, ki
                                           user or None))[0]
     if made["made"] or db.query(q.resume_task_sql(), (made["id"],)):
         _start_background(lambda: _run_task(made["id"], write, after))
-    return JSONResponse(status_code=202, content={"task": _task(made["id"]), "created": False, "applied": False})
+        return _task_answer(made["id"])
+    return _answer_again(made["id"], after)
 
 
 @app.post("/api/ingestion-jobs")
@@ -3278,7 +3338,13 @@ def create_ingestion_job(body: NewJobRequest, request: Request):
         counted = db.query(q.selected_rows_sql(kind, count=True), (param, *rest))
         if counted and counted[0]["n"] > BACKGROUND_ROWS:
             return _create_by_database(body, request, body.source, kind, param, source_id, rest)
-    if (made := _made_already(body)) is not None:
+    user = _user(request)
+    create_options = {k: v for k, v in (body.run.options or {}).items() if k not in MANAGED_OPTIONS}
+
+    def after_create(result):
+        return _created(result, user, create_options)
+
+    if (made := _made_already(body, after_create)) is not None:
         return made
     import psycopg
     name = body.name.strip()
@@ -3302,10 +3368,9 @@ def create_ingestion_job(body: NewJobRequest, request: Request):
     summary = nj.summary(plan)
     if body.dry_run or summary["invalid"]:
         return {"summary": summary, "settings": plan["settings"], "created": False}
-    user = _user(request)
     if not run.paused:     # anyone may set up a job, but one that runs needs the right to run what it starts
         _refuse(_permission_refusals({"job_variant": run.job_variant}, user)["run"])
-    options = {k: v for k, v in (run.options or {}).items() if k not in MANAGED_OPTIONS}
+    options = create_options
     _refuse_unknown_node_types(sch.own_cluster({"options": options}))
     timezone_ = sch.timezone_for(run.cadence_minutes, run.timezone)
     offs = sch.offsets(plan["groups"], run.cadence_minutes, run.stagger, sch.start_minute({"options": options, "cadence_minutes": run.cadence_minutes}))
@@ -3724,7 +3789,7 @@ def _rediscovery_tick(now: Optional[datetime] = None) -> List[int]:
         if not rediscovery.is_due(sch.options_of(job), now, bool(job["paused"])):
             continue
         claimed = db.query(q.claim_rediscovery_sql(),
-                           (json.dumps(rediscovery.running_record(now)), job["id"], rediscovery.RUN_STALE_S))
+                           (json.dumps(rediscovery.running_record(now)), job["id"], rediscovery.STALE_S))
         if claimed:
             started.append(job["id"])
             _start_background(lambda sid=job["id"]: _run_rediscovery(sid, now))
@@ -3739,7 +3804,7 @@ def rediscover_now(job_id: int, request: Request):
     _refuse(_job_permission_refusals(s, _user(request))["change"])
     now = datetime.now(timezone.utc)
     claimed = db.query(q.claim_rediscovery_sql(),
-                       (json.dumps(rediscovery.running_record(now)), int(job_id), rediscovery.RUN_STALE_S))
+                       (json.dumps(rediscovery.running_record(now)), int(job_id), rediscovery.STALE_S))
     if not claimed:
         raise HTTPException(409, "a re-discovery of this job is already running")
     _start_background(lambda: _run_rediscovery(int(job_id), now))
@@ -3750,12 +3815,21 @@ def _run_rediscovery(sid: int, started: datetime) -> None:
     """A job's re-discovery on its own thread. Its outcome (what was found and added, what vanished, the errors) or why
     it did not run is recorded on the job, even when it failed. A 409 because a group is running is 'deferred': the
     next re-discovery is the next day's. Each phase is recorded as it starts, so the job page can show where it is."""
-    record = {"status": "running", "started_at": started.astimezone(timezone.utc).isoformat()}
+    record = rediscovery.running_record(started)
+    stop = threading.Event()
+
+    def beat():
+        while not stop.wait(rediscovery.BEAT_S):
+            try:
+                db.execute(q.beat_rediscovery_sql(), (datetime.now(timezone.utc).isoformat(), int(sid)))
+            except Exception:
+                pass     # a missed beat is caught up by the next; STALE_S allows for several
 
     def report(**fields) -> None:
-        record.update(fields)
+        record.update(fields, heartbeat_at=datetime.now(timezone.utc).isoformat())
         db.execute(q.set_rediscovery_sql(), (json.dumps(record, default=str), int(sid)))
 
+    threading.Thread(target=beat, daemon=True, name="lakefed-rediscovery-beat").start()
     try:
         record.update(status="done", **_rediscover(sid, report))
     except HTTPException as e:
@@ -3763,6 +3837,8 @@ def _run_rediscovery(sid: int, started: datetime) -> None:
         record.update(status="deferred" if deferred else "failed", error=_error_text(e))
     except Exception as e:
         record.update(status="failed", error=_error_text(e))
+    finally:
+        stop.set()
     for progress_key in ("phase", "run_id", "server"):
         record.pop(progress_key, None)
     record["finished_at"] = datetime.now(timezone.utc).isoformat()

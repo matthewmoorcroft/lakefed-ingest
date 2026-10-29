@@ -134,7 +134,8 @@ def client(monkeypatch):
 
     fake = FakeDB()
     monkeypatch.setattr(main.db, "query", lambda sql, params=(): [{"task_collection": "other"}]
-                        if sql == q.collections_sql() else [])
+                        if sql == q.collections_sql() else [{"id": 1, "made": True}] if sql == q.insert_task_sql() else [])
+    monkeypatch.setattr(main.db, "execute", lambda sql, params=(): None)
     monkeypatch.setattr(main.db, "transaction", contextlib.contextmanager(lambda: (yield Cursor(fake))))
     monkeypatch.setattr(main.jobs, "schedule_variants", lambda: {"default": "1", "check": "2"})
     synced = []
@@ -248,10 +249,13 @@ def job_client(monkeypatch):
             return [dict(r) for r in rows]
         if sql == q.collections_sql():
             return [{"task_collection": m["task_collection"]} for m in members]
+        if sql == q.insert_task_sql():
+            return [{"id": 1, "made": True}]
         return []
 
     fake = FakeDB()
     monkeypatch.setattr(main.db, "query", answer)
+    monkeypatch.setattr(main.db, "execute", lambda sql, params=(): None)
     monkeypatch.setattr(main.db, "fetch", lambda cur, sql, params=(): answer(sql, params))
     monkeypatch.setattr(main.db, "transaction", contextlib.contextmanager(lambda: (yield FakeCursor(fake))))
     monkeypatch.setattr(main, "_refuse_job", lambda job, request, action: None)

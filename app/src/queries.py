@@ -1614,6 +1614,14 @@ def resume_task_sql() -> str:
             f"returning id")
 
 
+def resume_synced_task_sql() -> str:
+    """Restarts a write that committed but is not done (failed with its result kept: its Databricks sync failed, or the
+    app restarted before it). Sent again with its request id, it syncs again and writes nothing. Returns the id when
+    it was restarted. Param: id."""
+    return (f"update {SCHEMA}.app_task set status = 'running', error = null, finished_at = null, heartbeat_at = now() "
+            f"where id = %s and status = 'failed' and result is not null returning id")
+
+
 def running_task_sql() -> str:
     """Whether a job has a write running (its heartbeat fresh): a Delete waits for it. Params: job_id, seconds."""
     return (f"select id from {SCHEMA}.app_task where job_id = %s and status = 'running' "
@@ -2046,13 +2054,21 @@ def clear_schedule_option_sql() -> str:
 
 
 def claim_rediscovery_sql() -> str:
-    """Claim a job's re-discovery: its record becomes running, unless a run holds it (a running record younger than
-    the stale limit). Returns the id when claimed. Params: the running record as JSON, id, stale seconds."""
+    """Claim a job's re-discovery: its record becomes running, unless a run holds it (a running record whose heartbeat is
+    fresh). Returns the id when claimed. Params: the running record as JSON, id, stale seconds."""
     return (f"update {SCHEMA}.schedule set options = jsonb_set(coalesce(options, '{{}}'::jsonb), '{{rediscovery}}', "
             f"%s::jsonb) where id = %s and deleted_at is null and (options->'rediscovery' is null "
             f"or options->'rediscovery'->>'status' is distinct from 'running' "
-            f"or coalesce((options->'rediscovery'->>'started_at')::timestamptz, 'epoch'::timestamptz) "
+            f"or coalesce((options->'rediscovery'->>'heartbeat_at')::timestamptz, "
+            f"(options->'rediscovery'->>'started_at')::timestamptz, 'epoch'::timestamptz) "
             f"< now() - make_interval(secs => %s)) returning id")
+
+
+def beat_rediscovery_sql() -> str:
+    """Stamp a running re-discovery's heartbeat, so the record shows its thread is alive. Only while the record is
+    running, so a beat can't touch one that has ended. Params: the time (ISO text), id."""
+    return (f"update {SCHEMA}.schedule set options = jsonb_set(options, '{{rediscovery,heartbeat_at}}', "
+            f"to_jsonb(%s::text)) where id = %s and options->'rediscovery'->>'status' = 'running'")
 
 
 def set_rediscovery_sql() -> str:
