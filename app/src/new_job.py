@@ -185,7 +185,9 @@ def summary(planned: dict) -> dict:
     servers: Dict[str, dict] = {}
     for line in (line for line in planned["lines"] if line["status"] != "in_job"):
         s = servers.setdefault(line["server"], {"server": line["server"], "databases": set(), "tables": 0, "groups": set(),
-                                                "read_through": "UC connection" if line["row"].get("use_remote_query") else "JDBC"})
+                                                "read_through": "UC connection" if line["row"].get("use_remote_query") else "JDBC",
+                                                "load_types": {}})
+        s["load_types"][line["row"]["load_type"]] = s["load_types"].get(line["row"]["load_type"], 0) + 1
         s["databases"].add(line["row"].get("src_database"))
         s["tables"] += 1
         s["groups"].add(line["group"])

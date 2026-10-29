@@ -307,6 +307,15 @@ details.advanced .compute h4 { margin: var(--db-space-3) 0 var(--db-space-2); }
 .menu-items > button .sub { display: block; color: var(--muted); font-size: var(--db-font-size-sm); white-space: normal; }
 .menu-items.wide, .menu-items:has(.sub) { min-width: 320px; }
 .page-sub { font-size: var(--db-font-size-lg, 16px); margin: var(--db-space-4) 0 var(--db-space-2); }
+.modal:has(.discover) { width: min(880px, 94vw); }
+.discover .radio-row { display: flex; gap: 8px; align-items: center; font-weight: var(--db-font-weight-semibold); margin: var(--db-space-2) 0; }
+.discover .radio-body { margin: 0 0 var(--db-space-3) 24px; }
+.discover .tree-pick { max-height: 46vh; overflow: auto; }
+.pick-row { cursor: pointer; }
+.tri-box { display: inline-grid; place-items: center; width: 16px; height: 16px; min-height: 0; padding: 0; border-radius: 3px;
+           border: 1px solid var(--db-border-strong, #8a96a3); background: var(--db-surface-base); color: var(--accent-text);
+           font-size: 11px; line-height: 1; vertical-align: -3px; cursor: pointer; }
+.tri-box.all, .tri-box.part { background: var(--accent); border-color: var(--accent); }
 .empty-drop { border: 1px dashed var(--border); border-radius: var(--db-shape-container-small); padding: var(--db-space-4); text-align: center; color: var(--muted); margin: 0; }
 .menu-note { padding: 6px 12px; overflow-wrap: anywhere; }
 .menu-note + .menu-note { border-top: 1px solid var(--border); }

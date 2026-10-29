@@ -6,6 +6,7 @@ import { Crumbs, ConfirmButton, ErrorBox, Menu, Notice, PageHead, Pager, Section
 import { usePermissions } from "../permissions";
 import { CADENCES, IdentityFields, ParameterFields, RunFields, WritesFields, paramsSummary } from "./jobForm";
 import { ImportCsvDialog } from "./NewJob";
+import { DiscoverDialog } from "./Discover";
 
 // Edit an ingestion job: what it ingests (a tree from its servers), how it writes, its identity columns, when it
 // runs and its advanced configuration. A change in the tree applies once its dialog is confirmed, as Catalog Explorer
@@ -251,6 +252,7 @@ function useAddTables(jobId: string) {
   const qc = useQueryClient();
   const confirm = useConfirm();
   const [open, setOpen] = useState(false);
+  const [discovering, setDiscovering] = useState(false);
   const [found, setFound] = useState<Row | null>(null);
   const add = useMutation({
     mutationFn: async ({ csv, loadType }: { csv: string; loadType: string }) => {
@@ -271,6 +273,7 @@ function useAddTables(jobId: string) {
   });
   const dialog = <>
     {open && <ImportCsvDialog csv="" loadType="ct" onClose={(next) => { setOpen(false); if (next) add.mutate(next); }} />}
+    {discovering && <DiscoverDialog onClose={(lines) => { setDiscovering(false); if (lines) add.mutate({ csv: lines, loadType: "ct" }); }} />}
     {confirm.dialog}
   </>;
   const result = <>
@@ -279,7 +282,7 @@ function useAddTables(jobId: string) {
       added.<ul>{found.invalid.slice(0, 20).map((l: Row) => <li key={l.line}>line {l.line}, {l.table}: {l.errors.join("; ")}</li>)}</ul></Notice>}
     {add.data && <Notice tone="ok">Added {fmtInt(add.data.summary.tables)} {plural(add.data.summary.tables, "table")}.</Notice>}
   </>;
-  return { open: () => setOpen(true), dialog, result };
+  return { open: () => setOpen(true), discover: () => setDiscovering(true), dialog, result };
 }
 
 export default function JobEdit() {
@@ -452,6 +455,7 @@ export default function JobEdit() {
         actions={locked ? <button className="ghost" disabled title={locked}>Add tables ▾</button> : <Menu label="Add tables ▾" buttonClass="ghost" title="Add tables">
           <button onClick={addTables.open}>Import a CSV of tables<span className="sub">one line per table: where it is; the job says how to ingest it</span></button>
           <button onClick={() => setAddOpen(true)}>Import a CSV of databases<span className="sub">each database gets every table of the job, or pick them by hand</span></button>
+          <button onClick={addTables.discover}>Discover on a source<span className="sub">a UC connection, tested first; then the whole server, whole databases or single tables</span></button>
         </Menu>}>
         <p className="impact">Changes here apply as soon as you confirm them; Save does not cover them.</p>
         {addTables.dialog}{addTables.result}

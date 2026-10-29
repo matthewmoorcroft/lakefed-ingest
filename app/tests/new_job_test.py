@@ -80,6 +80,7 @@ def test_the_summary_counts_tables_databases_and_groups_per_server():
     assert summary["tables"] == 3 and summary["invalid"] == []
     assert [(s["server"], s["databases"], s["tables"], s["read_through"]) for s in summary["servers"]] == [
         ("sql_a", 2, 3, "UC connection")]
+    assert summary["servers"][0]["load_types"] == {"ct": 3}
 
 
 # ---- the endpoint (needs FastAPI and httpx) -----------------------------------------------------

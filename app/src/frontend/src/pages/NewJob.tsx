@@ -4,6 +4,7 @@ import { useNavigate } from "react-router-dom";
 import { api, type Row } from "../api";
 import { Crumbs, ErrorBox, Menu, Modal, Notice, PageHead, Section, fmtInt, plural, useConfirm } from "../components";
 import { CADENCES, IdentityFields, ParameterFields, RunFields, WritesFields, paramsSummary } from "./jobForm";
+import { DiscoverDialog } from "./Discover";
 
 // New ingestion job: the Edit view, empty, with Create in place of Save. Its tables are added in What it ingests
 // (Add tables: a CSV of where each table is), the rest is set as in Edit, and nothing is written until Create, which
@@ -28,6 +29,7 @@ export default function NewJob() {
   const [variant, setVariant] = useState<string | null>(null);
   const [groupsPerServer, setGroupsPerServer] = useState(4);
   const [importing, setImporting] = useState(false);
+  const [discovering, setDiscovering] = useState(false);
   const variants: string[] = options.data?.variants ?? [];
   // The check job is how the 1,000- and 100,000-table jobs were tested, so it is the default where there is one.
   const jobVariant = variant ?? (variants.includes("check") ? "check" : "default");
@@ -90,15 +92,17 @@ export default function NewJob() {
       <Section title="What it ingests" note="The servers, databases and tables this job ingests."
         actions={<Menu label="Add tables ▾" buttonClass="ghost" title="Add tables">
           <button onClick={() => setImporting(true)}>Import a CSV<span className="sub">one line per table: where it is; the job says how to ingest it</span></button>
+          <button onClick={() => setDiscovering(true)}>Discover on a source<span className="sub">a UC connection, tested first; then the whole server, whole databases or single tables</span></button>
         </Menu>}>
-        {!csv.trim() ? <p className="empty-drop">No tables yet. <b>Add tables</b>: import a CSV of where each table is.</p> : (
+        {!csv.trim() ? <p className="empty-drop">No tables yet. <b>Add tables</b>: import a CSV of where each table is, or discover them on a source.</p> : (
           <>
             <div className="table-wrap"><table className="data">
               <thead><tr><th>Server</th><th>Read through · load type</th><th className="num">Databases · tables</th><th className="num">Groups</th></tr></thead>
               <tbody>
                 {(summary?.servers ?? []).map((s: Row) => (
                   <tr key={s.server}><td className="name"><b>{s.server}</b></td>
-                    <td>{s.read_through} · {LOAD_TYPES.find(([k]) => k === loadType)?.[1]}</td>
+                    <td>{s.read_through} · {Object.entries(s.load_types as Record<string, number>).map(([k, n]) =>
+                      `${LOAD_TYPES.find(([key]) => key === k)?.[1] ?? k}${Object.keys(s.load_types).length > 1 ? ` ${fmtInt(n)}` : ""}`).join(", ")}</td>
                     <td className="num">{fmtInt(s.databases)} · {fmtInt(s.tables)}</td><td className="num">{fmtInt(s.groups.length)}</td></tr>
                 ))}
               </tbody>
@@ -108,11 +112,12 @@ export default function NewJob() {
               added:<ul>{summary!.invalid.slice(0, 20).map((l: Row) => <li key={l.line}>line {l.line}, {l.table}: {l.errors.join("; ")}</li>)}</ul>
               {summary!.invalid.length > 20 && <span className="muted">and {fmtInt(summary!.invalid.length - 20)} more.</span>}</Notice>}
             <ErrorBox error={preview.error} />
-            <div className="toolbar"><button className="ghost" onClick={() => setImporting(true)}>Replace the file</button>
+            <div className="toolbar"><button className="ghost" onClick={() => setImporting(true)}>Import a file instead</button>
               <button className="ghost" onClick={() => setCsv("")}>Remove the tables</button></div>
           </>
         )}
       </Section>
+      {discovering && <DiscoverDialog onClose={(lines) => { setDiscovering(false); if (lines) setCsv(lines); }} />}
       {importing && <ImportCsvDialog csv={csv} loadType={loadType} onClose={(next) => {
         setImporting(false); if (next) { setCsv(next.csv); setLoadType(next.loadType); } }} />}
 
