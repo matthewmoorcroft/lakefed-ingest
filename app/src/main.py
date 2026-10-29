@@ -801,12 +801,34 @@ def collections():
 # ---- ingestion jobs and job runs ----------------------------------------------------------------
 
 def _schedules():
-    """Active schedules and all their members, removed ones included (a member's past runs still belong to
-    the job runs of its time in the schedule), shared like _running. _active keeps the current members."""
+    """Active schedules, the deleted ones whose Delete is pending, and all their members, removed ones included (a
+    member's past runs still belong to the job runs of its time in the schedule), shared like _running. _active keeps
+    the current members. A pending deleted job carries its delete state (ingestion_jobs.delete_state)."""
     def compute():
-        rows = db.query(q.schedules_sql())
+        rows = _with_delete_states(db.query(q.schedules_sql()), datetime.now(timezone.utc))
         return rows, db.query(q.schedule_members_sql(), ([r["id"] for r in rows],)) if rows else []
     return _shared("schedules", compute)
+
+
+def _with_delete_states(rows: List[dict], now: datetime) -> List[dict]:
+    """The rows with each deleted job's delete state. One whose delete is finished (the delete job succeeded and no
+    tables are left) is marked ``delete_finished`` and leaves the list: the Deleted jobs history keeps it."""
+    deleted = [r for r in rows if r.get("deleted_at") is not None]
+    if not deleted:
+        return rows
+    left = {r["schedule_id"] for r in db.query(q.deleted_tables_left_sql(), ([r["id"] for r in deleted],))}
+    out = []
+    for r in rows:
+        if r.get("deleted_at") is None:
+            out.append(r)
+            continue
+        state = ij.delete_state(r, r["id"] in left, _delete_run(r), now)
+        if state["state"] == ij.DELETE_GONE:
+            with db.transaction() as cur:
+                cur.execute(q.set_schedule_flag_sql(), (["delete_finished"], True, int(r["id"])))
+            continue
+        out.append({**r, "delete": state})
+    return out
 
 
 def _deleting() -> set:
@@ -1093,7 +1115,8 @@ def ingestion_job(job_id: int, request: Request):
             "run_now": {"blocked": refusals["run"] or _run_now_blocker(job, mine), "refused": refusals["run"],
                         "going": _recorded_running(mine),
                         "groups": len(mine), "check": job.get("job_variant") == sch.CHECK_VARIANT},
-            "delete_blocked": refusals["delete"], "change_blocked": refusals["change"], **_audit(job)}
+            "delete_blocked": refusals["delete"], "change_blocked": refusals["change"],
+            "delete": job.get("delete"), **_audit(job)}
 
 
 def _job_groups(job_id: int) -> List[str]:
@@ -1126,9 +1149,21 @@ def _started_job(job: dict) -> Optional[str]:
 NO_IDENTITY = "the app can't tell who you are (the Databricks Apps proxy sent no user), so it refuses this"
 
 
+DELETED_JOB = ("this job is deleted: its runs and tables can't change while its delete runs or after it, and it "
+               "can't be run or edited; Run again on it starts its delete job again")
+
+
 def _permission_refusals(job: dict, user: str) -> dict:
     """{action: why the user may not take it, or None} for each action on an ingestion job (run, change, delete),
-    from their Databricks permission on the job its runs execute as."""
+    from their Databricks permission on the job its runs execute as. A deleted job can't be run or changed; its
+    delete stays open, for Run again."""
+    refusals = _job_permission_refusals(job, user)
+    if job.get("deleted_at") is None:
+        return refusals
+    return {**refusals, "run": DELETED_JOB, "change": DELETED_JOB}
+
+
+def _job_permission_refusals(job: dict, user: str) -> dict:
     if not (user or "").strip():
         return {action: NO_IDENTITY for action in jobs.ACTION_NEEDS}
     started = _started_job(job)
@@ -2685,14 +2720,14 @@ def _skipped_counts(members: List[dict]) -> dict:
 @app.get("/api/schedules")
 def list_schedules(details: bool = True):
     """Schedules with their members: when each runs next, its wrapper job, recent runs and warnings."""
-    rows = db.query(q.schedules_sql())
+    now = datetime.now(timezone.utc)
+    rows = _with_delete_states(db.query(q.schedules_sql()), now)
     members = db.query(q.schedule_members_sql(), ([r["id"] for r in rows],)) if rows else []
     active = [m for m in members if m["removed_at"] is None]
     colls = sorted({m["task_collection"] for m in active})
     stats = {r["task_collection"]: r for r in
              (db.query(q.collection_run_stats_sql(), (colls, colls, colls, colls)) if colls else [])}
     skipped = _skipped_counts(active) if details else {}
-    now = datetime.now(timezone.utc)
     return [{**s, "description": sch.describe(int(s["cadence_minutes"]), sch.start_minute(s), s["timezone"]),
              "members": _members_view(s, [m for m in active if m["schedule_id"] == s["id"]], stats, skipped, now)}
             for s in rows]
@@ -3025,10 +3060,11 @@ def _delete_blocker(job: dict, active: List[dict], groups: List[str]):
 
 
 def _record_delete(cur, sid: int, drop: bool) -> None:
-    """Record that the job's Delete runs the delete job, and with which flag; the earlier run is forgotten, so a start
-    that fails shows as not started."""
+    """Record that the job's Delete runs the delete job, and with which flag. The earlier run, its start error and its
+    finished mark are forgotten, so the job shows Deleting until this run's state is known."""
     cur.execute(q.set_schedule_flag_sql(), (["delete_drop_targets"], bool(drop), int(sid)))
-    cur.execute(q.clear_schedule_option_sql(), ("delete_run_id", int(sid)))
+    for key in ("delete_run_id", "delete_start_error", "delete_finished"):
+        cur.execute(q.clear_schedule_option_sql(), (key, int(sid)))
 
 
 def _start_delete_job(sid: int, drop: bool) -> dict:
@@ -3037,7 +3073,10 @@ def _start_delete_job(sid: int, drop: bool) -> dict:
     try:
         run_id = jobs.start_delete_job(sid, drop)
     except Exception as e:
-        return {"run_id": None, "url": None, "error": f"the delete job didn't start: {str(e).split('. ')[0]}"}
+        error = f"the delete job didn't start: {str(e).split('. ')[0]}"
+        with _write() as cur:
+            cur.execute(q.set_schedule_text_option_sql(), (["delete_start_error"], error, int(sid)))
+        return {"run_id": None, "url": None, "error": error}
     with _write() as cur:
         cur.execute(q.set_schedule_option_sql(), (["delete_run_id"], run_id, int(sid)))
     host = jobs.workspace_url()
@@ -3060,7 +3099,9 @@ def _delete_run(job: dict) -> Optional[dict]:
 def sync_schedule(sid: int, request: Request):
     """Re-sync the wrapper jobs (recreates missing ones and undoes edits made outside the app)."""
     s = _load_schedule(sid)[0]
-    _refuse_job(s, request, "change")
+    # A deleted job keeps its sync: it is how a wrapper job whose delete failed is deleted again, so only the
+    # change permission is checked here, not the deleted-job refusal.
+    _refuse(_job_permission_refusals(s, _user(request))["change"])
     cluster = _apply_cluster(sid) if sch.own_cluster(s) else None     # copies the ingestion job again
     return {"id": sid, "sync": _sync(sid, _user(request)), "cluster_error": cluster}
 

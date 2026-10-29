@@ -5,7 +5,7 @@ group runs of a window, and this module places and sums them, so it is tested wi
 A job run is one trigger of a schedule (schedules.job_runs places group runs by cadence slot). Placement is
 by the schedule as it is now, so it is exact for scheduled runs; a run started by hand inside a slot is an
 extra run, and a cluster start slower than the cadence can land a run in the next slot."""
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Dict, Iterable, List, Optional
 
 import queries as q
@@ -251,6 +251,50 @@ def status(job: dict, running: Optional[dict], last: Optional[dict], top_cause: 
     return {"label": "Current", "tone": "ok", "detail": [], "cause": None}
 
 
+DELETING, DELETE_FAILED, DELETE_GONE = "deleting", "failed", "gone"
+# A deleted job whose delete job run is not recorded yet is still starting for this long after the delete (the run is
+# recorded as the delete starts); after that, a missing run is a failure to show, not a start to wait for.
+DELETE_STARTING_S = 300
+
+
+def delete_state(job: dict, tables_left: bool, run: Optional[dict], now: datetime) -> dict:
+    """Where a deleted job's Delete stands. ``deleting`` while its delete job runs (or is starting), ``failed`` with
+    the reason when the start or the run failed, ``gone`` once the delete job succeeded and no tables are left: only
+    then does the job leave the Ingestion jobs list. ``run_again`` says whether the Delete can be run again (only
+    while tables remain: a drop that failed after the rows were removed has nothing left to delete again)."""
+    start_error = sch.options_of(job).get("delete_start_error")
+    if start_error:
+        return {"state": DELETE_FAILED, "reason": start_error, "run_again": True, "run": None}
+    if run is None:
+        if not tables_left:
+            return {"state": DELETE_GONE, "reason": None, "run_again": False, "run": None}
+        deleted_at = _when(job.get("deleted_at"))
+        if deleted_at.tzinfo is None:
+            deleted_at = deleted_at.replace(tzinfo=timezone.utc)
+        if now - deleted_at < timedelta(seconds=DELETE_STARTING_S):
+            return {"state": DELETING, "reason": None, "run_again": False, "run": None}
+        return {"state": DELETE_FAILED, "reason": "its delete job run was never recorded", "run_again": True, "run": None}
+    if is_active(run):
+        return {"state": DELETING, "reason": None, "run_again": False, "run": run}
+    if run.get("state") == "TERMINATED" and run.get("result") == "SUCCESS":
+        if tables_left:
+            return {"state": DELETE_FAILED, "reason": "the delete job finished, but tables are still there",
+                    "run_again": True, "run": run}
+        return {"state": DELETE_GONE, "reason": None, "run_again": False, "run": run}
+    how = run.get("result") or run.get("state") or "without a result"
+    reason = run.get("message") or f"the delete job ended {how}"
+    return {"state": DELETE_FAILED, "reason": reason, "run_again": tables_left, "run": run}
+
+
+def delete_status(delete: dict) -> dict:
+    """A deleted job's Status cell while its Delete is pending or failed."""
+    if delete["state"] == DELETING:
+        starting = "starting its delete job" if delete.get("run") is None else "its delete job is running"
+        return {"label": "Deleting", "tone": "run", "detail": [starting], "cause": None}
+    return {"label": "Delete failed", "tone": "bad", "detail": [delete["reason"]] if delete.get("reason") else [],
+            "cause": None}
+
+
 def last_finished(summaries: List[dict]) -> Optional[dict]:
     """A job's last finished job run (newest first): the newest one that ran. A trigger that did not run (a paused
     job's, say) is never it; None when none of them ran."""
@@ -330,6 +374,8 @@ def jobs_view(schedules: List[dict], members: List[dict], states: List[dict], ru
                                    else last.get("failed_in_a_row", 0)),
                "causes": causes[:3]}
         row["status"] = status(row, current, last, causes[0]["label"] if causes else None, warnings)
+        if s.get("delete"):
+            row.update(status=delete_status(s["delete"]), next_start=None, delete=s["delete"])
         rows.append(row)
         running_job_runs += [x for x in summaries if x["outcome"]["label"] == "Running"]
     rows.sort(key=lambda j: (-1 if j["running_job_run"] and j["state_failing"] else 0 if j["state_failing"] else

@@ -26,6 +26,20 @@ class Store:
     def now(self):
         return datetime.now(timezone.utc).isoformat()
 
+    def delete_pending(self, row):
+        """A deleted job the list shows: its delete failed to start, or its delete job hasn't marked it finished."""
+        options = sch.options_of(row)
+        return row["deleted_at"] is not None and ("delete_start_error" in options
+                                                  or ("delete_drop_targets" in options and "delete_finished" not in options))
+
+    def tables_left(self, schedule_id):
+        """Whether a deleted job's groups still have tables a Delete would remove (groups no live job holds)."""
+        live = {i for i, x in self.schedules.items() if x["deleted_at"] is None}
+        groups = {m["task_collection"] for m in self.members.values() if m["schedule_id"] == schedule_id}
+        held = {m["task_collection"] for m in self.members.values()
+                if m["schedule_id"] != schedule_id and m["removed_at"] is None and m["schedule_id"] in live}
+        return bool((groups - held) & self.with_tables)
+
     def run(self, sql, params):
         if sql in (q.touch_jobs_sql(), q.touch_group_jobs_sql()):
             import json
@@ -36,7 +50,8 @@ class Store:
                 row = self.schedules[sid]
                 row.update(updated_at=self.now(), options=json.dumps({**sch.options_of(row), "updated_by": user}))
             return []
-        if sql in (q.set_schedule_option_sql(), q.set_schedule_flag_sql(), q.clear_schedule_option_sql()):
+        if sql in (q.set_schedule_option_sql(), q.set_schedule_flag_sql(), q.set_schedule_text_option_sql(),
+                   q.clear_schedule_option_sql()):
             import json
             row = self.schedules[params[-1]]
             options = sch.options_of(row)
@@ -88,7 +103,9 @@ class Store:
         if "from lakefed_ingest.control" in sql and "distinct task_collection" in sql:
             return [{"task_collection": c} for c in sorted(self.with_tables)]
         if sql == q.schedules_sql():
-            return [dict(s) for s in self.schedules.values() if s["deleted_at"] is None]
+            return [dict(s) for s in self.schedules.values() if s["deleted_at"] is None or self.delete_pending(s)]
+        if sql == q.deleted_tables_left_sql():
+            return [{"schedule_id": sid} for sid in params[0] if self.tables_left(sid)]
         if sql == q.schedule_sql():
             s = self.schedules.get(params[0])
             return [dict(s)] if s else []
@@ -108,7 +125,7 @@ class Store:
                      "kept_names": kept[:q.DELETE_KEPT_LISTED]}]
         if sql == q.deletions_sql():
             rows = [dict(x) for x in self.schedules.values()
-                    if x["deleted_at"] is not None and "delete_drop_targets" in sch.options_of(x)]
+                    if x["deleted_at"] is not None and "delete_finished" in sch.options_of(x)]
             return sorted(rows, key=lambda x: x["deleted_at"], reverse=True)[:params[0]]
         if sql == q.schedule_members_sql():
             pending = lambda m: bool(m["removed_at"] and m["job_id"] and (m["synced_at"] is None or m["synced_at"] < m["removed_at"]))
@@ -213,7 +230,8 @@ def test_pause_resume_and_delete(api):
     assert all(j["schedule"]["pause_status"] == "UNPAUSED" for j in api.jobs.jobs.values())
     r = api.post(f"/api/schedules/{sid}/delete").json()
     assert sorted(x["action"] for x in r["sync"]) == ["deleted", "deleted"] and api.jobs.jobs == {}
-    assert api.get("/api/schedules").json() == []
+    listed = api.get("/api/schedules").json()     # its delete is pending: listed as deleting until its delete job ends
+    assert [(x["id"], x["delete"]["state"]) for x in listed] == [(sid, "deleting")]
     assert api.post(f"/api/schedules/{sid}/pause").status_code == 409
 
 
@@ -654,25 +672,33 @@ def test_a_group_another_live_job_also_holds_stays_with_its_tables(api):
     assert api.get(f"/api/ingestion-jobs/{sid}/delete-preview").json()["groups"] == ["c1", "c2"]
 
 
-def test_a_delete_job_that_did_not_start_is_listed_and_run_again_with_its_tick_box(api, monkeypatch):
+def test_a_delete_job_that_did_not_start_is_listed_as_failed_and_run_again_with_its_tick_box(api, monkeypatch):
     sid = api.post("/api/schedules", json=BODY).json()["id"]
     real = main.jobs.start_delete_job
     monkeypatch.setattr(main.jobs, "start_delete_job", lambda sid, drop: (_ for _ in ()).throw(RuntimeError("403 forbidden. more")))
     r = api.post(f"/api/schedules/{sid}/delete", json={"drop_targets": True}).json()
     assert r["deleted"] is True and r["delete_run"]["error"] == "the delete job didn't start: 403 forbidden"
-    listed = api.get("/api/ingestion-jobs/deletions").json()["deletions"]
-    assert [(d["id"], d["run"], d["drop_targets"], d["tables_left"]) for d in listed] == [(sid, None, True, 2)]
+    job = _listed(api, sid)
+    assert (job["status"]["label"], job["status"]["detail"]) == ("Delete failed", ["the delete job didn't start: 403 forbidden"])
+    assert api.get(f"/api/ingestion-jobs/{sid}").json()["delete"]["run_again"] is True
     monkeypatch.setattr(main.jobs, "start_delete_job", real)
     again = api.post(f"/api/schedules/{sid}/delete")                           # Run again: the stored tick box
     assert again.status_code == 200 and api.delete_runs[9001]["drop_targets"] is True
     assert api.post(f"/api/schedules/{sid}/delete").status_code == 409            # its delete is still running
-    run = api.get("/api/ingestion-jobs/deletions").json()["deletions"][0]["run"]
-    assert (run["run_id"], run["state"]) == (9001, "RUNNING")
+    assert _listed(api, sid)["status"]["label"] == "Deleting"
     api.delete_runs[9001].update(state="TERMINATED", result="SUCCESS")
     api.store.with_tables -= {"c1", "c2"}
+    assert _listed(api, sid) is None                                              # gone: it leaves the list
     done = api.get("/api/ingestion-jobs/deletions").json()["deletions"][0]
     assert (done["run"]["result"], done["tables_left"]) == ("SUCCESS", 0)
     assert api.post(f"/api/schedules/{sid}/delete").json()["delete_run"] is None    # nothing is left to delete
+
+
+def _listed(api, sid):
+    """The Ingestion jobs list's row for a job, or None when it is not listed."""
+    main._shared_reads.clear()      # the schedules are a shared read, kept for a few seconds
+    jobs_listed = api.get("/api/ingestion-jobs?filter=all&limit=100").json()["jobs"]
+    return next((j for j in jobs_listed if j["id"] == sid), None)
 
 
 def test_delete_refused_by_permission_starts_nothing(api, monkeypatch):
