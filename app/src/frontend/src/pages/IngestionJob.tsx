@@ -186,9 +186,9 @@ export default function IngestionJob() {
     onSuccess: () => { qc.invalidateQueries(); navigate("/ingestion-jobs"); },
   });
   const job = useQuery({ queryKey: ["ingestion-job", id], queryFn: () => api.get<Row>(`/ingestion-jobs/${encodeURIComponent(id)}`),
-                         refetchInterval: changing ? 3_000 : 60_000 });
+                         refetchInterval: changing ? 3_000 : 15_000 });
   const live = useQuery({ queryKey: ["ingestion-job-live", id], queryFn: () => api.get<Row>(`/ingestion-jobs/${encodeURIComponent(id)}/live`),
-                          refetchInterval: (q) => (changing ? 3_000 : (q.state.data as Row | undefined)?.active ? 5_000 : 30_000) });
+                          refetchInterval: (q) => (changing ? 3_000 : (q.state.data as Row | undefined)?.active ? 5_000 : 15_000) });
   const going = !!live.data?.active || !!job.data?.run_now?.going;
   useEffect(() => {
     if ((changing === "start" && going) || (changing === "stop" && !going)) setChanging(null);
@@ -204,7 +204,7 @@ export default function IngestionJob() {
   const runs = useQuery({
     queryKey: ["ingestion-job-runs", id, before],
     queryFn: () => api.get<Row>(`/ingestion-jobs/${encodeURIComponent(id)}/runs${qs({ before, limit: PAGE })}`),
-    refetchInterval: before ? false : 30_000,
+    refetchInterval: before ? false : 15_000,
   });
   const j = job.data;
   const last = j?.last_job_run;
@@ -259,7 +259,7 @@ export default function IngestionJob() {
       {j && (
         <div className="metrics">
           <div className="metric"><div className="metric-label">Tables now</div><StateBar row={j} />
-            <div className="metric-sub">{fmtInt(j.state_current)} current, {fmtInt(j.state_late)} late, {fmtInt(j.state_first_load)} waiting, {fmtInt(j.state_failing)} failing</div></div>
+            <div className="metric-sub">{fmtInt(j.state_loaded)} loaded, {fmtInt(j.late_databases)} late databases, {fmtInt(j.state_first_load)} waiting, {fmtInt(j.state_failing)} failing</div></div>
           <div className="metric"><div className="metric-label">Last job run</div>
             <div className="metric-value small-value">{last ? <Link to={jobRunPath(j.id, last.slot)}><RunStatus status={null} outcome={last.outcome} /></Link> : "Never run"}</div>
             <div className="metric-sub">{last ? `${fmtSlot(last.slot)}${last.took_s != null ? `, took ${fmtDuration(last.took_s)}` : ""}` : ""}</div></div>

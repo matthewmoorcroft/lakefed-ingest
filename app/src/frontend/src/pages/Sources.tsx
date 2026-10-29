@@ -19,7 +19,7 @@ function ReadVia({ via }: { via: Row[] }) {
 /** Source instances first; a chosen instance's ingestion jobs (jobs only: groups are on their job's page) and its
  * tables discovered and not registered. */
 export default function Sources() {
-  const found = useQuery({ queryKey: ["sources"], queryFn: () => api.get<Row>("/sources"), refetchInterval: 60_000 });
+  const found = useQuery({ queryKey: ["sources"], queryFn: () => api.get<Row>("/sources"), refetchInterval: 15_000 });
   const [chosen, setChosen] = useState<string | null>(null);
   const d = found.data;
   const instances: Row[] = d?.instances ?? [];
@@ -67,7 +67,7 @@ export default function Sources() {
                     <td className="name">{j.id != null ? <Link to={`/ingestion-jobs/${j.id}`}><b><Name>{j.name}</Name></b></Link> : <b>Not in any job</b>}</td>
                     <td className="num">{fmtInt(j.groups.length)}</td><td className="num">{fmtInt(j.databases)}</td><td className="num">{fmtInt(j.enabled_tables)}</td>
                     <td><StateBar row={j} /></td>
-                    <td>{j.paused ? `paused${Number(j.state_late) ? `, ${fmtInt(j.state_late)} late` : ""}` : j.id == null ? "run by hand or by the Databricks job" : j.description ?? ""}</td>
+                    <td>{j.paused ? `paused${Number(j.late_databases) ? `, ${fmtInt(j.late_databases)} late databases` : ""}` : j.id == null ? "run by hand or by the Databricks job" : j.description ?? ""}</td>
                   </tr>
                 ))}
                 {!pick.jobs.length && <tr><td colSpan={6} className="muted">No ingestion job reads this instance.</td></tr>}

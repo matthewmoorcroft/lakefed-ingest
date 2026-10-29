@@ -362,21 +362,25 @@ export function fmtLeft(seconds: unknown): string {
   return `about ${(s / 3600).toFixed(1)} h`;
 }
 
-export interface StateCounts { state_current?: unknown; state_late?: unknown; state_first_load?: unknown; state_failing?: unknown }
+export interface StateCounts {
+  state_current?: unknown; state_loaded?: unknown; state_late?: unknown; state_first_load?: unknown; state_failing?: unknown;
+}
 
 const STATES = [
-  ["state_current", "seg-current", "current"], ["state_late", "seg-late", "late"],
-  ["state_first_load", "seg-first", "waiting for a first load"], ["state_failing", "seg-failing", "failing"],
+  ["seg-current", "loaded"], ["seg-late", "late"], ["seg-first", "waiting for a first load"], ["seg-failing", "failing"],
 ] as const;
 
-/** Each enabled table's state now, as one bar. */
+/** Each state now as one bar. A table's row counts its tables (current, late, waiting, failing); a rollup row (a
+ *  group, job, server or instance) counts its loaded tables, late ones included, and its late databases are shown
+ *  beside the bar, not in it. */
 export function StateBar({ row }: { row: StateCounts }) {
-  const counts = STATES.map(([k]) => Number((row as any)[k] || 0));
+  const counts = [row.state_current ?? row.state_loaded, row.state_late, row.state_first_load, row.state_failing]
+    .map((value) => Number(value || 0));
   const total = counts.reduce((a, b) => a + b, 0);
-  const title = STATES.map(([, , label], i) => `${fmtInt(counts[i])} ${label}`).join(", ");
+  const title = STATES.map(([, label], i) => `${fmtInt(counts[i])} ${label}`).join(", ");
   return (
     <div className="bar" title={title} role="img" aria-label={title}>
-      {total > 0 && STATES.map(([k, cls], i) => counts[i] > 0 && <span key={k} className={cls} style={{ width: `${(100 * counts[i]) / total}%` }} />)}
+      {total > 0 && STATES.map(([cls], i) => counts[i] > 0 && <span key={cls} className={cls} style={{ width: `${(100 * counts[i]) / total}%` }} />)}
     </div>
   );
 }
@@ -384,7 +388,7 @@ export function StateBar({ row }: { row: StateCounts }) {
 export function StateKey() {
   return (
     <div className="key">
-      <span><i className="seg-current" />Current</span><span><i className="seg-late" />Late</span>
+      <span><i className="seg-current" />Loaded</span><span><i className="seg-late" />Late</span>
       <span><i className="seg-first" />Waiting for a first load</span><span><i className="seg-failing" />Failing</span>
     </div>
   );

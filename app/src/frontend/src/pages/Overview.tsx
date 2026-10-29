@@ -50,7 +50,7 @@ export function JobsTable({ jobs, notInJob, total, offset, limit, onPage, link, 
   const table = (
       <div className="table-wrap"><table className={audit ? "data fit" : "data"}>
         <thead><tr><th>Ingestion job</th><th className="num">Groups</th>{!audit && <th className="num">Databases</th>}
-          <th className="num">Tables</th><th>State now</th><th className="num">Failing</th><th className="num">Late</th>
+          <th className="num">Tables</th><th>State now</th><th className="num">Failing</th><th className="num">Late databases</th>
           <th>Last job run</th><th>Status</th>
           {audit && <>{sortHead("created_at", "Created")}{sortHead("updated_at", "Last updated")}</>}</tr></thead>
         <tbody>
@@ -61,7 +61,7 @@ export function JobsTable({ jobs, notInJob, total, offset, limit, onPage, link, 
               <td className="num">{fmtInt(j.groups?.length)}</td>{!audit && <td className="num">{fmtInt(j.databases)}</td>}
               <td className="num">{fmtInt(j.enabled_tables)}</td><td><StateBar row={j} /></td>
               <td className="num" style={{ color: Number(j.state_failing) ? "var(--bad)" : undefined }}>{fmtInt(j.state_failing)}</td>
-              <td className="num">{fmtInt(j.state_late)}</td>
+              <td className="num">{fmtInt(j.late_databases)}</td>
               <td>{j.id != null ? <LastJobRun job={j} /> : <Link to="/runs?job=none">its group runs</Link>}</td>
               <td><JobStatus status={j.status} /></td>
               {audit && <><td>{who(j.created_by, j.created_at)}</td><td>{who(j.updated_by, j.updated_at)}</td></>}
@@ -73,7 +73,7 @@ export function JobsTable({ jobs, notInJob, total, offset, limit, onPage, link, 
               <td className="num">{fmtInt(notInJob.groups.length)}</td>{!audit && <td className="num">{fmtInt(notInJob.databases)}</td>}
               <td className="num">{fmtInt(notInJob.enabled_tables)}</td><td><StateBar row={notInJob} /></td>
               <td className="num" style={{ color: Number(notInJob.state_failing) ? "var(--bad)" : undefined }}>{fmtInt(notInJob.state_failing)}</td>
-              <td className="num">{fmtInt(notInJob.state_late)}</td>
+              <td className="num">{fmtInt(notInJob.late_databases)}</td>
               <td><Link to="/runs?job=none">its group runs</Link></td><td><span className="muted">run by hand or by the Databricks job</span></td>
               {audit && <><td></td><td></td></>}
             </tr>
@@ -158,16 +158,17 @@ export function NeedsAttention({ jobs, total }: { jobs: Row[]; total: number }) 
 /** Every enabled table by state, each state linking to the tables in it, as the Jobs UI's run summary counts. */
 function Freshness({ totals }: { totals: Row }) {
   const states: [string, string, string, string][] = [
-    ["state_current", "seg-current", "Current", "/tables"], ["state_late", "seg-late", "Late", "/tables?status=sla_breached"],
+    ["state_loaded", "seg-current", "Loaded", "/tables"],
     ["state_first_load", "seg-first", "Waiting for a first load", "/tables?status=seeding"],
     ["state_failing", "seg-failing", "Failing", "/tables?status=failing"]];
   return (
-    <Section title="Freshness" note="Every enabled table of every job, by its state now.">
+    <Section title="Freshness" note="Every enabled table of every job, by its state now. A database is late when one of its tables is past its freshness target; its database page lists those tables.">
       <StateBar row={totals} />
       <div className="key" style={{ marginTop: 8 }}>
         {states.map(([key, cls, label, to]) => (
           <span key={key}><i className={cls} /><Link to={to}>{label}</Link> <b>{fmtInt(totals[key])}</b></span>
         ))}
+        <span><i className="seg-late" /><Link to="/ingestion-jobs?filter=late">Late databases</Link> <b>{fmtInt(totals.late_databases)}</b></span>
       </div>
     </Section>
   );
@@ -216,11 +217,11 @@ function RecentRuns({ jobs }: { jobs: Row[] }) {
  * the tables are, what runs next and what ran last, each item linking to its job or run. The jobs themselves are
  * listed on Ingestion jobs. */
 export default function OverviewPage() {
-  const ov = useQuery({ queryKey: ["overview"], queryFn: () => api.get<Overview>("/overview"), refetchInterval: 30_000 });
+  const ov = useQuery({ queryKey: ["overview"], queryFn: () => api.get<Overview>("/overview"), refetchInterval: 15_000 });
   const d = ov.data;
   const t = d?.totals ?? {};
   const enabled = Number(t.enabled_tables || 0);
-  const pct = enabled ? ((100 * Number(t.state_current || 0)) / enabled).toFixed(1) : "0.0";
+  const pct = enabled ? ((100 * Number(t.state_loaded || 0)) / enabled).toFixed(1) : "0.0";
   const jobs = Number(t.jobs || 0);
   const unscheduled = d?.not_in_job?.groups?.length ?? 0;
   const tiles: [string, string, ReactNode, ReactNode][] = d ? [
@@ -228,13 +229,13 @@ export default function OverviewPage() {
       <>{fmtInt(t.running_jobs)} running · {fmtInt(d.paused_jobs)} paused{unscheduled ? ` · ${fmtInt(unscheduled)} ${plural(unscheduled, "group")} in no job` : ""}</>],
     ["Databases", "/sources", <>{fmtInt(t.databases)}<small>{plural(t.databases, "database")}</small></>,
       <>on {fmtInt(t.servers)} {plural(t.servers, "server")}</>],
-    ["Tables", "/tables", <>{fmtInt(enabled)}<small>enabled</small></>, <>{pct}% current</>],
+    ["Tables", "/tables", <>{fmtInt(enabled)}<small>enabled</small></>, <>{pct}% loaded</>],
     ["Rows written, 24 hours", "/runs", <>{d.rows_24h.partial ? "at least " : ""}{fmtInt(d.rows_24h.rows)}<small>rows</small></>,
       <>by every job's runs</>]] : [];
   return (
     <>
       <PageHead title="Overview"
-        lead={d && (enabled ? <>{pct}% of <strong>{fmtInt(enabled)}</strong> enabled {plural(enabled, "table")} {enabled === 1 ? "is" : "are"} current,
+        lead={d && (enabled ? <>{pct}% of <strong>{fmtInt(enabled)}</strong> enabled {plural(enabled, "table")} {enabled === 1 ? "is" : "are"} loaded,
           in <strong>{fmtInt(jobs)}</strong> {plural(jobs, "ingestion job")}.</> : "No enabled tables yet.")}
         right={<Stamp at={d?.read_at} every={30} error={ov.error} />} />
       <ErrorBox error={ov.error} />
