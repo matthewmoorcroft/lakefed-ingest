@@ -255,7 +255,7 @@ def test_the_job_page_says_why_run_now_or_delete_cannot_start(client, monkeypatc
 
 def test_a_jobs_target_tables_come_with_their_sources_and_a_catalog_explorer_link(monkeypatch):
     target = dict(target="bronze.sales.orders", catalog="bronze", schema="sales", table="orders", sources=100,
-                  databases=100, with_client_id=100, outside_sources=0, rows_written_7d=4253, total=1)
+                  databases=100, with_client_id=100, outside_sources=0, rows_written_7d=4253, total=1, fan_in_total=1)
     seen = {}
 
     def query(sql, params=()):
@@ -269,7 +269,7 @@ def test_a_jobs_target_tables_come_with_their_sources_and_a_catalog_explorer_lin
     monkeypatch.setattr(main.db, "workspace", lambda: type("W", (), {"config": type("C", (), {"host": "https://h/"})()})())
     client = TestClient(main.app)
     body = client.get("/api/ingestion-jobs/1/targets", params={"search": "ord"}).json()
-    assert body["total"] == 1 and "total" not in body["items"][0]
+    assert body["total"] == 1 and body["fan_in"] == 1 and {"total", "fan_in_total"}.isdisjoint(body["items"][0])
     assert body["items"][0]["url"] == "https://h/explore/data/bronze/sales/orders"
     assert seen[q.job_targets_sql()] == (["c1", "c2"], ["c1", "c2"], ["c1", "c2"], "%ord%", 25, 0)
     sources = client.get("/api/ingestion-jobs/1/targets/sources", params={"target": "bronze.sales.orders"}).json()

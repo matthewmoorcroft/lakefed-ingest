@@ -1534,8 +1534,9 @@ _JOB_ROWS_WRITTEN = (f"from {SCHEMA}.control t left join {SCHEMA}.checkpoint cp 
 
 def job_targets_sql() -> str:
     """A job's target tables, one row each: how many of its source tables write it (and how many outside the job),
-    from how many databases, their states now, and the rows written over 7 days by the run records. Exact row counts
-    would need a SQL warehouse, which the app avoids. Params: groups, groups, groups, search pattern, limit, offset."""
+    from how many databases, their states now, and the rows written over 7 days by the run records; fan_in_total
+    counts the matching targets written from more than one source table. Exact row counts would need a SQL warehouse,
+    which the app avoids. Params: groups, groups, groups, search pattern, limit, offset."""
     return f"""
 with written as {_WRITTEN_7D},
 outside as (
@@ -1545,7 +1546,8 @@ select {_TARGET} as target, t.sink_catalog as catalog, t.sink_schema as schema, 
        count(*) as sources, count(distinct ({SERVER}, coalesce(t.src_database, ''))) as databases,
        count(*) filter (where t.client_id is not null) as with_client_id,
        coalesce(max(x.n), 0) as outside_sources, {STATE_COUNTS},
-       sum(w.rows_written) as rows_written_7d, max(w.last_written) as last_written, count(*) over () as total
+       sum(w.rows_written) as rows_written_7d, max(w.last_written) as last_written, count(*) over () as total,
+       sum(case when count(*) + coalesce(max(x.n), 0) > 1 then 1 else 0 end) over () as fan_in_total
 {_JOB_ROWS_WRITTEN}
 left join outside x on x.target = {_TARGET}
 where t.task_collection = any(%s) and {_TARGET} ilike %s

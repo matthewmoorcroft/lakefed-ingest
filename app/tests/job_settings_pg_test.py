@@ -251,6 +251,7 @@ def test_a_jobs_target_tables_count_their_sources_inside_and_outside_it_and_seve
     body = client.get(f"/api/ingestion-jobs/{client.sid}/targets").json()
     by_target = {t["target"]: t for t in body["items"]}
     assert body["total"] == 2 and list(by_target) == ["bronze.extraction.invoice", "bronze.extraction.orderline"]
+    assert body["fan_in"] == 2      # each is written from more than one source table
     order = by_target["bronze.extraction.orderline"]
     assert (order["sources"], order["databases"], order["with_client_id"], order["outside_sources"]) == (2, 2, 2, 1)
     assert order["rows_written_7d"] == 10 and by_target["bronze.extraction.invoice"]["rows_written_7d"] is None

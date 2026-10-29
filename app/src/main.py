@@ -788,16 +788,17 @@ def ingestion_job_tree(job_id: int, server: str = "", database: str = "", search
 @app.get("/api/ingestion-jobs/{job_id}/targets")
 def ingestion_job_targets(job_id: int, search: str = "", offset: int = 0, limit: int = 25):
     """A job's target tables: each with the source tables of the job writing it (and how many outside it), their
-    states, the rows the run records say were written over 7 days, and a link to the table in Catalog Explorer.
-    Searched by name and paged."""
+    states, the rows the run records say were written over 7 days, and a link to the table in Catalog Explorer;
+    fan_in counts those written from more than one source table. Searched by name and paged."""
     groups = _job_groups(job_id)
     offset, limit = max(0, int(offset)), max(1, min(int(limit), 200))
     rows = (db.query(q.job_targets_sql(), (groups, groups, groups, f"%{search.strip()}%", limit, offset))
             if groups else [])
     host = db.workspace().config.host.rstrip("/")
-    items = [{**{k: v for k, v in r.items() if k != "total"},
+    items = [{**{k: v for k, v in r.items() if k not in ("total", "fan_in_total")},
               "url": f"{host}/explore/data/{r['catalog']}/{r['schema']}/{r['table']}"} for r in rows]
-    return {"total": rows[0]["total"] if rows else 0, "offset": offset, "limit": limit, "items": items}
+    return {"total": rows[0]["total"] if rows else 0, "fan_in": rows[0]["fan_in_total"] if rows else 0,
+            "offset": offset, "limit": limit, "items": items}
 
 
 @app.get("/api/ingestion-jobs/{job_id}/targets/sources")

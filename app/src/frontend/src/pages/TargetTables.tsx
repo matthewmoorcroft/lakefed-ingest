@@ -2,10 +2,11 @@ import { Fragment, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { Link } from "react-router-dom";
 import { api, qs, type Row } from "../api";
-import { ErrorBox, Pager, Section, StateBar, StateKey, fmtAgo, fmtInt, plural } from "../components";
+import { ErrorBox, OutLink, Pager, Section, StateBar, StateKey, fmtAgo, fmtInt, plural } from "../components";
 
-// A job's target tables: where its data lands. Each target shows the job's source tables writing it (opened to the
-// list), any written from outside the job, their states, and the rows the run records say were written over 7 days.
+// A job's target tables: where its data lands. Each target says whether it is fanned in from many source tables or
+// written one-to-one, lists the job's source tables writing it (opened to the list), any written from outside the
+// job, their states, and the rows the run records say were written over 7 days. Names follow Catalog Explorer.
 // Exact row counts would need a SQL warehouse, which the app avoids; Catalog Explorer has them, one click away.
 
 const PAGE = 25;
@@ -38,6 +39,23 @@ function SourceRows({ jobId, target }: { jobId: string; target: string }) {
   );
 }
 
+/** Whether a target is fanned in from many source tables (counting those outside the job) or written one-to-one. */
+function WrittenFrom({ t }: { t: Row }) {
+  const writers = Number(t.sources) + Number(t.outside_sources);
+  if (writers <= 1) return <>One-to-one<span className="sub">1 source table</span></>;
+  const databases = `${fmtInt(t.databases)} ${plural(t.databases, "database")}${Number(t.outside_sources) ? " in this job" : ""}`;
+  return <>Fan-in from {fmtInt(writers)} source tables
+    <span className="sub">{databases}{Number(t.with_client_id) > 0 ? ", kept apart by client_id" : ""}</span></>;
+}
+
+/** "3 fan in, 2 are one-to-one", over the targets the search matches. */
+function fanInSummary(total: number, fanIn: number) {
+  const oneToOne = total - fanIn;
+  if (!fanIn) return `${total === 1 ? "It is" : "All are"} one-to-one: each is written from one source table.`;
+  if (!oneToOne) return `${fanIn === 1 ? "It fans in" : "All fan in"} from many source tables.`;
+  return `${fmtInt(fanIn)} fan in from many source tables; ${fmtInt(oneToOne)} ${oneToOne === 1 ? "is" : "are"} one-to-one.`;
+}
+
 export function TargetTables({ jobId }: { jobId: string }) {
   const [offset, setOffset] = useState(0);
   const [search, setSearch] = useState("");
@@ -49,12 +67,13 @@ export function TargetTables({ jobId }: { jobId: string }) {
   const total = targets.data?.total;
   return (
     <Section title={`Target tables${total != null ? `: ${fmtInt(total)}` : ""}`} actions={<StateKey />}
-      note="Where this job's data lands. Rows written are from the run records over the last 7 days; Catalog Explorer has each table's exact size.">
+      note={<>Where this job's data lands.{total ? ` ${fanInSummary(total, Number(targets.data?.fan_in ?? 0))}` : ""} Rows
+        written are from the run records over the last 7 days; Catalog Explorer has each table's exact size.</>}>
       <input className="search tree-search" placeholder="Find a target table" value={search}
         onChange={(e) => { setSearch(e.target.value); setOffset(0); setOpen(null); }} />
       <div className="table-wrap"><table className="data tree">
-        <thead><tr><th>Target table › its source tables</th><th className="num">Sources · databases</th>
-          <th>Outside this job</th><th>State now</th><th className="num">Rows written (7 days)</th><th>Catalog Explorer</th></tr></thead>
+        <thead><tr><th>Name › its source tables</th><th>Written from</th>
+          <th>Outside this job</th><th>State now</th><th className="num">Rows written (7 days)</th><th></th></tr></thead>
         <tbody>
           {(targets.data?.items ?? []).map((t: Row) => (
             <Fragment key={t.target}>
@@ -62,15 +81,14 @@ export function TargetTables({ jobId }: { jobId: string }) {
                 <td className="name"><button className="twisty" aria-expanded={open === t.target} title={t.target}
                   onClick={() => setOpen(open === t.target ? null : t.target)}>{open === t.target ? "▾" : "▸"}</button><b>{t.table}</b>
                   <span className="sub target-path">{t.catalog}.{t.schema}</span></td>
-                <td className="num">{fmtInt(t.sources)} · {fmtInt(t.databases)}
-                  {Number(t.with_client_id) > 0 && <span className="sub">kept apart by client_id</span>}</td>
+                <td><WrittenFrom t={t} /></td>
                 <td>{Number(t.outside_sources) > 0
                   ? <span className="tag warn">{fmtInt(t.outside_sources)} {plural(t.outside_sources, "source table")}</span>
                   : <span className="muted">none</span>}</td>
                 <td><StateBar row={t} /></td>
                 <td className="num">{t.rows_written_7d != null ? fmtInt(t.rows_written_7d) : ""}
                   <span className="sub">{t.last_written ? `last ${fmtAgo(t.last_written)}` : "none in 7 days"}</span></td>
-                <td><a href={t.url} target="_blank" rel="noreferrer">open</a></td>
+                <td><OutLink href={t.url}>Catalog Explorer</OutLink></td>
               </tr>
               {open === t.target && <SourceRows jobId={jobId} target={t.target} />}
             </Fragment>
