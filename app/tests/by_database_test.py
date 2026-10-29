@@ -74,7 +74,8 @@ def test_a_unit_keeps_only_the_tables_named_when_it_is_not_a_whole_database():
 def test_databases_are_packed_into_transactions_up_to_the_limit_and_a_database_is_never_split(monkeypatch):
     monkeypatch.setattr(bd, "TABLES_PER_TRANSACTION", 10)
     units = [bd.Unit("sql_a", f"d{i}", True) for i in range(5)]
-    chunks = [[unit.database for unit in chunk] for chunk in bd.transactions_of(list(zip(units, [4, 4, 4, 12, 1])))]
+    checked = [bd.Checked(unit, tables) for unit, tables in zip(units, [4, 4, 4, 12, 1])]
+    chunks = [[item.unit.database for item in chunk] for chunk in bd.transactions_of(checked)]
     assert chunks == [["d0", "d1"], ["d2"], ["d3"], ["d4"]]     # d3 is bigger than the limit: a transaction of its own
 
 
@@ -307,6 +308,10 @@ SCHEDULE = dict(name="Big job", cadence_minutes=60, timezone="UTC", stagger=True
 
 @pytest.fixture
 def big(monkeypatch):
+    return _big_client(monkeypatch)
+
+
+def _big_client(monkeypatch):
     source = Source({("sql_a", f"eng_{i:03d}"): [f"t{t}" for t in range(5)] for i in range(30)})
     store, tasks, fake = Store(), ByDatabaseTasks(), FakeDB()
 
@@ -403,7 +408,7 @@ def test_a_whole_server_upload_reads_each_database_by_its_exact_names(big, monke
     monkeypatch.setattr(main.db, "query", recording)
     _create(big)
     big.tasks.run()
-    assert seen.count(q.database_rows_exact_sql()) == 2        # the check's batch, then the one transaction
+    assert seen.count(q.database_rows_exact_sql()) == 1        # the check's batch: the write takes its plans
     assert q.database_rows_chunk_sql("upload") not in seen
 
 
@@ -422,7 +427,10 @@ def test_a_transaction_holds_whole_databases_up_to_the_table_limit(big, monkeypa
     assert big.store.transactions == 1 + 3 + 1       # the job, three transactions of ten databases, the result
 
 
-def test_a_database_that_fails_takes_its_transaction_and_the_same_request_finishes_the_job(big, monkeypatch):
+@pytest.mark.parametrize("plan_once_tables", [200_000, 0], ids=["plan_once", "two_passes"])
+def test_a_database_that_fails_takes_its_transaction_and_the_same_request_finishes_the_job(big, monkeypatch,
+                                                                                          plan_once_tables):
+    monkeypatch.setattr(bd, "PLAN_ONCE_TABLES", plan_once_tables)
     monkeypatch.setattr(bd, "TABLES_PER_TRANSACTION", 50)     # ten to a transaction: eng_020 starts the third
     big.store.fail_on = "eng_020"
     _create(big)
@@ -457,6 +465,51 @@ def test_a_big_create_reports_where_its_seconds_go_on_every_progress_write_and_t
         assert all(round(value, 1) == value for value in values), key
         assert values == sorted(values) and values[0] < values[-1], key
     assert seconds[0]["write"] == 0.0
+
+
+def _reads_of(monkeypatch) -> list:
+    """Records each statement a read sends to the database: the statements of the write under test."""
+    seen = []
+    read = main.db.query
+
+    def recording(sql, params=()):
+        seen.append(sql)
+        return read(sql, params)
+
+    monkeypatch.setattr(main.db, "query", recording)
+    return seen
+
+
+def test_a_selection_under_the_plan_once_cap_is_read_once_and_its_plans_are_written(big, monkeypatch):
+    seen = _reads_of(monkeypatch)
+    _create(big)
+    big.tasks.run()
+    assert big.get("/api/tasks/1").json()["status"] == "succeeded" and len(big.store.controls) == 150
+    assert seen.count(q.database_rows_exact_sql()) == 1
+    assert q.database_rows_chunk_sql("upload") not in seen
+
+
+@pytest.mark.parametrize("cap, reads", [(150, 1), (149, 2)], ids=["at_the_cap", "one_table_over"])
+def test_a_selection_at_the_cap_is_planned_once_and_one_table_over_it_twice(big, monkeypatch, cap, reads):
+    monkeypatch.setattr(bd, "PLAN_ONCE_TABLES", cap)
+    seen = _reads_of(monkeypatch)
+    _create(big)
+    big.tasks.run()
+    assert big.get("/api/tasks/1").json()["status"] == "succeeded" and len(big.store.controls) == 150
+    assert seen.count(q.database_rows_exact_sql()) == reads
+
+
+def test_planning_once_writes_the_same_control_rows_as_two_passes(monkeypatch):
+    once = _big_client(monkeypatch)
+    _create(once)
+    once.tasks.run()
+    monkeypatch.setattr(bd, "PLAN_ONCE_TABLES", 0)
+    twice = _big_client(monkeypatch)
+    _create(twice)
+    twice.tasks.run()
+    assert once.get("/api/tasks/1").json()["status"] == twice.get("/api/tasks/1").json()["status"] == "succeeded"
+    assert len(once.store.controls) == 150 and once.store.controls == twice.store.controls
+    assert once.store.members == twice.store.members and once.store.transactions == twice.store.transactions
 
 
 def test_the_same_request_id_after_success_answers_the_task_and_starts_nothing(big):
@@ -553,7 +606,7 @@ def test_a_big_add_reads_its_databases_in_batches_and_packs_them_into_transactio
     assert big.get(f"/api/tasks/{r.json()['task']['id']}").json()["status"] == "succeeded"
     assert len(big.store.controls) == 150
     assert q.database_rows_chunk_sql("upload") not in seen
-    assert seen.count(q.database_rows_exact_sql()) == 1 + 3     # the check's batch, then each transaction's
+    assert seen.count(q.database_rows_exact_sql()) == 1        # the check's batch: the write takes its plans
     assert big.store.transactions == 3 + 1                      # three transactions of ten databases, then the result
 
 

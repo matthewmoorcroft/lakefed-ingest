@@ -293,12 +293,14 @@ def create_by_database(catalog: server_catalog.ServerCatalog) -> ByDatabaseRun:
 
 
 def create_by_chunk(catalog: server_catalog.ServerCatalog) -> ByDatabaseRun:
-    """The by-database create as the route now runs it: the same two passes, but the databases are read a batch at a
-    time (one statement for the batch's tables), and the writes are packed into transactions of up to
-    TABLES_PER_TRANSACTION tables, each written by app._write_chunk (the writer the route calls). Runs under
+    """The by-database create as the route now runs it: the databases are read a batch at a time (one statement for the
+    batch's tables) and planned in the check, and the writes are packed into transactions of up to
+    TABLES_PER_TRANSACTION tables, each written by app._write_chunk (the writer the route calls). Up to PLAN_ONCE_TABLES
+    tables the write takes the check's plans, so the databases are read once; above it they are read again. Runs under
     no_connections()."""
     spec, server, listed, groups_of, columns, selected = _by_database_setup(catalog)
     opened = len(listed)
+    keep = by_database.keeps_plans(opened * catalog.tables_per_database)
     units = [by_database.Unit(spec["src_connection"], name, True) for name in listed]
     reads = [0.0]
     members: set = set()
@@ -323,7 +325,7 @@ def create_by_chunk(catalog: server_catalog.ServerCatalog) -> ByDatabaseRun:
                 errors += plan["errors"]
                 tables += len(plan["lines"])
                 groups.update(plan["groups"])
-                counted.append((unit, len(rows)))
+                counted.append(by_database.Checked(unit, len(rows), plan if keep else None))
         check_s = time.perf_counter() - started - (reads[0] - reads_before)
 
         state = {"stage": "writing", "databases_total": opened, "databases_written": 0, "tables_written": 0}
@@ -333,10 +335,10 @@ def create_by_chunk(catalog: server_catalog.ServerCatalog) -> ByDatabaseRun:
             job = app.ChunkJob(sid=schedule_id, name=SCALE_JOB, user=SCALE_USER, batch=SCALE_BATCH,
                                cadence_minutes=CADENCE_MINUTES, timezone=TIMEZONE, offsets={}, task_id=TASK_ID,
                                stages=by_database.Stages())
-            _record_pages(connection, opened)
             for chunk in by_database.transactions_of(counted):
-                plans = [by_database.plan_database(SCALE_JOB, CREATE_SETTINGS, rows, columns, groups_of, set(), set())
-                         for _, rows in rows_of(chunk) if rows]
+                plans = [checked.plan for checked in chunk] if keep else [
+                    by_database.plan_database(SCALE_JOB, CREATE_SETTINGS, rows, columns, groups_of, set(), set())
+                    for _, rows in rows_of([checked.unit for checked in chunk]) if rows]
                 if plans:
                     with connection.transaction() as cur:
                         app._write_chunk(cur, plans, job, state)

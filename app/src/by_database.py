@@ -17,6 +17,9 @@ DATABASE_PAGE = 500
 TABLES_PER_TRANSACTION = 5_000
 # The check reads the tables of this many databases in one statement.
 DATABASES_PER_READ = 100
+# A selection of at most this many tables keeps the plan of each database from its check, so the write takes those plans
+# instead of reading and planning the databases again. Above it the plans are not held, and the write reads them again.
+PLAN_ONCE_TABLES = 200_000
 
 
 def _now() -> float:
@@ -146,17 +149,31 @@ def rows_by_unit(units: List[Unit], rows: List[dict]) -> List[Tuple[Unit, List[d
             for unit in units]
 
 
-def transactions_of(counted: List[Tuple[Unit, int]]) -> Iterator[List[Unit]]:
-    """The databases, in order, packed into transactions: each (unit, tables) is added to the transaction being filled
-    until adding it would take that past TABLES_PER_TRANSACTION, and then the next transaction starts."""
-    chunk: List[Unit] = []
+class Checked:
+    """A database the check planned: its unit, its table count, and its plan. The plan is None when the selection is
+    above PLAN_ONCE_TABLES, and the write reads and plans the database again."""
+    __slots__ = ("unit", "tables", "plan")
+
+    def __init__(self, unit: Unit, tables: int, plan: Optional[dict] = None):
+        self.unit, self.tables, self.plan = unit, tables, plan
+
+
+def keeps_plans(tables: int) -> bool:
+    """Whether a selection of this many tables keeps each database's plan from the check (see PLAN_ONCE_TABLES)."""
+    return int(tables) <= PLAN_ONCE_TABLES
+
+
+def transactions_of(checked: List[Checked]) -> Iterator[List[Checked]]:
+    """The checked databases, in order, packed into transactions: each is added to the transaction being filled until
+    adding it would take that past TABLES_PER_TRANSACTION, and then the next transaction starts."""
+    chunk: List[Checked] = []
     tables = 0
-    for unit, count in counted:
-        if chunk and tables + count > TABLES_PER_TRANSACTION:
+    for database in checked:
+        if chunk and tables + database.tables > TABLES_PER_TRANSACTION:
             yield chunk
             chunk, tables = [], 0
-        chunk.append(unit)
-        tables += count
+        chunk.append(database)
+        tables += database.tables
     if chunk:
         yield chunk
 
