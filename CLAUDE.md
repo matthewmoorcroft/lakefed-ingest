@@ -83,6 +83,10 @@ secret). See `README.md`, `docs/deploy.md`, `docs/monitoring.md`, `docs/lakebase
 - `app_task` (a large write the app runs in a background thread: progress, heartbeat, a unique `request_id`),
   `table_upload` / `table_upload_line` (a CSV posted once, a row per line) and `job_selection` (what a job was chosen
   from: a whole server with its filter, a whole database, or tables), written by the operations app (version 9).
+- `rollup_database`, `rollup_group`: the monitoring rollups: one row per database (per server, connection, host and
+  instance label) and one per ingestion group, rewritten in the same transaction as the rows they count (the engine
+  after each database's work, the app after its own edits). The pages read them, so counts are never scanned from
+  control; a grain with no control row left is zeroed (`control_rows = 0`), not deleted. See `docs/lakebase_schema.md`.
 - DDL is applied by `StateStore.migrate` (from `apply_lakebase_schema.ipynb`, and from `ingest.ipynb`
   when `schema_version` is behind `state_store.SCHEMA_VERSION`, so upgrades are deploy-only): one
   transaction, split on `;` — no `DO $$` blocks, no `CREATE INDEX CONCURRENTLY`. Migrations must be
@@ -122,8 +126,8 @@ secret). See `README.md`, `docs/deploy.md`, `docs/monitoring.md`, `docs/lakebase
 - `lakefed_ingest_delete_job` → `delete_job.ipynb` (serverless, runs as the deployer, queued, one at a time):
   finishes an app job's Delete (`delete_job.py`). The app marks the job deleted and starts it with `schedule_id` and
   `drop_targets`. In one transaction, under each group's run lock (a run of any group refuses the lot), it deletes
-  the groups no other live job holds: their control, checkpoint, reseed_queue, database_check and check_work rows,
-  and the job's job_selection rows (what it was chosen from; skipped below schema version 9).
+  the groups no other live job holds: their control, checkpoint, reseed_queue, database_check, check_work and rollup
+  rows, and the job's job_selection rows (what it was chosen from; skipped below schema version 9).
   Run history (ingest_run, ingest_event) and control_change stay. With `drop_targets`, after the commit, it drops
   (`DROP TABLE IF EXISTS`) only the target tables no other group's rows write, never a schema.
 - `lakefed_ingest_discover` → `discover_tables.ipynb`: table discovery for bulk onboarding (params

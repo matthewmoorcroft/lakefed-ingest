@@ -26,6 +26,7 @@ from __future__ import annotations
 import json
 import re
 import threading
+import time
 import zlib
 from typing import Callable, List, Optional
 
@@ -527,6 +528,166 @@ def stamp_database_sql() -> str:
     )
 
 
+# ---- monitoring rollups ---------------------------------------------------------------------------
+# The operations app's pages read these instead of scanning every control row: one row per database (the grain of
+# the app's database_states_sql) and one per ingestion group. A write recomputes its databases from their own rows
+# (one aggregate, by index), so the counts are exact and never kept by deltas. A database with no rows left is
+# zeroed, not deleted (the app has no DELETE privilege). The app's queries.rollup_* keep this text equal (a test).
+
+ROLLUP_DATABASE_TABLE = f"{SCHEMA}.rollup_database"
+ROLLUP_GROUP_TABLE = f"{SCHEMA}.rollup_group"
+# Databases per statement: one statement's arrays and its aggregate stay small at 22,000 databases.
+ROLLUP_CHUNK = 200
+
+
+def _rollup_server_sql() -> str:
+    """The server a control row reaches, as the app's queries.SERVER spells it (alias t = control)."""
+    default_port = ("case lower(coalesce(t.src_type, 'sqlserver')) when 'oracle' then '1521' "
+                    "when 'postgresql' then '5432' when 'mysql' then '3306' else '1433' end")
+    endpoint = f"lower(t.src_host) || ':' || coalesce(nullif(t.src_port, 0)::text, {default_port})"
+    return (f"(case when t.src_connection is not null and (t.use_remote_query or t.src_host is null) "
+            f"then lower(t.src_connection) when t.src_host is not null then {endpoint} else '' end)")
+
+
+def rollup_database_rewrite_sql() -> str:
+    """Recompute the rollup rows of some databases of one collection, in one statement. Params: task_collection
+    per database (text[]), src_database per database (text[]). Each grain row (server, connection, host, instance
+    label) of a database gets its counts from the database's own control rows and checkpoints; a grain row the
+    database no longer has is zeroed. Enabled-table counts only, as the app's database_states_sql."""
+    return f"""
+with keys as (
+    select k.task_collection, k.src_database
+    from unnest(%s::text[], %s::text[]) as k(task_collection, src_database)),
+states as (
+    select t.task_collection, coalesce(t.src_database, '') as src_database, {_rollup_server_sql()} as server,
+           coalesce(t.src_connection, '') as src_connection, coalesce(lower(t.src_host), '') as src_host,
+           coalesce(t.source_instance_group, '') as instance_label, t.task_enabled, t.freshness_sla_minutes,
+           t.created_at, coalesce(cp.status = 'failed', false) as failing,
+           (cp.control_id is null or cp.phase = 'seeding') as first_load,
+           greatest(cp.last_success_at, case when cp.strategy = 'ct' and cp.phase = 'incremental'
+                    and cp.position ~ '^[0-9]+$' then case when cp.position::bigint >= dc.checked_version
+                    then dc.checked_at end end) as last_success_at
+    from keys k
+    join {CONTROL_TABLE} t on t.task_collection = k.task_collection and coalesce(t.src_database, '') = k.src_database
+    left join {CHECKPOINT_TABLE} cp on cp.control_id = t.id
+    left join {DATABASE_CHECK_TABLE} dc on dc.task_collection = t.task_collection
+        and dc.src_database = t.src_database and dc.source = {database_source_sql('t')}),
+agg as (
+    select task_collection, src_database, server, src_connection, src_host, instance_label,
+           count(*) as control_rows, count(*) filter (where task_enabled) as tables,
+           count(*) filter (where task_enabled and freshness_sla_minutes is null) as no_sla_tables,
+           count(*) filter (where task_enabled and failing) as failing,
+           count(*) filter (where task_enabled and not failing and first_load) as first_load,
+           count(*) filter (where task_enabled and not failing and not first_load) as loaded,
+           min(last_success_at) filter (where task_enabled) as oldest_success_at,
+           max(last_success_at) filter (where task_enabled) as newest_success_at,
+           max(last_success_at) as newest_any_success_at,
+           min(coalesce(last_success_at, created_at) + make_interval(mins => freshness_sla_minutes))
+               filter (where task_enabled and freshness_sla_minutes is not null and not failing
+                       and not first_load) as earliest_due_at
+    from states
+    group by task_collection, src_database, server, src_connection, src_host, instance_label),
+written as (
+    insert into {ROLLUP_DATABASE_TABLE} (task_collection, src_database, server, src_connection, src_host,
+        instance_label, tables, no_sla_tables, failing, first_load, loaded, oldest_success_at, newest_success_at,
+        newest_any_success_at, earliest_due_at, updated_at, control_rows)
+    select task_collection, src_database, server, src_connection, src_host, instance_label, tables, no_sla_tables,
+           failing, first_load, loaded, oldest_success_at, newest_success_at, newest_any_success_at,
+           earliest_due_at, now(), control_rows
+    from agg
+    on conflict (task_collection, src_database, server, src_connection, src_host, instance_label) do update set
+        tables = excluded.tables, no_sla_tables = excluded.no_sla_tables, failing = excluded.failing,
+        first_load = excluded.first_load, loaded = excluded.loaded,
+        oldest_success_at = excluded.oldest_success_at, newest_success_at = excluded.newest_success_at,
+        newest_any_success_at = excluded.newest_any_success_at, earliest_due_at = excluded.earliest_due_at,
+        control_rows = excluded.control_rows, updated_at = now()
+    returning 1),
+zeroed as (
+    update {ROLLUP_DATABASE_TABLE} r set tables = 0, no_sla_tables = 0, failing = 0, first_load = 0, loaded = 0,
+           oldest_success_at = null, newest_success_at = null, newest_any_success_at = null,
+           earliest_due_at = null, control_rows = 0, updated_at = now()
+    from keys k
+    where r.task_collection = k.task_collection and r.src_database = k.src_database
+      and not exists (select 1 from agg a where a.task_collection = r.task_collection
+                      and a.src_database = r.src_database and a.server = r.server
+                      and a.src_connection = r.src_connection and a.src_host = r.src_host
+                      and a.instance_label = r.instance_label)
+    returning 1)
+select (select count(*) from written) as written, (select count(*) from zeroed) as zeroed"""
+
+
+def rollup_group_rewrite_sql() -> str:
+    """Recompute the rollup rows of some ingestion groups from their database rows. Param: task_collection per group
+    (text[]). A group with no database rows is zeroed, as its rows are. Databases count those with an enabled table."""
+    return f"""
+with groups as (
+    select g.task_collection from unnest(%s::text[]) as g(task_collection)),
+agg as (
+    select g.task_collection,
+           coalesce(sum(r.tables), 0) as tables, coalesce(sum(r.no_sla_tables), 0) as no_sla_tables,
+           coalesce(sum(r.failing), 0) as failing, coalesce(sum(r.first_load), 0) as first_load,
+           coalesce(sum(r.loaded), 0) as loaded,
+           count(distinct (r.server, r.src_database)) filter (where r.tables > 0) as databases,
+           count(distinct r.server) filter (where r.tables > 0) as servers,
+           min(r.oldest_success_at) as oldest_success_at, max(r.newest_success_at) as newest_success_at
+    from groups g
+    left join {ROLLUP_DATABASE_TABLE} r on r.task_collection = g.task_collection
+    group by g.task_collection)
+insert into {ROLLUP_GROUP_TABLE} (task_collection, tables, no_sla_tables, failing, first_load, loaded, databases,
+    servers, oldest_success_at, newest_success_at, updated_at)
+select task_collection, tables, no_sla_tables, failing, first_load, loaded, databases, servers,
+       oldest_success_at, newest_success_at, now()
+from agg
+on conflict (task_collection) do update set
+    tables = excluded.tables, no_sla_tables = excluded.no_sla_tables, failing = excluded.failing,
+    first_load = excluded.first_load, loaded = excluded.loaded, databases = excluded.databases,
+    servers = excluded.servers, oldest_success_at = excluded.oldest_success_at,
+    newest_success_at = excluded.newest_success_at, updated_at = now()"""
+
+
+def delete_rollups_sql(table: str) -> str:
+    """Remove a deleted group's rollup rows (the delete job only; the app never deletes). Param: task_collection[]."""
+    return f"delete from {table} where task_collection = any(%s)"
+
+
+class RollupQueue:
+    """The databases of one collection whose rollup rows are due a rewrite, written in batches as their work ends.
+
+    Worker threads call ``add`` as each database's work finishes. A batch is written when it is full or the last
+    write is older than ``max_age_s``, so the pages follow a long run; ``flush`` writes what is left at the end.
+    A failed write keeps its databases queued, so the next write (or the run's end) tries them again."""
+
+    def __init__(self, store, task_collection: str, batch_size: int = ROLLUP_CHUNK, max_age_s: float = 5.0,
+                 clock: Callable[[], float] = time.monotonic):
+        self._store = store
+        self._task_collection = task_collection
+        self._batch_size = max(1, int(batch_size))
+        self._max_age_s = max_age_s
+        self._clock = clock
+        self._pending: set = set()
+        self._last_write = clock()
+        self._lock = threading.Lock()
+
+    def add(self, src_databases) -> None:
+        with self._lock:
+            self._pending.update(str(name or "") for name in src_databases)
+            if self._pending and (len(self._pending) >= self._batch_size
+                                  or self._clock() - self._last_write >= self._max_age_s):
+                self._write_locked()
+
+    def flush(self) -> None:
+        with self._lock:
+            self._write_locked()
+
+    def _write_locked(self) -> None:
+        if not self._pending:
+            return
+        names = sorted(self._pending)
+        self._store.rewrite_rollups(self._task_collection, names)
+        self._pending.clear()
+        self._last_write = self._clock()
+
+
 def enabled_collections_sql() -> str:
     """The collections with at least one enabled control row, in name order."""
     return f"select distinct task_collection from {CONTROL_TABLE} where task_enabled order by task_collection"
@@ -965,6 +1126,18 @@ class StateStore:
         if params:
             with self._cursor() as cur:
                 cur.executemany(stamp_database_sql(), params)
+
+    def rewrite_rollups(self, task_collection: str, src_databases) -> None:
+        """Recompute the monitoring rollups of some source databases of a collection, then the collection's group row,
+        in one transaction. Databases come from the collection's rows (a name's rows on every server)."""
+        names = sorted({str(name or "") for name in src_databases})
+        if not names:
+            return
+        with self._cursor() as cur, cur.connection.transaction():
+            for at in range(0, len(names), ROLLUP_CHUNK):
+                chunk = names[at:at + ROLLUP_CHUNK]
+                cur.execute(rollup_database_rewrite_sql(), ([task_collection] * len(chunk), chunk))
+            cur.execute(rollup_group_rewrite_sql(), ([task_collection],))
 
     def record_ct_begin_version(self, cfg: dict, begin_version) -> None:
         """Record the table's CT begin_version on its checkpoint (seed time, or first time seen)."""

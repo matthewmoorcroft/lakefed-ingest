@@ -591,3 +591,50 @@ create table if not exists lakefed_ingest.job_selection (
     created_at    timestamptz not null default now()
 );
 create index if not exists job_selection_job_idx on lakefed_ingest.job_selection (job_id);
+
+-- Monitoring rollups (the operations app's pages read these, not a scan of control). One row per database and
+-- ingestion group, rewritten from the database's own rows as its work ends (state_store.StateStore.rewrite_rollups)
+-- and by the app's edits, in the same transaction. A database with no rows left is zeroed, not deleted, and the
+-- delete job removes a deleted group's rows. `earliest_due_at` is when the first loaded table with a freshness target
+-- falls due (its last success or creation, plus the target); a database is late once that time has passed.
+create table if not exists lakefed_ingest.rollup_database (
+    task_collection       text        not null,
+    src_database          text        not null,         -- '' when the control row has none
+    server                text        not null,         -- the server key (queries.SERVER); '' when none
+    src_connection        text        not null,         -- '' when none
+    src_host              text        not null,         -- '' when none
+    instance_label        text        not null,         -- source_instance_group; '' when none
+    tables                int         not null,         -- enabled tables
+    no_sla_tables         int         not null,         -- enabled tables without a freshness target
+    failing               int         not null,         -- enabled tables whose checkpoint failed
+    first_load            int         not null,         -- enabled tables waiting for a first load
+    loaded                int         not null,         -- enabled tables neither failing nor waiting
+    control_rows          int         not null,         -- control rows in the grain, enabled or not; 0 once none
+    oldest_success_at     timestamptz,
+    newest_success_at     timestamptz,
+    newest_any_success_at timestamptz,                  -- over every row, enabled or not (a connection's databases)
+    earliest_due_at       timestamptz,
+    updated_at            timestamptz not null default now(),
+    constraint rollup_database_pk primary key (task_collection, src_database, server, src_connection, src_host,
+                                               instance_label)
+);
+create index if not exists rollup_database_due_idx
+    on lakefed_ingest.rollup_database (task_collection, earliest_due_at);
+
+create table if not exists lakefed_ingest.rollup_group (
+    task_collection       text        primary key,
+    tables                int         not null,
+    no_sla_tables         int         not null,
+    failing               int         not null,
+    first_load            int         not null,
+    loaded                int         not null,
+    databases             int         not null,         -- databases with an enabled table
+    servers               int         not null,
+    oldest_success_at     timestamptz,
+    newest_success_at     timestamptz,
+    updated_at            timestamptz not null default now()
+);
+
+-- A rollup rewrite reads one database's control rows by (collection, database name) instead of the whole collection.
+create index if not exists control_collection_database_idx
+    on lakefed_ingest.control (task_collection, (coalesce(src_database, '')));

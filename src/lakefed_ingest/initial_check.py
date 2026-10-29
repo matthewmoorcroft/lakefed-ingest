@@ -171,6 +171,10 @@ def run_check(store, lock_store, collections: List[str], detect_one: Callable, *
             writes_started = time.monotonic()
             store.bulk_advance_unchanged(result["rows"])
             store.stamp_databases(collection, result["database_stamps"], run_id)
+            # The rows and stamps above move last successes: their databases' rollups are recomputed.
+            database_of = {int(c["id"]): c.get("src_database") for c in configs}
+            store.rewrite_rollups(collection, {database for _, database, _, _ in result["database_stamps"]}
+                                  | {database_of[int(row[0])] for row in result["rows"]})
             check = {k: result[k] for k in ("work", "unchanged_databases", "unchanged_tables", "work_tables",
                                             "detected", "queries", "fast_exits")}
             check.update(table_rows=len(result["rows"]), database_stamps=len(result["database_stamps"]),

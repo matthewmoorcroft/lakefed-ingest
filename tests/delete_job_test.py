@@ -87,7 +87,8 @@ def test_a_deleted_jobs_groups_rows_go_in_order_under_each_groups_run_lock():
     assert result["groups"] == ["g1", "g2"] and result["deleted"]["control"] == 3
     assert [p for sql, p in cur.executed if sql == dj.lock_sql()] == [("lakefed_ingest:g1",), ("lakefed_ingest:g2",)]
     deletes = [re.match(r"delete from lakefed_ingest\.(\w+)", s).group(1) for s in statements(cur) if s.startswith("delete")]
-    assert deletes == ["reseed_queue", "checkpoint", "database_check", "check_work", "control"]
+    assert deletes == ["reseed_queue", "checkpoint", "database_check", "check_work", "rollup_database",
+                       "rollup_group", "control"]
     assert all(p == (["g1", "g2"],) for sql, p in cur.executed if sql.startswith("delete"))
     locks_end = max(i for i, s in enumerate(statements(cur)) if s == dj.lock_sql())
     assert locks_end < min(i for i, s in enumerate(statements(cur)) if s.startswith("delete"))
