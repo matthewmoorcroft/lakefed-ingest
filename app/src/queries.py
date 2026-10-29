@@ -1410,11 +1410,11 @@ def task_written_sql() -> str:
 
 
 def stale_tasks_sql() -> str:
-    """End the running tasks whose heartbeat stopped (the app restarted while writing): one with a result had
-    committed its tables and only missed what follows (failed_note is kept as its error), the rest were rolled back
-    with the app (failed, with rolled_back as the error). Params: rolled_back, failed_note, seconds, id (or null),
-    job_id (or null)."""
-    return (f"update {SCHEMA}.app_task set status = case when result is null then 'failed' else 'succeeded' end, "
+    """End the running tasks whose heartbeat stopped (the app restarted while writing). Every one ends failed, never
+    succeeded: one with a result had committed its tables but missed the Databricks job sync that follows, so its
+    failed_note says so and it is not shown as done; the rest were rolled back with the app (rolled_back is the error).
+    Params: rolled_back, failed_note, seconds, id (or null), job_id (or null)."""
+    return (f"update {SCHEMA}.app_task set status = 'failed', "
             f"error = case when result is null then %s else %s end, finished_at = now() "
             f"where status = 'running' and heartbeat_at < now() - make_interval(secs => %s) "
             f"and (id = %s or job_id = %s)")

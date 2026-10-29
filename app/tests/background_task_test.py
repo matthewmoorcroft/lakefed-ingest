@@ -223,7 +223,7 @@ def test_reading_a_task_first_ends_it_when_its_heartbeat_stopped(client):
 def test_the_stale_rule_tells_a_rolled_back_write_from_one_that_committed():
     sql = q.stale_tasks_sql()
     assert "status = 'running' and heartbeat_at < now() - make_interval(secs => %s)" in sql
-    assert "case when result is null then 'failed' else 'succeeded' end" in sql
+    assert "set status = 'failed'" in sql and "'succeeded'" not in sql
     # A late finish can't undo a stale task's verdict, nor a stale read undo a finish.
     assert q.finish_task_sql().endswith("where id = %s and status = 'running'")
     assert q.insert_task_sql().count("%s") == 6 and "on conflict (request_id)" in q.insert_task_sql()
