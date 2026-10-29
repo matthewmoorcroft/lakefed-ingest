@@ -12,9 +12,10 @@ INGEST_JOB_ID, SETUP_JOB_ID, DISCOVER_JOB_ID), with the frontend built (`npm run
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
-from contextlib import contextmanager
+from contextlib import asynccontextmanager, contextmanager
 import threading
 import time
 import uuid
@@ -36,10 +37,20 @@ import jobs
 import lakebase as db
 import new_job as nj
 import queries as q
+import rediscovery
 import rollup
 import schedules as sch
 
-app = FastAPI(title="lakefed_ingest operations", docs_url="/api/docs", openapi_url="/api/openapi.json")
+@asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    """The app's background scheduler for re-discovery (REDISCOVERY_TICK_S; 0 leaves it off)."""
+    if REDISCOVERY_TICK_S > 0:
+        threading.Thread(target=_rediscovery_scheduler, daemon=True, name="lakefed-app-rediscovery").start()
+    yield
+
+
+app = FastAPI(title="lakefed_ingest operations", docs_url="/api/docs", openapi_url="/api/openapi.json",
+              lifespan=_lifespan)
 STATIC = Path(__file__).parent / "static"
 
 # The routes that take a CSV of tables, and the most a request to one may carry: a whole server of 120,000 lines
@@ -1085,7 +1096,8 @@ def ingestion_job(job_id: int, request: Request):
             "run_now": {"blocked": refusals["run"] or _run_now_blocker(job, mine), "refused": refusals["run"],
                         "going": _recorded_running(mine),
                         "groups": len(mine), "check": job.get("job_variant") == sch.CHECK_VARIANT},
-            "delete_blocked": refusals["delete"], "change_blocked": refusals["change"], **_audit(job)}
+            "delete_blocked": refusals["delete"], "change_blocked": refusals["change"],
+            "rediscovery": rediscovery.view(sch.options_of(job)), **_audit(job)}
 
 
 def _job_groups(job_id: int) -> List[str]:
@@ -1755,6 +1767,28 @@ class JobTablesRequest(_TablesFrom):
     request_id: Optional[str] = Field(None, max_length=80)
 
 
+def _write_planned_tables(cur, job: dict, plan: dict, user: str, batch: str, progress=None,
+                          skip_taken: bool = False) -> List[tuple]:
+    """Inside the caller's transaction, with the job's groups locked: the plan's valid lines as control rows (each with
+    its change log line), their groups' run locks, the mixed-sink and split-database checks, and the job's new groups
+    as members with offsets. Returns the (row, id) pairs written; skip_taken leaves out a row whose target another
+    table writes, instead of refusing the lot."""
+    job_id = int(job["id"])
+    _lock_collections(cur, plan["groups"])
+    rows = [line["row"] for line in plan["lines"] if line["status"] == "valid"]
+    written = _insert_controls(cur, rows, user, batch, skip_taken=skip_taken, progress=progress)
+    _refuse_mixed_sinks(cur, [row for row, _ in written])
+    _refuse_split_databases(cur, [row for row, _ in written])
+    if plan["new_groups"]:
+        _, members = _load_schedule(job_id, cur)
+        active = [m for m in members if m["removed_at"] is None]
+        offs = sch.offsets([m["task_collection"] for m in active] + plan["new_groups"],
+                           int(job["cadence_minutes"]), bool(job.get("stagger")), sch.start_minute(job))
+        for g in plan["new_groups"]:
+            cur.execute(q.insert_member_sql(), (job_id, g, offs[g]))
+    return written
+
+
 @app.post("/api/ingestion-jobs/{job_id}/tables")
 def add_job_tables(job_id: int, body: JobTablesRequest, request: Request):
     """Preview (dry_run, the default) or add a CSV of tables to a job, as Add tables does in the Edit view: each line
@@ -1789,22 +1823,11 @@ def add_job_tables(job_id: int, body: JobTablesRequest, request: Request):
             summary = nj.summary(plan)
             if summary["invalid"]:
                 return {"summary": summary, "applied": False, "new_groups": []}
-            _lock_collections(cur, plan["groups"])
-            rows = [line["row"] for line in plan["lines"] if line["status"] == "valid"]
-            _insert_controls(cur, rows, user, batch, progress=progress)
-            _refuse_mixed_sinks(cur, rows)
-            _refuse_split_databases(cur, rows)
-            if plan["new_groups"]:
-                _, members = _load_schedule(job_id, cur)
-                active = [m for m in members if m["removed_at"] is None]
-                offs = sch.offsets([m["task_collection"] for m in active] + plan["new_groups"],
-                                   int(job["cadence_minutes"]), bool(job.get("stagger")), sch.start_minute(job))
-                for g in plan["new_groups"]:
-                    cur.execute(q.insert_member_sql(), (job_id, g, offs[g]))
+            written = _write_planned_tables(cur, job, plan, user, batch, progress=progress)
             _keep_selection(cur, job_id, selected, user)
             _touch(cur, user, [job_id])
             result = {"summary": summary, "applied": True}
-            _task_written(cur, task_id, result, job_id, len(rows))
+            _task_written(cur, task_id, result, job_id, len(written))
         return {**result, "new_groups": plan["new_groups"]}
 
     def after(result):
@@ -2562,7 +2585,8 @@ def _validate_schedule(body: ScheduleBody):
 
 # Options only the app's own steps write: who last changed the job, the copies job's copy and the app's run
 # applying it, and a deleted job's delete job run and whether it drops the target tables. A request's values for them are ignored, and the stored ones kept.
-MANAGED_OPTIONS = ("updated_by", sch.COPY_OPTION, "cluster_copy_run_id", "delete_run_id", "delete_drop_targets")
+MANAGED_OPTIONS = ("updated_by", sch.COPY_OPTION, "cluster_copy_run_id", "delete_run_id", "delete_drop_targets",
+                   rediscovery.RECORD)
 
 
 def _requested_options(body: "ScheduleBody") -> dict:
@@ -3180,6 +3204,130 @@ def spa(path: str):
     if not index.is_file():
         return JSONResponse(status_code=503, content={"detail": "frontend not built (npm run build)"})
     return FileResponse(index)
+
+
+# ---- re-discovery: a job's selection read again each day at its hour (rediscovery.py) ----------------------------------
+# The scheduler is a thread of the app, so it runs while the app does. A job that is due is claimed in Lakebase first
+# (its record becomes running), so one start runs however many ticks or app instances look; the re-discovery then runs
+# on its own thread, and its tables are written by the path Add tables takes, as the change log's re-discovery user.
+REDISCOVERY_TICK_S = float(os.environ.get("REDISCOVERY_TICK_S", "300"))   # 0 turns the scheduler off
+REDISCOVERY_POLL_S = float(os.environ.get("REDISCOVERY_POLL_S", "30"))
+REDISCOVERY_MAX_WAIT_S = float(os.environ.get("REDISCOVERY_MAX_WAIT_S", str(6 * 3600)))
+REDISCOVERY_USER = "re-discovery"
+
+
+def _rediscovery_scheduler() -> None:
+    while True:
+        time.sleep(REDISCOVERY_TICK_S)
+        try:
+            _rediscovery_tick()
+        except Exception:
+            logging.getLogger(__name__).exception("re-discovery tick failed")
+
+
+def _rediscovery_tick(now: Optional[datetime] = None) -> List[int]:
+    """Start the re-discovery of each job that is due now, each on its own thread. Returns the jobs started."""
+    now = now or datetime.now(timezone.utc)
+    started = []
+    for job in db.query(q.schedules_sql()):
+        if not rediscovery.is_due(sch.options_of(job), now, bool(job["paused"])):
+            continue
+        claimed = db.query(q.claim_rediscovery_sql(),
+                           (json.dumps(rediscovery.running_record(now)), job["id"], rediscovery.RUN_STALE_S))
+        if claimed:
+            started.append(job["id"])
+            _start_background(lambda sid=job["id"]: _run_rediscovery(sid, now))
+    return started
+
+
+def _run_rediscovery(sid: int, started: datetime) -> None:
+    """A job's re-discovery on its own thread. Its outcome (what was found and added, what vanished, the errors) or why
+    it did not run is recorded on the job, even when it failed. A 409 because a group is running is 'deferred': the
+    next re-discovery is the next day's."""
+    record = {"started_at": started.astimezone(timezone.utc).isoformat()}
+    try:
+        record.update(status="done", **_rediscover(sid))
+    except HTTPException as e:
+        deferred = e.status_code == 409 and "running" in str(e.detail)
+        record.update(status="deferred" if deferred else "failed", error=_error_text(e))
+    except Exception as e:
+        record.update(status="failed", error=_error_text(e))
+    record["finished_at"] = datetime.now(timezone.utc).isoformat()
+    db.execute(q.set_rediscovery_sql(), (json.dumps(record, default=str), int(sid)))
+    _forget_shared_reads()
+
+
+def _rediscover(sid: int) -> dict:
+    """Read a job's selection's servers again (one discovery run each), then add what the rules allow: in one
+    transaction under the job's lock and its groups' run locks, through the path Add tables takes. The job's new groups
+    are synced after the commit."""
+    job, _ = _load_schedule(sid)
+    selection = db.query(q.job_selection_sql(), (int(sid),))
+    if not selection:
+        return {"found": 0, "added": 0, "note": "the job was not made from a selection, so there is nothing to read again"}
+    discovery_parts = [p for p in selection if p["source_kind"] == "discovery"]
+    if not discovery_parts:
+        return {"found": 0, "added": 0, "note": "the job was made from an uploaded CSV, which has no source to read again"}
+    if not any(p["scope"] != "tables" for p in discovery_parts):
+        return {"found": 0, "added": 0, "note": "the job's selection is specific tables, which add nothing"}
+    ids = sorted({i for p in discovery_parts for i in str(p["source_id"] or "").split(",") if i})
+    readings, errors = rediscovery.specs(discovery_parts, db.query(q.selection_discoveries_sql(), (ids,)))
+    new_ids = []
+    for server, spec in readings:
+        discovery_id = uuid.uuid4().hex[:12]
+        run_id = jobs.run_now(_require(jobs.DISCOVER_JOB_ID, "discovery"),
+                              {"discovery_id": discovery_id, "spec": json.dumps(spec)})
+        new_ids.append(discovery_id)
+        ended = _wait_for_run(run_id)
+        if ended.get("result") != "SUCCESS":
+            errors.append(f"{server}: its discovery run ended {ended.get('result') or ended.get('state')}"
+                          + (f": {ended['message']}" if ended.get("message") else ""))
+    statuses = db.query(q.discovery_statuses_sql(), (new_ids,)) if new_ids else []
+    found = db.query(q.source_rows_sql("discovery"), (new_ids,)) if new_ids else []
+    taken = {r["task_collection"] for r in db.query(q.collections_sql())}
+    user, batch = REDISCOVERY_USER, uuid.uuid4().hex[:12]
+
+    def write() -> tuple:
+        with _write() as cur:
+            groups = _lock_job(cur, sid)
+            job_rows = db.fetch(cur, q.groups_control_rows_sql(for_update=True), (groups,)) if groups else []
+            picked = rediscovery.wanted(discovery_parts, found, statuses, job_rows)
+            limit = rediscovery.REPORT_LIMIT
+            outcome = {"found": len(picked["add"]), "added": 0, "skipped": 0,
+                       "new_databases": picked["new_databases"][:limit],
+                       "vanished": {"count": len(picked["vanished"]), "tables": picked["vanished"][:limit]},
+                       "errors": (errors + [f"{e['database']}: {e['error']}" for e in picked["errors"]])[:limit],
+                       "discovery_ids": new_ids}
+            if not picked["add"]:
+                return outcome, []
+            plan = nj.plan_for_job(job["name"], nj.csv_of(nj.DISCOVERY_COLUMNS, [r["fields"] for r in picked["add"]]),
+                                   "ct", job_rows, nj.DEFAULT_GROUPS_PER_SERVER, taken)
+            if plan["errors"]:
+                raise HTTPException(422, {"errors": plan["errors"]})
+            written = _write_planned_tables(cur, job, plan, user, batch, skip_taken=True)
+            if written:
+                _touch(cur, user, [sid])
+            outcome["added"] = len(written)
+            outcome["skipped"] = len(picked["add"]) - len(written)
+            outcome["skipped_tables"] = [{"table": line["table"], "errors": line["errors"]}
+                                         for line in plan["lines"] if line["status"] == "invalid"][:limit]
+            return outcome, plan["new_groups"]
+
+    outcome, new_groups = write()
+    if new_groups:
+        _sync(sid, user)
+    return outcome
+
+
+def _wait_for_run(run_id: int) -> dict:
+    """A Databricks run's end (jobs.run_ended), polled every REDISCOVERY_POLL_S until REDISCOVERY_MAX_WAIT_S."""
+    waited = 0.0
+    while (ended := jobs.run_ended(run_id)) is None:
+        if waited >= REDISCOVERY_MAX_WAIT_S:
+            raise HTTPException(504, f"discovery run {run_id} is still going after {int(waited)} seconds")
+        time.sleep(REDISCOVERY_POLL_S)
+        waited += REDISCOVERY_POLL_S
+    return ended
 
 
 if __name__ == "__main__":

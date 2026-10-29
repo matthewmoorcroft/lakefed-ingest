@@ -1825,6 +1825,36 @@ def clear_schedule_option_sql() -> str:
     return f"update {SCHEMA}.schedule set options = options - %s where id = %s"
 
 
+def claim_rediscovery_sql() -> str:
+    """Claim a job's re-discovery: its record becomes running, unless a run holds it (a running record younger than
+    the stale limit). Returns the id when claimed. Params: the running record as JSON, id, stale seconds."""
+    return (f"update {SCHEMA}.schedule set options = jsonb_set(coalesce(options, '{{}}'::jsonb), '{{rediscovery}}', "
+            f"%s::jsonb) where id = %s and deleted_at is null and (options->'rediscovery' is null "
+            f"or options->'rediscovery'->>'status' is distinct from 'running' "
+            f"or coalesce((options->'rediscovery'->>'started_at')::timestamptz, 'epoch'::timestamptz) "
+            f"< now() - make_interval(secs => %s)) returning id")
+
+
+def set_rediscovery_sql() -> str:
+    """Write a job's re-discovery record (options.rediscovery). Params: the record as JSON, id."""
+    return (f"update {SCHEMA}.schedule set options = jsonb_set(coalesce(options, '{{}}'::jsonb), '{{rediscovery}}', "
+            f"%s::jsonb) where id = %s")
+
+
+def selection_discoveries_sql() -> str:
+    """The discovery rows a selection was made from (one per database read): the server's connection or host and port,
+    its secrets, its listing and when each was read. Param: list of discovery ids."""
+    return (f"select lower(coalesce(src_connection, src_host)) as server, src_type, src_connection, src_host, src_port, "
+            f"secret_key, src_database, listing, finished_at from {SCHEMA}.discovery where discovery_id = any(%s)")
+
+
+def discovery_statuses_sql() -> str:
+    """Each database a discovery read, with its status and error (the master row when a server couldn't be listed).
+    Param: list of discovery ids."""
+    return (f"select lower(coalesce(src_connection, src_host)) as server, src_database, status, error "
+            f"from {SCHEMA}.discovery where discovery_id = any(%s)")
+
+
 def schedule_sql() -> str:
     """One schedule (deleted or not). Param: id."""
     return (f"select id, {', '.join(SCHEDULE_FIELDS)}, created_by, created_at, updated_at, deleted_at "
