@@ -184,12 +184,13 @@ def test_a_failed_write_ends_its_task_failed_with_what_the_request_would_have_sa
     assert failed["result"] is None and client.synced == [] and client.db.rolled_back == []
 
 
-def test_a_sync_that_fails_after_the_commit_keeps_the_task_succeeded_and_says_why(client, monkeypatch):
+def test_a_sync_that_fails_after_the_commit_ends_the_task_failed_with_its_result_kept_and_says_why(client, monkeypatch):
     monkeypatch.setattr(main, "_sync", lambda sid, user: (_ for _ in ()).throw(RuntimeError("jobs API down")))
     task = _create(client, 120).json()["task"]
     client.tasks.run()
     done = client.get(f"/api/tasks/{task['id']}").json()
-    assert done["status"] == "succeeded" and done["result"]["after_error"] == "jobs API down"
+    assert done["status"] == "failed" and done["result"]["after_error"] == "jobs API down"
+    assert done["error"].startswith(main.TASK_WRITTEN_NOT_SYNCED) and done["error"].endswith("jobs API down")
 
 
 def test_progress_is_recorded_by_the_beat_while_the_write_runs(monkeypatch):

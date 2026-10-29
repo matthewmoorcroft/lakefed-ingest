@@ -31,7 +31,7 @@ const KINDS: Record<string, string> = { create: "Creating the job", tables: "Add
 /** "Writing 52,000 of 100,200 tables", or what it ended with. */
 export function TaskProgress({ task }: { task: Row | null }) {
   if (!task) return null;
-  if (task.status === "failed") return <Notice tone="bad">Nothing was written: {task.error}</Notice>;
+  if (task.status === "failed") return <Notice tone="bad">{task.result ? "Not done: " : "Nothing was written: "}{task.error}</Notice>;
   if (task.status === "succeeded") return <Notice tone="ok">Written: {fmtInt(task.total)} {plural(task.total, "table")}.</Notice>;
   return (
     <Notice>

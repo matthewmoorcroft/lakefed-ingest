@@ -345,6 +345,8 @@ BACKGROUND_ROWS = int(os.environ.get("BACKGROUND_ROWS", "5000"))
 TASK_BEAT_S = float(os.environ.get("TASK_BEAT_S", "2"))
 # A running task's heartbeat older than this means its thread is gone: the app restarted while it wrote.
 TASK_STALE_S = int(os.environ.get("TASK_STALE_S", "120"))
+TASK_WRITTEN_NOT_SYNCED = ("The tables were written, but their Databricks jobs were not synced, so the task is not "
+                           "done:")
 TASK_ROLLED_BACK = ("the app restarted while writing these tables; its transaction was rolled back with it, so none "
                     "of them was written: send it again")
 TASK_UNSYNCED = ("the tables were written, but the app restarted before the job's Databricks jobs were synced: "
@@ -405,11 +407,12 @@ def _run_task(task_id: int, write, after) -> None:
     result, status, error = None, "failed", None
     try:
         result = write(progress, task_id)
-        status = "succeeded"
         try:
             result = after(result)
+            status = "succeeded"
         except Exception as e:
             result = {**result, "after_error": _error_text(e)}
+            error = f"{TASK_WRITTEN_NOT_SYNCED} {_error_text(e)}"
     except BaseException as e:
         error = _error_text(e)
     finally:
