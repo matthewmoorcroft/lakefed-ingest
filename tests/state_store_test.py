@@ -4,6 +4,8 @@ No database or psycopg needed — psycopg is imported lazily inside StateStore.c
 """
 import json
 import re
+import threading
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 
 import pytest
@@ -1112,7 +1114,7 @@ class _FakeConn:
     def __init__(self, name):
         self.name, self.closed, self.broken = name, False, False
     def cursor(self):
-        return self.name
+        return nullcontext(self.name)
 
 
 def test_dropped_connection_is_replaced_before_the_next_statement():
@@ -1121,17 +1123,22 @@ def test_dropped_connection_is_replaced_before_the_next_statement():
         opened.append(_FakeConn(f"c{len(opened) + 2}"))
         return opened[-1]
     store = ss.StateStore(_FakeConn("c1"), reconnect=reopen)
-    assert store._cursor() == "c1" and not opened          # healthy: no new connection
+    with store._cursor() as cur:                           # healthy: no new connection
+        assert cur == "c1" and not opened
     store._conn.broken = True
-    assert store._cursor() == "c2" and len(opened) == 1    # dropped: reopened once
-    assert store._cursor() == "c2"
+    with store._cursor() as cur:                           # dropped: reopened once
+        assert cur == "c2" and len(opened) == 1
+    with store._cursor() as cur:
+        assert cur == "c2"
 
 
 def test_without_reconnect_a_dropped_connection_stays_dropped():
     # The lock connection: losing it means the advisory lock is gone, which must not be hidden.
     store = ss.StateStore(_FakeConn("c1"))
     store._conn.closed = True
-    assert store._cursor() == "c1" and store.is_alive() is False
+    with store._cursor() as cur:
+        assert cur == "c1"
+    assert store.is_alive() is False
 
 
 # ---- append write mode: pending appends -----------------------------------------------------------
@@ -1374,3 +1381,170 @@ def test_the_check_reads_an_ingestion_jobs_groups_by_its_id_and_none_of_a_delete
     sql = ss.schedule_collections_sql()
     assert "m.schedule_id = %s" in sql and "m.removed_at is null" in sql and "s.deleted_at is null" in sql
     assert sql.count("%s") == 1
+
+
+# ---- one connection shared by many threads: a transaction keeps other statements out of it ------------------------
+# Every worker and check thread writes through the StateStore's one connection. The fake follows psycopg's rules for
+# that case: a transaction opened while another is open becomes a savepoint, and a transaction that exits with an
+# error rolls back what it ran. Threads wait on events (WAIT_S is only a ceiling), so each run takes the same order.
+
+WAIT_S = 1.0
+
+
+def test_a_failed_rollup_leaves_the_checkpoint_and_pending_writes_of_other_workers_committed():
+    rollup_open, pending_done, checkpoint_done = threading.Event(), threading.Event(), threading.Event()
+
+    def on_execute(thread, sql):
+        if thread != "rollup":
+            return
+        if sql == ss.rollup_database_rewrite_sql():
+            rollup_open.set()
+            _wait_all([pending_done, checkpoint_done])     # the other workers run while the rollup's transaction is open
+        elif sql == ss.rollup_group_rewrite_sql():
+            raise RuntimeError("lakebase unreachable")
+
+    conn = _SharedConnection(on_execute)
+    store = ss.StateStore(conn)
+    rollup, rollup_errors = _start("rollup", store.rewrite_rollups, "c1", ["db1"])
+    assert rollup_open.wait(WAIT_S)
+    pending, _ = _start("worker-b", store.record_pending, CFG, 9, 4, done=pending_done)
+    checkpoint, _ = _start("worker-c", store.advance_checkpoint, CFG, 9, done=checkpoint_done)
+    for thread in (rollup, pending, checkpoint):
+        thread.join(timeout=10)
+
+    assert [str(error) for error in rollup_errors] == ["lakebase unreachable"]
+    assert _transactions_run_one_at_a_time(conn.events)
+    assert [thread for thread, _ in conn.rolled_back] == ["rollup"] * len(conn.rolled_back)
+    assert {thread for kind, thread, *_ in conn.events if kind == "execute"} >= {"worker-b", "worker-c"}
+
+
+def test_rollups_of_two_collections_never_share_a_transaction():
+    x_open, y_done = threading.Event(), threading.Event()
+
+    def on_execute(thread, sql):
+        if thread == "collection-x" and sql == ss.rollup_database_rewrite_sql():
+            x_open.set()
+            y_done.wait(WAIT_S)                            # collection y finishes its rollup while x's is open
+
+    conn = _SharedConnection(on_execute)
+    store = ss.StateStore(conn)
+    collection_x, x_errors = _start("collection-x", store.rewrite_rollups, "x", ["d1"])
+    assert x_open.wait(WAIT_S)
+    collection_y, y_errors = _start("collection-y", store.rewrite_rollups, "y", ["d2"], done=y_done)
+    for thread in (collection_x, collection_y):
+        thread.join(timeout=10)
+
+    assert x_errors == [] and y_errors == []
+    assert not any(kind == "savepoint" for kind, *_ in conn.events)
+    assert _transactions_run_one_at_a_time(conn.events)
+    assert [kind for kind, *_ in conn.events if kind in ("begin", "commit")] == ["begin", "commit", "begin", "commit"]
+
+
+class _SharedConnection:
+    """A psycopg-style connection that several threads use at once. ``events`` logs each transaction step and each
+    executed statement as (kind, thread, ...) in the order they ran. ``on_execute(thread, sql)`` runs before each
+    statement and may block or raise. ``rolled_back`` lists the (thread, sql) of the statements a rollback undid."""
+
+    def __init__(self, on_execute=lambda thread, sql: None):
+        self.events, self.rolled_back = [], []
+        self.on_execute = on_execute
+        self._depth, self._open = 0, []
+
+    def cursor(self):
+        return _SharedCursor(self)
+
+    @contextmanager
+    def transaction(self):
+        thread = threading.current_thread().name
+        self.events.append(("savepoint" if self._depth else "begin", thread))
+        self._depth += 1
+        try:
+            yield
+        except BaseException:
+            self._finish(thread, "rollback")
+            raise
+        self._finish(thread, "commit")
+
+    def _finish(self, thread, kind):
+        self._depth -= 1
+        if self._depth == 0:
+            self.events.append((kind, thread))
+            if kind == "rollback":
+                self.rolled_back.extend(self._open)
+            self._open = []
+        else:
+            self.events.append(("release", thread))
+
+    def execute(self, sql):
+        thread = threading.current_thread().name
+        self.on_execute(thread, sql)
+        self.events.append(("execute", thread, sql))
+        if self._depth:
+            self._open.append((thread, sql))
+
+
+class _SharedCursor:
+    def __init__(self, conn):
+        self.conn, self.connection = conn, conn
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def execute(self, sql, params=None):
+        self.conn.execute(sql)
+
+    def executemany(self, sql, seq):
+        self.conn.execute(sql)
+
+    def fetchone(self):
+        return None
+
+    def fetchall(self):
+        return []
+
+
+def _transactions_run_one_at_a_time(events) -> bool:
+    """True iff no transaction opened inside another, and between a transaction's begin and its end every statement
+    belongs to the thread that opened it."""
+    owner = None
+    for event in events:
+        kind, thread = event[0], event[1]
+        if kind == "savepoint":
+            return False
+        if kind == "begin":
+            if owner is not None:
+                return False
+            owner = thread
+        elif kind in ("commit", "rollback"):
+            if thread != owner:
+                return False
+            owner = None
+        elif kind == "execute" and owner is not None and thread != owner:
+            return False
+    return owner is None
+
+
+def _start(name, target, *args, done=None):
+    """Run ``target(*args)`` on a named thread; returns (thread, errors). ``done`` is set when the call ends."""
+    errors = []
+
+    def run():
+        try:
+            target(*args)
+        except Exception as error:
+            errors.append(error)
+        finally:
+            if done is not None:
+                done.set()
+
+    thread = threading.Thread(target=run, name=name, daemon=True)
+    thread.start()
+    return thread, errors
+
+
+def _wait_all(events):
+    for event in events:
+        event.wait(WAIT_S)

@@ -28,6 +28,7 @@ import re
 import threading
 import time
 import zlib
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Callable, List, Optional
 
@@ -1033,18 +1034,26 @@ class StateStore:
         # The statement that hit the drop still fails (and its table retries next run), so nothing
         # is ever executed twice. Never set for the lock connection: a dropped lock must stay dropped.
         self._reconnect = reconnect
-        self._reconnect_lock = threading.Lock()
+        # Every worker thread shares this connection. The lock is held by ``_cursor`` for each statement and
+        # each transaction, so a transaction keeps every other thread's statements out until it ends.
+        self._lock = threading.RLock()
 
+    @contextmanager
     def _cursor(self):
-        if self._reconnect is not None and (self._conn.closed or self._conn.broken):
-            with self._reconnect_lock:
-                if self._conn.closed or self._conn.broken:
-                    self._conn = self._reconnect()
-        return self._conn.cursor()
+        """A cursor for one statement, or for one transaction (``cur.connection.transaction()``). The lock is held
+        for the whole ``with`` block, so a transaction's statements and its commit or rollback run as one unit: no
+        other thread's statement can land inside it, and a failed transaction never rolls back someone else's write.
+        psycopg already runs one statement at a time, so this only extends that to the transaction's span."""
+        with self._lock:
+            if self._reconnect is not None and (self._conn.closed or self._conn.broken):
+                self._conn = self._reconnect()
+            with self._conn.cursor() as cur:
+                yield cur
 
     @property
     def connection(self):
-        """The underlying psycopg connection (for raw DDL / bulk inserts)."""
+        """The underlying psycopg connection (for raw DDL / bulk inserts). Statements sent through it skip the lock
+        ``_cursor`` takes, so use it from one thread only."""
         return self._conn
 
     @classmethod
@@ -1491,10 +1500,11 @@ class StateStore:
         """True iff the connection is still usable. A dropped lock connection means the
         session-level advisory lock it held has been released."""
         try:
-            if self._conn.closed:
-                return False
-            with self._conn.cursor() as cur:
-                cur.execute("select 1")
+            with self._lock:
+                if self._conn.closed:
+                    return False
+                with self._conn.cursor() as cur:
+                    cur.execute("select 1")
             return True
         except Exception:
             return False
