@@ -316,6 +316,13 @@ the staging swap. Each unit holds one slot of a shared budget and its own FAIR p
 holds a slot while waiting on other work, so nested fan-out can't deadlock. The budget is per run;
 concurrent runs of different collections each have their own.
 
+**Defaults.** The bundle's defaults are what a one-database tuning sweep validated on one
+Standard_D16ds_v5 driver with one Standard_D8ds_v5 worker: `parallelism` 192, `append_batch_size` 4
+(8 loads the same, 16 is slower) and `spark_conf` `{"spark.sql.codegen.wholeStage": "false"}`, which
+saves compiling every append's plan (the sinks' clustering on write) for about 26% more tables per second
+on one cluster. 192 per run is many queries on one server when several collections run at once: on a
+server that hosts other work, set `max_queries_per_source` below.
+
 **Per-source cap.** Concurrent runs whose collections read the same server add up, so a source can
 get many runs' `parallelism` at once. Set `max_queries_per_source` (default `0`, off) to cap the
 queries on one source across every run that shares the Lakebase database. A source is a UC connection
@@ -442,6 +449,11 @@ recommended settings (load type from Change Tracking / rowversion / primary key,
 column) into Lakebase. The optional operations app reviews them and creates control rows in bulk;
 without the app, query `discovered_table` and insert control rows yourself. Check constraints reject invalid combinations (e.g.
 `ct` on a non-SQL Server source). See `notebooks/load_control_example.ipynb`.
+A whole server's databases are listed through `master` (the spec's `pattern` is a LIKE filter), or, for an
+Azure SQL server whose login can't open `master`, through Azure Resource Manager: the spec's `azure_credential` (a
+Unity Catalog service credential whose managed identity has Reader on the server; the job's runner needs `ACCESS` on
+it) and `azure_resource_id` (`/subscriptions/<id>/resourceGroups/<group>/providers/Microsoft.Sql/servers/<server>`,
+or `managedInstances/<instance>`). The databases are then read through the connection as usual.
 
 **Schema changes.** Writes use schema evolution. Adding a column to `select_list` adds it to the
 sink and reseeds that table so historical rows are backfilled. With the job parameter

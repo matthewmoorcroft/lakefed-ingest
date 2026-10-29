@@ -89,6 +89,34 @@ def test_discover_lists_by_a_name_filter_and_says_which_databases_it_couldnt_rea
     assert "function databasesOfCsv" in discover and "take them from a CSV file" in discover
 
 
+def test_discover_can_list_an_azure_sql_server_through_azure_and_reads_the_whole_server_the_same_way():
+    discover = (FRONTEND / "pages" / "Discover.tsx").read_text()
+    assert "Service credential" in discover and "Server resource id" in discover and "Reader on the server" in discover
+    assert "azure_credential" in discover and "azure_resource_id" in discover and "...(tested?.azure ?? {})" in discover
+
+
 def test_the_target_schema_field_says_a_new_schema_is_made_by_the_first_run():
     form = (FRONTEND / "pages" / "jobForm.tsx").read_text()
     assert "A new schema is made by the first run" in form and "CREATE SCHEMA on the catalog" in form
+
+
+def test_discover_offers_typed_or_csv_databases_on_the_lab_logins_real_errors():
+    import re
+    discover = (FRONTEND / "pages" / "Discover.tsx").read_text()
+    source = re.search(r"const cantList = .*?/(.+)/i\.test", discover).group(1)
+    cant_list = re.compile(source, re.I)
+    # lfc_sqlserver_test's login, a user contained in each database, opening master (29 Oct):
+    assert cant_list.search("[FAILED_JDBC.CONNECTION] Failed JDBC on the operation: Failed to connect to the database. "
+                            "SQLSTATE: HV000")
+    assert cant_list.search("Login failed for user 'lfc_ingest'.")
+    assert not cant_list.search("the discovery run ended CANCELED")
+
+
+def test_delete_says_what_goes_and_what_stays_and_offers_the_target_tables():
+    page = (FRONTEND / "pages" / "IngestionJob.tsx").read_text()
+    assert "Also delete the target tables" in page and "drop_targets: dropTargets" in page
+    assert "with their checkpoints. Run history and the change log stay." in page
+    assert "another job also writes" in page and "kept_names" in page and "schemas stay" in page
+    assert "move to Not in any job" not in page                    # groups always belong to a job: none are left behind
+    jobs_page = (FRONTEND / "pages" / "IngestionJobs.tsx").read_text()
+    assert "Deleted jobs" in jobs_page and "Run again" in jobs_page

@@ -1,4 +1,4 @@
-import { Fragment, useState } from "react";
+import { Fragment, useEffect, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import { api, qs, type ApiError, type Row } from "../api";
@@ -7,7 +7,7 @@ import { Tree } from "./JobEdit";
 import { TargetTables } from "./TargetTables";
 import { RunningTasks } from "./tasks";
 import { OutLink,
-  Crumbs, Badge, ErrorBox, Menu, Name, Notice, PageHead, ProgressBar, RunStatus, Section, StateBar, fmtClock, fmtDuration, fmtInt,
+  Crumbs, Badge, ErrorBox, Menu, Modal, Name, Notice, PageHead, ProgressBar, RunStatus, Section, StateBar, fmtClock, fmtDuration, fmtInt,
   fmtSlot, fmtSpeed, fmtTime, jobRunPath, plural, progressFrom, useConfirm, type ConfirmRequest
 } from "../components";
 
@@ -35,7 +35,7 @@ export function JobRunsTable({ runs, showJob }: { runs: Row[]; showJob?: boolean
   const columns = showJob ? 11 : 10;
   const [open, setOpen] = useState<string | null>(null);
   return (
-    <div className="table-wrap"><table className="data dense">
+    <div className="table-wrap"><table className="data dense fit wrap-head">
       <thead><tr><th>Job run</th>{showJob && <th>Ingestion job</th>}<th>Outcome</th><th className="num">Group runs</th>
         <th className="num">Took</th><th className="num">Tables loaded</th><th className="num">Tables/min</th>
         <th className="num">Rows written</th><th className="num">Parallelism</th><th className="num">Clusters</th>
@@ -56,7 +56,7 @@ export function JobRunsTable({ runs, showJob }: { runs: Row[]; showJob?: boolean
             {showJob && <td className="name"><Link to={`/ingestion-jobs/${r.job_id}`}><Name>{r.job_name}</Name></Link></td>}
             <td><RunStatus status={null} outcome={r.outcome} />{r.outcome?.note && <span className="sub">{r.outcome.note}</span>}</td>
             <td className="num">{fmtInt(r.ran)} of {fmtInt(r.members)}{Number(r.extra) > 0 && <span className="sub">{fmtInt(r.extra)} extra</span>}</td>
-            <td className="num">{r.took_s != null ? fmtDuration(r.took_s) : r.running_s != null ? `${fmtDuration(r.running_s)} so far` : ""}</td>
+            <td className="num">{r.took_s != null ? fmtDuration(r.took_s) : r.running_s != null ? <>{fmtDuration(r.running_s)}<span className="sub">so far</span></> : ""}</td>
             <td className="num">{fmtInt(r.loaded)}</td>
             <td className="num">{r.speed_tables_per_min != null ? fmtSpeed(r.speed_tables_per_min) : ""}</td>
             <td className="num">{rowsText(r)}</td>
@@ -168,19 +168,38 @@ export default function IngestionJob() {
   const before = pages[pages.length - 1];
   const qc = useQueryClient();
   const confirm = useConfirm();
+  // Between pressing Run now or Cancel run and the live view showing the change, the button waits ("Starting…",
+  // "Cancelling…"), for two minutes at most.
+  const [changing, setChanging] = useState<"start" | "stop" | null>(null);
+  const refresh = () => ["ingestion-job", "ingestion-job-live", "ingestion-job-runs"].forEach((k) => qc.invalidateQueries({ queryKey: [k, id] }));
   const runNow = useMutation({
     mutationFn: () => api.post<Row>(`/ingestion-jobs/${encodeURIComponent(id)}/run`, {}),
-    onSuccess: () => { qc.invalidateQueries({ queryKey: ["ingestion-job", id] }); qc.invalidateQueries({ queryKey: ["ingestion-job-live", id] }); },
+    onSuccess: () => { setChanging("start"); refresh(); },
   });
+  const stop = useMutation({
+    mutationFn: () => api.post<Row>(`/ingestion-jobs/${encodeURIComponent(id)}/stop`, {}),
+    onSuccess: () => { setChanging("stop"); refresh(); },
+  });
+  const [deleting, setDeleting] = useState(false);
   const remove = useMutation({
-    mutationFn: () => api.post<Row>(`/schedules/${encodeURIComponent(id)}/delete`, {}),
+    mutationFn: (dropTargets: boolean) => api.post<Row>(`/schedules/${encodeURIComponent(id)}/delete`, { drop_targets: dropTargets }),
     onSuccess: () => { qc.invalidateQueries(); navigate("/ingestion-jobs"); },
   });
   const job = useQuery({ queryKey: ["ingestion-job", id], queryFn: () => api.get<Row>(`/ingestion-jobs/${encodeURIComponent(id)}`),
-                         refetchInterval: 60_000 });
+                         refetchInterval: changing ? 3_000 : 60_000 });
   const live = useQuery({ queryKey: ["ingestion-job-live", id], queryFn: () => api.get<Row>(`/ingestion-jobs/${encodeURIComponent(id)}/live`),
-                          refetchInterval: (q) => ((q.state.data as Row | undefined)?.active ? 5_000 : 30_000) });
-  const going = !!live.data?.active;
+                          refetchInterval: (q) => (changing ? 3_000 : (q.state.data as Row | undefined)?.active ? 5_000 : 30_000) });
+  const going = !!live.data?.active || !!job.data?.run_now?.going;
+  useEffect(() => {
+    if ((changing === "start" && going) || (changing === "stop" && !going)) setChanging(null);
+  }, [changing, going]);
+  useEffect(() => {
+    if (!changing) return;
+    const timer = setTimeout(() => setChanging(null), 120_000);
+    return () => clearTimeout(timer);
+  }, [changing]);
+  const starting = runNow.isPending || changing === "start";
+  const stopping = stop.isPending || changing === "stop";
   const refusal = (runNow.error as ApiError | null)?.detail;
   const runs = useQuery({
     queryKey: ["ingestion-job-runs", id, before],
@@ -202,26 +221,37 @@ export default function IngestionJob() {
             : j.job_variant && j.job_variant !== "default" ? <>, Databricks job variant <strong>{j.job_variant}</strong></> : null}
 .</>}
         right={j && <span className="card-actions">
-          {/* As a Databricks job page: Delete in the more-actions menu, Edit beside Run now, Run now the primary action. */}
+          {/* As a Databricks job page: Delete in the more-actions menu, Edit beside Run now, Run now the primary action,
+              which becomes Cancel run while a run of the job is going. */}
           <Menu label="⋮" title="More actions">
             <button className="danger-text" disabled={!!j.delete_blocked || remove.isPending} title={j.delete_blocked ?? undefined}
-              onClick={() => confirm.ask(deleteJobRequest(j.name, j.groups?.length, j.enabled_tables)).then((ok) => ok && remove.mutate())}>{remove.isPending ? "Deleting…" : "Delete job"}</button>
+              onClick={() => setDeleting(true)}>{remove.isPending ? "Deleting…" : "Delete job"}</button>
           </Menu>
           <button disabled={!!j.change_blocked} title={j.change_blocked ?? undefined}
             onClick={() => navigate(`/ingestion-jobs/${id}/edit`)}>Edit</button>
-          <button className="primary" disabled={!!j.run_now?.blocked || runNow.isPending || going}
-            title={j.run_now?.blocked ?? (going ? "A run of this job is going: Running now shows it" : undefined)}
-            onClick={() => confirm.ask(runNowRequest(j)).then((ok) => ok && runNow.mutate())}>{runNow.isPending ? "Starting…" : "Run now"}</button></span>} />
+          {starting || stopping
+            ? <button className="primary" disabled title={starting ? "Waiting for the run to show as going" : "Waiting for the runs to end"}>
+                {starting ? "Starting…" : "Cancelling…"}</button>
+            : going
+              ? <button className="danger" disabled={!!j.run_now?.refused} title={j.run_now?.refused ?? "Cancel the run of this job going now"}
+                  onClick={() => confirm.ask(cancelRunRequest(j, live.data)).then((ok) => ok && stop.mutate())}>Cancel run</button>
+              : <button className="primary" disabled={!!j.run_now?.blocked} title={j.run_now?.blocked ?? undefined}
+                  onClick={() => confirm.ask(runNowRequest(j)).then((ok) => ok && runNow.mutate())}>Run now</button>}</span>} />
       {j && <p className="muted small">Created by {j.created_by ?? "unknown"}{j.created_at ? `, ${fmtTime(j.created_at)}` : ""} ·
         Last updated by {j.updated_by ?? "unknown"}{j.updated_at ? `, ${fmtTime(j.updated_at)}` : ""}</p>}
       {confirm.dialog}
       <RunningTasks jobId={id} />
+      {deleting && j && <DeleteJobDialog job={j} onClose={(drop) => { setDeleting(false); if (drop !== null) remove.mutate(drop); }} />}
       <Refused action="Run now" refusal={j?.run_now?.blocked} />
       <Refused action="Edit and Delete" refusal={j?.change_blocked} />
       <ErrorBox error={remove.error} />
       {refusal?.run_url ? <Notice tone="warn">Not started: a run of this job is already going (<OutLink href={refusal.run_url}>open it</OutLink>),
-        and Databricks would skip a second one. Running now below follows it; Run now is open again when it ends.</Notice>
+        and Databricks would skip a second one. Running now below follows it; cancel it, or Run now is open again when it ends.</Notice>
         : <ErrorBox error={runNow.error} />}
+      <ErrorBox error={stop.error} />
+      {stop.isSuccess && <Notice tone={stop.data.errors?.length ? "warn" : "ok"}>Cancelled {fmtInt(stop.data.cancelled.length)}{" "}
+        {plural(stop.data.cancelled.length, "Databricks run")}{stop.data.closed ? `, and closed ${fmtInt(stop.data.closed)} ${plural(stop.data.closed, "group run")} as ended without finishing` : ""}.
+        {stop.data.errors?.length ? <> Not cancelled: {stop.data.errors.join("; ")}.</> : null}</Notice>}
       {runNow.isSuccess && <Notice tone="ok">Started {fmtInt(runNow.data.started.length)} {plural(runNow.data.started.length, "Databricks job run")}:{" "}
         {runNow.data.started.map((r: Row, i: number) => <Fragment key={r.run_id}>{i ? ", " : ""}{r.url ? <OutLink href={r.url}>run {r.run_id}</OutLink> : `run ${r.run_id}`}</Fragment>)}.
         Running now follows it below.</Notice>}
@@ -238,14 +268,14 @@ export default function IngestionJob() {
             <div className="metric-sub">{j.paused ? "no trigger fires until it is resumed" : "its first group starts then"}</div></div>
           <div className="metric"><div className="metric-label">Speed</div>
             <div className="metric-value">{j.median_speed_tables_per_min != null ? fmtSpeed(j.median_speed_tables_per_min) : "–"}<small>tables/min</small></div>
-            <div className="metric-sub">{Number(j.speed_job_runs) ? `median of the last ${fmtInt(j.speed_job_runs)} job ${plural(j.speed_job_runs, "run")} that loaded tables`
+            <div className="metric-sub">{Number(j.speed_job_runs) ? `tables loaded, median of the last ${fmtInt(j.speed_job_runs)} job ${plural(j.speed_job_runs, "run")} that loaded any`
               : "no job run loaded tables in 7 days"}</div></div>
           <div className="metric"><div className="metric-label">Job run time</div>
             <div className="metric-value">{j.p95_took_s != null ? fmtDuration(j.p95_took_s) : "–"}</div>
             <div className="metric-sub">p95 over 7 days</div></div>
         </div>
       )}
-      {going && <RunningNow live={live.data!} />}
+      {live.data?.active && <RunningNow live={live.data} />}
       <Section title="Job runs" note="Newest first; one row per trigger. Open a run for the groups it ran."
         actions={<span className="pager-buttons">
           <button className="ghost" disabled={!pages.length} onClick={() => setPages(pages.slice(0, -1))}>Newer</button>
@@ -275,11 +305,66 @@ function runNowRequest(j: Row): ConfirmRequest {
       <p>Clusters and the sources' load cost money while they run.</p></> };
 }
 
-/** What deleting a job does, for its dialog (the job page and the Schedules card): the job goes, everything it
- * loaded stays. */
-export function deleteJobRequest(name: unknown, groups: unknown, tables: unknown): ConfirmRequest {
-  return { title: `Delete ${name}?`, action: "Delete", danger: true,
-    body: <><p>Its schedule and its Databricks jobs are deleted.</p>
-      <p>Its {fmtInt(groups)} {plural(groups, "group")} move to Not in any job, and their {fmtInt(tables)} {plural(tables, "table")},
-        target tables, checkpoints and run history all stay.</p></> };
+/** Delete's dialog: what goes (the job, its Databricks jobs, its groups' tables and their state), what stays (run
+ * history and the change log, and any group another job also runs), and the tick box that also drops the target
+ * tables only this job writes. Read from the delete preview, so the counts are those the delete job acts on. */
+function DeleteJobDialog({ job, onClose }: { job: Row; onClose: (dropTargets: boolean | null) => void }) {
+  const [drop, setDrop] = useState(false);
+  const preview = useQuery({ queryKey: ["delete-preview", job.id],
+    queryFn: () => api.get<Row>(`/ingestion-jobs/${encodeURIComponent(job.id)}/delete-preview`) });
+  const p = preview.data;
+  const disabled = preview.error ? "Can't read what Delete removes" : !p ? "Reading what Delete removes…" : p.blocked ?? undefined;
+  return (
+    <Modal title={`Delete ${job.name}?`} action="Delete" danger actionDisabled={disabled} onClose={(ok) => onClose(ok ? drop : null)}>
+      <ErrorBox error={preview.error} />
+      {!p && !preview.error && <p className="muted">Reading what Delete removes…</p>}
+      {p && <>
+        {p.blocked && <Notice tone="warn">{p.blocked}</Notice>}
+        {deleteJobText(p).map((line) => <p key={line}>{line}</p>)}
+        {Number(p.targets) + Number(p.kept) > 0 && <>
+          <label className="checkbox"><input type="checkbox" checked={drop} onChange={(e) => setDrop(e.target.checked)} />{" "}
+            Also delete the target tables</label>
+          <p className="muted small">{targetTablesText(p, drop)}</p>
+        </>}
+      </>}
+    </Modal>
+  );
+}
+
+/** What Delete removes and keeps, line by line, from the delete preview. */
+export function deleteJobText(p: Row): string[] {
+  const groups = Number(p.groups?.length ?? 0), tables = Number(p.tables ?? 0), kept = p.groups_kept ?? [];
+  return [
+    "Its schedule and its Databricks jobs are deleted.",
+    ...(groups ? [`Its ${fmtInt(groups)} ${plural(groups, "group")} and their ${fmtInt(tables)} ${plural(tables, "table")} are deleted, `
+      + "with their checkpoints. Run history and the change log stay."] : []),
+    ...(kept.length ? [`${fmtInt(kept.length)} ${plural(kept.length, "group")} another job also runs ${kept.length === 1 ? "stays" : "stay"}, `
+      + `with ${kept.length === 1 ? "its" : "their"} tables: ${kept.join(", ")}.`] : []),
+  ];
+}
+
+/** The tick box's note: how many target tables it drops, and the ones another job also writes, which it keeps. */
+export function targetTablesText(p: Row, drop: boolean): string {
+  const targets = Number(p.targets ?? 0), kept = Number(p.kept ?? 0), names: string[] = p.kept_names ?? [];
+  const more = kept > names.length ? `, and ${fmtInt(kept - names.length)} more` : "";
+  const keeps = kept ? ` ${fmtInt(kept)} ${plural(kept, "target table")} another job also writes ${kept === 1 ? "is" : "are"} kept: `
+    + `${names.join(", ")}${more}.` : "";
+  return (drop
+    ? `${fmtInt(targets)} ${plural(targets, "target table")} only this job writes ${targets === 1 ? "is" : "are"} dropped, with `
+      + "their data, after its tables are deleted. This can't be undone; schemas stay."
+    : `Unticked, its ${fmtInt(targets)} ${plural(targets, "target table")} ${targets === 1 ? "stays" : "stay"} in Unity Catalog, with `
+      + "their data.") + keeps;
+}
+
+// What Cancel run stops, for its dialog, named from the live view: the job's run, its check and its group runs going.
+function cancelRunRequest(j: Row, live: Row | undefined): ConfirmRequest {
+  const groups: Row[] = (live?.group_runs ?? []).filter((g: Row) => g.active);
+  const parts = [
+    ...(live?.wrappers?.length ? [`the job's run (${(live.wrappers as Row[]).map((w) => `run ${w.run_id}`).join(", ")})`] : []),
+    ...(["Queued", "Starting", "Running"].includes(live?.check?.status?.label) ? [`its check (run ${live!.check.run_id})`] : []),
+    ...(groups.length ? [`${fmtInt(groups.length)} ${plural(groups.length, "group run")} (${groups.map((g) => g.task_collection).join(", ")})`] : []),
+  ];
+  return { title: `Cancel the run of ${j.name}?`, action: "Cancel run", danger: true,
+    body: <><p>This cancels {parts.length ? parts.join(", ") : "the run of this job going now"} in Databricks.</p>
+      <p>Tables loading now stop part way. The next run loads them again from their last checkpoint.</p></> };
 }

@@ -1,0 +1,95 @@
+"""A job's Delete against a real Postgres: the app's dialog counts (queries.delete_groups_sql, delete_targets_sql) and
+the delete job's transaction (delete_job.delete_rows), which must name the same groups and leave history alone.
+
+Skipped unless LAKEFED_APP_TEST_PG names a Postgres server where the test may create and drop its own database."""
+import os
+import sys
+import uuid
+from pathlib import Path
+
+import pytest
+import queries as q
+
+URI = os.environ.get("LAKEFED_APP_TEST_PG")
+pytestmark = pytest.mark.skipif(not URI, reason="LAKEFED_APP_TEST_PG not set")
+REPO = Path(__file__).resolve().parents[2]
+
+
+@pytest.fixture
+def pg():
+    psycopg = pytest.importorskip("psycopg")
+    sys.path.insert(0, str(REPO / "src" / "lakefed_ingest"))
+    import state_store
+    name = f"lakefed_app_delete_{uuid.uuid4().hex[:8]}"
+    admin = psycopg.connect(URI, autocommit=True)
+    admin.execute(f"create database {name}")
+    conn = psycopg.connect(psycopg.conninfo.make_conninfo(URI, dbname=name), autocommit=True)
+    try:
+        for statement in state_store.split_sql_statements((REPO / "src/lakefed_ingest/lakebase_schema.sql").read_text()):
+            conn.execute(statement)
+        yield conn
+    finally:
+        conn.close()
+        admin.execute(f"drop database {name}")
+        admin.close()
+
+
+def _job(conn, name, groups, deleted=False):
+    sid = conn.execute("insert into lakefed_ingest.schedule (name, cadence_minutes, deleted_at) values (%s, 60, "
+                       + ("now()" if deleted else "null") + ") returning id", (name,)).fetchone()[0]
+    for group in groups:
+        conn.execute("insert into lakefed_ingest.schedule_member (schedule_id, task_collection, removed_at) values "
+                     "(%s, %s, " + ("now()" if deleted else "null") + ")", (sid, group))
+    return sid
+
+
+def _row(conn, group, table, sink=None, client=None):
+    """A control row; a target table shared by two rows is a consolidated one, a client_id each."""
+    return conn.execute(
+        "insert into lakefed_ingest.control (task_collection, src_host, src_port, secret_key, src_database, src_schema, "
+        "src_table, sink_catalog, sink_schema, sink_table, primary_key, select_list, client_id) values "
+        "(%s, 'h', 1433, 'k1', 'db', 'dbo', %s, 'm', 'l', %s, 'id', 'id', %s) returning id",
+        (group, table, sink or f"{group}_{table}", client)).fetchone()[0]
+
+
+def test_the_dialog_and_the_delete_job_agree_and_history_stays(pg):
+    import delete_job
+    sid = _job(pg, "Hourly", ["g1", "g2"])
+    _job(pg, "Other", ["g2", "g3"])
+    first = _row(pg, "g1", "a")
+    _row(pg, "g1", "b", sink="FAN_IN", client="x")
+    _row(pg, "g3", "c", sink="fan_in", client="y")
+    pg.execute("insert into lakefed_ingest.checkpoint (control_id, src_database, src_schema, src_table, phase) values "
+               "(%s, 'db', 'dbo', 'a', 'incremental')", (first,))
+    groups = [r[0] for r in pg.execute(q.delete_groups_sql(), (sid, sid)).fetchall()]
+    assert groups == ["g1"]                                         # g2 is in Other too
+    tables, targets, kept, names = pg.execute(q.delete_targets_sql(), (groups, groups, groups)).fetchone()
+    assert (tables, targets, kept, names) == (2, 1, 1, ["m.l.FAN_IN"])
+    pg.execute("update lakefed_ingest.schedule set deleted_at = now() where id = %s", (sid,))
+    pg.execute("update lakefed_ingest.schedule_member set removed_at = now() where schedule_id = %s", (sid,))
+    with pg.cursor() as cur, cur.connection.transaction():
+        result = delete_job.delete_rows(cur, sid)
+    assert result["groups"] == ["g1"] and result["deleted"]["control"] == 2 and result["deleted"]["checkpoint"] == 1
+    assert result["targets"] == {"drop": ["`m`.`l`.`g1_a`"], "kept": ["`m`.`l`.`FAN_IN`"]}
+    left = pg.execute("select task_collection from lakefed_ingest.control order by 1").fetchall()
+    assert left == [("g3",)]
+
+
+def test_a_run_holding_a_groups_lock_refuses_the_delete_and_the_deletion_is_listed(pg):
+    import psycopg
+    import delete_job
+    import state_store
+    sid = _job(pg, "Hourly", ["g1"], deleted=True)
+    _row(pg, "g1", "a")
+    pg.execute(q.set_schedule_flag_sql(), (["delete_drop_targets"], True, sid))
+    run = psycopg.connect(pg.info.dsn, autocommit=True)                 # the ingestion run's session lock
+    try:
+        run.execute(state_store.try_lock_collection_sql(), (state_store.collection_lock_key("g1"),))
+        with pytest.raises(delete_job.RunGoing):
+            with pg.cursor() as cur, cur.connection.transaction():
+                delete_job.delete_rows(cur, sid)
+    finally:
+        run.close()
+    assert pg.execute("select count(*) from lakefed_ingest.control").fetchone()[0] == 1
+    listed = pg.execute(q.deletions_sql(), (10,)).fetchall()
+    assert [(r[0], r[2]["delete_drop_targets"]) for r in listed] == [(sid, True)]

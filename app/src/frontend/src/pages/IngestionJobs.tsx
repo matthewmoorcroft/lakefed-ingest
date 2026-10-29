@@ -1,8 +1,8 @@
 import { useState } from "react";
-import { useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { api, qs, type Row } from "../api";
-import { ErrorBox, PageHead, Section, Stamp, StateKey, fmtInt } from "../components";
+import { ErrorBox, OutLink, PageHead, RunStatus, Section, Stamp, StateKey, fmtInt, fmtShort, fmtTime, type Outcome } from "../components";
 import { JobsTable, type JobSort } from "./Overview";
 
 const FILTERS = [["all", "All"], ["running", "Running"], ["failing", "Failing"], ["late", "Late"], ["paused", "Paused"]] as const;
@@ -49,6 +49,56 @@ export default function IngestionJobs() {
           total={jobs.data.total} offset={offset} limit={PAGE} onPage={setOffset} fill
           sort={sort} onSort={(next) => { setOffset(0); setSort(next); }} />}
       </Section>
+      <Deletions />
     </>
   );
+}
+
+/** The latest deleted jobs and their delete job runs: going, done, or failed with why, and Run again for one whose
+ * tables are still there. Shown only when there is one. */
+function Deletions() {
+  const qc = useQueryClient();
+  const page = useQuery({ queryKey: ["ingestion-job-deletions"], queryFn: () => api.get<Row>("/ingestion-jobs/deletions"),
+    refetchInterval: (q) => (((q.state.data as Row | undefined)?.deletions ?? []).some((d: Row) => deletionOutcome(d).tone === "run") ? 5_000 : 60_000) });
+  const again = useMutation({
+    mutationFn: (d: Row) => api.post<Row>(`/schedules/${encodeURIComponent(d.id)}/delete`, { drop_targets: !!d.drop_targets }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["ingestion-job-deletions"] }),
+  });
+  const rows: Row[] = page.data?.deletions ?? [];
+  if (!rows.length && !page.error) return null;
+  return (
+    <Section title="Deleted jobs" note="Delete starts the delete job, which deletes the job's tables and their state, and the target tables when ticked. Run history stays.">
+      <ErrorBox error={page.error ?? again.error} />
+      <div className="table-wrap"><table className="data">
+        <thead><tr><th>Ingestion job</th><th>Deleted</th><th>Target tables</th><th>Delete job</th><th className="num">Tables left</th><th /></tr></thead>
+        <tbody>
+          {rows.map((d) => {
+            const outcome = deletionOutcome(d);
+            return (
+              <tr key={d.id}>
+                <td className="name"><b>{d.name}</b></td>
+                <td title={fmtTime(d.deleted_at)}>{fmtShort(d.deleted_at)}</td>
+                <td>{d.drop_targets ? "Dropped" : "Kept"}</td>
+                <td><OutLink href={d.run?.url}><RunStatus status={null} outcome={outcome} /></OutLink>
+                  {outcome.note && outcome.tone === "bad" && <span className="sub">{outcome.note}</span>}</td>
+                <td className="num">{fmtInt(d.tables_left)}</td>
+                <td>{outcome.tone !== "run" && Number(d.tables_left) > 0 &&
+                  <button className="ghost" disabled={again.isPending} onClick={() => again.mutate(d)}>Run again</button>}</td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table></div>
+    </Section>
+  );
+}
+
+/** A deleted job's delete job run as a status: not started, deleting, deleted, or failed with its message. */
+export function deletionOutcome(d: Row): Outcome {
+  const run = d.run;
+  if (!run) return { label: "Not started", tone: "bad", note: "The delete job didn't start: Run again starts it" };
+  if (!run.result && ["QUEUED", "PENDING", "RUNNING", "TERMINATING", "BLOCKED", "WAITING_FOR_RETRY"].includes(run.state))
+    return { label: "Deleting", tone: "run", note: null };
+  if (run.result === "SUCCESS") return { label: "Deleted", tone: "ok", note: null };
+  return { label: run.result ? "Failed" : "Unknown", tone: "bad", note: run.message || null };
 }

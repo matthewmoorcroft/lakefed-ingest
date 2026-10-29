@@ -106,8 +106,9 @@ resources:
         # ONE concurrency knob: max units of query work running at once in this run (CT read+MERGE,
         # a seed, one partition of a partitioned seed, a small source query, the staging swap) —
         # across all tables. Per run: concurrent collections on separate clusters each get their own.
-        # 32 captured most of the gain in load tests on a 16-core driver (sweep is driver-bound); raise
-        # per collection once tenant SQL Server capacity is measured.
+        # 192 is what the one-database tuning sweep validated on one D16ds_v5 driver + 1 x D8ds_v5 worker
+        # (most units wait on the source, not the cores). On a server that hosts other work, set
+        # max_queries_per_source so every run together stays under what it can take.
         - name: parallelism
           default: ${var.parallelism}
         # Per-DB source credentials (JSON {user, password}); may be Azure Key Vault-backed.
@@ -127,8 +128,9 @@ resources:
         - name: reseed_on_new_columns
           default: ${var.reseed_on_new_columns}
         # Append sinks with client_id: up to this many tables appending to the same sink are read in
-        # one Spark job (a task per source database) and written in one Delta commit. "1" = per table.
-        # A batch holds one `parallelism` slot per table, so raise parallelism with it.
+        # one Spark job (a task per source database) and written in one Delta commit. "1" = per table;
+        # 4 is the sweep's validated value (8 loads the same, 16 is slower). A batch holds one
+        # `parallelism` slot per table, so raise parallelism with it.
         - name: append_batch_size
           default: ${var.append_batch_size}
         # Onboarding at scale: at most this many seeds per run; the rest seed in later runs, while the
@@ -160,6 +162,7 @@ resources:
         - name: fail_on_table_errors
           default: ${var.fail_on_table_errors}
         # Spark session settings for this run, a JSON object of setting -> value (blank keeps the
-        # cluster's), e.g. to compare code generation or write settings on one cluster.
+        # cluster's). The default turns whole-stage code generation off: the sinks' clustering on write
+        # makes every append's plan compile otherwise, which the sweep measured at +26% tables per second.
         - name: spark_conf
           default: ${var.spark_conf}

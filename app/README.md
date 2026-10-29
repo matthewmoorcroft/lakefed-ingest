@@ -20,8 +20,9 @@ root doesn't depend on it, and everything the app does can also be done with SQL
 | **Bulk import** | Discover a server's tables (the `lakefed_ingest_discover` job, catalog metadata only), review the recommended settings in an editable grid, set shared fields once (collection, sink catalog / schema / table templates, `client_id` template, freshness SLA), and register the selection. Tables at or above a size threshold (default 1 GB) get a partitioned seed; tables already registered start unticked; duplicates are skipped |
 | **Import CSV** | Import a CSV of tables into one ingestion group: each line says where a table is (`src_connection`, or `src_host` with `secret_key`; `src_database`, `src_schema`, `src_table`; `select_list`, `primary_key`, `cursor_column`; `client_id` and `attr:<column>` for a fan-in), and the group's settings say how to ingest it (source type, load type, write mode, fan-in, sink name templates, freshness target, read options). A group's settings are the values its rows share, shown on its page with an Export CSV of the same form; a new group, or a setting its rows differ on, is set at import. Every line is previewed and checked as Add table checks a row; Apply writes only when none is invalid, skips tables already registered, and logs each row as an import. At most 5,000 lines per import |
 
-Every write asks for confirmation. The app never deletes rows (deleted schedules are marked deleted); it
-deletes only the wrapper jobs it created for schedules. To remove tables for good or prune old history,
+Every write asks for confirmation. The app itself never deletes rows (deleted schedules are marked deleted); it
+deletes only the wrapper jobs it created for schedules, and a job's Delete hands its tables to the delete job (below).
+To remove tables for good or prune old history,
 see [Removing tables and old history](../docs/lakebase_schema.md#removing-tables-and-old-history).
 
 ## Schedules
@@ -90,6 +91,22 @@ the ingestion job can't change its cluster, so a job with its own cluster runs i
 
 Changing the cluster needs Can Manage on the job's Databricks job, like any change.
 
+**Deleting a job.** A group always belongs to a job, so a job's Delete leaves no groups behind. The app has no
+`DELETE` privilege on the Lakebase tables, so the deletion is finished by the `lakefed_ingest_delete_job` job,
+which runs as the deployer:
+- the dialog (from `GET /api/ingestion-jobs/{id}/delete-preview`) says how many groups and tables go, the groups
+  another job also runs (they stay), and has the tick box **Also delete the target tables**, with how many target
+  tables only this job writes and the names of those another job's rows also write (kept);
+- Delete is refused while a run of the job is going (Lakebase or the Jobs API sees one), and when the groups have
+  tables but no delete job is configured;
+- otherwise the app marks the job deleted and its groups removed, syncs (its wrapper jobs and any cluster copy go),
+  and starts the delete job with `schedule_id` and `drop_targets`, recording the run in the schedule's options;
+- the delete job deletes the groups' control, checkpoint, reseed_queue, database_check and check_work rows in one
+  transaction under their run locks, and keeps run history and the change log. Ticked, it then drops the target
+  tables only those groups write (`DROP TABLE IF EXISTS`, never a schema);
+- Ingestion jobs lists the latest deleted jobs under **Deleted jobs**: the delete job's run (deleting, deleted, or
+  failed with why) and the tables left, with **Run again** for one that didn't finish.
+
 ## Guard rails for edits
 
 Data integrity comes first, so edits go through the server's rules, not the browser's:
@@ -141,15 +158,28 @@ The app runs as its own service principal (created with the app):
 - **Jobs:** `CAN_MANAGE` on the ingestion, check, setup and discovery jobs, through app resources, so it can
   read their access lists. This is a trade-off for the per-user checks below: starting runs needs only
   `CAN_MANAGE_RUN`, but the Permissions API returns a job's access list only to those who manage it, so the
-  service principal could also edit or delete these jobs. The app never edits or deletes them.
+  service principal could also edit or delete these jobs. The app never edits or deletes them. The cluster copies
+  and delete jobs need only `CAN_MANAGE_RUN`: the app starts them and reads their runs.
 - **Lakebase:** granted by the `lakefed_ingest_app_grants` job:
   - `CAN_USE` on the instance (to mint its own short-lived credential);
   - a Postgres role;
   - `SELECT`, `INSERT` and `UPDATE` on the `lakefed_ingest` tables, with no `DELETE`.
+- **Source connections:** `USE CONNECTION` on each Unity Catalog connection named in the bundle's
+  `source_connections` variable (comma-separated), granted by the same job as whoever runs it, who needs to own
+  or manage those connections. The app lists connections as its own identity, so Discover shows only those it
+  holds `USE CONNECTION` on; the connections aren't the bundle's, so they are named, not created. A connection
+  the job can't grant on is reported in its output and the others are still granted; Discover's screen names
+  the grant for any connection it can't see.
+- **Azure SQL listing (optional):** for a login that can't open master, Discover's Test connection can have the
+  discovery job list an Azure SQL server's (or Managed Instance's) databases through Azure Resource Manager instead.
+  It takes a Unity Catalog service credential (Catalog Explorer, External data, Credentials) on an access connector
+  whose managed identity has Reader on the server, `ACCESS` on that credential for whoever runs the discovery job,
+  and the server's resource id, both typed under Azure SQL on the Test connection step. The app never calls Azure;
+  each listed database is then read through the connection, and one the login can't open fails on its own.
 - **Who can act:** every action on an existing ingestion job follows the signed-in user's own Databricks
   permission on the job its runs execute as (the check job on a check schedule, else the ingestion job), as the
   Jobs UI does:
-  - running it (Run now), or a new job that isn't paused: `CAN_MANAGE_RUN`;
+  - running it (Run now), cancelling its run (Cancel run), or a new job that isn't paused: `CAN_MANAGE_RUN`;
   - changing it (Edit and Save, Pause, Resume, Sync jobs), its groups' tables (edit, enable, disable, reseed,
     Add table, Import CSV, Bulk import's register), or deleting it: `CAN_MANAGE` or owner;
   - a change to tables needs `CAN_MANAGE` on every ingestion job that runs one of their groups, since a group
@@ -178,8 +208,8 @@ Prerequisites: the ingestion bundle is deployed and its setup job has run (Lakeb
 1. Add a target to `app/databricks.yml` for your workspace (the committed `dev` / `prod` hosts are
    placeholders). Set the variables that differ from the defaults:
    - `lakebase_instance`, `lakebase_database`: the ingestion bundle's values.
-   - `ingest_job_id`, `setup_job_id`, `discover_job_id`, `check_job_id`, `cluster_copies_job_id`: looked up by job
-     name. In development mode the ingestion
+   - `ingest_job_id`, `setup_job_id`, `discover_job_id`, `check_job_id`, `cluster_copies_job_id`, `delete_job_id`:
+     looked up by job name, so deploy the ingestion bundle first. In development mode the ingestion
      bundle prefixes job names (`[dev your_name] lakefed_ingest`), so set the ids or the prefixed
      names for dev targets.
    - `app_name`: 30 characters max.
@@ -190,7 +220,7 @@ Prerequisites: the ingestion bundle is deployed and its setup job has run (Lakeb
    cd app
    databricks bundle deploy -t <target>
    databricks bundle run lakefed_ingest_app -t <target>          # deploys the code and starts the app
-   databricks bundle run lakefed_ingest_app_grants -t <target>   # Lakebase access for the app
+   databricks bundle run lakefed_ingest_app_grants -t <target>   # Lakebase access, and USE CONNECTION on source_connections
    ```
 3. Grant `CAN_USE` on the app to your operators, then open the URL printed by `bundle run`.
 

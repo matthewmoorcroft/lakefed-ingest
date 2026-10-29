@@ -662,6 +662,31 @@ def _detail(run: dict) -> dict:
     return d if isinstance(d, dict) else {}
 
 
+def open_runs_sql() -> str:
+    """Every run still recorded as running, group runs and checks, with the Databricks run that ran it: what the app
+    reconciles with Databricks (main._close_ended_runs)."""
+    return f"select run_id, task_collection, job_run_id, started_at from {SCHEMA}.ingest_run where status = 'running'"
+
+
+def close_ended_run_sql() -> str:
+    """Close one run still 'running' whose Databricks run has ended, and its events still running (or waiting for a
+    retry that never came), as failed: what the engine's close_abandoned_runs does when the group's next run starts,
+    done by the app when it finds the Databricks run over, so a run cancelled in Databricks doesn't stay running.
+    Params: detail, run_id, error (appended to a retried attempt's), error. Returns (runs closed, events closed)."""
+    return (
+        f"with dead as (update {SCHEMA}.ingest_run set status = 'failed', finished_at = now(), detail = %s "
+        "where run_id = %s and status = 'running' returning run_id), "
+        f"events as (update {SCHEMA}.ingest_event e set status = 'failed', finished_at = coalesce(e.finished_at, now()), "
+        "duration_ms = coalesce(e.duration_ms, (extract(epoch from (now() - e.started_at)) * 1000)::bigint), "
+        "error = case when e.status = 'retried' then concat(e.error, ' | ', %s) else %s end "
+        "from dead where e.run_id = dead.run_id and (e.status = 'running' or ("
+        f"e.status = 'retried' and not exists (select 1 from {SCHEMA}.ingest_event later "
+        "where later.run_id = e.run_id and later.control_id = e.control_id and later.id > e.id))) "
+        "returning e.id) "
+        "select (select count(*) from dead), (select count(*) from events)"
+    )
+
+
 def run_outcome(run: dict, progress: Optional[dict] = None) -> dict:
     """What a group run's engine record means, as the pages show it: a label, a tone and an optional note.
     The engine records a run that loaded with some table failures as failed, and a run another run closed
@@ -680,6 +705,8 @@ def run_outcome(run: dict, progress: Optional[dict] = None) -> dict:
     closed_by = _detail(run).get("closed_by_run")
     if closed_by is not None:
         return {"label": "Ended without finishing", "tone": "bad", "note": f"closed by run {closed_by}"}
+    if _detail(run).get("closed_by_app"):
+        return {"label": "Ended without finishing", "tone": "bad", "note": _detail(run).get("reason")}
     if status in ("failed", "completed") and failed:
         return {"label": "Succeeded with failures", "tone": "warn", "note": f"{failed:,} {'table' if failed == 1 else 'tables'} failed"}
     return {"label": "Failed", "tone": "bad", "note": None}
@@ -1695,6 +1722,10 @@ def update_control_sql(fields: List[str]) -> str:
     return f"update {SCHEMA}.control set " + ", ".join(f"{f} = %s" for f in fields) + " where id = %s"
 
 
+# The kept target tables the Delete dialog names (the rest are counted).
+DELETE_KEPT_LISTED = 20
+
+
 def collection_lock_sql() -> str:
     """Take a collection's run lock for this transaction (the same key the ingestion job holds for a
     whole run). False = a run of that collection is in progress. Param: lock key."""
@@ -1870,6 +1901,47 @@ def update_member_offset_sql() -> str:
 def remove_members_sql() -> str:
     """Soft-remove members (their jobs are deleted by the next sync). Param: list of member ids."""
     return f"update {SCHEMA}.schedule_member set removed_at = now() where id = any(%s) and removed_at is null"
+
+
+def set_schedule_flag_sql() -> str:
+    """Set one key of a schedule's options to true or false. Params: key (as a one-element text array), value, id."""
+    return (f"update {SCHEMA}.schedule set options = jsonb_set(coalesce(options, '{{}}'::jsonb), %s::text[], "
+            f"to_jsonb(%s::boolean)) where id = %s")
+
+
+def delete_groups_sql() -> str:
+    """The groups a job's Delete removes: every member it had, removed or not, that no other live job holds (the
+    delete job's delete_job.groups_sql, read the same way). Params: schedule id, schedule id."""
+    return (f"select distinct m.task_collection from {SCHEMA}.schedule_member m where m.schedule_id = %s "
+            f"and not exists (select 1 from {SCHEMA}.schedule_member o join {SCHEMA}.schedule s on s.id = o.schedule_id "
+            f"where o.task_collection = m.task_collection and o.removed_at is null and s.deleted_at is null "
+            f"and o.schedule_id <> %s) order by 1")
+
+
+def delete_targets_sql() -> str:
+    """The groups' tables and target tables, for the Delete dialog: how many tables (control rows), how many target
+    tables only they write, and the target tables rows of any other group also write (kept; names compared without
+    case, as delete_job.targets_sql does), at most ``DELETE_KEPT_LISTED`` of them by name. Params: groups, groups,
+    groups."""
+    return (f"with mine as (select distinct sink_catalog, sink_schema, sink_table from {SCHEMA}.control "
+            f"where task_collection = any(%s)), "
+            f"theirs as (select distinct lower(sink_catalog) c, lower(sink_schema) s, lower(sink_table) t "
+            f"from {SCHEMA}.control where not (task_collection = any(%s))), "
+            f"marked as (select m.*, exists (select 1 from theirs where c = lower(m.sink_catalog) "
+            f"and s = lower(m.sink_schema) and t = lower(m.sink_table)) as shared from mine m) "
+            f"select (select count(*) from {SCHEMA}.control where task_collection = any(%s)) as tables, "
+            f"(select count(*) from marked where not shared) as targets, "
+            f"(select count(*) from marked where shared) as kept, "
+            f"(select coalesce(json_agg(k order by k), '[]'::json) from (select sink_catalog || '.' || sink_schema "
+            f"|| '.' || sink_table as k from marked where shared order by 1 limit {DELETE_KEPT_LISTED}) named) "
+            f"as kept_names")
+
+
+def deletions_sql() -> str:
+    """The latest deleted jobs whose Delete started the delete job (``options.delete_drop_targets`` set), newest
+    first, for the Ingestion jobs page. Param: how many."""
+    return (f"select id, name, options, deleted_at from {SCHEMA}.schedule where deleted_at is not null "
+            f"and options ? 'delete_drop_targets' order by deleted_at desc limit %s")
 
 
 def member_synced_sql() -> str:

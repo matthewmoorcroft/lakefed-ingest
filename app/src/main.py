@@ -639,8 +639,63 @@ def _read_at(key) -> str:
 
 def _running() -> List[dict]:
     """queries.running_progress_sql, shared: every running group run's progress, read once per
-    MONITOR_CACHE_S however many pages ask."""
-    return _shared("running", lambda: db.query(q.running_progress_sql()))
+    MONITOR_CACHE_S however many pages ask. Runs whose Databricks run has ended are closed first
+    (_close_ended_runs), so a run cancelled in Databricks never stays running here."""
+    def compute():
+        try:
+            _close_ended_runs()
+        except Exception:           # the pages still show what is recorded; the next read tries again
+            pass
+        return db.query(q.running_progress_sql())
+    return _shared("running", compute)
+
+
+def ended_reason(ended: dict) -> str:
+    """Why the app closed a run, in the run's own words: how its Databricks run ended, and when."""
+    if ended["state"] == "NOT_FOUND":
+        return "its Databricks run no longer exists, so it ended without finishing"
+    how = ended.get("result") or ended["state"]
+    at = f" at {ended['ended']}" if ended.get("ended") else ""
+    why = f" ({ended['message']})" if ended.get("message") else ""
+    return f"its Databricks run ended {how}{at} without finishing{why}"[:1000]
+
+
+# A run the Jobs API doesn't know is closed only once it began this long ago: a run of another workspace sharing the
+# state database, or one the API briefly can't find, is never taken for ended while it may still be going.
+NOT_FOUND_AFTER = timedelta(hours=24)
+
+
+def _older_than(started_at, age: timedelta) -> bool:
+    if started_at is None:
+        return False
+    when = q._when(started_at)
+    return (when if when.tzinfo else when.replace(tzinfo=timezone.utc)) < datetime.now(timezone.utc) - age
+
+
+def _close_ended_runs(user: Optional[str] = None) -> int:
+    """Close each run recorded as running whose Databricks run has ended (cancelled in Databricks, or its cluster
+    gone): failed, with how its Databricks run ended, and its events still running, as the engine closes an abandoned
+    run. A run with no job run id (run by hand outside a job), whose state can't be read now, or still going in
+    Databricks (queued, pending, running, terminating, or retrying) is left as it is; nothing is ever cancelled here.
+    Returns how many were closed."""
+    closed = 0
+    for r in db.query(q.open_runs_sql()):
+        job_run = str(r.get("job_run_id") or "").strip()
+        if not job_run.isdigit():
+            continue
+        try:
+            ended = jobs.run_ended(job_run)
+        except Exception:
+            continue
+        if not ended or (ended["state"] == "NOT_FOUND" and not _older_than(r.get("started_at"), NOT_FOUND_AFTER)):
+            continue
+        reason = ended_reason(ended)
+        detail = json.dumps({"closed_by_app": user or "reconcile", "reason": reason, "databricks_run": int(job_run),
+                             "databricks_state": ended["state"], "databricks_result": ended.get("result")})
+        with _write() as cur:
+            cur.execute(q.close_ended_run_sql(), (detail, int(r["run_id"]), reason, reason))
+        closed += 1
+    return closed
 
 
 # The most running job runs, and jobs needing attention, the Overview lists; Runs and Ingestion jobs list all.
@@ -928,6 +983,36 @@ def groups_not_in_job():
     return {**not_in_job, "name": "Not in any job", "groups_detail": rows}
 
 
+@app.get("/api/ingestion-jobs/deletions")
+def job_deletions():
+    """The latest deleted jobs whose Delete runs the delete job, newest first: each one's delete job run (going,
+    finished or failed, with its message), whether it drops the target tables, and how many of its tables are left
+    (none once the delete job has finished)."""
+    out = []
+    for s in db.query(q.deletions_sql(), (DELETIONS_LISTED,)):
+        plan = _delete_plan(s["id"])
+        out.append({"id": s["id"], "name": s["name"], "deleted_at": s["deleted_at"],
+                    "drop_targets": bool(sch.options_of(s).get("delete_drop_targets")), "run": _delete_run(s),
+                    "tables_left": plan["tables"], "groups_left": len(plan["groups"])})
+    return {"deletions": out, "configured": bool(jobs.DELETE_JOB_ID)}
+
+
+@app.get("/api/ingestion-jobs/{job_id}/delete-preview")
+def delete_preview(job_id: int):
+    """What Delete would remove, for its dialog: the groups it deletes and those it keeps (another job holds them),
+    their tables, the target tables only they write, and the target tables another job's rows also write (kept and
+    named); and why it can't be deleted now, if so."""
+    job, members = _load_schedule(job_id)
+    active = [m for m in members if m["removed_at"] is None]
+    plan = _delete_plan(job_id)
+    kept_groups = sorted({m["task_collection"] for m in active} - set(plan["groups"]))
+    blocker = _delete_blocker(job, active, plan["groups"])
+    if not blocker and plan["tables"] and not jobs.DELETE_JOB_ID:
+        blocker = NO_DELETE_JOB
+    return {**plan, "groups_kept": kept_groups, "configured": bool(jobs.DELETE_JOB_ID),
+            "blocked": blocker.get("message") if isinstance(blocker, dict) else blocker}
+
+
 @app.get("/api/permissions")
 def permissions(request: Request):
     """What the signed-in user may do, from their Databricks permissions, so each page can show a button disabled
@@ -995,8 +1080,10 @@ def ingestion_job(job_id: int, request: Request):
             "median_speed_tables_per_min": speeds[len(speeds) // 2] if speeds else None, "speed_job_runs": len(speeds),
             "p95_took_s": sorted(week)[min(len(week) - 1, int(0.95 * len(week)))] if week else None,
             "groups_detail": group_rows, "read_at": now.isoformat(),
-            # For the Run now button: why it can't start now (None when it can), and what one run starts.
-            "run_now": {"blocked": refusals["run"] or _run_now_blocker(job, mine),
+            # For the Run now button: why it can't start now (None when it can), whether a run is going (the button
+            # is then Cancel run, which the run permission also gates), and what one run starts.
+            "run_now": {"blocked": refusals["run"] or _run_now_blocker(job, mine), "refused": refusals["run"],
+                        "going": _recorded_running(mine),
                         "groups": len(mine), "check": job.get("job_variant") == sch.CHECK_VARIANT},
             "delete_blocked": refusals["delete"], "change_blocked": refusals["change"], **_audit(job)}
 
@@ -1145,13 +1232,19 @@ def _refuse_groups_outside_jobs(groups: Iterable[str]) -> None:
 
 
 def _run_now_blocker(job: dict, members: List[dict]) -> Optional[str]:
-    """Why the job can't be started by hand right now (a run of it is going, or its wrapper jobs aren't synced)."""
-    groups = {m["task_collection"] for m in members}
-    if any(r["task_collection"] in groups for r in _running()):
-        return "a run of this job is already running"
+    """Why the job can't be started by hand right now (a run of it is going, or its wrapper jobs aren't synced). The
+    running runs are read after the app has closed those whose Databricks run ended (_running)."""
+    if _recorded_running(members):
+        return "a run of this job is already running: cancel it, or wait for it to end"
     if not members or any(not m.get("job_id") for m in members):
         return "the job's Databricks jobs are not synced yet"
     return None
+
+
+def _recorded_running(members: List[dict]) -> bool:
+    """Whether Lakebase has a run of one of these groups going, after closing those whose Databricks run ended."""
+    groups = {m["task_collection"] for m in members}
+    return any(r["task_collection"] in groups for r in _running())
 
 
 @app.post("/api/ingestion-jobs/{job_id}/run")
@@ -1188,6 +1281,18 @@ def _active_wrapper_runs(members: List[dict]) -> List[dict]:
     return sorted(out, key=lambda r: r.get("started") or "", reverse=True)
 
 
+def _job_databricks_runs(job: dict, members: List[dict]) -> dict:
+    """The Databricks runs of one ingestion job, as the Jobs API has them: its wrapper jobs' runs going now, its check
+    job's recent runs (check kind) and the ingestion job's recent runs, of every group (main filters to the job's)."""
+    groups = sorted({m["task_collection"] for m in members})
+    check_kind = (job.get("job_variant") or "default") == sch.CHECK_VARIANT
+    checks = [r for r in jobs.runs(jobs.CHECK_JOB_ID, limit=10) if ij.check_run_of(r, job["id"], groups)] \
+        if check_kind and jobs.CHECK_JOB_ID else []
+    target = (sch.copy_job_id(job) or _ingest_job_id("default")) if check_kind else _wrapper_target(job)
+    ingest = jobs.runs(target, limit=max(25, 3 * len(groups))) if target else []
+    return {"groups": groups, "wrappers": _active_wrapper_runs(members), "checks": checks, "ingest": ingest}
+
+
 @app.get("/api/ingestion-jobs/{job_id}/live")
 def ingestion_job_live(job_id: int):
     """The job run going now, as its Databricks runs are: the wrapper runs, the check run and what it found (check
@@ -1195,20 +1300,75 @@ def ingestion_job_live(job_id: int):
     from the Jobs API, which sees a run from its start, joined with Lakebase. Nothing is going: active is false."""
     job, members = _load_schedule(job_id)
     members = [m for m in members if m.get("removed_at") is None]
-    groups = sorted({m["task_collection"] for m in members})
     now = datetime.now(timezone.utc)
-    wrappers = _active_wrapper_runs(members)
-    check_kind = (job.get("job_variant") or "default") == sch.CHECK_VARIANT
-    checks = [r for r in jobs.runs(jobs.CHECK_JOB_ID, limit=10) if ij.check_run_of(r, job_id, groups)] \
-        if check_kind and jobs.CHECK_JOB_ID else []
-    target = (sch.copy_job_id(job) or _ingest_job_id("default")) if check_kind else _wrapper_target(job)
-    ingest = jobs.runs(target, limit=max(25, 3 * len(groups))) if target else []
+    found_runs = _job_databricks_runs(job, members)
+    groups, wrappers, checks, ingest = (found_runs[k] for k in ("groups", "wrappers", "checks", "ingest"))
     check = max(checks, key=lambda r: r.get("started") or "", default=None)
     work_ids = sorted({(r.get("parameters") or {}).get("work_id") for r in ingest} - {None, ""})
     found = db.query(q.check_work_found_sql(), (work_ids,)) if check and work_ids else []
     stamped = db.query(q.database_checks_since_sql(), (groups, check["started"]))[0]["databases"] \
         if check and check.get("started") and groups else None
     return ij.live_view(wrappers, checks, ingest, groups, found, stamped, _running(), now)
+
+
+@app.post("/api/ingestion-jobs/{job_id}/stop")
+def stop_ingestion_job(job_id: int, request: Request):
+    """Stop the job's run going now, as the Databricks job run page's Cancel run does: cancel its wrapper runs, its
+    check run and the group runs of its groups (those the Jobs API lists, and any its groups' records name), then
+    close the records of the runs it cancelled or found already over (the cancel itself takes Databricks a moment).
+    A record whose run it could neither cancel nor read stays running. Needs what Run now needs. Nothing going: 409."""
+    job, members = _load_schedule(job_id)
+    _refuse_job(job, request, "run")
+    members = [m for m in members if m.get("removed_at") is None]
+    user = _user(request)
+    found_runs = _job_databricks_runs(job, members)
+    groups = set(found_runs["groups"])
+    going = [dict(r, kind="wrapper") for r in found_runs["wrappers"]] + \
+        [dict(r, kind="check") for r in found_runs["checks"] if ij.is_active(r)] + \
+        [dict(r, kind="group") for r in found_runs["ingest"]
+         if ij.is_active(r) and (r.get("parameters") or {}).get("task_collection") in groups]
+    recorded = [r for r in db.query(q.open_runs_sql()) if r["task_collection"] in groups]
+    if not going and not recorded:
+        raise HTTPException(409, "no run of this job is going")
+    jobs.forget_run_states()
+    errors, over = [], set()
+    listed = {int(r["run_id"]) for r in going}
+    for r in recorded:
+        job_run = str(r.get("job_run_id") or "").strip()
+        if not job_run.isdigit() or int(job_run) in listed:
+            continue
+        try:        # a run the list missed (an older one on a busy ingestion job) is cancelled too
+            if jobs.run_ended(job_run):
+                over.add(int(job_run))
+            else:
+                going.append({"kind": "group", "run_id": int(job_run),
+                              "parameters": {"task_collection": r["task_collection"]}})
+                listed.add(int(job_run))
+        except Exception as e:
+            errors.append(f"run {job_run}: {str(e).split('. ')[0][:200]}")
+    cancelled = []
+    for r in {int(r["run_id"]): r for r in going}.values():
+        try:
+            jobs.cancel(r["run_id"])
+            cancelled.append({"kind": r["kind"], "run_id": r["run_id"], "job_id": r.get("job_id"), "url": r.get("url"),
+                              "task_collection": (r.get("parameters") or {}).get("task_collection")})
+        except Exception as e:      # one that ended meanwhile, or a refusal: the others are still stopped
+            errors.append(f"run {r['run_id']}: {str(e).split('. ')[0][:200]}")
+    stopped = over | {int(r["run_id"]) for r in cancelled}
+    closing = [r for r in recorded
+               if str(r.get("job_run_id") or "").strip().isdigit() and int(r["job_run_id"]) in stopped]
+    reason = f"stopped from the app by {user}"
+    detail = json.dumps({"closed_by_app": user, "reason": reason})
+    batch = uuid.uuid4().hex[:12]
+    with _write() as cur:
+        for r in closing:
+            cur.execute(q.close_ended_run_sql(), (detail, int(r["run_id"]), reason, reason))
+        for group in sorted({r.get("task_collection") for r in cancelled if r.get("task_collection")} |
+                            {r["task_collection"] for r in closing}) or [None]:
+            _log(cur, user, "job_stop", None, group, "run", None, f"{job['name']}: {len(cancelled)} Databricks runs cancelled",
+                 batch=batch)
+    jobs.forget_run_states()
+    return {"cancelled": cancelled, "closed": len(closing), "errors": errors}
 
 
 @app.get("/api/ingestion-jobs/{job_id}/compute")
@@ -2044,7 +2204,7 @@ def ingest_job():
 
 class RunRequest(BaseModel):
     task_collection: str = Field(min_length=1)
-    parallelism: int = Field(default=32, ge=1, le=256)
+    parallelism: int = Field(default=192, ge=1, le=256)
 
 
 @app.post("/api/jobs/ingest/run")
@@ -2108,6 +2268,12 @@ class SourceDiscoverRequest(BaseModel):
     whole_server: bool = False
     # A database name filter for listing the server, as SQL Server's LIKE reads it (discovery.pattern_errors).
     pattern: str = Field(default="", max_length=128, pattern=r"^[A-Za-z0-9_%\-\[\]\.$#@]*$")
+    # For an Azure SQL server whose login can't open master: a Unity Catalog service credential with Reader on the
+    # server, and the server's resource id. The discovery job then lists the databases through Azure
+    # (discovery.azure_databases); the app never calls Azure. Both or neither.
+    azure_credential: str = Field(default="", max_length=255, pattern=r"^[A-Za-z0-9_\-]*$")
+    azure_resource_id: str = Field(default="", max_length=512, pattern=r"^(/subscriptions/[0-9A-Za-z-]+/resourceGroups/"
+                                   r"[-\w.()]+/providers/Microsoft\.Sql/(servers|managedInstances)/[a-z0-9][a-z0-9-]*)?$")
 
 
 def _connection_unseen(name: str, listing_error: Optional[str]) -> str:
@@ -2126,6 +2292,8 @@ def start_source_discovery(body: SourceDiscoverRequest, request: Request):
     names = list(dict.fromkeys(d.strip() for d in body.databases if d.strip()))
     if body.kind == "tables" and not body.whole_server and not names:
         raise HTTPException(422, "choose the whole server or at least one database")
+    if bool(body.azure_credential) != bool(body.azure_resource_id):
+        raise HTTPException(422, "listing through Azure takes both a service credential and the server's resource id")
     listed = connections()
     if body.src_connection not in {c["name"] for c in listed["connections"]}:
         raise HTTPException(404, _connection_unseen(body.src_connection, listed.get("error")))
@@ -2134,7 +2302,9 @@ def start_source_discovery(body: SourceDiscoverRequest, request: Request):
     did = uuid.uuid4().hex[:12]
     spec = {"src_type": "sqlserver", "src_connection": body.src_connection, "kind": body.kind,
             "databases": "*" if body.kind == "tables" and body.whole_server else names, "requested_by": _user(request),
-            **({"pattern": body.pattern} if body.pattern else {})}
+            **({"pattern": body.pattern} if body.pattern else {}),
+            **({"azure_credential": body.azure_credential, "azure_resource_id": body.azure_resource_id}
+               if body.azure_credential else {})}
     if body.kind == "list":
         spec.pop("databases")
     rid = jobs.run_now(job_id, {"discovery_id": did, "spec": json.dumps(spec)})
@@ -2391,8 +2561,8 @@ def _validate_schedule(body: ScheduleBody):
 
 
 # Options only the app's own steps write: who last changed the job, the copies job's copy and the app's run
-# applying it. A request's values for them are ignored, and the stored ones kept.
-MANAGED_OPTIONS = ("updated_by", sch.COPY_OPTION, "cluster_copy_run_id")
+# applying it, and a deleted job's delete job run and whether it drops the target tables. A request's values for them are ignored, and the stored ones kept.
+MANAGED_OPTIONS = ("updated_by", sch.COPY_OPTION, "cluster_copy_run_id", "delete_run_id", "delete_drop_targets")
 
 
 def _requested_options(body: "ScheduleBody") -> dict:
@@ -2761,23 +2931,114 @@ def resume_schedule(sid: int, request: Request):
     return _set_paused(sid, False, request)
 
 
+class DeleteJobBody(BaseModel):
+    drop_targets: bool = False
+
+
 @app.post("/api/schedules/{sid}/delete")
-def delete_schedule(sid: int, request: Request):
-    """Delete a schedule (an ingestion job) and its wrapper jobs; the schedule row is kept, marked deleted. Its groups
-    move to Not in any job, and their tables, control rows, checkpoints and run history all stay."""
+def delete_schedule(sid: int, request: Request, body: Optional[DeleteJobBody] = None):
+    """Delete a schedule (an ingestion job): it is marked deleted (the row is kept), its wrapper jobs are deleted, and
+    the delete job starts, which deletes its groups' tables and their state as the deployer (the app has no DELETE
+    privilege) and, with ``drop_targets``, the target tables only those groups write. Run history and the change log
+    stay. Refused while a run of the job is going. On a job already deleted, it starts the delete job again (Run
+    again on Ingestion jobs), with the flag it was deleted with unless the body sets it."""
     user = _user(request)
     s, members = _load_schedule(sid)
     _refuse_job(s, request, "delete")
-    active = [m["id"] for m in members if m["removed_at"] is None]
+    active = [m for m in members if m["removed_at"] is None]
+    plan = _delete_plan(sid)
+    blocker = _delete_blocker(s, active, plan["groups"])
+    if blocker:
+        raise HTTPException(409, blocker)
+    if plan["tables"] and not jobs.DELETE_JOB_ID:
+        raise HTTPException(409, NO_DELETE_JOB)
+    if s.get("deleted_at") is not None:
+        if not plan["tables"]:
+            return {"id": sid, "deleted": True, "sync": [], "delete_run": None}
+        drop = body.drop_targets if body else bool(sch.options_of(s).get("delete_drop_targets"))
+        with _write() as cur:
+            _record_delete(cur, sid, drop)
+        return {"id": sid, "deleted": True, "sync": [], "delete_run": _start_delete_job(sid, drop)}
+    drop = bool(body and body.drop_targets)
     with _write() as cur:
         cur.execute(q.delete_schedule_sql(), (int(sid),))
         if active:
-            cur.execute(q.remove_members_sql(), (active,))   # their jobs are deleted by the sync below
-        _log(cur, user, "schedule_delete", None, None, s["name"], None, None)
+            cur.execute(q.remove_members_sql(), ([m["id"] for m in active],))   # their jobs are deleted by the sync below
+        if plan["tables"]:
+            _record_delete(cur, sid, drop)
+        _log(cur, user, "schedule_delete", None, None, s["name"], None, "drop_targets" if drop else None)
     synced = _sync(sid, user)
     if sch.options_of(s).get(sch.COPY_OPTION):     # its copy of the ingestion job goes too
         _apply_cluster(sid)
-    return {"id": sid, "deleted": True, "sync": synced}
+    return {"id": sid, "deleted": True, "sync": synced,
+            "delete_run": _start_delete_job(sid, drop) if plan["tables"] else None}
+
+
+NO_DELETE_JOB = ("no delete job is configured for this app, so the job's groups and their tables would stay behind "
+                 "outside any job: deploy the engine bundle, then the app, and delete again")
+# Deleted jobs the Ingestion jobs page lists with their delete job run.
+DELETIONS_LISTED = 10
+
+
+def _delete_plan(sid: int) -> dict:
+    """What a job's Delete removes, read fresh: the groups no other live job holds, their tables (control rows), the
+    target tables only they write, and those another group's rows also write (kept, the first DELETE_KEPT_LISTED
+    named)."""
+    groups = [r["task_collection"] for r in db.query(q.delete_groups_sql(), (int(sid), int(sid)))]
+    if not groups:
+        return {"groups": [], "tables": 0, "targets": 0, "kept": 0, "kept_names": []}
+    row = db.query(q.delete_targets_sql(), (groups, groups, groups))[0]
+    names = row.get("kept_names") or []
+    return {"groups": groups, "tables": int(row.get("tables") or 0), "targets": int(row.get("targets") or 0),
+            "kept": int(row.get("kept") or 0), "kept_names": json.loads(names) if isinstance(names, str) else list(names)}
+
+
+def _delete_blocker(job: dict, active: List[dict], groups: List[str]):
+    """Why the job can't be deleted right now: a run of it, or of a group it deletes, is going (Lakebase sees a run
+    once its cluster is up, the Jobs API from its start), or its delete job is still running."""
+    if any(r["task_collection"] in {m["task_collection"] for m in active} | set(groups) for r in _running()):
+        return "a run of this job is going: wait for it to end, or stop it, then delete the job"
+    going = _active_wrapper_runs(active)
+    if going:
+        return {"message": f"a run of this job is going, started {going[0].get('started') or 'just now'}: wait for it "
+                           "to end, or stop it, then delete the job",
+                "run_url": going[0].get("url"), "run_id": going[0].get("run_id")}
+    run = _delete_run(job)
+    if run and ij.is_active(run):
+        return {"message": "this job's delete is still running", "run_url": run.get("url"), "run_id": run.get("run_id")}
+    return None
+
+
+def _record_delete(cur, sid: int, drop: bool) -> None:
+    """Record that the job's Delete runs the delete job, and with which flag; the earlier run is forgotten, so a start
+    that fails shows as not started."""
+    cur.execute(q.set_schedule_flag_sql(), (["delete_drop_targets"], bool(drop), int(sid)))
+    cur.execute(q.clear_schedule_option_sql(), ("delete_run_id", int(sid)))
+
+
+def _start_delete_job(sid: int, drop: bool) -> dict:
+    """Start the delete job for a deleted job and record its run. A start that fails is reported, not raised: the job
+    is deleted already, and Run again on Ingestion jobs starts it later."""
+    try:
+        run_id = jobs.start_delete_job(sid, drop)
+    except Exception as e:
+        return {"run_id": None, "url": None, "error": f"the delete job didn't start: {str(e).split('. ')[0]}"}
+    with _write() as cur:
+        cur.execute(q.set_schedule_option_sql(), (["delete_run_id"], run_id, int(sid)))
+    host = jobs.workspace_url()
+    return {"run_id": run_id, "url": f"{host}/jobs/{jobs.DELETE_JOB_ID}/runs/{run_id}" if host else None, "error": None}
+
+
+def _delete_run(job: dict) -> Optional[dict]:
+    """The job's latest delete job run, as the Jobs API has it, or None (not started, or unreadable: error set)."""
+    run_id = sch.options_of(job).get("delete_run_id")
+    if not run_id:
+        return None
+    try:
+        return jobs.run_state(run_id)
+    except Exception as e:
+        return {"run_id": run_id, "state": None, "result": None, "url": None,
+                "message": f"can't read the delete job's run: {str(e).split('. ')[0]}"}
 
 
 @app.post("/api/schedules/{sid}/sync")

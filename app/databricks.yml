@@ -35,11 +35,20 @@ variables:
     description: Id of the check job (schedules of the check variant; looked up by name, like ingest_job_id).
     lookup:
       job: lakefed_ingest_check
+  source_connections:
+    description: Unity Catalog connections the app discovers through, comma-separated. The grants job gives the
+      app's service principal USE CONNECTION on each, as whoever runs it (that person needs to own or manage them).
+    default: ""
   cluster_copies_job_id:
     description: Id of the cluster copies job, which makes the ingestion job's copies for app jobs with their own
       cluster (looked up by name, like ingest_job_id).
     lookup:
       job: lakefed_ingest_cluster_copies
+  delete_job_id:
+    description: Id of the delete job, which deletes a deleted app job's groups and, if asked, their target tables
+      (looked up by name, like ingest_job_id).
+    lookup:
+      job: lakefed_ingest_delete_job
 
 targets:
   dev:

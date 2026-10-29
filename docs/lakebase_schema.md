@@ -374,7 +374,8 @@ chosen from an upload or a discovery. One row per part: `job_id`, `scope` (`serv
 matching `filter`; `database`: a whole database; `tables`: the `tables` named, as schema.table), `server`,
 `src_database`, `source_kind` (`discovery` or `upload`) and `source_id`, `created_by`, `created_at`. A later
 re-discovery reads it: a whole server takes its new databases, a whole database its new tables, chosen tables
-nothing more. Tables given as CSV lines in the request body record nothing here.
+nothing more. Tables given as CSV lines in the request body record nothing here. A job's Delete removes its rows:
+the delete job (`lakefed_ingest_delete_job`) deletes them in the transaction that deletes the job's groups.
 
 Telemetry tables grow with every run. To keep long-term history cheaply, snapshot them to Delta
 (see [monitoring.md](monitoring.md)) and prune old rows from Lakebase.
@@ -391,6 +392,9 @@ before versions were recorded) counts as version 0.
 
 Neither the ingestion job nor the operations app deletes configuration or history (a re-run
 discovery replaces only its own `discovered_table` rows), and the app has no `DELETE` privilege.
+The one exception is an app job's Delete: the `lakefed_ingest_delete_job` job, run as the deployer, deletes that
+job's groups' control rows and their state (run history and `control_change` stay), and, when asked, the target
+tables only they write (`src/lakefed_ingest/delete_job.py`).
 
 **To stop ingesting a table,** disable it: `task_enabled = false`, or **Disable** in the app. Runs skip
 it from then on; it's reversible and logged.
