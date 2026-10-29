@@ -115,13 +115,17 @@ def not_a_check(alias: str = "") -> str:
 
 
 def last_runs_sql() -> str:
-    """Each ingestion group's latest run."""
+    """Each ingestion group's latest run: the groups with tables or in a job, each read newest first through
+    ingest_run_collection_idx, so it costs one index step per group rather than a scan of every run ever made."""
     return f"""
-select distinct on (task_collection) task_collection, run_id, status, started_at, finished_at,
-       total, ok, failed, skipped, detail
-from {SCHEMA}.ingest_run
-where {not_a_check()}
-order by task_collection, started_at desc"""
+select r.* from (select task_collection from {SCHEMA}.control
+                 union select task_collection from {SCHEMA}.schedule_member) g
+cross join lateral (
+    select task_collection, run_id, status, started_at, finished_at, total, ok, failed, skipped, detail
+    from {SCHEMA}.ingest_run
+    where task_collection = g.task_collection and {not_a_check()}
+    order by started_at desc limit 1
+) r"""
 
 
 def running_progress_sql() -> str:
@@ -392,6 +396,11 @@ with ev as (
     from {SCHEMA}.ingest_event e
     left join {SCHEMA}.control t on t.id = e.control_id
     where e.task_collection = %s
+      -- Only the events read below, not the group's whole history: first loads (any age, through
+      -- ingest_event_first_load_idx), the last 24 hours, and the running run's.
+      and ((e.status = 'ok' and e.action in ('seed', 'reseed', 'full'))
+           or e.finished_at > now() - interval '24 hours' or e.status = 'running'
+           or exists (select 1 from {SCHEMA}.ingest_run r where r.run_id = e.run_id and r.status = 'running'))
 ),
 latest_first as (
     select distinct on (control_id) server, src_database, rows_merged
@@ -458,17 +467,17 @@ def last_ran_group_runs_sql() -> str:
     """Per membership of each job, its group's newest finished group run (not skipped, not running) while it was
     the member, with its schedule_id: where a job's last job run is found when none of its recent triggers ran.
     Within one member, start order is slot order, so the newest slot among these is the job's newest that ran.
-    Param: schedule ids."""
+    Each member's is one step down ingest_run_collection_idx, not a pass over its whole history. Param: schedule ids."""
     return f"""
-select schedule_id, {_RUN_COLUMNS} from (
-    select m.schedule_id, r.*,
-           row_number() over (partition by m.id order by r.started_at desc) as newest
-    from {SCHEMA}.ingest_run r
-    join {SCHEMA}.schedule_member m on m.task_collection = r.task_collection
-    where m.schedule_id = any(%s) and r.status not in ('skipped', 'running')
-      and (m.added_at is null or r.started_at >= m.added_at) and (m.removed_at is null or r.started_at < m.removed_at)
-) x
-where newest = 1"""
+select m.schedule_id, r.*
+from {SCHEMA}.schedule_member m
+cross join lateral (
+    select {_RUN_COLUMNS} from {SCHEMA}.ingest_run
+    where task_collection = m.task_collection and status not in ('skipped', 'running')
+      and (m.added_at is null or started_at >= m.added_at) and (m.removed_at is null or started_at < m.removed_at)
+    order by started_at desc limit 1
+) r
+where m.schedule_id = any(%s)"""
 
 
 def group_runs_in_windows_sql() -> str:
@@ -1519,11 +1528,13 @@ group by 1 order by 1 limit %s offset %s"""
 
 
 def job_tables_sql() -> str:
-    """Params: groups, server, database, search pattern, limit, offset."""
+    """One database's tables of a job, each with its last success counting its database's check stamp
+    (LAST_SUCCESS), as the rest of the app shows it. Params: groups, server, database, search pattern, limit, offset."""
     return f"""
 select t.id, t.src_schema as schema, t.src_table as "table", t.load_type, t.primary_key, t.select_list,
        t.sink_catalog || '.' || t.sink_schema || '.' || t.sink_table as target, t.task_enabled as enabled,
-       t.task_collection, cp.status, cp.phase, cp.last_success_at, {STATE_COUNTS}, count(*) over () as total
+       t.task_collection, cp.status, cp.phase, max({LAST_SUCCESS}) as last_success_at, {STATE_COUNTS},
+       count(*) over () as total
 {_JOB_ROWS} and {SERVER} = %s and coalesce(t.src_database, '') = %s
   and (t.src_schema || '.' || t.src_table) ilike %s
 group by t.id, cp.control_id order by lower(t.src_schema), lower(t.src_table) limit %s offset %s"""
@@ -1568,8 +1579,8 @@ def job_target_sources_sql() -> str:
     return f"""
 with written as {_WRITTEN_7D}
 select t.id, {SERVER} as server, t.src_database as database, t.src_schema as schema, t.src_table as "table",
-       t.client_id, t.task_collection, t.task_enabled as enabled, cp.status, cp.phase, cp.last_success_at,
-       {STATE_COUNTS}, max(w.rows_written) as rows_written_7d, max(w.last_written) as last_written,
+       t.client_id, t.task_collection, t.task_enabled as enabled, cp.status, cp.phase,
+       max({LAST_SUCCESS}) as last_success_at, {STATE_COUNTS}, max(w.rows_written) as rows_written_7d, max(w.last_written) as last_written,
        count(*) over () as total
 {_JOB_ROWS_WRITTEN}
 where t.task_collection = any(%s) and t.sink_catalog = %s and t.sink_schema = %s and t.sink_table = %s

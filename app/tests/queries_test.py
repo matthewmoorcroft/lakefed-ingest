@@ -344,3 +344,9 @@ def test_lists_of_group_runs_leave_out_the_check_jobs_own_records():
                 q.last_runs_sql(), q.running_progress_sql(), q.collection_run_stats_sql()):
         assert q.not_a_check() in sql or q.not_a_check("x") in sql
     assert q.not_a_check() not in q.group_runs_sql()      # job runs place the checks themselves
+
+
+def test_a_jobs_table_lists_count_the_database_check_stamp_in_each_tables_last_success():
+    for sql in (q.job_tables_sql(), q.job_target_sources_sql()):
+        assert f"max({q.LAST_SUCCESS}) as last_success_at" in sql and "cp.phase, cp.last_success_at" not in sql
+        assert "database_check dc" in sql

@@ -349,6 +349,8 @@ create index if not exists ingest_run_collection_idx
 -- launch share its launch id, so the app shows them as one job run. Null for runs started otherwise.
 alter table lakefed_ingest.ingest_run add column if not exists work_id text;
 create index if not exists ingest_run_work_idx on lakefed_ingest.ingest_run (work_id);
+-- Every group's runs by time (the app's Runs page across groups, a window's batched appends).
+create index if not exists ingest_run_started_idx on lakefed_ingest.ingest_run (started_at);
 
 -- One row per (run, table): per-table telemetry for a run.
 create table if not exists lakefed_ingest.ingest_event (
@@ -389,6 +391,15 @@ create index if not exists ingest_event_failed_idx
     where status = 'failed';
 create index if not exists ingest_event_collection_idx
     on lakefed_ingest.ingest_event (task_collection, finished_at);
+-- Recent failures across every group by time (the app's errors and failed tables).
+create index if not exists ingest_event_failed_time_idx
+    on lakefed_ingest.ingest_event (started_at)
+    where status = 'failed';
+-- Each table's latest first load (seed, reseed or full), whatever its age: the rows a database's tables hold,
+-- read without passing over the group's other events.
+create index if not exists ingest_event_first_load_idx
+    on lakefed_ingest.ingest_event (task_collection, control_id, finished_at)
+    where status = 'ok' and action in ('seed', 'reseed', 'full');
 
 -- NOTE: the two-level controller/batching was removed — one run ingests a whole task_collection in
 -- one task (see ingest.ipynb), so there is no `task_batch` table. A `task_batch` left over from an

@@ -130,7 +130,9 @@ def split_sql_statements(ddl: str) -> List[str]:
 #   3, 4 = the check job (initial checks, launches)
 #   6 = schedule.options (a set start time). It is 6, not 5: the start-time branch numbered it 5 before it met
 #       the check job's 3 and 4, and a database migrated to that 5 must still get 3 and 4.
-SCHEMA_VERSION = 7
+#   7 = discovery.src_connection (discovery through a UC connection)
+#   8 = indexes for the app's run history reads (runs by time, recent failures, each table's latest first load)
+SCHEMA_VERSION = 8
 # Advisory lock that serializes migrations (the setup job and ingestion runs of any collection): two
 # int keys, so it can't collide with a collection's one-key lock whatever the collection is named,
 # and a class of its own (not SOURCE_LOCK_CLASS).

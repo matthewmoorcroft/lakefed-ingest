@@ -281,9 +281,16 @@ when the watermark hasn't moved.
 | `started_at`, `finished_at`, `duration_ms` | Timing |
 | `rows_read`, `rows_merged` | Row counts from the Delta commit metrics (NULL when the runtime doesn't report them) |
 | `position_from`, `position_to` | Checkpoint position before and after (CT version, or cursor value) |
-| `pool` | Spark FAIR pools the table's work ran in |
+| `pool` | Spark FAIR pools the table's work ran in; `batch<size>` for a member of a batched append, whose rows are in the run's `detail.batch_rows`, not in `rows_merged` |
 | `error` | Error message for a failed or retried attempt, with its deepest Java cause when Spark's message leaves it out |
 | `retry_count` | Earlier attempts of this table in the run: 0 for the first, 1 for the first retry. Write-conflict retries inside an attempt are logged in the job output only |
+
+Indexes for the operations app's history reads (schema version 8): runs by `started_at` across every
+collection; failed events by `started_at`; and each table's first loads (`ok` events of `seed`, `reseed` or
+`full`) by collection, control row and time, so a database's rows are read without passing over the
+collection's other events. Like every migration they are built in the upgrade's one transaction, which holds
+the telemetry tables' write lock while it builds them: on a database with years of history, run
+`lakefed_ingest_setup` at a quiet time rather than leave the upgrade to the next ingestion run.
 
 ## `control_change` — change log
 
