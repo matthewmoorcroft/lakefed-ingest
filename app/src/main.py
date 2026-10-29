@@ -809,6 +809,12 @@ def _schedules():
     return _shared("schedules", compute)
 
 
+def _deleting() -> set:
+    """The groups of jobs being deleted (queries.deleting_groups_sql), shared like _schedules: they stay with their
+    job, under Deleted jobs, until the delete job removes them."""
+    return _shared("deleting", lambda: {r["task_collection"] for r in db.query(q.deleting_groups_sql())})
+
+
 def _active(members: List[dict]) -> List[dict]:
     return [m for m in members if m.get("removed_at") is None]
 
@@ -900,7 +906,8 @@ def _jobs_view() -> dict:
         start = min([ij.window(int(s["cadence_minutes"]), ij.RECENT_JOB_RUNS + 1, now) for s in schedules]
                     + [q._when(r["started_at"]) - timedelta(days=1) for r in running if r.get("started_at")], default=now)
         runs = _group_runs(groups, start, now + timedelta(seconds=1))
-        view = ij.jobs_view(schedules, members, states, running, runs, stats, now)
+        deleting = _deleting()
+        view = ij.jobs_view(schedules, members, states, running, runs, stats, now, deleting=deleting)
         by_id = {s["id"]: s for s in schedules}
         # A job none of whose recent triggers ran (paused overnight, say): its last job run is found before them.
         earlier = _last_ran([by_id[j["id"]] for j in view["jobs"] if j["id"] is not None and not j["last_job_run"]], now)
@@ -916,7 +923,7 @@ def _jobs_view() -> dict:
             causes = {job_id: q.group_errors([f for f in failures if f["run_id"] in ids]) for job_id, ids in latest_ids.items()}
         if causes or earlier:
             view = ij.jobs_view(schedules, members, states, running, runs, stats, now, causes_by_job=causes,
-                                earlier_last_by_job=earlier)
+                                earlier_last_by_job=earlier, deleting=deleting)
         return view
     return _shared("jobs_view", compute)
 
@@ -972,7 +979,7 @@ def groups_not_in_job():
     """The groups in no ingestion job, as a page of their own: their tables by state and each group's last run, so a
     deployment with no jobs (a read-only share) still opens its groups and tables from the jobs list."""
     schedules, members = _schedules()
-    _, not_in_job = rollup.jobs(_states(), schedules, members)
+    _, not_in_job = rollup.jobs(_states(), schedules, members, _deleting())
     not_in_job = not_in_job or {"groups": []}
     groups, stats, last_runs = rollup.groups(_states()), _group_stats(), _last_runs()
     rows = []
@@ -1883,7 +1890,8 @@ def job_runs_across(job: Optional[str] = None, outcome: Optional[str] = None, be
     limit = max(1, min(int(limit), 100))
     schedules, members = _schedules()
     if job == "none":
-        unscheduled = sorted({s["task_collection"] for s in _states()} - {m["task_collection"] for m in _active(members)})
+        unscheduled = sorted({s["task_collection"] for s in _states()} - {m["task_collection"] for m in _active(members)}
+                             - _deleting())
         rows = _with_rows_written(db.query(q.group_runs_before_sql(), (unscheduled, end, limit + 1))) if unscheduled else []
         more = len(rows) > limit
         rows = rows[:limit]
@@ -1925,7 +1933,7 @@ def sources():
             listed, listed_error = _connections(), None
         except Exception as e:
             listed, listed_error = [], str(e)
-        view = rollup.sources(_states(), listed, db.query(q.not_ingested_sql()), schedules, members)
+        view = rollup.sources(_states(), listed, db.query(q.not_ingested_sql()), schedules, members, _deleting())
         for instance in view["instances"]:
             for j in instance["jobs"]:
                 if j.get("cadence_minutes"):

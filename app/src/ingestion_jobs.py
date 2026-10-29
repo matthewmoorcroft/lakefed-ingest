@@ -290,7 +290,7 @@ def consecutive_failed(summaries: List[dict]) -> int:
 def jobs_view(schedules: List[dict], members: List[dict], states: List[dict], running: List[dict],
               runs: List[dict], stats_by_group: Dict[str, dict], now: datetime,
               causes_by_job: Optional[Dict[int, List[dict]]] = None,
-              earlier_last_by_job: Optional[Dict[int, dict]] = None) -> dict:
+              earlier_last_by_job: Optional[Dict[int, dict]] = None, deleting: Iterable[str] = ()) -> dict:
     """Every ingestion job as a row (sums, cadence, next start, last finished job run, the running one, and
     Status), "Not in any job", the running job runs, and the jobs that need attention. `runs` are the group
     runs of the last RECENT_JOB_RUNS triggers of every job, with their work; `stats_by_group` each group's
@@ -301,7 +301,7 @@ def jobs_view(schedules: List[dict], members: List[dict], states: List[dict], ru
     job run."""
     causes_by_job, earlier_last_by_job = causes_by_job or {}, earlier_last_by_job or {}
     p50_by_group = {g: st.get("p50_s") for g, st in stats_by_group.items()}
-    job_sums, not_in_job = rollup.jobs(states, schedules, members)
+    job_sums, not_in_job = rollup.jobs(states, schedules, members, deleting)
     groups = rollup.groups(states)
     group_tables = {name: g["enabled_tables"] for name, g in groups.items()}
     running_by_run = {r["run_id"]: r for r in running}

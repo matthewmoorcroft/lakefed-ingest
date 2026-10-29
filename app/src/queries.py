@@ -1918,6 +1918,16 @@ def delete_groups_sql() -> str:
             f"and o.schedule_id <> %s) order by 1")
 
 
+def deleting_groups_sql() -> str:
+    """The groups of deleted jobs whose Delete runs the delete job (``options.delete_drop_targets`` set) and that no
+    live job holds: they belong to the deleted job, shown under Deleted jobs as deleting (or as a failed delete to run
+    again), until the delete job removes them, never as "Not in any job"."""
+    return (f"select distinct m.task_collection from {SCHEMA}.schedule_member m join {SCHEMA}.schedule d "
+            f"on d.id = m.schedule_id where d.deleted_at is not null and d.options ? 'delete_drop_targets' "
+            f"and not exists (select 1 from {SCHEMA}.schedule_member o join {SCHEMA}.schedule s on s.id = o.schedule_id "
+            f"where o.task_collection = m.task_collection and o.removed_at is null and s.deleted_at is null) order by 1")
+
+
 def delete_targets_sql() -> str:
     """The groups' tables and target tables, for the Delete dialog: how many tables (control rows), how many target
     tables only they write, and the target tables rows of any other group also write (kept; names compared without
