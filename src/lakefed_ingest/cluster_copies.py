@@ -10,6 +10,7 @@ the bundle's job, and its copy, if any, is deleted.
 The bundle's job is copied again on every run, so a redeploy reaches the copies the next time the job runs (the app
 starts it on every cluster change and every Sync jobs)."""
 import copy
+import uuid
 from typing import Dict, List, Optional
 
 CLUSTER_KEYS = ("driver_node_type_id", "node_type_id", "num_workers")
@@ -72,17 +73,27 @@ def plan(schedules: List[dict], copies: Dict[str, int], bundle_job: dict, owner:
     return out
 
 
+def principal_of(identity: str) -> dict:
+    """The access-control entry for a deployer or app identity. A service principal's user name is its application
+    id (a UUID), and the permissions API refuses that as a user, so a UUID is named as a service principal."""
+    try:
+        uuid.UUID(identity)
+    except ValueError:
+        return {"user_name": identity}
+    return {"service_principal_name": identity}
+
+
 def copy_permissions(bundle_acl: List[dict], app_principal: Optional[str], owner_user: str) -> List[dict]:
     """A copy's access list: the bundle job's own direct grants (so whoever may run or manage the ingestion job may
     run or manage its copies, as the app's checks expect), the deployer as owner, and the app's service principal
     with Can Manage (it starts the copy and reads its access list)."""
-    out = [{"user_name": owner_user, "permission_level": "IS_OWNER"}]
+    owner = principal_of(owner_user)
+    out = [{**owner, "permission_level": "IS_OWNER"}]
     for entry in bundle_acl:
         direct = [p["permission_level"] for p in entry.get("all_permissions") or []
                   if not p.get("inherited") and p["permission_level"] != "IS_OWNER"]
         principal = {k: entry[k] for k in ("user_name", "group_name", "service_principal_name") if entry.get(k)}
-        if direct and principal and principal.get("user_name") != owner_user \
-                and principal.get("service_principal_name") != app_principal:
+        if direct and principal and principal != owner and principal.get("service_principal_name") != app_principal:
             out.append({**principal, "permission_level": direct[0]})
     if app_principal:
         out.append({"service_principal_name": app_principal, "permission_level": "CAN_MANAGE"})

@@ -1,5 +1,10 @@
 """The ingestion job's per-app-job copies (cluster_copies): what a copy is, and when one is made, kept or deleted."""
+import json
+from pathlib import Path
+
 import cluster_copies as cc
+
+NOTEBOOK = Path(__file__).parent.parent / "src" / "lakefed_ingest" / "cluster_copies.ipynb"
 
 BUNDLE = {
     "name": "[dev someone] lakefed_ingest", "max_concurrent_runs": 100,
@@ -50,6 +55,22 @@ def test_jobs_with_their_own_cluster_get_a_copy_and_jobs_back_at_the_defaults_lo
 def test_blank_cluster_values_mean_the_bundle_jobs_own():
     assert cc.cluster_of(schedule(1, cluster={"driver_node_type_id": "", "num_workers": 2})) == {"num_workers": 2}
     assert cc.cluster_of(schedule(1)) is None
+
+
+def test_a_service_principal_deployer_is_named_by_its_application_id_in_the_copy_permissions():
+    app_id = "6e1c9b4a-1f2e-4d3c-9a8b-7c6d5e4f3a2b"
+    acl = [{"service_principal_name": app_id, "all_permissions": [{"permission_level": "IS_OWNER"}]},
+           {"group_name": "operators", "all_permissions": [{"permission_level": "CAN_MANAGE_RUN"}]}]
+    assert cc.copy_permissions(acl, "app-sp", app_id) == [
+        {"service_principal_name": app_id, "permission_level": "IS_OWNER"},
+        {"group_name": "operators", "permission_level": "CAN_MANAGE_RUN"},
+        {"service_principal_name": "app-sp", "permission_level": "CAN_MANAGE"}]
+
+
+def test_the_copy_is_recorded_before_its_permissions_are_set_so_a_failure_there_is_found_next_run():
+    cells = [c["source"] for c in json.loads(NOTEBOOK.read_text(encoding="utf-8"))["cells"] if c["cell_type"] == "code"]
+    code = next(cell for cell in cells if "copy_permissions" in cell)
+    assert code.rindex("record(sid, job_id)") < code.index('"PUT"')
 
 
 def test_a_copy_is_shared_as_the_ingestion_job_is_with_the_app_managing_it():
