@@ -33,6 +33,7 @@ import job_settings as js
 import job_settings_sql as jss
 import jobs
 import lakebase as db
+import new_job as nj
 import queries as q
 import rollup
 import schedules as sch
@@ -1855,6 +1856,93 @@ def create_schedule(body: ScheduleBody, request: Request):
     synced = _sync(sid, user)
     cluster = _apply_cluster(sid) if sch.own_cluster(body.model_dump()) else None
     return {"id": sid, "sync": synced, "cluster_error": cluster}
+
+
+class NewJobRun(BaseModel):
+    """When a new job runs, as the Edit view's When it runs and Advanced configuration set it."""
+    cadence_minutes: int = 60
+    timezone: str = "UTC"
+    paused: bool = True
+    notify_emails: Optional[str] = None
+    parameters: dict = {}
+    options: dict = {}
+    job_variant: str = "default"
+    stagger: bool = True
+
+
+class NewJobRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=80)
+    csv: str
+    settings: dict = {}
+    groups_per_server: int = nj.DEFAULT_GROUPS_PER_SERVER
+    run: NewJobRun = NewJobRun()
+    dry_run: bool = True
+
+
+@app.post("/api/ingestion-jobs")
+def create_ingestion_job(body: NewJobRequest, request: Request):
+    """Preview (dry_run, the default) or create an ingestion job in one go, as New ingestion job does: its tables from
+    a CSV of where each one is (new_job.plan), written with the job's settings into groups per server, and the job
+    (a schedule with those groups). Creating is one transaction: the schedule, every table (all or nothing: a target
+    another table writes refuses the lot), the groups' members; then its Databricks jobs are synced."""
+    import psycopg
+    name = body.name.strip()
+    run = body.run.model_copy()
+    run.stagger = run.stagger and run.job_variant != sch.CHECK_VARIANT
+    taken = {r["task_collection"] for r in db.query(q.collections_sql())}
+
+    def planned():
+        plan = nj.plan(name, body.csv, body.settings, body.groups_per_server, taken)
+        errors = list(plan["errors"])
+        if not errors and plan["groups"]:
+            schedule = {**run.model_dump(), "name": name, "members": plan["groups"],
+                        "timezone": sch.timezone_for(run.cadence_minutes, run.timezone)}
+            errors += sch.validate(schedule, plan["groups"], jobs.schedule_variants())
+        if errors:
+            raise HTTPException(422, {"errors": errors})
+        return plan
+
+    plan = planned()
+    summary = nj.summary(plan)
+    if body.dry_run or summary["invalid"]:
+        return {"summary": summary, "settings": plan["settings"], "created": False}
+    user = _user(request)
+    if not run.paused:     # anyone may set up a job, but one that runs needs the right to run what it starts
+        _refuse(_permission_refusals({"job_variant": run.job_variant}, user)["run"])
+    options = {k: v for k, v in (run.options or {}).items() if k not in MANAGED_OPTIONS}
+    _refuse_unknown_node_types(sch.own_cluster({"options": options}))
+    timezone_ = sch.timezone_for(run.cadence_minutes, run.timezone)
+    offs = sch.offsets(plan["groups"], run.cadence_minutes, run.stagger, sch.start_minute({"options": options, "cadence_minutes": run.cadence_minutes}))
+    batch = uuid.uuid4().hex[:12]
+    try:
+        with db.transaction() as cur:
+            _lock_collections(cur, plan["groups"])
+            cur.execute(q.insert_schedule_sql(), (name, run.cadence_minutes, timezone_, json.dumps(run.parameters),
+                                                  run.job_variant or "default", run.stagger, run.paused,
+                                                  run.notify_emails or None, json.dumps(options) if options else None,
+                                                  user or None))
+            sid = cur.fetchone()[0]
+            rows = [line["row"] for line in plan["lines"]]
+            for row in rows:
+                cur.execute(q.insert_control_if_absent_sql(), q.control_params(row))
+                res = cur.fetchone()
+                if not res:
+                    raise HTTPException(409, f"another table already writes {row['sink_catalog']}.{row['sink_schema']}."
+                                             f"{row['sink_table']}" + (f" for {row['client_id']}" if row.get("client_id") else ""))
+                _log(cur, user, "import", res[0], row["task_collection"], batch=batch)
+            _refuse_mixed_sinks(cur, rows)
+            _refuse_split_databases(cur, rows)
+            for group in plan["groups"]:
+                cur.execute(q.insert_member_sql(), (sid, group, offs[group]))
+                _log(cur, user, "schedule_create", None, group, "schedule", None,
+                     f"{name} ({sch.describe(run.cadence_minutes, offs[group], timezone_)})", batch=batch)
+            _touch(cur, user, [sid])
+    except psycopg.errors.UniqueViolation:
+        raise HTTPException(409, f"an ingestion job named '{name}' already exists")
+    synced = _sync(sid, user)
+    cluster = _apply_cluster(sid) if sch.own_cluster({"options": options}) else None
+    return {"id": sid, "summary": summary, "settings": plan["settings"], "created": True, "sync": synced,
+            "cluster_error": cluster}
 
 
 @app.post("/api/schedules/{sid}")
