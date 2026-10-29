@@ -185,3 +185,12 @@ def test_a_hundred_thousand_tables_discover_in_one_run():
     run = steps.discover(server)
     assert run.tables == (417 - len(run.refused)) * 240
     assert len(run.listed) == 417
+
+
+@pytest.mark.skipif(not SCALE, reason="LAKEFED_SCALE=1 runs the 22,000-database size (several minutes)")
+def test_twenty_two_thousand_databases_discover_every_one_the_server_can_open():
+    catalog = sc.ServerCatalog(databases=22_000)
+    run = steps.discover(catalog)
+    assert sorted(run.refused) == sorted(catalog.unopenable_names())
+    assert run.discovered == 22_000 - len(catalog.unopenable_names())
+    assert run.tables == run.discovered * sc.DEFAULT_TABLES_PER_DATABASE

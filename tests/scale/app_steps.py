@@ -1,7 +1,7 @@
 """The operations app's steps at scale: creating an ingestion job by reference to a discovery, and uploading a CSV of
 tables. They call the app's own planning (new_job.plan, read_upload) and its write helpers (main._insert_controls,
-main._log_lines, main._keep_selection, ...) with the recording cursor from lakebase_fake. no_connections() is in force for
-all of it, so a step that tried to reach a database would raise.
+main._log_lines, main._keep_selection, ...) with the recording cursor from lakebase_fake. no_connections() is in force
+for all of it, so a step that tried to reach a database would raise.
 
 What is not measured here: the reads the route does from Lakebase (the selection's rows, the discovered rows) and the
 request's own JSON handling. Those come back as rows built in Python, and the report says so.
@@ -154,7 +154,7 @@ MONITORING_PATHS = ("/api/overview", "/api/collections", "/api/errors", "/api/in
 
 
 def monitoring_shapes(paths: Tuple[str, ...] = MONITORING_PATHS) -> List[dict]:
-    """The Lakebase statements each monitoring page issues, with the app's own routes through TestClient and the database
+    """The Lakebase statements each monitoring page issues: the app's own routes through TestClient, with the database
     stubbed to record and answer with no rows. This gives the shape of each page (which statements, how many); the rows
     a statement returns at scale are not in it. Runs under no_connections()."""
     from unittest import mock
@@ -179,8 +179,8 @@ def _upload_text(text: str, lines_hint: Optional[int]) -> UploadRun:
     read = nj.read_upload(text)
     read_s = time.perf_counter() - started
     if read["errors"]:
-        return UploadRun(lines=lines_hint or 0, errors=list(read["errors"]), csv_bytes=len(text.encode()), read_s=read_s,
-                         write_s=0.0, connection=None)
+        return UploadRun(lines=lines_hint or 0, errors=list(read["errors"]), csv_bytes=len(text.encode()),
+                         read_s=read_s, write_s=0.0, connection=None)
     upload_id, lines = "scale-upload", read["lines"]
     ok = sum(line["status"] == "ok" for line in lines)
     connection = lakebase_fake.RecordingConnection()
