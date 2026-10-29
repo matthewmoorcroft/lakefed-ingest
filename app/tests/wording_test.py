@@ -74,3 +74,9 @@ def test_the_nav_says_schedules_and_jobs_and_its_page_names_the_databricks_jobs(
 def test_the_backend_names_the_databricks_job():
     main_py = (FRONTEND.parent.parent / "main.py").read_text()
     assert "no ingestion job configured" not in main_py and "no Databricks ingestion job configured" in main_py
+
+
+def test_discover_says_when_the_login_cant_open_master_and_takes_typed_databases():
+    discover = (FRONTEND / "pages" / "Discover.tsx").read_text()
+    assert "this connection's login can't open" in discover and "VIEW ANY DATABASE" in discover
+    assert "function TypedDatabases" in discover and "!tested?.typed" in discover   # typed names are read by name

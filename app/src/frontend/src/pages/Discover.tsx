@@ -45,6 +45,24 @@ function TriBox({ pick, label, onClick }: { pick: Pick; label: string; onClick: 
     aria-label={label} title={pick === "part" ? "Chosen in part" : undefined} onClick={onClick}>{pick === "all" ? "✓" : ""}</button>;
 }
 
+/** A test that failed because the login can't open master, where SQL Server lists its databases. */
+const cantList = (error: unknown) => /FAILED_JDBC\.CONNECTION|Login failed|Cannot open database|HV000/i.test(String((error as Error)?.message ?? error));
+
+/** The databases typed by hand, one per line or separated by commas, for a login that can't list the server's. */
+function TypedDatabases({ onUse }: { onUse: (names: string[]) => void }) {
+  const [text, setText] = useState("");
+  const names = [...new Set(text.split(/[\s,;]+/).map((n) => n.trim()).filter(Boolean))];
+  return (
+    <div className="form-grid">
+      <label className="wide">Its databases<textarea rows={4} value={text} placeholder={"lfc_eng_001\nlfc_eng_002"}
+        onChange={(e) => setText(e.target.value)} />
+        <span className="help">One per line, or separated by commas. Each is read on its own in the next step.</span></label>
+      <div className="toolbar"><button disabled={!names.length} onClick={() => onUse(names)}>
+        Use {names.length ? `these ${fmtInt(names.length)} ${plural(names.length, "database")}` : "these databases"}</button></div>
+    </div>
+  );
+}
+
 function Step1({ chosen, setChosen, tested, setTested }: { chosen: string; setChosen: (c: string) => void;
                  tested: Row | null; setTested: (t: Row | null) => void }) {
   const { config } = useSettings();
@@ -99,10 +117,14 @@ function Step1({ chosen, setChosen, tested, setTested }: { chosen: string; setCh
           <div className="toolbar">
             <button disabled={!chosen || testing} onClick={test}>{testing ? "Testing…" : "Test connection"}</button>
             {testing && <span className="muted">Reading the server's databases: a few minutes when the discovery cluster starts cold.</span>}
-            {tested && <span><Tag tone="ok">Connected</Tag> <span className="muted">reads {fmtInt(tested.databases.length)}{" "}
-              {plural(tested.databases.length, "database")} through {chosen}</span></span>}
+            {tested && <span><Tag tone="ok">{tested.typed ? "Typed" : "Connected"}</Tag> <span className="muted">{tested.typed ? "uses" : "reads"}{" "}
+              {fmtInt(tested.databases.length)} {plural(tested.databases.length, "database")} through {chosen}</span></span>}
           </div>
-          {error != null && <Notice tone="bad">The connection failed its test: {String((error as Error).message ?? error)}</Notice>}
+          {error != null && <Notice tone="bad">The connection failed its test: {String((error as Error).message ?? error)}
+            {cantList(error) && <p>The server's databases are listed from its master database, and this connection's login can't open
+              it. The databases themselves may still be readable through the connection: type them below. Or give the login access to
+              master (a user there with VIEW ANY DATABASE) and test again.</p>}</Notice>}
+          {error != null && cantList(error) && <TypedDatabases onUse={(names) => { setError(null); setTested({ discovery_id: null, databases: names, typed: true }); }} />}
         </div>
       )}
       <label className="radio-row"><input type="radio" checked={how === "create"} onChange={() => setHow("create")} /> Create a connection</label>
@@ -218,7 +240,8 @@ export function DiscoverDialog({ onClose }: { onClose: (lines: string | null) =>
       const unread = whole.filter((d) => !tables[d]);
       const read: Row[] = [];
       if (unread.length) {
-        const all = unread.length === databases.length;
+        // A whole server is listed from master; databases typed by hand are read by name instead.
+        const all = unread.length === databases.length && !tested?.typed;
         const id = await discover(connection, all ? { whole_server: true } : { databases: unread });
         read.push(...await api.get<Row[]>(`/discoveries/${id}/tables`));
       }
