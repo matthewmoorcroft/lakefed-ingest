@@ -186,12 +186,6 @@ def timezone_for(cadence: int, tz: Optional[str]) -> str:
     return "UTC" if int(cadence) <= 60 else (str(tz or "").strip() or "UTC")
 
 
-def options_of(schedule: dict) -> dict:
-    """A schedule's options as a dict (stored as JSON)."""
-    options = schedule.get("options") or {}
-    return json.loads(options) if isinstance(options, str) else options
-
-
 def updated_by(schedule: dict) -> Optional[str]:
     """Who last changed the job or its groups' tables in the app (options.updated_by). A job never changed since it
     was created was last updated by its creator, as the Databricks Jobs list shows it. None: not recorded (jobs
@@ -206,10 +200,7 @@ def updated_by(schedule: dict) -> Optional[str]:
 def start_minute(schedule: dict) -> int:
     """A schedule's set start time, minutes after local midnight (schedule.options.start_minute; 0 when unset or
     for a minute or hourly schedule)."""
-    options = schedule.get("options") or {}
-    if isinstance(options, str):
-        options = json.loads(options)
-    return int(options.get("start_minute") or 0) if int(schedule.get("cadence_minutes") or 0) > 60 else 0
+    return int(options_of(schedule).get("start_minute") or 0) if int(schedule.get("cadence_minutes") or 0) > 60 else 0
 
 
 def offsets(collections: Iterable[str], cadence: int, stagger: bool, start_minute: int = 0) -> Dict[str, int]:

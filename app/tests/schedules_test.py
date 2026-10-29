@@ -2,6 +2,7 @@
 import json
 import re
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 
@@ -358,6 +359,19 @@ def test_a_set_start_time_moves_every_members_offset_and_wraps_within_the_cadenc
     assert sch.offsets(["a", "b"], 1440, True, start_minute=150) == {"a": 150, "b": 180}
     assert sch.offsets(["a"], 360, False, start_minute=390) == {"a": 30}
     assert sch.offsets(["a", "b"], 30, True, start_minute=150) == {"a": 0, "b": 15}   # minutes ignore a start
+
+
+def test_a_start_time_is_read_whether_the_options_are_stored_as_text_or_as_a_dict():
+    assert sch.start_minute({"cadence_minutes": 1440, "options": '{"start_minute": 150}'}) == 150
+    assert sch.start_minute({"cadence_minutes": 1440, "options": {"start_minute": 150}}) == 150
+    assert sch.start_minute({"cadence_minutes": 30, "options": {"start_minute": 150}}) == 0
+
+
+def test_a_schedules_options_are_parsed_in_one_place():
+    source = Path(sch.__file__).read_text()
+    assert source.count("def options_of(") == 1
+    body = source[source.index("def start_minute("):]
+    assert "json.loads" not in body[:body.index("\ndef ", 1)]
 
 
 def test_a_daily_schedule_at_a_set_time_fires_then_and_its_job_runs_are_named_by_that_time():
