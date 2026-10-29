@@ -2,13 +2,17 @@
 5.3-million-table sizes (see run_scale.py for the table they make). No database and no workspace is touched: everything
 runs against the simulated server and the recording fakes."""
 import json
+import math
 import os
 import re
 
 import pytest
 
 import paths  # noqa: F401  (sys.path)
+import app_steps as apps
 import ct_engine
+import lakebase_fake
+import new_job as nj
 import server_catalog as sc
 import simulation as sim
 import steps
@@ -113,6 +117,66 @@ def test_the_writer_columns_are_the_notebook_columns():
     source = "".join("".join(cell["source"]) for cell in notebook["cells"] if cell["cell_type"] == "code")
     notebook_cols = re.findall(r'"(\w+)"', re.search(r"TABLE_COLS = \[(.*?)\]", source, re.S).group(1))
     assert notebook_cols == steps.TABLE_COLS
+
+
+def test_the_recording_connection_counts_executemany_per_row_and_multi_row_values_by_group():
+    connection = lakebase_fake.RecordingConnection()
+    with connection.cursor() as cursor:
+        cursor.executemany("insert into lakefed_ingest.control_change (a) values (%s)", [(1,), (2,), (3,)])
+        cursor.execute("insert into lakefed_ingest.control (a, b) values (%s, %s), (%s, %s)", (1, 2, 3, 4))
+    assert connection.statements["insert lakefed_ingest.control_change"] == 3
+    assert connection.statements["insert lakefed_ingest.control"] == 1
+    assert connection.rows["insert lakefed_ingest.control"] == 2
+
+
+def test_create_by_reference_plans_every_discovered_table_and_writes_it_in_thousands(small_catalog):
+    run = apps.create_by_reference(small_catalog)
+    assert run.errors == []
+    assert run.tables == steps.discover(small_catalog).tables
+    assert run.connection.statements["insert lakefed_ingest.control"] == math.ceil(run.tables / 1000)
+    change_log_statements = run.connection.statements["insert lakefed_ingest.control_change"]
+    assert change_log_statements == math.ceil(run.tables / 1000) + 1   # plus one for the groups' schedule_create lines
+    assert run.connection.statements["insert lakefed_ingest.schedule_member"] == run.groups
+    assert run.connection.statements["insert lakefed_ingest.schedule"] == 1
+
+
+def test_an_upload_writes_its_header_and_each_line_a_thousand_to_a_statement(small_catalog):
+    run = apps.upload_by_reference(small_catalog)
+    assert run.errors == []
+    assert run.lines == steps.discover(small_catalog).tables
+    assert run.connection.statements["insert lakefed_ingest.table_upload"] == 1
+    assert run.connection.statements["insert lakefed_ingest.table_upload_line"] == math.ceil(run.lines / 1000)
+
+
+def test_the_line_caps_refuse_the_file_past_them():
+    errors, _ = apps.create_refusal(nj.MAX_LINES + 1)
+    assert errors == [f"{nj.MAX_LINES + 1:,} lines: at most {nj.MAX_LINES:,} in one import"]
+    errors, _ = apps.upload_refusal(nj.MAX_LINES + 1)
+    assert errors == [f"more than {nj.MAX_LINES:,} lines: at most {nj.MAX_LINES:,} in one file"]
+
+
+def test_the_collections_page_reads_the_control_table_once():
+    shapes = {s["path"]: s for s in apps.monitoring_shapes(("/api/collections",))}
+    assert shapes["/api/collections"]["status"] == 200
+    assert shapes["/api/collections"]["kinds"] == {"select lakefed_ingest.control": 1}
+
+
+def test_no_connection_is_made_while_the_steps_run():
+    import lakebase
+    with lakebase_fake.no_connections():
+        with pytest.raises(RuntimeError):
+            lakebase.connect()
+        with pytest.raises(RuntimeError):
+            lakebase.workspace()
+
+
+@pytest.mark.skipif(not SCALE, reason="LAKEFED_SCALE=1 runs the 100,000-table size")
+def test_create_and_upload_at_a_hundred_thousand_tables_are_planned_in_full():
+    catalog = sc.ServerCatalog(databases=417)
+    run = apps.create_by_reference(catalog)
+    assert run.errors == [] and run.tables == steps.discover(catalog).tables
+    upload = apps.upload_by_reference(catalog)
+    assert upload.lines == run.tables and upload.errors == []
 
 
 @pytest.mark.skipif(not SCALE, reason="LAKEFED_SCALE=1 runs the 100,000-table size")

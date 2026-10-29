@@ -32,11 +32,11 @@ def rows_in(sql: str) -> int:
 class RecordingConnection:
     """What a Lakebase connection was asked to do. ``answers(sql)`` gives back the rows a read returns, if any."""
 
-    def __init__(self, answers: Optional[Callable[[str], List[tuple]]] = None):
+    def __init__(self, answers: Optional[Callable[[str, tuple], List[tuple]]] = None):
         self.statements: Counter = Counter()
         self.rows: Counter = Counter()
         self.transactions = 0
-        self._answers = answers or (lambda sql: [])
+        self._answers = answers or (lambda sql, params: [])
 
     def record(self, sql: str, rows: int, count: int = 1) -> None:
         kind = statement_kind(sql)
@@ -77,7 +77,7 @@ class RecordingCursor:
 
     def execute(self, sql: str, params: Optional[Sequence] = None) -> None:
         self._connection.record(sql, rows_in(sql))
-        self._result = self._connection._answers(sql)
+        self._result = self._connection._answers(sql, tuple(params or ()))
 
     def executemany(self, sql: str, parameter_sets: Sequence[Sequence]) -> None:
         count = len(parameter_sets)
@@ -90,3 +90,22 @@ class RecordingCursor:
 
     def fetchone(self) -> Optional[tuple]:
         return self._result[0] if self._result else None
+
+
+@contextmanager
+def no_connections() -> Iterator[None]:
+    """While the block runs, opening a Lakebase connection or a workspace client raises: a step that tries one fails
+    loudly instead of reaching a database."""
+    import psycopg
+
+    import lakebase
+
+    def refuse(*args, **kwargs):
+        raise RuntimeError("the scale harness does not connect to a database or a workspace")
+
+    saved = (lakebase.connect, lakebase.workspace, psycopg.connect)
+    lakebase.connect = lakebase.workspace = psycopg.connect = refuse
+    try:
+        yield
+    finally:
+        lakebase.connect, lakebase.workspace, psycopg.connect = saved
