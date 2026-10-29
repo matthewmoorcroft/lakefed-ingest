@@ -107,6 +107,39 @@ which runs as the deployer:
 - Ingestion jobs lists the latest deleted jobs under **Deleted jobs**: the delete job's run (deleting, deleted, or
   failed with why) and the tables left, with **Run again** for one that didn't finish.
 
+## Re-discovery
+
+A job made from a discovery can add new databases and tables by itself. On its Edit page, under When it runs,
+**Add new databases and tables** is off by default, or daily at an hour in UTC. It's stored as the schedule option
+`rediscover_hour`, and the job page shows the hour and the last run.
+
+Once a day at that hour, the scheduler in the app process (a thread; `REDISCOVERY_TICK_S`, default 300 seconds, 0
+turns it off) runs the discover job again over the job's selection and adds what the rules allow:
+
+| The job was chosen as | Re-discovery adds |
+|---|---|
+| a whole server, with its filter | each new database matching the filter, with all its tables. New tables of a database the job already has are not added |
+| a whole database | its new tables |
+| specific tables | nothing |
+
+What it adds goes through the same path as Add tables: the run locks, the checks, the job's own settings and the
+usual group sizes. The change log records each added table under the user `re-discovery`. Tables the source no
+longer has are kept and listed as vanished. A database that can't be opened fails alone and is listed under errors.
+
+Other rules: a paused job is skipped; a run that meets a group already running is deferred to the next day; a job
+made from an uploaded CSV has nothing to read again. Each run claims its job in SQL first, so two app instances
+don't run the same job twice. The scheduler runs only while the app runs: a day missed while it was down runs on
+the first tick after the hour.
+
+A whole-server part reads its servers again from `discovery.listing` (how the discovery listed databases: the LIKE
+pattern, the Azure resource and the host secret template, never a secret). A discovery made before schema version
+12 has no listing, so discover that server again from Add tables. A host whose databases take different secrets, with
+no template recorded, can't have a whole-server part read again (discover it from Add tables); its whole-database
+parts are read once per secret.
+
+The job page's block shows the last run: its status (running, done, deferred or failed), when it started and
+finished, what it found and added, what was skipped, the new databases, the vanished tables, and any errors.
+
 ## Guard rails for edits
 
 Data integrity comes first, so edits go through the server's rules, not the browser's:

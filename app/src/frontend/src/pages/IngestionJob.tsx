@@ -276,6 +276,7 @@ export default function IngestionJob() {
         </div>
       )}
       {live.data?.active && <RunningNow live={live.data} />}
+      {j && <RediscoveryRecord rediscovery={j.rediscovery} />}
       <Section title="Job runs" note="Newest first; one row per trigger. Open a run for the groups it ran."
         actions={<span className="pager-buttons">
           <button className="ghost" disabled={!pages.length} onClick={() => setPages(pages.slice(0, -1))}>Newer</button>
@@ -291,6 +292,51 @@ export default function IngestionJob() {
       </Section>}
       {j && <TargetTables jobId={id} />}
     </>
+  );
+}
+
+const REDISCOVERY_STATUS: Record<string, string> = { running: "Running", done: "Done", deferred: "Deferred", failed: "Failed" };
+
+/** The job's daily look for new databases and tables: whether it is on (and when), and what the last one did. */
+function RediscoveryRecord({ rediscovery }: { rediscovery?: Row }) {
+  const last = rediscovery?.last as Row | null | undefined;
+  const hour = rediscovery?.hour;
+  if (hour == null && !last) return null;
+  const note = hour == null ? "Off. Turn it on from Edit, under When it runs."
+    : `Daily at ${String(hour).padStart(2, "0")}:00 UTC, set from Edit under When it runs.`;
+  return (
+    <Section title="Adding new databases and tables" note={note}>
+      {last ? <RediscoveryLast last={last} /> : <p className="muted">It has not run yet.</p>}
+    </Section>
+  );
+}
+
+function RediscoveryLast({ last }: { last: Row }) {
+  const vanished = last.vanished as Row | undefined;
+  const vanishedTables: string[] = vanished?.tables ?? [];
+  const errors: string[] = last.errors ?? [];
+  const skipped: Row[] = last.skipped_tables ?? [];
+  return (
+    <div>
+      <p>
+        <b>{REDISCOVERY_STATUS[last.status] ?? String(last.status)}</b>
+        {last.started_at && <>, started {fmtTime(last.started_at)}</>}
+        {last.finished_at && <>, finished {fmtTime(last.finished_at)}</>}
+      </p>
+      {last.error && <Notice tone="warn">{last.error}</Notice>}
+      {last.status === "deferred" && <p className="muted small">A group of the job was running, so nothing was added. The next
+        attempt is the next day's.</p>}
+      {last.note && <p className="muted">{last.note}.</p>}
+      {last.status === "done" && !last.note && <ul>
+        <li>Found <b>{fmtInt(last.found)}</b> {plural(last.found, "table")} to add: added <b>{fmtInt(last.added)}</b>, skipped{" "}
+          <b>{fmtInt(last.skipped)}</b> <span className="muted small">(their target was already written by another table)</span></li>
+        <li>New databases: {last.new_databases?.length ? last.new_databases.join(", ") : "none"}</li>
+        <li>Vanished from the source and kept: <b>{fmtInt(vanished?.count)}</b>
+          {vanishedTables.length ? <>: {vanishedTables.join(", ")}{vanishedTables.length < Number(vanished?.count) ? ", and more" : ""}</> : null}</li>
+        {errors.length > 0 && <li>Could not be read: {errors.join("; ")}</li>}
+        {skipped.length > 0 && <li>Not added: {skipped.map((s) => `${s.table} (${(s.errors ?? []).join(", ")})`).join("; ")}</li>}
+      </ul>}
+    </div>
   );
 }
 

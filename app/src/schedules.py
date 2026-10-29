@@ -53,8 +53,9 @@ FLAGS = [k for k, check in PARAMETERS.items() if check is _flag]
 # Keys of schedule.options the app sets: start_minute = a set start time for daily and every 2 to 12 hours
 # schedules; cluster = the job's own cluster ({driver_node_type_id, node_type_id, num_workers}, run by a copy of the
 # ingestion job); cluster_copy_run_id = the copies job's run applying it. ingest_copy_job_id (that copy) is written
-# only by the copies job (cluster_copies.ipynb), never taken from a request.
-OPTIONS = ("start_minute", "cluster", "cluster_copy_run_id")
+# only by the copies job (cluster_copies.ipynb), never taken from a request. rediscover_hour = the UTC hour a job adds
+# its selection's new databases and tables (rediscovery.py); absent when off.
+OPTIONS = ("start_minute", "cluster", "cluster_copy_run_id", "rediscover_hour")
 COPY_OPTION = "ingest_copy_job_id"
 CLUSTER_KEYS = ("driver_node_type_id", "node_type_id", "num_workers")
 # Workers an app job may ask for: enough for the largest tested shape, small enough to bound a mistake's cost.
@@ -128,6 +129,9 @@ def validate(body: dict, known_collections: Iterable[str], variants: Iterable[st
                 errs.append("options.start_minute: a minute of the day, 0 to 1439")
             elif int(body.get("cadence_minutes") or 0) <= 60:
                 errs.append("options.start_minute: only daily and every 2 to 12 hours schedules start at a set time")
+        hour = options.get("rediscover_hour")
+        if hour is not None and (not isinstance(hour, int) or isinstance(hour, bool) or not 0 <= hour <= 23):
+            errs.append("options.rediscover_hour: an hour of the day in UTC, 0 to 23")
         errs += cluster_problems(options.get("cluster"), body.get("job_variant") or "default")
     return errs
 

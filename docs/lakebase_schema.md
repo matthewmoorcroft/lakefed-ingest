@@ -316,7 +316,9 @@ in the operations app's Bulk import page.
   (`src_connection`, read through `remote_query` with no secret) or a host (`src_host`, `src_port`,
   `secret_key`); `status` (`running` | `ok` | `failed`, or `listed` for a discovery that only lists the server's
   databases, as Test connection does), `error`, and the number of tables found. A connection that fails is recorded
-  on the server's `master` row.
+  on the server's `master` row. `listing` (JSON, schema version 11): how it listed its databases, for a later
+  re-discovery: `pattern`, `azure_credential`, `azure_resource_id` and `secret_key_template`. Never a secret. Null
+  for discoveries made before version 11.
 - **`discovered_table`:** one row per table, with size and row counts, whether Change Tracking is
   enabled, and the recommended settings: `select_list` (unsupported column types listed in
   `excluded_columns`), `primary_key`, `load_type` (`ct` if CT and a PK; `cursor` on a rowversion
@@ -331,7 +333,9 @@ Written by the operations app (see "Schedules" in `app/README.md`); the ingestio
 - **`schedule`:** `name` (unique among active schedules), `cadence_minutes` (5, 10, 15, 20, 30, 60, 120,
   180, 240, 360, 720 or 1440), `timezone`, `parameters` (ingestion job parameters, JSON), `job_variant`,
   `stagger`, `paused`, `notify_emails`, `options` (JSON, null = none: `start_minute`, a set start time in
-  minutes after local midnight for daily and every 2 to 12 hours schedules), who created it and when, and
+  minutes after local midnight for daily and every 2 to 12 hours schedules; `rediscover_hour`, the UTC hour of the
+  job's daily re-discovery, absent when off; `rediscovery`, the last re-discovery's record, written by the app),
+  who created it and when, and
   `deleted_at` (soft delete).
 - **`schedule_member`:** one row per (schedule, collection): `offset_minutes` (start offset within the
   cadence: the schedule's start time plus the member's stagger), `job_id` (the wrapper job the app created), `synced_at`, `sync_error`, and `removed_at`
@@ -375,7 +379,8 @@ chosen from an upload or a discovery. One row per part: `job_id`, `scope` (`serv
 matching `filter`; `database`: a whole database; `tables`: the `tables` named, as schema.table), `server`,
 `src_database`, `source_kind` (`discovery` or `upload`) and `source_id`, `created_by`, `created_at`. A later
 re-discovery reads it: a whole server takes its new databases, a whole database its new tables, chosen tables
-nothing more. Tables given as CSV lines in the request body record nothing here. A job's Delete removes its rows:
+nothing more (see Re-discovery in [app/README.md](../app/README.md)). Tables given as CSV lines in the request body
+record nothing here. A job's Delete removes its rows:
 the delete job (`lakefed_ingest_delete_job`) deletes them in the transaction that deletes the job's groups.
 
 Telemetry tables grow with every run. To keep long-term history cheaply, snapshot them to Delta

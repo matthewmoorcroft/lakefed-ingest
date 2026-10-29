@@ -27,7 +27,8 @@ function scheduleForm(schedule: Row) {
   return {
     run: { cadence_minutes: schedule.cadence_minutes, start: `${String(Math.floor(start / 60)).padStart(2, "0")}:${String(start % 60).padStart(2, "0")}`,
            timezone: Number(schedule.cadence_minutes) > 60 ? schedule.timezone : "Europe/London",
-           paused: schedule.paused, notify_emails: schedule.notify_emails ?? "" } as Row,
+           paused: schedule.paused, notify_emails: schedule.notify_emails ?? "",
+           rediscover_hour: typeof schedule.options?.rediscover_hour === "number" ? schedule.options.rediscover_hour : null } as Row,
     params: Object.fromEntries(Object.entries(schedule.parameters ?? {}).map(([k, v]) => [k, String(v)])) as Record<string, string>,
     name: String(schedule.name),
   };
@@ -369,14 +370,15 @@ export default function JobEdit() {
       }
       if (schedule) {
         const cadence = Number(run.cadence_minutes);
-        const { cluster: stored, ...kept } = schedule.options ?? {};
+        const { cluster: stored, rediscover_hour: _storedHour, ...kept } = schedule.options ?? {};
         // Until the cluster is read, keep what's stored; at the Databricks job's own values, the job has no cluster of its own.
         const own = !clusterInfo.data || !cluster ? stored : ownCluster(cluster, clusterInfo.data.defaults);
         await api.post(`/schedules/${schedule.id}`, {
           name: name.trim() || schedule.name, cadence_minutes: cadence, timezone: cadence <= 60 ? "UTC" : run.timezone || "Europe/London",
           stagger: schedule.stagger, paused: run.paused, notify_emails: run.notify_emails || null, job_variant: schedule.job_variant,
           options: { ...kept, ...(own ? { cluster: own } : {}),
-            ...(cadence > 60 ? { start_minute: startMinute(run.start) } : { start_minute: undefined }) },
+            ...(cadence > 60 ? { start_minute: startMinute(run.start) } : { start_minute: undefined }),
+            ...(run.rediscover_hour == null ? {} : { rediscover_hour: Number(run.rediscover_hour) }) },
           members: (schedule.members as Row[]).map((m) => m.task_collection),
           parameters: Object.fromEntries(Object.entries(params).filter(([, v]) => v.trim() !== "").map(([k, v]) => [k, v.trim()])),
         }).catch((e: Error) => {
@@ -486,6 +488,17 @@ export default function JobEdit() {
 
       {schedule && <Section title="When it runs">
         <RunFields run={run} setRun={setRun} params={params} setParams={setParams} cadences={cadences} />
+        <div className="form-grid">
+          <label>Add new databases and tables
+            <select value={run.rediscover_hour ?? ""}
+              onChange={(e) => setRun({ ...run, rediscover_hour: e.target.value === "" ? null : Number(e.target.value) })}>
+              <option value="">Off</option>
+              {Array.from({ length: 24 }, (_, hour) => <option key={hour} value={hour}>{`Daily at ${String(hour).padStart(2, "0")}:00 UTC`}</option>)}
+            </select>
+            <span className="help">Once a day the servers are read again and the job adds what its selection allows: every new
+              database matching a whole server's filter, with all its tables, and the new tables of a whole database. Specific
+              tables add nothing. Tables the source no longer has are kept and listed on the job page.</span></label>
+        </div>
       </Section>}
 
       {/* Compute and the tuning keys are one closed section, at the defaults the job was tested with, as on the board. */}
