@@ -1113,8 +1113,8 @@ def ingestion_job(job_id: int, request: Request):
             # For the Run now button: why it can't start now (None when it can), whether a run is going (the button
             # is then Cancel run, which the run permission also gates), and what one run starts.
             "run_now": {"blocked": refusals["run"] or _run_now_blocker(job, mine), "refused": refusals["run"],
-                        "going": _recorded_running(mine),
-                        "groups": len(mine), "check": job.get("job_variant") == sch.CHECK_VARIANT},
+                        "groups": len(mine), "check": job.get("job_variant") == sch.CHECK_VARIANT,
+                        **_run_phase_of(job, mine, now)},
             "delete_blocked": refusals["delete"], "change_blocked": refusals["change"],
             "delete": job.get("delete"), **_audit(job)}
 
@@ -1316,12 +1316,35 @@ def run_ingestion_job(job_id: int, request: Request):
     return {"started": started}
 
 
+def _job_active_runs(job: dict, members: List[dict]) -> List[dict]:
+    """Every Databricks run of an ingestion job that is still active, from the poller's table: its wrapper runs, its
+    check job's run (check kind), and the group runs of its groups. Cancel run cancels all of them, so Cancelling
+    waits for all of them to end."""
+    groups = {m["task_collection"] for m in members}
+    runs = _active_wrapper_runs(members)
+    check_kind = (job.get("job_variant") or "default") == sch.CHECK_VARIANT
+    if check_kind and jobs.CHECK_JOB_ID:
+        runs += [r for r in run_poller.runs_of(jobs.CHECK_JOB_ID, active_only=True, limit=10)
+                 if ij.check_run_of(r, job["id"], groups)]
+    target = (sch.copy_job_id(job) or _ingest_job_id("default")) if check_kind else _wrapper_target(job)
+    if target and groups:
+        runs += [r for r in run_poller.runs_of(target, active_only=True, limit=50) if r.get("task_collection") in groups]
+    return runs
+
+
 def _active_wrapper_runs(members: List[dict]) -> List[dict]:
     """The job's wrapper jobs' runs going now (active only), newest first."""
     out = []
     for wrapper in sorted({int(m["job_id"]) for m in members if m.get("job_id")}):
         out += [r for r in run_poller.runs_of(wrapper, active_only=True, limit=5) if ij.is_active(r)]
     return sorted(out, key=lambda r: r.get("started") or "", reverse=True)
+
+
+def _run_phase_of(job: dict, members: List[dict], now: datetime) -> dict:
+    """Where Run now and Cancel run stand for a job (ingestion_jobs.run_phase), from its active runs. ``going`` is
+    true while any run is active, so a page that asks what is going reads the same thing as the buttons."""
+    phase = ij.run_phase(_job_active_runs(job, members), now)
+    return {**phase, "going": phase["phase"] != ij.IDLE}
 
 
 def _job_databricks_runs(job: dict, members: List[dict]) -> dict:

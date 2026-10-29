@@ -2171,7 +2171,7 @@ def job_selection_sql() -> str:
 # ---- Databricks runs the app tracks (lakefed_ingest.databricks_run, written by run_poller) ----------------------------
 
 DATABRICKS_RUN_COLUMNS = ("run_id, job_id, kind, schedule_id, task_collection, trigger, parameters, life_cycle_state, "
-                          "result_state, state_message, run_page_url, started_at, ended_at")
+                          "result_state, state_message, run_page_url, started_at, ended_at, seen_at")
 
 
 def databricks_run_params(row: dict) -> dict:

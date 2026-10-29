@@ -243,13 +243,40 @@ def test_the_groups_in_no_job_have_a_page_of_their_own(client):
     assert (body["enabled_tables"], body["name"]) == (3, "Not in any job")
 
 
+def test_the_job_page_follows_a_run_from_starting_to_running_to_cancelling_and_idle(client, monkeypatch):
+    monkeypatch.setattr(main.jobs, "ingest_variants", lambda: {"default": "555"})
+    monkeypatch.setattr(main.jobs, "user_job_permission", lambda job_id, user: "CAN_MANAGE_RUN")
+    signed_in = {"X-Forwarded-Email": "op@example.com"}
+    now = NOW       # the page's clock (this file reads the app at a fixed time)
+    going = []      # the poller's active group runs of job 555, as its table shows them
+    monkeypatch.setattr(main.run_poller, "runs_of", lambda job_id, active_only=False, limit=25:
+                        [dict(r) for r in going] if str(job_id) == "555" else [])
+
+    def run_now():
+        return client.get("/api/ingestion-jobs/1", headers=signed_in).json()["run_now"]
+
+    assert run_now()["phase"] == "idle"
+    going.append(dict(run_id=7, job_id=555, task_collection="c1", state="PENDING", started=now.isoformat(), seen=None))
+    starting = run_now()
+    assert (starting["phase"], starting["going"], starting["timed_out"]) == ("starting", True, False)
+    going[0].update(state="RUNNING", url="https://h/run/7")
+    assert (run_now()["phase"], run_now()["run_url"]) == ("running", "https://h/run/7")
+    going[0].update(state="TERMINATING", seen=(now - timedelta(minutes=11)).isoformat())
+    cancelling = run_now()
+    assert (cancelling["phase"], cancelling["timed_out"]) == ("cancelling", True), cancelling
+    going.clear()
+    assert (run_now()["phase"], run_now()["going"]) == ("idle", False)
+
+
 def test_the_job_page_says_why_run_now_or_delete_cannot_start(client, monkeypatch):
     monkeypatch.setattr(main.jobs, "ingest_variants", lambda: {"default": "555"})
+    monkeypatch.setattr(main.run_poller, "runs_of", lambda job_id, active_only=False, limit=25: [])
     monkeypatch.setattr(main.jobs, "user_job_permission", lambda job_id, user: "CAN_MANAGE_RUN")
     signed_in = {"X-Forwarded-Email": "op@example.com"}
     body = client.get("/api/ingestion-jobs/1", headers=signed_in).json()
     assert body["run_now"] == {"blocked": "the job's Databricks jobs are not synced yet", "refused": None, "going": False,
-                              "groups": 2, "check": False}
+                              "groups": 2, "check": False, "phase": "idle", "since": None, "timed_out": False,
+                              "run_id": None, "run_url": None}
     assert body["delete_blocked"] == "deleting needs Can Manage on the Databricks job 555; you have Can Manage Run"
     # With no user from the Apps proxy, nothing is allowed, whatever the job's access list says.
     anonymous = client.get("/api/ingestion-jobs/1").json()

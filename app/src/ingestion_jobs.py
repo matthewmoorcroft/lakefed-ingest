@@ -457,6 +457,40 @@ def check_run_of(run: dict, schedule_id: int, groups: Iterable[str]) -> bool:
     return bool(named) and named <= set(groups)
 
 
+IDLE, STARTING, RUNNING, CANCELLING = "idle", "starting", "running", "cancelling"
+# How long Databricks may take to start a run, or to end the runs of a cancel, before the page says plainly that
+# Databricks has not confirmed it. The page keeps Run now off meanwhile: a run is never shown as ended before it is.
+START_CONFIRM_S = 15 * 60
+CANCEL_CONFIRM_S = 10 * 60
+
+
+def run_phase(active: List[dict], now: datetime) -> dict:
+    """Where a job's Run now and Cancel run stand, from its active Databricks runs as the poller records them: idle
+    when none is active; cancelling while any is terminating, until every one has ended; running once one is RUNNING;
+    starting while the rest are queued or pending. A run dict has state, started, seen (when its state last changed),
+    run_id and url. ``timed_out`` says Databricks has not confirmed the change within its limit."""
+    if not active:
+        return {"phase": IDLE, "since": None, "timed_out": False, "run_id": None, "run_url": None}
+    terminating = [r for r in active if r.get("state") == "TERMINATING"]
+    running = [r for r in active if r.get("state") == "RUNNING"]
+    if terminating:
+        phase, limit, runs = CANCELLING, CANCEL_CONFIRM_S, terminating
+        since_of = [r.get("seen") or r.get("started") for r in terminating]
+    elif running:
+        phase, limit, runs = RUNNING, None, running
+        since_of = [r.get("started") or r.get("seen") for r in running]
+    else:
+        phase, limit, runs = STARTING, START_CONFIRM_S, active
+        since_of = [r.get("started") or r.get("seen") for r in active]
+    moments = [_when(v) for v in since_of if v]
+    moments = [m if m.tzinfo else m.replace(tzinfo=timezone.utc) for m in moments]
+    since = min(moments, default=None)
+    first = min(runs, key=lambda r: r.get("started") or "")
+    timed_out = bool(limit and since is not None and (now - since).total_seconds() > limit)
+    return {"phase": phase, "since": since.isoformat() if since else None, "timed_out": timed_out,
+            "run_id": first.get("run_id"), "run_url": first.get("url")}
+
+
 def run_state_label(run: dict) -> dict:
     """A Databricks run's state in the app's words, as the Jobs UI shows it: Starting while its cluster comes up."""
     state, result = run.get("state"), run.get("result")
