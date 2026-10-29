@@ -459,6 +459,21 @@ def test_a_heartbeat_after_a_commit_never_lowers_a_big_create_progress(big):
     assert big.store.beats > 1 and big.store.lowered == []
 
 
+def test_a_beat_just_before_the_task_ends_keeps_the_written_count(big, monkeypatch):
+    finish = main.db.execute
+
+    def beat_then_finish(sql, params=()):
+        if sql == q.finish_task_sql():
+            _beat_after_commit(big.store, big.tasks)
+        return finish(sql, params)
+
+    monkeypatch.setattr(main.db, "execute", beat_then_finish)
+    r = _create(big)
+    big.tasks.run()
+    assert big.get(f"/api/tasks/{r.json()['task']['id']}").json()["status"] == "succeeded"
+    assert big.tasks.rows[1]["done"] == 150 and big.store.lowered == []
+
+
 def test_adding_tables_by_reference_to_a_job_writes_each_database_as_its_own_task(big, monkeypatch):
     own = _job_for_a_big_add(big, monkeypatch)
     dry = big.post("/api/ingestion-jobs/7/tables", json={"source": {"upload_id": "u1", "whole_server": True}})
