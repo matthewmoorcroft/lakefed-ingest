@@ -1,4 +1,5 @@
 import { createContext, useContext } from "react";
+import { PageErrorBoundary } from "./errorBoundary";
 import { NavLink, Navigate, Route, Routes, useLocation } from "react-router-dom";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, type Config } from "./api";
@@ -65,6 +66,8 @@ export default function App() {
             <button className="ghost" onClick={() => qc.invalidateQueries()}>Refresh data</button>
             <UserMenu config={config.data} />
           </div>
+          {/* A page that throws shows what happened instead of a white window; a new page starts clean. */}
+          <PageErrorBoundary key={pathname}>
           <Routes>
             <Route path="/" element={<Navigate to="/overview" replace />} />
             <Route path="/overview" element={<Overview />} />
@@ -91,6 +94,7 @@ export default function App() {
             <Route path="/changes" element={<Changes />} />
             <Route path="*" element={<Navigate to="/overview" replace />} />
           </Routes>
+          </PageErrorBoundary>
         </main>
       </div>
     </SettingsContext.Provider>

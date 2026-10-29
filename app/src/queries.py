@@ -2513,9 +2513,14 @@ def database_rows_sql(kind: str) -> str:
 
 
 def selected_servers_sql(kind: str) -> str:
-    """A selection's servers: each one's databases and tables it takes, in the order of the servers. Params: the same as
-    selected_rows_sql (the source's, whole_server, filter, database keys, table keys)."""
-    return (f"select r.server, count(distinct lower(r.src_database)) as databases, count(*) as tables "
+    """A selection's servers: each one's databases and tables it takes, and its tables by load type (load_unset: a line
+    that leaves it to the job), in the order of the servers. One aggregate in Lakebase: only these few rows reach the
+    app. Params: the same as selected_rows_sql (the source's, whole_server, filter, database keys, table keys)."""
+    return (f"select r.server, count(distinct lower(r.src_database)) as databases, count(*) as tables, "
+            f"count(*) filter (where r.load_type = 'ct') as load_ct, "
+            f"count(*) filter (where r.load_type = 'cursor') as load_cursor, "
+            f"count(*) filter (where r.load_type = 'full') as load_full, "
+            f"count(*) filter (where r.load_type is null or r.load_type not in ('ct', 'cursor', 'full')) as load_unset "
             f"from ({source_rows_sql(kind)}) r where {_SELECTED} group by r.server order by r.server")
 
 

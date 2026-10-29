@@ -40,6 +40,36 @@ def test_the_summary_names_every_group_of_each_server_before_anything_is_read():
     assert summary["tables"] == 5_280_000 and summary["databases"] == 22_000
 
 
+def test_the_summary_counts_each_servers_tables_by_load_type_with_the_jobs_default_for_unset_ones():
+    servers = [{"server": "sql_a", "databases": 100, "tables": 100_000, "load_ct": 90_000, "load_cursor": 0,
+                "load_full": 9_000, "load_unset": 1_000}]
+    summary = bd.summary_of("Big job", servers, default_load_type="ct")
+    assert summary["servers"][0]["load_types"] == {"ct": 91_000, "full": 9_000}
+    assert bd.summary_of("Big job", servers, default_load_type="full")["servers"][0]["load_types"] == \
+        {"ct": 90_000, "full": 10_000}
+
+
+def test_every_create_paths_server_rows_have_the_same_fields():
+    """The page draws one row per server from the preview's servers, whichever way the job was chosen: by reference to a
+    discovery or an upload (summary_of), or by its lines (new_job.summary). A field one path leaves out broke the page."""
+    by_reference = bd.summary_of("Big job", [{"server": "sql_a", "databases": 2, "tables": 3, "load_ct": 3,
+                                             "load_cursor": 0, "load_full": 0, "load_unset": 0}], default_load_type="ct")
+    by_lines = nj.summary({"lines": [{"status": "new", "server": "sql_a", "group": "big_job_sql_a_c01",
+                                      "row": {"load_type": "ct", "src_database": "db1", "use_remote_query": True}}],
+                           "groups": ["big_job_sql_a_c01"]})
+    assert set(by_reference["servers"][0]) == set(by_lines["servers"][0])
+    for row in (by_reference["servers"][0], by_lines["servers"][0]):
+        assert isinstance(row["load_types"], dict) and isinstance(row["groups"], list)
+        assert isinstance(row["databases"], int) and isinstance(row["tables"], int)
+
+
+def test_the_selections_servers_are_counted_by_load_type_in_one_aggregate():
+    sql = q.selected_servers_sql("discovery")
+    assert sql.count("count(*) filter (where") == 4 and "group by r.server" in sql
+    for name in ("load_ct", "load_cursor", "load_full", "load_unset"):
+        assert f"as {name}" in sql
+
+
 def test_databases_are_paged_in_key_order_and_a_short_page_ends_them():
     names = [("sql_a", f"db_{i:04d}") for i in range(1200)]
     asked = []

@@ -3394,7 +3394,7 @@ def _create_by_database(body: NewJobRequest, request: Request, selection: Select
                                all_groups, jobs.schedule_variants())
     if errors:
         raise HTTPException(422, {"errors": errors})
-    summary = by_database.summary_of(name, servers)
+    summary = by_database.summary_of(name, servers, settings["load_type"])
     if body.dry_run:
         return {"summary": summary, "settings": settings, "created": False}
     if not run.paused:     # anyone may set up a job, but one that runs needs the right to run what it starts

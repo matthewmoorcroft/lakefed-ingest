@@ -5,6 +5,7 @@ import { api, type Row } from "../api";
 import { Crumbs, ErrorBox, Menu, Modal, Notice, PageHead, Section, fmtInt, plural, useConfirm } from "../components";
 import { CADENCES, IdentityFields, ParameterFields, RunFields, WritesFields, paramsSummary } from "./jobForm";
 import { DiscoverDialog } from "./Discover";
+import { serverRowCells } from "./previewRows";
 import { ClusterFields, clusterSummary, ownCluster } from "./JobEdit";
 import { SourcePick, nothingPicked, pickedAny, pickedText, type Picked } from "./SourcePick";
 import { TaskProgress, finished, newRequestId, resumableWrite } from "./tasks";
@@ -149,12 +150,12 @@ export default function NewJob() {
             <div className="table-wrap"><table className="data">
               <thead><tr><th>Server</th><th>Read through · load type</th><th className="num">Databases · tables</th><th className="num">Groups</th></tr></thead>
               <tbody>
-                {(summary?.servers ?? []).map((s: Row) => (
-                  <tr key={s.server}><td className="name"><b>{s.server}</b></td>
-                    <td>{s.read_through} · {Object.entries(s.load_types as Record<string, number>).map(([k, n]) =>
-                      `${LOAD_TYPES.find(([key]) => key === k)?.[1] ?? k}${Object.keys(s.load_types).length > 1 ? ` ${fmtInt(n)}` : ""}`).join(", ")}</td>
-                    <td className="num">{fmtInt(s.databases)} · {fmtInt(s.tables)}</td><td className="num">{fmtInt(s.groups.length)}</td></tr>
-                ))}
+                {(Array.isArray(summary?.servers) ? summary.servers : []).map((s: Row) => {
+                  const cells = serverRowCells(s, LOAD_TYPES);
+                  return <tr key={cells.server}><td className="name"><b>{cells.server}</b></td>
+                    <td>{cells.readThrough} · {cells.loadTypes}</td>
+                    <td className="num">{cells.counts}</td><td className="num">{cells.groups}</td></tr>;
+                })}
               </tbody>
             </table></div>
             {summary && Number(summary.discovered) > 0 && <p className="muted">{fmtInt(summary.discovered)} {plural(summary.discovered, "table")}

@@ -195,16 +195,20 @@ def plan_database(job_name: str, given: dict, rows: List[dict], columns: List[st
     return plan
 
 
-def summary_of(job_name: str, servers: List[dict]) -> dict:
+def summary_of(job_name: str, servers: List[dict], default_load_type: str = "ct") -> dict:
     """What a big job's preview shows before Create, from the selection's servers (queries.selected_servers_sql): each
-    server's databases, tables and group names, and the totals. Nothing is checked yet: checked is False, and by_database
-    is True, so the page says the lines are read when the write runs."""
+    server's databases, tables, tables by load type (a line that sets none takes the job's default_load_type) and group
+    names, and the totals: the same fields per server as new_job.summary. Nothing is checked yet: checked is False, and
+    by_database is True, so the page says the lines are read when the write runs."""
     groups_of = groups_by_server(servers)
     out_servers = []
     for s in sorted(servers, key=lambda s: s["server"]):
         names = nj.group_names(job_name, s["server"], groups_of[s["server"]])
-        out_servers.append({"server": s["server"], "databases": s["databases"], "tables": s["tables"], "groups": names,
-                            "read_through": "JDBC" if ":" in s["server"] else "UC connection"})
+        load_types = {load_type: int(s.get(f"load_{load_type}") or 0) for load_type in nj.LOAD_TYPES}
+        load_types[default_load_type] = load_types.get(default_load_type, 0) + int(s.get("load_unset") or 0)
+        out_servers.append({"server": s["server"], "databases": int(s["databases"]), "tables": int(s["tables"]),
+                            "groups": names, "read_through": "JDBC" if ":" in s["server"] else "UC connection",
+                            "load_types": {k: n for k, n in load_types.items() if n}})
     all_groups = [g for s in out_servers for g in s["groups"]]
     return {"servers": out_servers, "tables": sum(s["tables"] for s in servers),
             "databases": sum(s["databases"] for s in servers), "groups": all_groups, "in_job": 0,

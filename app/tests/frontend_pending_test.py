@@ -14,3 +14,10 @@ NODE_TESTS = APP / "tests" / "js" / "pending_helpers.test.mjs"
 def test_the_job_page_pending_helpers_pass_their_node_tests():
     result = subprocess.run(["node", "--test", str(NODE_TESTS)], capture_output=True, text=True, timeout=120)
     assert result.returncode == 0, result.stdout[-4000:] + result.stderr[-2000:]
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="Node is not installed")
+def test_a_page_never_goes_white_pass_their_node_tests():
+    tests = APP / "tests" / "js" / "page_safety.test.mjs"
+    result = subprocess.run(["node", "--test", str(tests)], capture_output=True, text=True, timeout=120)
+    assert result.returncode == 0, result.stdout[-4000:] + result.stderr[-2000:]
