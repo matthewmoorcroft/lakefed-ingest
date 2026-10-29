@@ -1,7 +1,9 @@
 """A big job written one database at a time: how many groups a server's tables take, the pages of databases a source is
 read in, the units a selection takes, and the plan of one database. Pure: the endpoints and the background task read
 Lakebase and write each database's own transaction (main.py)."""
+import contextlib
 import math
+import time
 from typing import Callable, Dict, Iterator, List, Optional, Tuple
 
 import new_job as nj
@@ -15,6 +17,44 @@ DATABASE_PAGE = 500
 TABLES_PER_TRANSACTION = 5_000
 # The check reads the tables of this many databases in one statement.
 DATABASES_PER_READ = 100
+
+
+def _now() -> float:
+    return time.monotonic()
+
+
+class Stages:
+    """Where a big write's time goes, in seconds, for its task's progress: "check" is the check pass (from the start until
+    the write pass begins), "write" is the write pass so far, and "read" and "plan" are the reads and the planning of both
+    passes so far. Each value is cumulative and rounded to a tenth of a second, so it only grows as the write goes on."""
+
+    def __init__(self, clock: Optional[Callable[[], float]] = None):
+        self._clock = clock or _now
+        self._started = self._clock()
+        self._write_started: Optional[float] = None
+        self._spent = {"read": 0.0, "plan": 0.0}
+
+    @contextlib.contextmanager
+    def timed(self, stage: str) -> Iterator[None]:
+        """Adds the time the block takes to the read or plan total."""
+        started = self._clock()
+        try:
+            yield
+        finally:
+            self._spent[stage] += self._clock() - started
+
+    def begin_write(self) -> None:
+        self._write_started = self._clock()
+
+    def seconds(self) -> Dict[str, float]:
+        """The four stages so far, for a task's progress."""
+        now = self._clock()
+        if self._write_started is None:
+            check, write = now - self._started, 0.0
+        else:
+            check, write = self._write_started - self._started, now - self._write_started
+        return {"check": round(check, 1), "read": round(self._spent["read"], 1),
+                "plan": round(self._spent["plan"], 1), "write": round(write, 1)}
 
 
 def groups_for_tables(tables: int) -> int:

@@ -3293,8 +3293,8 @@ def _units_of(kind: str, param, selection: "Selection"):
 class ChunkJob:
     """The job a by-database write puts its databases into: its schedule, who asked and the batch their log lines carry,
     the schedule's cadence and time zone (for the create lines' text), each group's offset, the task whose progress each
-    transaction records, and whether a member it adds is logged (Create logs them as schedule_create; Add tables never
-    has)."""
+    transaction records, the write's stage clock, and whether a member it adds is logged (Create logs them as
+    schedule_create; Add tables never has)."""
     sid: int
     name: str
     user: str
@@ -3303,6 +3303,7 @@ class ChunkJob:
     timezone: str
     offsets: dict
     task_id: int
+    stages: by_database.Stages
     log_members: bool = True
 
 
@@ -3343,6 +3344,7 @@ def _write_chunk(cur, plans: List[dict], job: ChunkJob, state: dict) -> None:
             _log_lines(cur, [_schedule_create_line(job, group) for group in created])
     state["databases_written"] += len(plans)
     state["tables_written"] += len(lines)
+    state["seconds"] = job.stages.seconds()
     cur.execute(q.task_progress_json_sql(), (json.dumps(state), state["tables_written"], job.task_id))
 
 
@@ -3410,20 +3412,24 @@ def _create_by_database(body: NewJobRequest, request: Request, selection: Select
     def units():
         return _units_of(kind, param, selection)
 
-    def plan_of(rows, own):
-        plan = by_database.plan_database(name, body.settings, rows, columns, groups_of, taken, own)
-        return plan
+    def plan_of(rows, own, stages):
+        with stages.timed("plan"):
+            return by_database.plan_database(name, body.settings, rows, columns, groups_of, taken, own)
 
-    def check(task_id, own):
+    def read_of(chunk, stages):
+        with stages.timed("read"):
+            return _rows_of_units(kind, param, chunk)
+
+    def check(own, stages):
         """Every database planned, nothing written: the file's and the settings' problems, and the groups in use.
         Returns each database that has tables with its table count, in order, for the write to pack into
         transactions."""
         errors_found, counted = [], []
         for read_batch in by_database.read_batches(list(units())):
-            for unit, rows in _rows_of_units(kind, param, read_batch):
+            for unit, rows in read_of(read_batch, stages):
                 if not rows:
                     continue
-                plan = plan_of(rows, own)
+                plan = plan_of(rows, own, stages)
                 if plan["errors"]:
                     raise HTTPException(422, {"errors": plan["errors"][:20]})
                 for line in plan["lines"]:
@@ -3439,9 +3445,12 @@ def _create_by_database(body: NewJobRequest, request: Request, selection: Select
         task = db.query(q.task_sql(), (task_id,))[0]
         sid = task["job_id"]
         own = set(_job_groups(sid)) if sid else set()
-        state = {"stage": "checking", "databases_total": databases_total, "databases_written": 0, "tables_written": 0}
+        stages = by_database.Stages()
+        state = {"stage": "checking", "databases_total": databases_total, "databases_written": 0, "tables_written": 0,
+                 "seconds": stages.seconds()}
         db.execute(q.task_progress_json_sql(), (json.dumps(state), 0, task_id))
-        counted = check(task_id, own)
+        counted = check(own, stages)
+        stages.begin_write()
         state["stage"] = "writing"
         if sid is None:
             try:
@@ -3457,9 +3466,9 @@ def _create_by_database(body: NewJobRequest, request: Request, selection: Select
             except psycopg.errors.UniqueViolation:
                 raise HTTPException(409, f"an ingestion job named '{name}' already exists")
         job = ChunkJob(sid=sid, name=name, user=user, batch=batch, cadence_minutes=run.cadence_minutes,
-                       timezone=timezone_, offsets=offs, task_id=task_id)
+                       timezone=timezone_, offsets=offs, task_id=task_id, stages=stages)
         for chunk in by_database.transactions_of(counted):
-            plans = [plan_of(rows, own) for _, rows in _rows_of_units(kind, param, chunk) if rows]
+            plans = [plan_of(rows, own, stages) for _, rows in read_of(chunk, stages) if rows]
             if plans:
                 with _write() as cur:
                     _write_chunk(cur, plans, job, state)
@@ -3502,20 +3511,25 @@ def _add_by_database(job_id: int, body: "JobTablesRequest", request: Request, ki
     databases_total = sum(s["databases"] for s in servers)
     parts = _selection_parts(selection, [s["server"] for s in servers] if selection.whole_server else [])
 
-    def plan_of(rows):
-        return by_database.plan_database(job["name"], given, rows, columns, {}, taken, set(groups),
-                                         group_of=inputs["group_of"], have=inputs["have"])
+    def plan_of(rows, stages):
+        with stages.timed("plan"):
+            return by_database.plan_database(job["name"], given, rows, columns, {}, taken, set(groups),
+                                             group_of=inputs["group_of"], have=inputs["have"])
 
-    def check():
+    def read_of(chunk, stages):
+        with stages.timed("read"):
+            return _rows_of_units(kind, param, chunk)
+
+    def check(stages):
         """Every database planned, nothing written: the lines that cannot be taken, and the groups the job would add.
         Returns those totals, and each database with its table count, in order, for the write to pack into
         transactions."""
         invalid, tables, in_job, new_groups, counted = [], 0, 0, set(), []
         for read_batch in by_database.read_batches(list(_units_of(kind, param, selection))):
-            for unit, rows in _rows_of_units(kind, param, read_batch):
+            for unit, rows in read_of(read_batch, stages):
                 if not rows:
                     continue
-                plan = plan_of(rows)
+                plan = plan_of(rows, stages)
                 if plan["errors"]:
                     raise HTTPException(422, {"errors": plan["errors"][:20]})
                 for line in plan["lines"]:
@@ -3533,18 +3547,21 @@ def _add_by_database(job_id: int, body: "JobTablesRequest", request: Request, ki
         return {"tables": tables, "in_job": in_job, "new_groups": sorted(new_groups)}, counted
 
     def write(progress, task_id):
-        state = {"stage": "checking", "databases_total": databases_total, "databases_written": 0, "tables_written": 0}
+        stages = by_database.Stages()
+        state = {"stage": "checking", "databases_total": databases_total, "databases_written": 0, "tables_written": 0,
+                 "seconds": stages.seconds()}
         db.execute(q.task_progress_json_sql(), (json.dumps(state), 0, task_id))
-        found, counted = check()
+        found, counted = check(stages)
+        stages.begin_write()
         active = [m for m in _load_schedule(job_id)[1] if m["removed_at"] is None]
         offs = sch.offsets([m["task_collection"] for m in active] + found["new_groups"], int(job["cadence_minutes"]),
                            bool(job.get("stagger")), sch.start_minute(job))
         state["stage"] = "writing"
         chunk_job = ChunkJob(sid=job_id, name=job["name"], user=user, batch=batch,
                              cadence_minutes=int(job["cadence_minutes"]), timezone=job["timezone"], offsets=offs,
-                             task_id=task_id, log_members=False)
+                             task_id=task_id, stages=stages, log_members=False)
         for chunk in by_database.transactions_of(counted):
-            plans = [plan_of(rows) for _, rows in _rows_of_units(kind, param, chunk) if rows]
+            plans = [plan_of(rows, stages) for _, rows in read_of(chunk, stages) if rows]
             if plans:
                 with _write() as cur:
                     _lock_job(cur, job_id)

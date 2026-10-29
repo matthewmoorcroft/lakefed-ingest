@@ -331,7 +331,8 @@ def create_by_chunk(catalog: server_catalog.ServerCatalog) -> ByDatabaseRun:
         if not errors:
             schedule_id = _open_job(connection, selected)
             job = app.ChunkJob(sid=schedule_id, name=SCALE_JOB, user=SCALE_USER, batch=SCALE_BATCH,
-                               cadence_minutes=CADENCE_MINUTES, timezone=TIMEZONE, offsets={}, task_id=TASK_ID)
+                               cadence_minutes=CADENCE_MINUTES, timezone=TIMEZONE, offsets={}, task_id=TASK_ID,
+                               stages=by_database.Stages())
             _record_pages(connection, opened)
             for chunk in by_database.transactions_of(counted):
                 plans = [by_database.plan_database(SCALE_JOB, CREATE_SETTINGS, rows, columns, groups_of, set(), set())

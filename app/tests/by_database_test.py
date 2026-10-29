@@ -135,6 +135,24 @@ def test_planning_22000_databases_of_240_tables_takes_about_a_few_minutes_with_f
     assert planned == sample * 240 and per_database < 0.05
 
 
+def test_the_stage_seconds_are_cumulative_rounded_and_the_check_stops_when_the_write_begins():
+    now = [0.0]
+    stages = bd.Stages(clock=lambda: now[0])
+    now[0] = 1.0
+    with stages.timed("read"):
+        now[0] = 1.44
+    with stages.timed("plan"):
+        now[0] = 1.7
+    assert stages.seconds() == {"check": 1.7, "read": 0.4, "plan": 0.3, "write": 0.0}
+    now[0] = 2.5
+    stages.begin_write()
+    now[0] = 3.0
+    first = stages.seconds()
+    now[0] = 4.0
+    assert first == {"check": 2.5, "read": 0.4, "plan": 0.3, "write": 0.5}
+    assert stages.seconds() == {"check": 2.5, "read": 0.4, "plan": 0.3, "write": 1.5}
+
+
 # ---- the write, with a fake source and Lakebase --------------------------------------------------------------------
 
 class Source:
@@ -180,9 +198,14 @@ def _beat_after_commit(store, tasks):
 
 
 class ByDatabaseTasks(Tasks):
+    def __init__(self):
+        super().__init__()
+        self.progress_history = []
+
     def execute(self, sql, params=()):
         if sql == q.task_progress_json_sql():
             self.rows[params[2]].update(progress=json.loads(params[0]), done=params[1])
+            self.progress_history.append(json.loads(params[0]))
             return
         super().execute(sql, params)
 
@@ -259,6 +282,7 @@ class ByDatabaseCursor(FakeCursor):
         elif sql == q.task_progress_json_sql():
             self.db.statements.append((sql, params))
             self.tasks.rows[params[2]].update(progress=json.loads(params[0]), done=params[1])
+            self.tasks.progress_history.append(json.loads(params[0]))
         elif sql == q.task_job_sql():
             self.db.statements.append((sql, params))
             self.tasks.rows[params[1]]["job_id"] = params[0]
@@ -343,6 +367,11 @@ def big(monkeypatch):
     return c
 
 
+def _without_seconds(progress: dict) -> dict:
+    """A task's progress with its stage seconds left out: the seconds are measured, so a test checks the counts."""
+    return {key: value for key, value in progress.items() if key != "seconds"}
+
+
 def _create(client, request_id="big-1", dry_run=False):
     return client.post("/api/ingestion-jobs", json={"name": "Big job", "settings": FAN_IN, "dry_run": dry_run,
                                                     "request_id": request_id,
@@ -356,8 +385,9 @@ def test_a_big_create_is_a_task_that_writes_its_databases_in_transactions(big):
     done = big.get(f"/api/tasks/{r.json()['task']['id']}").json()
     assert done["status"] == "succeeded" and done["job_id"] == 7 and done["result"]["summary"]["tables"] == 150
     assert len(big.store.controls) == 150 and big.synced == [7]
-    assert big.tasks.rows[1]["progress"] == {"stage": "writing", "databases_total": 30, "databases_written": 30,
-                                             "tables_written": 150}
+    assert _without_seconds(big.tasks.rows[1]["progress"]) == {
+        "stage": "writing", "databases_total": 30, "databases_written": 30, "tables_written": 150}
+    assert set(big.tasks.rows[1]["progress"]["seconds"]) == {"check", "read", "plan", "write"}
     assert big.store.transactions == 1 + 1 + 1       # the job, the 150 tables in one transaction, then the result
     assert {g for _, g in big.store.members} == {row["task_collection"] for row in big.store.controls}
 
@@ -399,7 +429,8 @@ def test_a_database_that_fails_takes_its_transaction_and_the_same_request_finish
     big.tasks.run()
     failed = big.get("/api/tasks/1").json()
     assert failed["status"] == "failed" and failed["error"] == "the source went away"
-    assert failed["progress"] == {"stage": "writing", "databases_total": 30, "databases_written": 20, "tables_written": 100}
+    assert _without_seconds(failed["progress"]) == {
+        "stage": "writing", "databases_total": 30, "databases_written": 20, "tables_written": 100}
     assert len(big.store.controls) == 100 and big.synced == []    # the third transaction was rolled back
     big.store.fail_on = None
     before = big.store.control_statements
@@ -410,6 +441,22 @@ def test_a_database_that_fails_takes_its_transaction_and_the_same_request_finish
     assert done["status"] == "succeeded" and done["job_id"] == 7
     assert len(big.store.controls) == 150 and big.store.schedules == [7] and big.synced == [7]
     assert big.store.control_statements - before == 1           # eng_020 to eng_029 only, in one statement
+
+
+def test_a_big_create_reports_where_its_seconds_go_on_every_progress_write_and_they_only_grow(big, monkeypatch):
+    ticks = iter(range(10_000))
+    monkeypatch.setattr(bd, "_now", lambda: next(ticks) * 0.25)
+    _create(big)
+    big.tasks.run()
+    history = big.tasks.progress_history
+    assert [progress["stage"] for progress in history] == ["checking", "writing"]
+    seconds = [progress["seconds"] for progress in history]
+    assert all(set(values) == {"check", "read", "plan", "write"} for values in seconds)
+    for key in ("check", "read", "plan", "write"):
+        values = [values[key] for values in seconds]
+        assert all(round(value, 1) == value for value in values), key
+        assert values == sorted(values) and values[0] < values[-1], key
+    assert seconds[0]["write"] == 0.0
 
 
 def test_the_same_request_id_after_success_answers_the_task_and_starts_nothing(big):
