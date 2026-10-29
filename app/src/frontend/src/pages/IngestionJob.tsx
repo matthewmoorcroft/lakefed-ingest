@@ -219,7 +219,8 @@ export default function IngestionJob() {
           {j.delete ? (deletion?.runAgain
             ? <button className="danger" disabled={remove.isPending} onClick={() => remove.mutate(!!j.delete.drop_targets)}>
                 {remove.isPending ? "Starting the delete…" : "Run again"}</button>
-            : <button disabled title="The job's delete is pending: this page is read only until it has finished">Deleting…</button>)
+            : <button disabled title={deletion?.tone === "bad" ? deletion.text : "The job's delete is pending: this page is read only until it has finished"}>
+                {deletion?.tone === "bad" ? "Delete failed" : "Deleting…"}</button>)
             : <>
                 <Menu label="⋮" title="More actions">
                   <button className="danger-text" disabled={!!j.delete_blocked || remove.isPending} title={j.delete_blocked ?? undefined}
