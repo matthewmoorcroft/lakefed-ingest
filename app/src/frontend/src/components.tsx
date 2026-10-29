@@ -528,6 +528,7 @@ export function Modal({ title, action, danger, actionDisabled, onClose, children
         <h2 id={id}>{title}</h2>
         {children && <div className="modal-body">{children}</div>}
         <div className="modal-actions">
+          {actionDisabled && <span className="modal-why muted" role="status">{actionDisabled}</span>}
           <button ref={cancel} onClick={() => onClose(false)}>Cancel</button>
           <button className={danger ? "danger" : "primary"} disabled={!!actionDisabled} title={actionDisabled}
             onClick={() => onClose(true)}>{action}</button>

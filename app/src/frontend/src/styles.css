@@ -336,6 +336,9 @@ button.th-sort { border: 0; background: transparent; padding: 0; font: inherit; 
 .modal-body { color: var(--text); }
 .modal-body p { margin: 0 0 var(--db-space-2); }
 .modal-actions { display: flex; justify-content: flex-end; gap: var(--db-space-2); margin-top: var(--db-space-4); }
+/* Why the dialog's action is off, said beside it rather than only in a tooltip. */
+.modal-actions .modal-why { margin-right: auto; align-self: center; min-width: 0; }
+.modal-actions > button { flex-shrink: 0; white-space: nowrap; }
 
 /* A job run opened to its group runs, as a Databricks run's task list under its row. */
 .run-groups { padding: 4px 8px 10px 28px; }

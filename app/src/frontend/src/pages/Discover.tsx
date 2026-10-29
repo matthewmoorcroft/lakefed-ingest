@@ -1,10 +1,11 @@
-import { Fragment, useState } from "react";
+import { Fragment, useEffect, useState } from "react";
 import { keepPreviousData, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, qs, type Row } from "../api";
 import { ErrorBox, Modal, Notice, OutLink, Pager, Tag, fmtInt, plural } from "../components";
 import { useSettings } from "../App";
 import { DatabaseTables } from "./SourcePick";
 import { serverRowPick, underFilter, type Pick } from "./pickState";
+import { connectionNextBlock, discoveryWait, waitingSince, type RunWait } from "../pending";
 
 // Add tables, Discover on a source: as Lakeflow Connect's Connection and Source steps. Step 1 is the Unity Catalog
 // connection, tested before anything is discovered; step 2 picks the whole server, whole databases or single tables in
@@ -16,11 +17,30 @@ export type { Pick };
 const RUNNING = new Set(["PENDING", "QUEUED", "RUNNING", "TERMINATING", "BLOCKED", "WAITING_FOR_RETRY"]);
 const wait = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
-/** Start a discovery through the connection and wait for its run to end; its id, or the reason it failed. */
-async function discover(connection: string, request: Row): Promise<string> {
+/** A discovery run the dialog waits on: its state as last read, when the page started it, and what it does once going. */
+type DialogWait = { wait: RunWait | null; asked: Date; reading: string };
+
+/** Now, read again every second while `on`, so a wait's time so far keeps counting on the page. */
+function useNow(on: boolean): Date {
+  const [now, setNow] = useState(() => new Date());
+  useEffect(() => {
+    if (!on) return;
+    setNow(new Date());
+    const timer = setInterval(() => setNow(new Date()), 1000);
+    return () => clearInterval(timer);
+  }, [on]);
+  return now;
+}
+
+/** Start a discovery through the connection and wait for its run to end; its id, or the reason it failed. onWait hears
+ *  each change of the run's state with when the page first saw it, so the page can say what it waits for. */
+async function discover(connection: string, request: Row, onWait?: (wait: RunWait) => void): Promise<string> {
   const started = await api.post<Row>("/discoveries/source", { src_connection: connection, ...request });
+  let waiting: RunWait | null = null;
   for (;;) {
     const run = await api.get<Row>(`/discoveries/runs/${started.run_id}`);
+    const next = waitingSince(waiting, String(run.state ?? ""), new Date());
+    if (next !== waiting) { waiting = next; onWait?.(next); }
     if (!RUNNING.has(run.state)) {
       if (run.result && run.result !== "SUCCESS") {
         const rows = await api.get<Row[]>(`/discoveries/${started.discovery_id}/databases`);
@@ -35,8 +55,9 @@ async function discover(connection: string, request: Row): Promise<string> {
 
 /** Read the tables of some databases into Lakebase: the discovery's id, and each database that couldn't be read with
  *  the first line of why. A database the login can name but not open fails on its own; the others are still read. */
-async function readTables(connection: string, request: Row): Promise<{ id: string; failed: [string, string][] }> {
-  const id = await discover(connection, request);
+async function readTables(connection: string, request: Row, onWait?: (wait: RunWait) => void):
+    Promise<{ id: string; failed: [string, string][] }> {
+  const id = await discover(connection, request, onWait);
   const rows = await api.get<Row[]>(`/discoveries/${id}/databases`);
   return { id, failed: rows.filter((r) => r.status === "failed").map((r) => [r.src_database, String(r.error ?? "").split("\n")[0]]) };
 }
@@ -75,8 +96,9 @@ function TypedDatabases({ onUse }: { onUse: (names: string[]) => void }) {
   );
 }
 
-function Step1({ chosen, setChosen, tested, setTested }: { chosen: string; setChosen: (c: string) => void;
-                 tested: Row | null; setTested: (t: Row | null) => void }) {
+function Step1({ chosen, setChosen, tested, setTested, waiting, setWaiting }: { chosen: string; setChosen: (c: string) => void;
+                 tested: Row | null; setTested: (t: Row | null) => void; waiting: string | null;
+                 setWaiting: (wait: DialogWait | null) => void }) {
   const { config } = useSettings();
   const [how, setHow] = useState<"existing" | "create">("existing");
   const [search, setSearch] = useState("");
@@ -101,12 +123,16 @@ function Step1({ chosen, setChosen, tested, setTested }: { chosen: string; setCh
   const found: Row[] = (list.data?.connections ?? []).filter((c: Row) => c.discoverable && c.name.toLowerCase().includes(search.toLowerCase()));
   const test = async () => {
     setTesting(true); setError(null); setTested(null);
+    const asked = new Date();
+    const reading = "Reading the server's databases";
+    setWaiting({ wait: null, asked, reading });
     try {
-      const id = await discover(chosen, { kind: "list", ...(pattern.trim() ? { pattern: pattern.trim() } : {}), ...azure });
+      const id = await discover(chosen, { kind: "list", ...(pattern.trim() ? { pattern: pattern.trim() } : {}), ...azure },
+                                (wait) => setWaiting({ wait, asked, reading }));
       const rows = await api.get<Row[]>(`/discoveries/${id}/databases`);
       setTested({ discovery_id: id, databases: rows.filter((r) => r.status === "listed").map((r) => r.src_database),
                   pattern: pattern.trim(), azure });
-    } catch (e) { setError(e); } finally { setTesting(false); }
+    } catch (e) { setError(e); } finally { setTesting(false); setWaiting(null); }
   };
   return (
     <>
@@ -138,7 +164,7 @@ function Step1({ chosen, setChosen, tested, setTested }: { chosen: string; setCh
             <label className="inline">Databases matching<input className="search" placeholder="all, or e.g. lfc_eng_%" value={pattern}
               onChange={(e) => { setPattern(e.target.value); setTested(null); }} /></label>
             <button disabled={!chosen || testing} onClick={test}>{testing ? "Testing…" : "Test connection"}</button>
-            {testing && <span className="muted">Reading the server's databases: a few minutes when the discovery cluster starts cold.</span>}
+            {testing && <span className="muted">{waiting ?? "Testing the connection"}.</span>}
             {!testing && !tested && <span className="muted">% matches any characters and _ any one, as in SQL Server; blank lists every database.</span>}
             {tested && <span><Tag tone="ok">{tested.typed ? "Typed" : "Connected"}</Tag> <span className="muted">{tested.typed ? "uses" : "reads"}{" "}
               {fmtInt(tested.databases.length)} {plural(tested.databases.length, "database")} through {chosen}</span></span>}
@@ -300,6 +326,10 @@ export function DiscoverDialog({ onClose }: { onClose: (pick: DiscoveredPick | n
   const [read, setRead] = useState<Record<string, string>>({});
   const [failed, setFailed] = useState<[string, string][]>([]);
   const [error, setError] = useState<unknown>(null);
+  // What a discovery run the dialog waits on is doing, and since when: the connection test, or the reading on Add.
+  const [waiting, setWaiting] = useState<DialogWait | null>(null);
+  const now = useNow(waiting !== null);
+  const waitText = waiting ? discoveryWait(waiting.wait, waiting.asked, waiting.reading, now) : null;
   const discoveryId: string | null = tested?.discovery_id ?? null;
   const typedNames: string[] = discoveryId == null ? (tested?.databases ?? []) : [];
   const whole = Object.keys(picks).filter((d) => picks[d] === "all" && !coveredByServer(wholeServer, d));
@@ -313,10 +343,15 @@ export function DiscoverDialog({ onClose }: { onClose: (pick: DiscoveredPick | n
   // tested pattern, so the databases picked one by one are in it already.
   const finish = async () => {
     setStep(3); setError(null);
+    const asked = new Date();
+    const reading = "Reading the chosen databases' tables";
+    const onWait = (wait: RunWait) => setWaiting({ wait, asked, reading });
+    setWaiting({ wait: null, asked, reading });
     try {
       let readServer = serverRead;
       if (wholeServer.on && !readServer) {
-        const got = await readTables(connection, { whole_server: true, ...(tested?.pattern ? { pattern: tested.pattern } : {}), ...(tested?.azure ?? {}) });
+        const got = await readTables(connection, { whole_server: true, ...(tested?.pattern ? { pattern: tested.pattern } : {}), ...(tested?.azure ?? {}) },
+                                     onWait);
         if (got.failed.length) { setFailed(() => got.failed); setStep(2); return; }
         readServer = got.id; setServerRead(got.id);
       }
@@ -324,7 +359,7 @@ export function DiscoverDialog({ onClose }: { onClose: (pick: DiscoveredPick | n
       const ids = new Set([...(readServer ? [readServer] : []), ...Object.values(read)]);
       if (unread.length) {
         // Databases typed by hand are read by name.
-        const got = await readTables(connection, { databases: unread });
+        const got = await readTables(connection, { databases: unread }, onWait);
         ids.add(got.id);
         if (got.failed.length) {
           // Keep what was read, and say which databases weren't, before anything is added.
@@ -339,11 +374,11 @@ export function DiscoverDialog({ onClose }: { onClose: (pick: DiscoveredPick | n
                        databases: whole.map((d) => ({ server: connection, database: d })), tables };
       const label = wholeServer.on ? `${connection}, ${chosenWords}` : `${chosenWords} on ${connection}`;
       onClose({ source, label });
-    } catch (e) { setError(e); setStep(2); }
+    } catch (e) { setError(e); setStep(2); } finally { setWaiting(null); }
   };
   const title = step === 1 ? "Add tables · Step 1 of 2: the connection" : `Add tables · Step 2 of 2: choose on ${connection}`;
-  const blocked = step === 1 ? (tested ? undefined : "Test the connection first")
-    : step === 3 ? "Reading the chosen databases' tables" : chosen ? undefined : "Choose the server, databases or tables first";
+  const blocked = step === 1 ? connectionNextBlock(Boolean(tested), waitText)
+    : step === 3 ? waitText ?? "Reading the chosen databases' tables" : chosen ? undefined : "Choose the server, databases or tables first";
   return (
     <Modal title={title} action={step === 1 ? "Next: choose tables" : step === 3 ? "Reading…" : "Add the tables chosen"}
       actionDisabled={blocked} onClose={(ok) => {
@@ -354,11 +389,12 @@ export function DiscoverDialog({ onClose }: { onClose: (pick: DiscoveredPick | n
       <div className="discover">
         {step === 1 && <p className="muted">Discover is the first choice: it reads the tables through the connection. A CSV upload
           is the fallback, for a list Discover can't find.</p>}
-        {step === 1 && <Step1 chosen={connection} setChosen={setConnection} tested={tested} setTested={setTested} />}
+        {step === 1 && <Step1 chosen={connection} setChosen={setConnection} tested={tested} setTested={setTested}
+          waiting={waitText} setWaiting={setWaiting} />}
         {step >= 2 && <Step2 connection={connection} discoveryId={discoveryId} typedNames={typedNames} picks={picks} setPicks={setPicks}
           wholeServer={wholeServer} setWholeServer={setWholeServer} read={read} setRead={setRead} failed={failed} setFailed={setFailed} />}
-        {step === 3 && <p className="muted">Reading the tables of what was chosen: a few minutes when the discovery cluster starts cold.
-          The tables are added to the job's page when it ends.</p>}
+        {step === 3 && <p className="muted">{waitText ?? "Reading the tables of what was chosen"}. The tables are added to the job's
+          page when it ends.</p>}
         {step === 2 && chosen > 0 && <p className="muted">{chosenWords} chosen.</p>}
         <ErrorBox error={error} />
       </div>

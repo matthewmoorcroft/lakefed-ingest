@@ -244,3 +244,43 @@ export function rediscoveryNotice(progress: RediscoveryProgress | null | undefin
       return { tone: "ok", text: `Re-discovery done: found ${progress.found ?? 0} to add, added ${progress.added ?? 0}.` };
   }
 }
+
+/** A discovery run's state and when the page first saw it: the time a wait is said to have begun. */
+export interface RunWait { state: string; since: Date }
+
+const COMPUTE_WAIT = new Set(["QUEUED", "PENDING", "BLOCKED", "WAITING_FOR_RETRY"]);
+
+/** The wait after a new reading of the run's state: the same wait (and its time) while it holds, queued and pending
+ *  counting as one wait for compute, else a new one from now. */
+export function waitingSince(current: RunWait | null, state: string, now: Date): RunWait {
+  if (current && (current.state === state || (COMPUTE_WAIT.has(current.state) && COMPUTE_WAIT.has(state)))) return current;
+  return { state, since: now };
+}
+
+const clock = (at: Date) => `${String(at.getHours()).padStart(2, "0")}:${String(at.getMinutes()).padStart(2, "0")}`;
+
+function elapsed(since: Date, now: Date): string {
+  const seconds = Math.max(0, Math.floor((now.getTime() - since.getTime()) / 1000));
+  return seconds < 60 ? `${seconds} s` : `${Math.floor(seconds / 60)} min ${seconds % 60} s`;
+}
+
+/** What a discovery run waits for, in plain words with how long so far and the time it began, so a button it holds
+ *  off never just says no: "Waiting for compute" while Databricks queues the run or starts its serverless compute,
+ *  then `reading` once the run is going. `asked` is when the page started the run, for before its first state. */
+export function discoveryWait(wait: RunWait | null, asked: Date, reading: string, now: Date = new Date()): string {
+  const since = wait?.since ?? asked;
+  const time = `${elapsed(since, now)} so far, since ${clock(since)}`;
+  if (!wait) return `Starting the discovery job: ${time}`;
+  if (COMPUTE_WAIT.has(wait.state)) {
+    return `Waiting for compute: ${time}. The discovery job's serverless compute is starting, which can take a few minutes`;
+  }
+  return `${reading}: ${time}`;
+}
+
+/** Why Next is off on the connection step: it needs a passed connection test, and while the test runs, what it is
+ *  doing (its first sentence: the rest is said beside the test). Nothing once the test has passed. */
+export function connectionNextBlock(passed: boolean, testing: string | null): string | undefined {
+  if (passed) return undefined;
+  if (testing) return `Next needs a passed connection test. Testing now: ${testing.split(". ")[0]}`;
+  return "Next needs a passed connection test: choose a connection, then Test connection";
+}

@@ -2,7 +2,7 @@
 // strips the types in pending.ts as it loads it). frontend_pending_test.py runs this file from pytest.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { changeInProgress, deleteNotice, isUnconfirmed, requestWriteNotice, runButton, runTimeoutNotice, rediscoveryBusy, rediscoveryButton, rediscoveryNotice, saveNotice, setupRunBlocks, setupRunNotice, syncFailureLines }
+import { changeInProgress, connectionNextBlock, deleteNotice, discoveryWait, waitingSince, isUnconfirmed, requestWriteNotice, runButton, runTimeoutNotice, rediscoveryBusy, rediscoveryButton, rediscoveryNotice, saveNotice, setupRunBlocks, setupRunNotice, syncFailureLines }
   from "../../src/frontend/src/pending.ts";
 
 const IDLE = { phase: "idle", timed_out: false, run_url: null, blocked: null, refused: null };
@@ -355,4 +355,47 @@ test("a re-discovery whose start failed says so, and nothing when none has run",
   assert.deepEqual(rediscoveryNotice(null, false, new Error("409 already running")),
     { tone: "bad", text: "Re-discovery did not start: 409 already running." });
   assert.equal(rediscoveryNotice(null, false, null), null);
+});
+
+// Local times, as the page shows them: 20:42 and 20:45 on 29 Oct.
+const ASKED = new Date(2026, 9, 29, 20, 42, 46);
+const RUNNING_FROM = new Date(2026, 9, 29, 20, 45, 31);
+const LATER = new Date(2026, 9, 29, 20, 45, 30);
+
+test("a discovery run says what it waits for, for how long and since when, from its state", () => {
+  assert.equal(discoveryWait(null, ASKED, "Reading the server's databases", ASKED),
+               "Starting the discovery job: 0 s so far, since 20:42");
+  for (const state of ["QUEUED", "PENDING", "BLOCKED", "WAITING_FOR_RETRY"]) {
+    assert.equal(discoveryWait({ state, since: ASKED }, ASKED, "Reading the server's databases", LATER),
+                 "Waiting for compute: 2 min 44 s so far, since 20:42. The discovery job's serverless compute is starting, "
+                 + "which can take a few minutes");
+  }
+  const reading = { state: "RUNNING", since: RUNNING_FROM };
+  assert.equal(discoveryWait(reading, ASKED, "Reading the server's databases", new Date(2026, 9, 29, 20, 45, 47)),
+               "Reading the server's databases: 16 s so far, since 20:45");
+  assert.equal(discoveryWait({ state: "TERMINATING", since: RUNNING_FROM }, ASKED, "Reading", RUNNING_FROM),
+               "Reading: 0 s so far, since 20:45");
+});
+
+test("the time a state began is kept while the state holds, and moves when it changes", () => {
+  const first = waitingSince(null, "PENDING", ASKED);
+  assert.deepEqual(first, { state: "PENDING", since: ASKED });
+  assert.equal(waitingSince(first, "PENDING", RUNNING_FROM), first);
+  assert.equal(waitingSince(first, "QUEUED", RUNNING_FROM), first, "queued and pending are one wait for compute");
+  assert.deepEqual(waitingSince(first, "RUNNING", RUNNING_FROM), { state: "RUNNING", since: RUNNING_FROM });
+});
+
+test("times before ten in the morning keep their leading zero, and an hour reads as minutes", () => {
+  const at = new Date(2026, 9, 29, 9, 5);
+  assert.equal(discoveryWait({ state: "RUNNING", since: at }, at, "Reading", new Date(2026, 9, 29, 10, 6, 3)),
+               "Reading: 61 min 3 s so far, since 09:05");
+});
+
+test("Next on the connection step says it needs a passed test, and what the test is doing while it runs", () => {
+  assert.equal(connectionNextBlock(false, null), "Next needs a passed connection test: choose a connection, then Test connection");
+  assert.equal(connectionNextBlock(false, "Waiting for compute: 5 s so far, since 20:42"),
+               "Next needs a passed connection test. Testing now: Waiting for compute: 5 s so far, since 20:42");
+  assert.equal(connectionNextBlock(false, discoveryWait({ state: "PENDING", since: ASKED }, ASKED, "Reading", LATER)),
+               "Next needs a passed connection test. Testing now: Waiting for compute: 2 min 44 s so far, since 20:42");
+  assert.equal(connectionNextBlock(true, null), undefined);
 });
