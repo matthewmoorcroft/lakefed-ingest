@@ -651,6 +651,11 @@ def ct_begin_version(cfg: dict, slots=None) -> Optional[int]:
 CT_TABLE_NOT_ENABLED_MSG = ("Change Tracking is not enabled on this source table "
                             "(CHANGE_TRACKING_MIN_VALID_VERSION() is NULL); enable it, then the table re-seeds")
 
+# OBJECT_ID is NULL: no such table at the source, or the login cannot see it. Its CT state is NULL too, so this is
+# checked first, or a missing table would read as one with Change Tracking off.
+SOURCE_TABLE_NOT_FOUND_MSG = ("source table not found: {table} does not exist at the source, or the login cannot "
+                              "see it; check src_schema and src_table")
+
 
 def require_table_ct(cfg: dict, slots=None) -> int:
     """Raise unless Change Tracking is enabled on the TABLE; returns its min valid version. The seed
@@ -1385,11 +1390,13 @@ def committed_clients(spark, sink_fqn: str, cfgs, run_id, slots=None) -> set:
 
 def seed_prep_sql(cfg: dict) -> str:
     """What a CT seed needs before it reads, in one query: the database's CT version (V0, captured
-    BEFORE the seed), the table's min valid version (NULL: CT is off on it) and its begin_version."""
+    BEFORE the seed), the table's min valid version (NULL: CT is off on it), its begin_version, and its
+    object id (NULL: the table is not there)."""
     obj = quote_nstr(f"{quote_ident(cfg['src_schema'])}.{quote_ident(cfg['src_table'])}")
     return (f"SELECT CAST({int(cfg['id'])} AS BIGINT) AS control_id, "
             "CAST(CHANGE_TRACKING_CURRENT_VERSION() AS BIGINT) AS v, "
             f"CAST(CHANGE_TRACKING_MIN_VALID_VERSION(OBJECT_ID({obj})) AS BIGINT) AS mv, "
+            f"CAST(OBJECT_ID({obj}) AS BIGINT) AS oid, "
             "(SELECT CAST(begin_version AS BIGINT) FROM sys.change_tracking_tables "
             f"WHERE object_id = OBJECT_ID({obj})) AS bv")
 
@@ -1426,6 +1433,9 @@ def prepare_seed(spark, cfg: dict, slots=None) -> Tuple[int, Optional[int]]:
         row = _read(spark, cfg, seed_prep_sql(cfg)).first()
     if row is None or row["v"] is None:
         raise RuntimeError(CT_NOT_ENABLED_MSG)
+    if row["oid"] is None:
+        raise RuntimeError(SOURCE_TABLE_NOT_FOUND_MSG.format(
+            table=f"{quote_ident(cfg['src_schema'])}.{quote_ident(cfg['src_table'])}"))
     if row["mv"] is None:
         raise RuntimeError(CT_TABLE_NOT_ENABLED_MSG)
     return int(row["v"]), (int(row["bv"]) if row["bv"] is not None else None)
