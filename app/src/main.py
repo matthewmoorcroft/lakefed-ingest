@@ -228,22 +228,55 @@ def config(request: Request):
 MONITOR_CACHE_S = max(0, int(os.environ.get("MONITOR_CACHE_S", "15")))
 _shared_reads: dict = {}
 _shared_lock = threading.Lock()
+_shared_computing: dict = {}     # key: the lock its one compute holds, so other requests wait for it
+_shared_generation = [0]         # bumped by every committed write: a read begun before it isn't kept
 
 
 def _shared(key, compute, ttl=None):
     """compute() at most once per `ttl` seconds (MONITOR_CACHE_S by default) for key, shared by every
-    request."""
+    request. When it is due, one request computes it and the others asking meanwhile wait for that result
+    instead of running the same query. A read that a write committed during is returned but not kept."""
     ttl = MONITOR_CACHE_S if ttl is None else ttl
-    if ttl:
+    if not ttl:
+        return compute()
+
+    def fresh():
+        hit = _shared_reads.get(key)
+        return hit if hit and time.time() - hit[1] < ttl else None
+
+    with _shared_lock:
+        hit = fresh()
+        if hit:
+            return hit[0]
+        computing = _shared_computing.setdefault(key, threading.Lock())
+    with computing:
         with _shared_lock:
-            hit = _shared_reads.get(key)
-            if hit and time.time() - hit[1] < ttl:
+            hit = fresh()
+            if hit:
                 return hit[0]
-    value = compute()
-    if ttl:
+            generation = _shared_generation[0]
+        value = compute()
         with _shared_lock:
-            _shared_reads[key] = (value, time.time())
+            if generation == _shared_generation[0]:
+                _shared_reads[key] = (value, time.time())
     return value
+
+
+def _forget_shared_reads() -> None:
+    """Drop every shared read, so the pages show a change as soon as it is committed rather than up to a minute
+    later."""
+    with _shared_lock:
+        _shared_generation[0] += 1
+        _shared_reads.clear()
+
+
+@contextmanager
+def _write():
+    """db.transaction, then the shared reads forgotten once it has committed: every write the app makes (tables,
+    settings, jobs, schedules, imports) goes through it."""
+    with db.transaction() as cur:
+        yield cur
+    _forget_shared_reads()
 
 
 # Table states change at run cadence, so the one per-database scan they come from is shared for longer
@@ -835,7 +868,7 @@ def ingestion_job_cluster(job_id: int, request: Request):
         state = jobs.run_state(run_id)
         applying = {"run_id": run_id, "state": state["state"], "result": state["result"], "url": state["url"]}
         if state["state"] in ("TERMINATED", "SKIPPED", "INTERNAL_ERROR"):
-            with db.transaction() as cur:
+            with _write() as cur:
                 cur.execute(q.clear_schedule_option_sql(), ("cluster_copy_run_id", int(job_id)))
             if state["result"] == "SUCCESS":
                 _sync(job_id, _user(request))
@@ -915,7 +948,7 @@ def edit_ingestion_job_settings(job_id: int, body: JobSettingsRequest, request: 
             return checked(fetch, groups)[1]
     _refuse_job_tables(_load_schedule(job_id)[0], groups, request)
     try:
-        with db.transaction() as cur:
+        with _write() as cur:
             groups = _lock_job(cur, job_id)
             _lock_collections(cur, groups)
             fetch = lambda sql, params=(): db.fetch(cur, sql, params)
@@ -1020,7 +1053,7 @@ def enable_job_tables(job_id: int, body: JobEnableRequest, request: Request):
     """Enable or disable a job's tables on a server, in a database, or one table in every database."""
     _refuse_job_tables(_load_schedule(job_id)[0], _job_groups(job_id), request)
     batch = uuid.uuid4().hex[:12]
-    with db.transaction() as cur:
+    with _write() as cur:
         groups = _lock_job(cur, job_id)
         ids = _job_row_ids(cur, groups, body) if groups else []
         if not ids:
@@ -1056,7 +1089,7 @@ def edit_job_table(job_id: int, body: JobTableEditRequest, request: Request):
     groups = _job_groups(job_id)
     if not body.dry_run:
         _refuse_job_tables(_load_schedule(job_id)[0], groups, request)
-    with db.transaction() as cur:
+    with _write() as cur:
         groups = _lock_job(cur, job_id)
         ids = _job_row_ids(cur, groups, body) if groups else []
         rows = _locked_rows(cur, ids) if ids else []
@@ -1115,7 +1148,7 @@ def add_job_databases(job_id: int, body: JobDatabasesRequest, request: Request):
         return {"summary": summary}
     _refuse_job_tables(job, groups + plan["new_groups"], request)
     user, batch = _user(request), uuid.uuid4().hex[:12]
-    with db.transaction() as cur:
+    with _write() as cur:
         groups = _lock_job(cur, job_id)
         rows = db.fetch(cur, q.groups_control_rows_sql(for_update=True), (groups,)) if groups else []
         plan, summary = planned(rows)
@@ -1179,7 +1212,7 @@ def add_job_tables(job_id: int, body: JobTablesRequest, request: Request):
         return {"summary": nj.summary(plan), "applied": False}
     _refuse_job_tables(job, groups + plan["groups"], request)
     user, batch = _user(request), uuid.uuid4().hex[:12]
-    with db.transaction() as cur:
+    with _write() as cur:
         groups = _lock_job(cur, job_id)
         plan = planned(db.fetch(cur, q.groups_control_rows_sql(for_update=True), (groups,)) if groups else [])
         summary = nj.summary(plan)
@@ -1454,7 +1487,7 @@ class EnableRequest(Ids):
 def set_enabled(body: EnableRequest, request: Request):
     batch = uuid.uuid4().hex[:12]
     checked = _refuse_rows_groups(body.ids, request)
-    with db.transaction() as cur:
+    with _write() as cur:
         rows = _locked_rows(cur, body.ids)
         _recheck_locked_rows(rows, checked, request)
         _lock_collections(cur, [r["task_collection"] for r in rows])
@@ -1471,7 +1504,7 @@ def set_enabled(body: EnableRequest, request: Request):
 def reseed(body: Ids, request: Request):
     batch = uuid.uuid4().hex[:12]
     checked = _refuse_rows_groups(body.ids, request)
-    with db.transaction() as cur:
+    with _write() as cur:
         rows = _locked_rows(cur, body.ids)
         _recheck_locked_rows(rows, checked, request)
         _lock_collections(cur, [r["task_collection"] for r in rows])
@@ -1491,7 +1524,7 @@ def add_table(row: dict, request: Request):
     errs = q.validate_control_row(row)
     if errs:
         raise HTTPException(422, {"errors": errs})
-    with db.transaction() as cur:
+    with _write() as cur:
         _lock_collections(cur, [row.get("task_collection")])
         cur.execute(q.insert_control_sql(), q.control_params(row))
         new_id = cur.fetchone()[0]
@@ -1532,7 +1565,7 @@ def edit_tables(body: EditRequest, request: Request):
         _refuse_groups_outside_jobs([new_coll])
         checked = _refuse_rows_groups(body.ids, request, also=[new_coll])
     try:
-        with db.transaction() as cur:
+        with _write() as cur:
             rows = _locked_rows(cur, body.ids)
             plans = q.plan_edit(rows, body.changes, bulk=bulk)
             summary = {"rows": len(plans), "changed": sum(1 for p in plans if p["changes"]),
@@ -1754,7 +1787,7 @@ def register(discovery_id: str, body: RegisterRequest, request: Request):
         _refuse_groups_outside_jobs([body.task_collection])
         _refuse_groups([body.task_collection], request)
         batch = uuid.uuid4().hex[:12]
-        with db.transaction() as cur:
+        with _write() as cur:
             _lock_collections(cur, [body.task_collection])
             for name, row in valid:
                 cur.execute(q.insert_control_if_absent_sql(), q.control_params(row))
@@ -1818,7 +1851,7 @@ def import_csv(body: ImportRequest, request: Request):
         _refuse_groups_outside_jobs([group])
         _refuse_groups([group], request)
         batch = uuid.uuid4().hex[:12]
-        with db.transaction() as cur:
+        with _write() as cur:
             _lock_collections(cur, [group])
             plan = planned(db.fetch(cur, q.collection_control_rows_sql(), (group,)))
             invalid = counted(plan["lines"]).get("invalid")
@@ -1959,7 +1992,7 @@ def _apply_cluster(sid: int) -> Optional[str]:
         run_id = jobs.start_cluster_copies(sid)
     except Exception as e:
         return f"the cluster copies job didn't start: {str(e).split('. ')[0]}"
-    with db.transaction() as cur:
+    with _write() as cur:
         cur.execute(q.set_schedule_option_sql(), (["cluster_copy_run_id"], run_id, int(sid)))
     return None
 
@@ -1969,7 +2002,7 @@ def _sync(sid: int, user: str) -> List[dict]:
     schedule's sync lock, with the members read after taking it, so concurrent syncs don't both create a
     job. A failed sync never raises once the schedule's change is committed: errors are per member."""
     batch = uuid.uuid4().hex[:12]
-    with db.transaction() as cur:
+    with _write() as cur:
         cur.execute(q.schedule_lock_sql(), (q.SCHEDULE_LOCK_CLASS, q.schedule_lock_key(sid)))
         s, members = _load_schedule(sid, cur)
         active = [m for m in members if m["removed_at"] is None]
@@ -2089,7 +2122,7 @@ def create_schedule(body: ScheduleBody, request: Request):
         _refuse(_permission_refusals({"job_variant": body.job_variant}, user)["run"])
     batch = uuid.uuid4().hex[:12]
     try:
-        with db.transaction() as cur:
+        with _write() as cur:
             cur.execute(q.insert_schedule_sql(), (body.name.strip(), body.cadence_minutes, body.timezone,
                                                   json.dumps(body.parameters), body.job_variant or "default",
                                                   body.stagger, body.paused, body.notify_emails or None,
@@ -2164,7 +2197,7 @@ def create_ingestion_job(body: NewJobRequest, request: Request):
     offs = sch.offsets(plan["groups"], run.cadence_minutes, run.stagger, sch.start_minute({"options": options, "cadence_minutes": run.cadence_minutes}))
     batch = uuid.uuid4().hex[:12]
     try:
-        with db.transaction() as cur:
+        with _write() as cur:
             _lock_collections(cur, plan["groups"])
             cur.execute(q.insert_schedule_sql(), (name, run.cadence_minutes, timezone_, json.dumps(run.parameters),
                                                   run.job_variant or "default", run.stagger, run.paused,
@@ -2234,7 +2267,7 @@ def update_schedule(sid: int, body: ScheduleBody, request: Request):
     offs = sch.offsets(body.members, body.cadence_minutes, body.stagger, sch.start_minute(new))
     batch = uuid.uuid4().hex[:12]
     try:
-        with db.transaction() as cur:
+        with _write() as cur:
             # Serialized with job-wide edits (_lock_job) and syncs, which read the members under this lock.
             cur.execute(q.schedule_lock_sql(), (q.SCHEDULE_LOCK_CLASS, q.schedule_lock_key(sid)))
             if changed:
@@ -2269,7 +2302,7 @@ def _set_paused(sid: int, paused: bool, request: Request):
         raise HTTPException(409, "schedule was deleted")
     _refuse_job(s, request, "change")
     if bool(s["paused"]) != paused:
-        with db.transaction() as cur:
+        with _write() as cur:
             cur.execute(q.update_schedule_sql(["paused"]), (paused, int(sid)))
             _log(cur, user, "schedule_pause" if paused else "schedule_resume", None, None, f"{s['name']}.paused",
                  s["paused"], paused)
@@ -2295,7 +2328,7 @@ def delete_schedule(sid: int, request: Request):
     s, members = _load_schedule(sid)
     _refuse_job(s, request, "delete")
     active = [m["id"] for m in members if m["removed_at"] is None]
-    with db.transaction() as cur:
+    with _write() as cur:
         cur.execute(q.delete_schedule_sql(), (int(sid),))
         if active:
             cur.execute(q.remove_members_sql(), (active,))   # their jobs are deleted by the sync below
