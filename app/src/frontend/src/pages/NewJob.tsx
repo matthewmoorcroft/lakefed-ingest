@@ -82,7 +82,8 @@ export default function NewJob() {
   const current = JSON.stringify({ ...previewBody, request_id: null });
   const settled = useSettled(current, 600);
   const preview = useQuery({
-    queryKey: ["new-job-preview", settled], enabled: !!chosen && !!name.trim(), retry: false,
+    // Shown as soon as tables are chosen: a blank name or target only holds Create back, never the preview.
+    queryKey: ["new-job-preview", settled], enabled: !!chosen, retry: false,
     queryFn: () => api.post<Row>("/ingestion-jobs", previewBody),
     // A file's database-only lines are discovered by name before the preview can count them: asked again until they are.
     refetchInterval: (query) => (query.state.data?.discovering ? 3000 : false),
@@ -133,7 +134,9 @@ export default function NewJob() {
 
       <Section title="Name">
         <div className="form-grid"><label>Job name<input value={name} placeholder="e.g. Engagement extraction" onChange={(e) => setName(e.target.value)} />
-          <span className="help">Its Databricks jobs and its groups are named after it.</span></label></div>
+          <span className="help">Its Databricks jobs and its groups are named after it.</span>
+          {!name.trim() && <span className="help needed">Needed to create the job; until then the preview names its groups
+            "new job", and checks the names are free once you give one</span>}</label></div>
       </Section>
 
       <Section title="What it ingests" note="The servers, databases and tables this job ingests."
@@ -161,7 +164,6 @@ export default function NewJob() {
             {summary && Number(summary.discovered) > 0 && <p className="muted">{fmtInt(summary.discovered)} {plural(summary.discovered, "table")}
               found by name for the file's database lines{Number(summary.covered) > 0
                 ? `; ${fmtInt(summary.covered)} the file names in a row of its own, whose settings are used` : ""}.</p>}
-            {!name.trim() && <p className="muted">Name the job to check its tables.</p>}
             {(summary?.invalid ?? []).length > 0 && <Notice tone="bad">{fmtInt(summary!.invalid.length)} {plural(summary!.invalid.length, "line")} can't be
               added:<ul>{summary!.invalid.slice(0, 20).map((l: Row) => <li key={l.line}>line {l.line}, {l.table}: {l.errors.join("; ")}</li>)}</ul>
               {summary!.invalid.length > 20 && <span className="muted">and {fmtInt(summary!.invalid.length - 20)} more.</span>}</Notice>}

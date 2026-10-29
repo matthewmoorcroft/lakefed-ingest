@@ -729,3 +729,23 @@ def test_a_preview_with_its_target_set_names_nothing_missing(big):
     answer = big.post("/api/ingestion-jobs", json={"name": "Big job", "settings": FAN_IN, "dry_run": True,
                                                    "source": {"upload_id": "u1", "whole_server": True}})
     assert answer.status_code == 200 and answer.json()["target_missing"] == []
+
+
+def test_a_preview_with_no_name_and_no_target_shows_the_selection_and_names_both(big):
+    settings = {**FAN_IN, "sink_catalog": "", "sink_schema": ""}
+    answer = big.post("/api/ingestion-jobs", json={"name": "", "settings": settings, "dry_run": True,
+                                                   "source": {"upload_id": "u1", "whole_server": True}})
+    assert answer.status_code == 200
+    body = answer.json()
+    assert body["summary"]["tables"] == 150 and body["name_missing"] is True
+    assert body["target_missing"] == ["target catalog", "target schema"]
+
+
+def test_create_with_no_name_and_no_target_is_refused_naming_both(big):
+    settings = {**FAN_IN, "sink_catalog": "", "sink_schema": ""}
+    answer = big.post("/api/ingestion-jobs", json={"name": " ", "settings": settings, "dry_run": False,
+                                                   "request_id": "no-name",
+                                                   "source": {"upload_id": "u1", "whole_server": True}})
+    assert answer.status_code == 422
+    assert answer.json()["detail"]["errors"] == ["name the job", "set the target catalog", "set the target schema"]
+    assert big.store.controls == [] and big.store.schedules == []

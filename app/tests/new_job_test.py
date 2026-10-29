@@ -437,3 +437,10 @@ def test_the_target_is_needed_to_create_but_not_to_preview_the_lines():
     previewed = nj.plan("Job", text, no_target, require_target=False)
     assert previewed["errors"] == [] and len(previewed["lines"]) == 1
     assert nj.setting_errors(nj.settings_of(no_target), require_target=False) == []
+
+
+def test_a_preview_by_lines_needs_no_name_but_its_create_does(client):
+    r = _create(client, name="", settings={**FAN_IN, "sink_catalog": ""})
+    assert r.status_code == 200 and r.json()["summary"]["tables"] and r.json()["name_missing"] is True
+    r = _create(client, dry_run=False, name="", settings={**FAN_IN, "sink_catalog": ""})
+    assert r.status_code == 422 and r.json()["detail"]["errors"][:2] == ["name the job", "set the target catalog"]

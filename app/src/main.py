@@ -3262,7 +3262,8 @@ class NewJobRun(BaseModel):
 
 
 class NewJobRequest(_TablesFrom):
-    name: str = Field(min_length=1, max_length=80)
+    # Blank in a preview, which shows the tables whatever the name; Create refuses a blank name ("name the job").
+    name: str = Field(default="", max_length=80)
     settings: dict = {}
     groups_per_server: int = nj.DEFAULT_GROUPS_PER_SERVER
     run: NewJobRun = NewJobRun()
@@ -3381,22 +3382,23 @@ def _create_by_database(body: NewJobRequest, request: Request, selection: Select
     user = _user(request)
     settings = nj.settings_of(body.settings)
     errors = nj.given_errors(body.settings) + nj.setting_errors(settings, require_target=not body.dry_run)
-    if not name:
+    if not name and not body.dry_run:
         errors.insert(0, "name the job")
     servers = db.query(q.selected_servers_sql(kind), (param, *rest))
     if not servers:
         errors.append("the selection takes no tables")
     groups_of = by_database.groups_by_server(servers)
-    all_groups = [g for s in servers for g in nj.group_names(name, s["server"], groups_of[s["server"]])]
+    all_groups = [g for s in servers for g in nj.group_names(name or PREVIEW_NAME, s["server"], groups_of[s["server"]])]
     timezone_ = sch.timezone_for(run.cadence_minutes, run.timezone)
-    if not errors:
+    if not errors and name:     # the schedule's checks (its name and groups free) wait for the name
         errors += sch.validate({**run.model_dump(), "name": name, "members": all_groups, "timezone": timezone_},
                                all_groups, jobs.schedule_variants())
     if errors:
         raise HTTPException(422, {"errors": errors})
-    summary = by_database.summary_of(name, servers, settings["load_type"])
+    summary = by_database.summary_of(name or PREVIEW_NAME, servers, settings["load_type"])
     if body.dry_run:
-        return {"summary": summary, "settings": settings, "created": False, "target_missing": _target_missing(settings)}
+        return {"summary": summary, "settings": settings, "created": False, "target_missing": _target_missing(settings),
+                "name_missing": not name}
     if not run.paused:     # anyone may set up a job, but one that runs needs the right to run what it starts
         _refuse(_permission_refusals({"job_variant": run.job_variant}, user)["run"])
     options = {k: v for k, v in (run.options or {}).items() if k not in MANAGED_OPTIONS}
@@ -3618,6 +3620,10 @@ def create_ingestion_job(body: NewJobRequest, request: Request):
     return _create_job(body, request)
 
 
+# The name a preview groups the tables under while the job has none yet: the groups are named from the job's name.
+PREVIEW_NAME = "new job"
+
+
 def _target_missing(settings: dict) -> List[str]:
     """The target fields a preview's settings leave blank, by name, for the page to say what Create needs."""
     return [label for key, label in js.TARGET_SETTINGS if not str(settings.get(key) or "").strip()]
@@ -3645,10 +3651,12 @@ def _create_job(body: NewJobRequest, request: Request, inline: bool = False, pro
         return {"discovering": True, "summary": None, "settings": {}, "created": False, "databases": selected["databases"]}
 
     def planned():
-        plan = _file_lines(nj.plan(name, text, body.settings, body.groups_per_server, taken,
-                                   require_target=not body.dry_run), selected)
+        # A preview with no name yet groups the tables under PREVIEW_NAME and checks no group against the taken ones.
+        unnamed_preview = body.dry_run and not name
+        plan = _file_lines(nj.plan(PREVIEW_NAME if unnamed_preview else name, text, body.settings, body.groups_per_server,
+                                   set() if unnamed_preview else taken, require_target=not body.dry_run), selected)
         errors = list(plan["errors"])
-        if not errors and plan["groups"]:
+        if not errors and plan["groups"] and not unnamed_preview:
             schedule = {**run.model_dump(), "name": name, "members": plan["groups"],
                         "timezone": sch.timezone_for(run.cadence_minutes, run.timezone)}
             errors += sch.validate(schedule, plan["groups"], jobs.schedule_variants())
@@ -3660,7 +3668,7 @@ def _create_job(body: NewJobRequest, request: Request, inline: bool = False, pro
     summary = nj.summary(plan)
     if body.dry_run or summary["invalid"]:
         return {"summary": summary, "settings": plan["settings"], "created": False,
-                "target_missing": _target_missing(plan["settings"])}
+                "target_missing": _target_missing(plan["settings"]), "name_missing": not name}
     if not run.paused:     # anyone may set up a job, but one that runs needs the right to run what it starts
         _refuse(_permission_refusals({"job_variant": run.job_variant}, user)["run"])
     options = create_options
