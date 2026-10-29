@@ -426,8 +426,11 @@ commit;
 
 ## Changing the schema
 
-An upgrade doesn't run only the new statements: it re-applies the whole of `lakebase_schema.sql`, plus
-the pending `state_store.RENAMES`, to a database at any earlier version. So every statement must be:
+An upgrade re-reads the whole of `lakebase_schema.sql`, plus the pending `state_store.RENAMES`, and runs
+them against a database at any earlier version. `StateStore.migrate` skips a statement the catalog
+(`pg_catalog`) shows is already in place: a table or index that exists, a column that exists with the same
+type, nullability and default, or a backfill whose probe query (`UPDATE_PROBES`) finds no rows. A statement
+it can't decide from the catalog still runs. A fresh database runs the whole file. So every statement must be:
 
 - **Idempotent:** safe to run again. Use `create ... if not exists`, `add column if not exists`, and
   `drop constraint if exists` right before `add constraint`. A backfill (`update`) must be a no-op
@@ -445,6 +448,27 @@ renaming one: add the new column, write both, move the readers, and drop the old
 checks each statement's form. A statement that changes an existing column or rows (`alter column`,
 `update`) must be reviewed as a no-op once applied and listed in `REVIEWED_NON_ADDITIVE`. Then bump
 `state_store.SCHEMA_VERSION` and add the new fingerprint to `SCHEMA_FINGERPRINTS`; the test says what to add.
+
+### Locks and waiting
+
+The whole migration is one transaction, and a statement that changes a table takes an `ACCESS EXCLUSIVE`
+lock on it, held until the commit. So a migration waits for running loads that hold those tables. Each
+attempt waits at most 3 s for a lock (`LOCK_TIMEOUT_S`, the Postgres `lock_timeout`). On a `55P03` timeout
+the transaction is rolled back and the migration retries after 5, 10, 20, then 40 s, for up to 10 attempts
+(`MIGRATE_ATTEMPTS`, about 5 minutes in all). If the last attempt times out, `StateStore.migrate` raises
+`MigrationLockTimeout`, the setup job fails with a message to run it again, and nothing has changed.
+
+An ingestion run that finds a migration pending and can't get it done does not ingest. It logs that the
+migration waits, exits the notebook with `status: migration_waiting` and `schema_version` set, and the job
+run succeeds. No `ingest_run` row is written for that run, and the next run tries the migration again.
+Any other migration error still fails the run.
+
+Two things still hold the locks for the whole transaction on every upgrade. The 14 constraint
+re-declarations (`drop constraint if exists`, then `add constraint`, 28 statements) always run, because a
+stored CHECK definition can't yet be compared with the file. Adding a CHECK validates every existing row, so
+on `control` (the largest table) that holds an `ACCESS EXCLUSIVE` lock for the scan. Until those are decided
+from the catalog or written as `NOT VALID` plus a later `VALIDATE`, an upgrade that touches the `control` or
+`checkpoint` constraints should run between ingestion runs, not during them.
 
 Upgrades that only add columns, tables or indexes are safe while runs are going. A version that renames,
 or adds a constraint to a table the ingestion job writes, can fail tables of a run still on the old code
