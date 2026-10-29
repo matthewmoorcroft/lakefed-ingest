@@ -429,6 +429,9 @@ create table if not exists lakefed_ingest.discovery (
 -- A discovery through a Unity Catalog connection (remote_query) names it instead of a host and secret. A discovery
 -- of the 'list' kind only lists the server's databases (status 'listed', no tables), as Test connection does.
 alter table lakefed_ingest.discovery add column if not exists src_connection text;
+-- How the discovery listed its databases (the LIKE pattern, the Azure resource, the host's secret template), so a
+-- later re-discovery of a job's selection reads the same way. Null for a discovery made before this column.
+alter table lakefed_ingest.discovery add column if not exists listing jsonb;
 
 create table if not exists lakefed_ingest.discovered_table (
     discovery_id          text        not null,

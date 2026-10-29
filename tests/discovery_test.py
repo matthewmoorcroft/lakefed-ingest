@@ -141,6 +141,14 @@ def test_a_discovery_through_a_uc_connection_reads_with_no_secret():
     assert (jdbc["src_host"], jdbc["secret_key"]) == ("h1", "creds-eng_001") and "use_remote_query" not in jdbc
 
 
+def test_listing_keeps_how_a_discovery_listed_but_never_the_secret():
+    spec = {"src_host": "h1", "secret_key": "s3cret", "secret_key_template": "creds-{database}", "pattern": "lfc_%",
+            "azure_credential": "", "azure_resource_id": "/subscriptions/x", "databases": "*"}
+    assert d.listing_of(spec) == {"pattern": "lfc_%", "secret_key_template": "creds-{database}",
+                                  "azure_resource_id": "/subscriptions/x"}
+    assert d.listing_of({"src_connection": "sql_a", "databases": ["a"]}) == {}
+
+
 @pytest.mark.parametrize("spec,error", [
     ({"databases": ["a"]}, "src_connection (a UC connection) or src_host"),
     ({"src_host": "h1", "databases": ["a"]}, "secret_key"),
