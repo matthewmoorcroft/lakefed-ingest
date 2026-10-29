@@ -834,7 +834,7 @@ def close_ended_run_sql() -> str:
         "where run_id = %s and status = 'running' returning run_id), "
         f"events as (update {SCHEMA}.ingest_event e set status = 'failed', finished_at = coalesce(e.finished_at, now()), "
         "duration_ms = coalesce(e.duration_ms, (extract(epoch from (now() - e.started_at)) * 1000)::bigint), "
-        "error = case when e.status = 'retried' then concat(e.error, ' | ', %s) else %s end "
+        "error = case when e.status = 'retried' then concat(e.error, ' | ', %s::text) else %s end "
         "from dead where e.run_id = dead.run_id and (e.status = 'running' or ("
         f"e.status = 'retried' and not exists (select 1 from {SCHEMA}.ingest_event later "
         "where later.run_id = e.run_id and later.control_id = e.control_id and later.id > e.id))) "

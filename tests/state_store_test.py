@@ -269,7 +269,7 @@ def test_close_abandoned_runs_sql_closes_the_collections_other_open_runs_and_the
     assert ("e.status = 'retried' and not exists (select 1 from " + ss.EVENT_TABLE + " later "
             "where later.run_id = e.run_id and later.control_id = e.control_id and later.id > e.id)") in event_update
     assert "finished_at = coalesce(e.finished_at, now())" in event_update
-    assert "when e.status = 'retried' then concat(e.error, ' | ', %s)" in event_update
+    assert "when e.status = 'retried' then concat(e.error, ' | ', %s::text)" in event_update
     assert sql.rstrip().endswith("select (select count(*) from dead), (select count(*) from events)")
     # detail, task_collection, run_id, error (twice: a running event's, appended to a retried one's)
     assert sql.count("%s") == 5

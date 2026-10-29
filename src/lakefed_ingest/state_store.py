@@ -968,7 +968,7 @@ def close_abandoned_runs_sql() -> str:
         "where task_collection = %s and status = 'running' and run_id <> %s returning run_id), "
         f"events as (update {EVENT_TABLE} e set status = 'failed', finished_at = coalesce(e.finished_at, now()), "
         "duration_ms = coalesce(e.duration_ms, (extract(epoch from (now() - e.started_at)) * 1000)::bigint), "
-        "error = case when e.status = 'retried' then concat(e.error, ' | ', %s) else %s end "
+        "error = case when e.status = 'retried' then concat(e.error, ' | ', %s::text) else %s end "
         "from dead where e.run_id = dead.run_id and (e.status = 'running' or ("
         f"e.status = 'retried' and not exists (select 1 from {EVENT_TABLE} later "
         "where later.run_id = e.run_id and later.control_id = e.control_id and later.id > e.id))) "

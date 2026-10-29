@@ -170,6 +170,26 @@ def test_cancel_run_cancels_the_jobs_wrappers_and_its_groups_runs_and_closes_the
     assert sorted(p[3] for p in stops) == ["c1", "c2"] and len({p[-1] for p in stops}) == 1     # one batch
 
 
+def test_cancel_run_while_every_group_loads_closes_each_record_with_a_statement_postgres_can_type(api, monkeypatch):  # noqa: F811
+    # The 29 Oct sequence: every group of the job loading, Cancel run, Databricks then reporting each run cancelled.
+    # The store refuses a statement as Postgres does when a parameter can't be typed, so an untyped one fails here.
+    from sql_parameter_types_test import untyped_parameters
+    sid, cancelled, closes = _stop_setup(api, monkeypatch, recorded=[_open(65, "c1", "21"), _open(66, "c2", "22")])
+    real_run = api.store.run
+
+    def typed_run(sql, params):
+        if untyped_parameters(sql):
+            raise RuntimeError("could not determine data type of parameter $3")
+        return real_run(sql, params)
+    monkeypatch.setattr(api.store, "run", typed_run)
+    api.active_runs[555] = [_going(21, task_collection="c1"), _going(22, task_collection="c2")]
+    r = api.post(f"/api/ingestion-jobs/{sid}/stop")
+    assert r.status_code == 200, r.text
+    assert sorted(cancelled) == [21, 22] and r.json()["closed"] == 2 and sorted(c[0] for c in closes) == [65, 66]
+    # The reconcile, once Databricks reports them over, runs the same statement: it must be one Postgres can type too.
+    assert untyped_parameters(q.close_ended_run_sql()) == []
+
+
 def test_cancel_run_on_a_check_job_cancels_its_check_run_too_but_not_another_jobs(api, monkeypatch):  # noqa: F811
     monkeypatch.setattr(main.jobs, "CHECK_JOB_ID", "777")
     sid, _ = _run_now_setup(api, monkeypatch, dict(BODY, job_variant="check"))
