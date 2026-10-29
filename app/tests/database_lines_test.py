@@ -79,6 +79,25 @@ def test_a_preview_asks_again_while_the_discovery_runs_and_shares_its_run(monkey
     assert len(discovery.runs) == 1
 
 
+def test_a_database_line_takes_its_databases_table_rows_whatever_is_picked(monkeypatch):
+    def query(sql, params=()):
+        if sql == q.upload_sql():
+            return [{"upload_id": "u1", "columns": list(nj.UPLOAD_COLUMNS)}]
+        if sql == q.upload_database_lines_sql():
+            return [{"line": 3, "src_database": "eng_001", "fields": {"src_connection": "sql_a", "src_database": "eng_001"}}]
+        if sql == q.selected_rows_page_sql("upload"):
+            taken = q.selection_key("sql_a", "eng_001") in params[3]
+            return [_table_row(2, "eng_001", "t1", "id")] if taken else []
+        return []
+
+    monkeypatch.setattr(main.db, "query", query)
+    selected = main._selected(main.Selection(upload_id="u1"))
+    assert [r["src_table"] for r in selected["rows"]] == ["t1"]
+    found = {"rows": [_found(3, "eng_001", "t1", "id, a"), _found(3, "eng_001", "t2", "id")], "unreadable": []}
+    out = main._with_databases(selected, found)
+    assert (out["covered"], out["discovered"]) == (1, 1) and "id, a" not in out["text"]
+
+
 def test_a_database_that_cannot_be_opened_fails_alone_and_is_named(monkeypatch):
     statuses = [{"src_database": "eng_001", "status": "ok", "error": None},
                 {"src_database": "eng_002", "status": "failed", "error": "login failed for the service principal"}]

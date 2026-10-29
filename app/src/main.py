@@ -721,12 +721,12 @@ def _selection_parts(selection: Selection, whole_servers: List[str]) -> list:
 SELECTED_PAGE = 1000   # the tables a selection is read from Lakebase by, one keyset page at a time
 
 
-def _selected_rows(kind: str, param, selection: Selection) -> List[dict]:
+def _selected_rows(kind: str, param, selection: Selection, whole_databases: Iterable[str] = ()) -> List[dict]:
     """The tables a selection takes, read a page at a time in key order. The read stops, with a refusal, when the rows
     passed BACKGROUND_ROWS: the count before it said fewer, so the selection grew while it was read, and the request
     is sent again to be written in the background. The request holds at most BACKGROUND_ROWS rows, whatever the source
-    has."""
-    database_keys = [q.selection_key(d.server, d.database) for d in selection.databases]
+    has. whole_databases are more database keys taken whole, besides the selection's own."""
+    database_keys = [q.selection_key(d.server, d.database) for d in selection.databases] + list(whole_databases)
     table_keys = [q.selection_key(t.server, t.database, name) for t in selection.tables for name in t.tables]
     rows, after = [], ("", "", -1, "", "")
     while True:
@@ -760,7 +760,11 @@ def _selected(selection: Selection) -> dict:
                           for r in db.query(q.upload_database_lines_sql(), (param,))]
     else:
         columns = list(nj.DISCOVERY_COLUMNS)
-    rows = _selected_rows(kind, param, selection)
+    # A database-only line takes its database whole, so the file's own table rows in it are taken whatever is picked,
+    # and discovery's copies of those tables are left out (_with_databases).
+    whole_databases = [q.selection_key(js.server_of({"src_connection": line["connection"], "use_remote_query": True}),
+                                       line["database"]) for line in database_lines]
+    rows = _selected_rows(kind, param, selection, whole_databases)
     if not rows and not database_lines:
         raise HTTPException(422, {"errors": ["the selection takes no tables"]})
     whole = ([s["server"] for s in db.query(q.source_servers_sql(kind), (param, selection.filter))]
