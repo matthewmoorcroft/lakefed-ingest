@@ -351,7 +351,7 @@ def upload_by_reference(catalog: server_catalog.ServerCatalog, limit: Optional[i
     line per table, q.CONTROL_BATCH lines to a statement. Runs under no_connections()."""
     with lakebase_fake.no_connections():
         rows = discovered_rows(catalog, limit=limit)
-        text = nj.csv_of(list(nj.DISCOVERY_COLUMNS), rows)
+        text = nj.csv_of(_upload_columns(), rows)
         return _upload_text(text, lines_hint=len(rows))
 
 
@@ -389,7 +389,7 @@ def monitoring_shapes(paths: Tuple[str, ...] = MONITORING_PATHS) -> List[dict]:
 
 def _upload_text(text: str, lines_hint: Optional[int]) -> UploadRun:
     started = time.perf_counter()
-    read = nj.read_upload(text)
+    read = nj.read_upload(text, sim.connection_spec()["src_connection"])
     read_s = time.perf_counter() - started
     if read["errors"]:
         return UploadRun(lines=lines_hint or 0, errors=list(read["errors"]), csv_bytes=len(text.encode()),
@@ -411,10 +411,16 @@ def _upload_text(text: str, lines_hint: Optional[int]) -> UploadRun:
                      connection=connection)
 
 
-def _repeated_csv(line_count: int) -> str:
+def _upload_columns() -> List[str]:
+    """The discovery columns an upload takes: the file reads through the connection chosen before it, so not the
+    server's own columns (new_job.UPLOAD_REFUSED_COLUMNS)."""
+    return [c for c in nj.DISCOVERY_COLUMNS if c not in nj.UPLOAD_REFUSED_COLUMNS]
+
+
+def _repeated_csv(line_count: int, columns: Optional[List[str]] = None) -> str:
     """A CSV of line_count copies of one table: enough lines to reach a limit, and cheap to build."""
     sample = _discovered_fields(sim.connection_spec(), "lfc_eng_00000", {"src_schema": "dbo", "src_table": "t_00000"})
-    return nj.csv_of(list(nj.DISCOVERY_COLUMNS), [sample] * line_count)
+    return nj.csv_of(columns or list(nj.DISCOVERY_COLUMNS), [sample] * line_count)
 
 
 def create_refusal(line_count: int) -> Tuple[List[str], float]:
@@ -427,9 +433,9 @@ def create_refusal(line_count: int) -> Tuple[List[str], float]:
 
 def upload_refusal(line_count: int) -> Tuple[List[str], float]:
     """read_upload on a CSV of line_count lines: its refusal, and how long reading took to give it."""
-    text = _repeated_csv(line_count)
+    text = _repeated_csv(line_count, _upload_columns())
     started = time.perf_counter()
-    read = nj.read_upload(text)
+    read = nj.read_upload(text, sim.connection_spec()["src_connection"])
     return list(read["errors"]), time.perf_counter() - started
 
 
