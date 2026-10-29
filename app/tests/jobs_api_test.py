@@ -290,3 +290,4 @@ def test_the_timeline_draws_each_jobs_runs_in_its_own_lane_with_their_groups(cli
     assert ran and all(r["ended_at"] and r["groups"] and {"group", "status", "run_id"} <= set(r["groups"][0]) for r in ran)
     # A trigger that did not run has no span; a running job run with no group run started yet ends now.
     assert all(r["ended_at"] is None for lane in lanes.values() for r in lane["runs"] if r["outcome"]["label"] == "Not run")
+    assert not any(r["outcome"].get("paused") for r in lanes["Nightly"]["runs"])      # Nightly is paused

@@ -196,7 +196,8 @@ def test_the_timeline_has_one_lane_per_job_with_its_planned_triggers(api, monkey
     api.post("/api/schedules", json=BODY)
     lanes = api.get("/api/timeline?hours=2").json()["jobs"]
     assert [(lane["name"], lane["paused"]) for lane in lanes] == [("Prod 15", False)]
-    assert len(lanes[0]["planned"]) <= 2 and lanes[0]["runs"] == []      # only since the schedule began; none ran yet
+    assert len(lanes[0]["planned"]) <= 2      # only since the schedule began
+    assert not any(r["started_at"] for r in lanes[0]["runs"])       # no group run has started (the current slot may be open)
     api.store.members[1]["added_at"] = api.store.members[2]["added_at"] = "2020-01-01T00:00:00+00:00"
     api.store.schedules[1]["updated_at"] = "2020-01-01T00:00:00+00:00"
     main._shared_reads.clear()      # the schedules are a shared read

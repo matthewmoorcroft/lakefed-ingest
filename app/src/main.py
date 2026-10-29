@@ -2002,9 +2002,9 @@ def _timeline_run(job_run: dict, now: datetime) -> dict:
 @app.get("/api/timeline")
 def timeline(hours: int = 24):
     """The last `hours` as the Jobs UI's run timeline, one lane per ingestion job: its job runs (each with its span,
-    outcome and groups), its planned triggers (the current schedule, since it or the group last changed) and the
-    triggers Databricks skipped because the previous run was still going (from the wrapper jobs' runs). The group runs
-    of groups in no job make one more lane."""
+    outcome and groups; a paused job's triggers that did not run left out), its planned triggers (the current
+    schedule, since it or the group last changed) and the triggers Databricks skipped because the previous run was
+    still going (from the wrapper jobs' runs). The group runs of groups in no job make one more lane."""
     hours = max(1, min(int(hours), 168))
     end = datetime.now(timezone.utc)
     start = end - timedelta(hours=hours)
@@ -2024,7 +2024,9 @@ def timeline(hours: int = 24):
                 skipped += [jobs.ts(t) for t in (_skipped_starts(m["job_id"], start, end, client) or [])]
         lanes.append({"job_id": s["id"], "name": s["name"], "paused": bool(s["paused"]),
                       "description": sch.describe(int(s["cadence_minutes"]), sch.start_minute(s), s["timezone"] or "UTC"),
-                      "runs": [_timeline_run(jr, end) for jr in _job_runs_of(s, start, end, end)],
+                      # A paused job's triggers that did not run are left out, as Runs folds them away.
+                      "runs": [_timeline_run(jr, end) for jr in _job_runs_of(s, start, end, end)
+                               if not (jr["outcome"]["label"] == "Not run" and jr["outcome"].get("paused"))],
                       "planned": sorted(planned), "skipped": sorted(skipped)})
     unscheduled = sorted({st["task_collection"] for st in _states()} - {m["task_collection"] for m in active})
     group_runs = [{k: r.get(k) for k in ("run_id", "task_collection", "status", "started_at", "finished_at")}
