@@ -44,7 +44,7 @@ export default function Runs() {
   const runs = useQuery({
     queryKey: ["job-runs", job, outcome, before],
     queryFn: () => api.get<Row>(`/job-runs${qs({ job, outcome, before, limit: PAGE })}`),
-    refetchInterval: before ? false : 30_000,
+    refetchInterval: before ? false : 15_000,
   });
   const jobs = useQuery({ queryKey: ["job-runs-jobs"], queryFn: () => api.get<Row>(`/job-runs${qs({ limit: 1 })}`) });
   const d = runs.data;

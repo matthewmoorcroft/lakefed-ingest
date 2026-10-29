@@ -196,35 +196,55 @@ def job_settings(job_id) -> dict:
     return workspace().jobs.get(int(job_id)).settings.as_dict()
 
 
+def run_row(run) -> dict:
+    """A Jobs API run (the SDK's Run) as the app reads a run: its ids, parameters (a parameter the run wasn't given
+    takes its default, as a run of a schedule ingests its default task_collection), state, times and page."""
+    params = {p.name: p.value if p.value is not None else p.default for p in (getattr(run, "job_parameters", None) or [])}
+    st = run.state
+    return {
+        "run_id": run.run_id,
+        "job_id": run.job_id,
+        "parameters": params,
+        "task_collection": params.get("task_collection"),
+        "state": st.life_cycle_state.value if st and st.life_cycle_state else None,
+        "result": st.result_state.value if st and st.result_state else None,
+        "message": st.state_message if st else None,
+        "started": ts(run.start_time),
+        "ended": ts(run.end_time),
+        "trigger": run.trigger.value if run.trigger else None,
+        "url": run.run_page_url,
+    }
+
+
 def runs(job_id, active_only: bool = False, limit: int = 25) -> List[dict]:
+    """A job's runs, newest first, from the Jobs API (at most ``limit``)."""
     rows = []
     # The Jobs API caps a page at 25 runs; the SDK pages through, and we stop at `limit`.
     for r in workspace().jobs.list_runs(job_id=int(job_id), active_only=active_only, limit=min(limit, 25)):
-        # A parameter the run wasn't given runs with its default (a run of the job's own schedule ingests its
-        # default task_collection), as launcher.SdkJobs.active_runs reads it.
-        params = {p.name: p.value if p.value is not None else p.default for p in (getattr(r, "job_parameters", None) or [])}
-        st = r.state
-        rows.append({
-            "run_id": r.run_id,
-            "job_id": r.job_id,
-            "parameters": params,
-            "task_collection": params.get("task_collection"),
-            "state": st.life_cycle_state.value if st and st.life_cycle_state else None,
-            "result": st.result_state.value if st and st.result_state else None,
-            "started": ts(r.start_time),
-            "ended": ts(r.end_time),
-            "trigger": r.trigger.value if r.trigger else None,
-            "url": r.run_page_url,
-        })
+        rows.append(run_row(r))
         if len(rows) >= limit:
             break
     return rows
 
 
+def get_run(run_id):
+    """One Jobs API run (the SDK's Run); raises NotFound when Databricks has no such run."""
+    return workspace().jobs.get_run(int(run_id))
+
+
+def is_not_found(error: Exception) -> bool:
+    """Whether a Jobs API error says the run or job does not exist (as opposed to a failure to ask)."""
+    from databricks.sdk.errors import NotFound
+    return isinstance(error, NotFound)
+
+
 def run_now(job_id, job_parameters: dict) -> int:
     waiter = workspace().jobs.run_now(job_id=int(job_id), job_parameters=job_parameters)
     resp = getattr(waiter, "response", waiter)
-    return int(resp.run_id)
+    run_id = int(resp.run_id)
+    import run_poller
+    run_poller.note_started(job_id, run_id, job_parameters)
+    return run_id
 
 
 def start_cluster_copies(schedule_id) -> int:
@@ -269,6 +289,8 @@ def run_state(run_id) -> dict:
 
 def cancel(run_id) -> None:
     workspace().jobs.cancel_run(run_id=int(run_id))
+    import run_poller
+    run_poller.mark_stopping([int(run_id)])
 
 
 # A run's life cycle as the Jobs API ends it; a run recorded as running whose Databricks run is in one of these

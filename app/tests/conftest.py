@@ -17,3 +17,11 @@ def _no_shared_reads_between_tests():
     yield
     if sys.modules.get("main") is not None:
         sys.modules["main"]._shared_reads.clear()
+
+
+@pytest.fixture(autouse=True)
+def _run_poller_table_missing(monkeypatch):
+    """The run poller's table is missing unless a test says otherwise, so the readers answer from the Jobs API (as
+    before the poller) and no test reaches Lakebase through the poller."""
+    import run_poller
+    monkeypatch.setattr(run_poller, "table_ready", lambda: False)

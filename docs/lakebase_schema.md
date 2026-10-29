@@ -19,6 +19,7 @@ as `lakefed_ingest_lakebase.lakefed_ingest.<table>` (see [monitoring.md](monitor
 | `control_change` | **Audit.** Every change the operations app makes to control rows | The operations app |
 | `discovery`, `discovered_table` | **Onboarding.** Tables found by the discovery job, with recommended control-row settings | The discovery job |
 | `schedule`, `schedule_member` | **Scheduling.** Cadences for running collections, and the wrapper job per (schedule, collection) | The operations app |
+| `databricks_run` | **Telemetry.** The Databricks runs the operations app shows, with their state | The operations app's run poller |
 | `schema_version` | **Bookkeeping.** Schema versions applied | The setup job, or the first ingestion run after an upgrade |
 
 ```mermaid
@@ -379,6 +380,20 @@ the delete job (`lakefed_ingest_delete_job`) deletes them in the transaction tha
 
 Telemetry tables grow with every run. To keep long-term history cheaply, snapshot them to Delta
 (see [monitoring.md](monitoring.md)) and prune old rows from Lakebase.
+
+## `databricks_run`: the Databricks runs the app shows
+
+Written by the operations app's run poller (`app/src/run_poller.py`), which lists each job the app shows runs of every
+15 seconds and writes a run only when its state changed. The pages read this table rather than the Jobs API.
+- **`run_id`** (primary key), **`job_id`**, and **`kind`**: `wrapper` (a schedule's wrapper job), `check`, `group` (the
+  ingestion job, its variants and a schedule's cluster copy), `setup`, `discover`, `delete`, or `copies`.
+- **`schedule_id`** (wrapper, group copy and check runs) and **`task_collection`** (what the run ingests).
+- **`trigger`**, **`parameters`** (the run's job parameters, JSON), **`life_cycle_state`** (QUEUED ... TERMINATED,
+  SKIPPED, INTERNAL_ERROR, or NOT_FOUND when the Jobs API has no such run), **`result_state`**, **`state_message`**,
+  **`run_page_url`**, **`started_at`**, **`ended_at`**, and **`seen_at`** (when the poller last saw a change).
+- The app has no DELETE on Lakebase, so rows are never removed: prune old ones as the owner, as with `ingest_run`.
+- Added by the schema version that created it. Its statements are `create table if not exists` and `create index if not exists` only,
+  so the upgrade takes no lock on an existing table.
 
 ## `schema_version` — schema versions applied
 

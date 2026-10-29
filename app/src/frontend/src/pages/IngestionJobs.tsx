@@ -22,7 +22,7 @@ export default function IngestionJobs() {
   const jobs = useQuery({
     queryKey: ["ingestion-jobs", filter, search, offset, sort],
     queryFn: () => api.get<JobsPage>(`/ingestion-jobs${qs({ filter, search, offset, limit: PAGE, sort: sort.by, descending: sort.descending })}`),
-    refetchInterval: 30_000,
+    refetchInterval: 15_000,
   });
   const counts = jobs.data?.counts ?? {};
   return (
