@@ -74,7 +74,7 @@ variables:
     default: "200"
   table_retries:
     description: Extra attempts per table after a transient source error, in the same run ("0" = off).
-    default: "0"
+    default: "2"
   table_retry_budget:
     description: Table retries in the whole run; once spent, failures fail at once.
     default: "20"

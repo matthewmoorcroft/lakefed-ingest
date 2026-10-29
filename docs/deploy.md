@@ -31,7 +31,7 @@ targets:
       # append_batch_size: "16"
       # max_seeds_per_run: "10000"
       # max_queries_per_source: "64"         # see README "Concurrency"
-      # table_retries: "2"                    # see README "Table retries"
+      # table_retries: "0"                    # off; the default "2" retries transient errors (README "Table retries")
       # fail_on_table_errors: "true"         # a run with failed tables ends as failed (README "Table retries")
 ```
 

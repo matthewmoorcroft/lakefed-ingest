@@ -1,6 +1,6 @@
 """Table retries: a table whose load fails with a transient source error (a refused or dropped
 connection, a timeout, Azure SQL throttling) is tried again in the same run after a pause, instead
-of waiting for the next run. Off unless job parameter ``table_retries`` is above 0.
+of waiting for the next run. Job parameter ``table_retries`` (default 2) sets the attempts; 0 turns it off.
 
 * ``classify`` (pure): "transient" or "permanent". The rules that rule a retry out are checked
   first and win; an error no rule recognises is permanent, so it fails as it always has.
@@ -64,6 +64,8 @@ _TRANSIENT = (
     "connect timed out", "The TCP/IP connection to the host", "The connection is closed", "forcibly closed",
     "ORA-03113", "ORA-03114", "ORA-03135", "ORA-12170", "ORA-12541", "Communications link failure",
     "too many clients", "Too many connections",
+    # Unity Catalog throttling a remote_query read (a UC connection): "TEMPORARILY_UNAVAILABLE: Too many requests".
+    "TEMPORARILY_UNAVAILABLE", "Too many requests", "REQUEST_LIMIT_EXCEEDED",
 )
 # Azure SQL throttling and availability, deadlock victim, and transport errors.
 _TRANSIENT_CODES = {40501, 40613, 40197, 49918, 49919, 49920, 10928, 10929, 1205, 233, 10053, 10054, 10060}
