@@ -146,6 +146,12 @@ The app runs as its own service principal (created with the app):
   - `CAN_USE` on the instance (to mint its own short-lived credential);
   - a Postgres role;
   - `SELECT`, `INSERT` and `UPDATE` on the `lakefed_ingest` tables, with no `DELETE`.
+- **Source connections:** `USE CONNECTION` on each Unity Catalog connection named in the bundle's
+  `source_connections` variable (comma-separated), granted by the same job as whoever runs it, who needs to own
+  or manage those connections. The app lists connections as its own identity, so Discover shows only those it
+  holds `USE CONNECTION` on; the connections aren't the bundle's, so they are named, not created. A connection
+  the job can't grant on is reported in its output and the others are still granted; Discover's screen names
+  the grant for any connection it can't see.
 - **Who can act:** every action on an existing ingestion job follows the signed-in user's own Databricks
   permission on the job its runs execute as (the check job on a check schedule, else the ingestion job), as the
   Jobs UI does:
@@ -190,7 +196,7 @@ Prerequisites: the ingestion bundle is deployed and its setup job has run (Lakeb
    cd app
    databricks bundle deploy -t <target>
    databricks bundle run lakefed_ingest_app -t <target>          # deploys the code and starts the app
-   databricks bundle run lakefed_ingest_app_grants -t <target>   # Lakebase access for the app
+   databricks bundle run lakefed_ingest_app_grants -t <target>   # Lakebase access, and USE CONNECTION on source_connections
    ```
 3. Grant `CAN_USE` on the app to your operators, then open the URL printed by `bundle run`.
 
