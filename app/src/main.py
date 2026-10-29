@@ -1675,7 +1675,7 @@ def ingest_job():
 
 class RunRequest(BaseModel):
     task_collection: str = Field(min_length=1)
-    parallelism: int = Field(default=32, ge=1, le=256)
+    parallelism: int = Field(default=192, ge=1, le=256)
 
 
 @app.post("/api/jobs/ingest/run")

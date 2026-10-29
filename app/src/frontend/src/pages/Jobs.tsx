@@ -43,7 +43,7 @@ export default function Jobs({ embedded }: { embedded?: boolean }) {
   const byJob = (rows: Row[]) => embedded ? rows.map(({ task_collection, schedule, ...r }) => ({ ingestion_job: schedule ?? "started by hand", ...r })) : rows;
   const active = byJob(job.data?.active ?? []), recent = byJob(job.data?.recent ?? []);
   const coll = collection || collections.data?.[0] || "";
-  const par = parallelism === "" ? Number(j?.parameters?.parallelism || 32) : parallelism;
+  const par = parallelism === "" ? Number(j?.parameters?.parallelism || 192) : parallelism;
   return (
     <>
       {!embedded && <PageHead title="Databricks jobs" lead="The Databricks job that ingests one ingestion group a run, and the schema setup job."
