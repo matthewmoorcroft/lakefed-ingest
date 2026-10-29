@@ -2,6 +2,7 @@
 
 Skipped when FastAPI isn't installed (the repo's base test environment needs only pytest);
 run with the app's requirements installed: `pip install -r app/src/requirements.txt httpx pytest`."""
+import contextlib
 import json
 from datetime import datetime, timedelta, timezone
 
@@ -225,6 +226,20 @@ def test_enable_and_reseed_are_locked_and_logged(client):
     assert actions == ["disable", "reseed", "reseed"]
     client.db.running = {"lakefed_ingest:c1"}
     assert client.post("/api/tables/reseed", json={"ids": [7]}).status_code == 409
+
+
+def test_reseed_counts_the_checkpoints_it_flipped_not_the_rollups_written_after_it(client, monkeypatch):
+    """The count is the reseed statement's: the rollup rewrites after it run on the same cursor, and a cursor's rowcount
+    is its last statement's."""
+    class Cursor(FakeCursor):
+        def execute(self, sql, params=()):
+            super().execute(sql, params)
+            if sql == q.force_reseed_sql():
+                self.rowcount = len(params[0])
+            elif sql == q.control_databases_sql("ids"):
+                self._rows = [("c1", "db1")]
+    monkeypatch.setattr(main.db, "transaction", contextlib.contextmanager(lambda: (yield Cursor(client.db))))
+    assert client.post("/api/tables/reseed", json={"ids": [7, 8]}).json() == {"updated": 2}
 
 
 # ---- review findings: static files, inserts, discovery runs ----------------------------------------

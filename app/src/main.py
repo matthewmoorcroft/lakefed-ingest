@@ -2376,8 +2376,8 @@ def reseed(body: Ids, request: Request):
         _recheck_locked_rows(rows, checked, request)
         _lock_collections(cur, [r["task_collection"] for r in rows])
         cur.execute(q.force_reseed_sql(), (body.ids,))
-        _rewrite_rollups_for_ids(cur, body.ids)
         n = cur.rowcount
+        _rewrite_rollups_for_ids(cur, body.ids)
         cur.execute(q.log_reseed_sql(), ("manual", body.ids))
         for r in rows:
             _log(cur, _user(request), "reseed", r["id"], r["task_collection"], reseed="manual", batch=batch)
