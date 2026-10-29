@@ -152,6 +152,16 @@ def test_a_server_that_is_no_longer_kept_says_so():
     assert readings == [] and "no longer kept" in errors[0]
 
 
+def test_a_connection_server_with_only_specific_tables_is_not_read_again():
+    readings, errors = rd.specs([discovery_part(tables_part("eng_001", ["t1"], server="sql_a"))], [connection_source()])
+    assert readings == [] and errors == []
+
+
+def test_a_table_only_server_that_is_no_longer_kept_is_not_reported():
+    readings, errors = rd.specs([discovery_part(tables_part("eng_001", ["t1"]))], [])
+    assert readings == [] and errors == []
+
+
 # ---- a run, through the app's write path (fake database) ------------------------------------------------------------
 
 def test_the_tick_starts_each_due_job_once_and_skips_one_it_cannot_claim(monkeypatch):

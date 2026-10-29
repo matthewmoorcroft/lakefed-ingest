@@ -110,13 +110,15 @@ def specs(parts: List[dict], sources: List[dict]) -> Tuple[List[Tuple[str, dict]
     out: List[Tuple[str, dict]] = []
     errors: List[str] = []
     for server in sorted({server_key(p["server"]) for p in parts if p.get("source_kind") == "discovery"}):
+        whole = any(p["scope"] == "server" and server_key(p["server"]) == server for p in parts)
+        names = sorted({p["src_database"] for p in parts
+                        if p["scope"] == "database" and server_key(p["server"]) == server}, key=str.lower)
+        if not whole and not names:
+            continue
         mine = [s for s in sources if server_key(s["server"]) == server]
         if not mine:
             errors.append(f"{server}: its discovery is no longer kept, so it can't be read again")
             continue
-        whole = any(p["scope"] == "server" and server_key(p["server"]) == server for p in parts)
-        names = sorted({p["src_database"] for p in parts
-                        if p["scope"] == "database" and server_key(p["server"]) == server}, key=str.lower)
         newest = max(mine, key=lambda s: str(s.get("finished_at") or ""))
         listing = newest.get("listing")
         if whole and listing is None:
