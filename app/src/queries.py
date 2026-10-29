@@ -2200,15 +2200,24 @@ _SELECTED = ("(%s and position(lower(%s) in lower(r.src_database)) > 0) "
              "= any(%s)")
 
 
-def selected_rows_sql(kind: str, count: bool = False) -> str:
-    """The tables a selection takes from a source: with whole_server, every table of a database matching the filter;
-    the whole databases named; the tables named (selection_key). Params: the source's, whole_server, filter, database
-    keys, table keys. In the order a plan reads them; count gives only how many."""
-    if count:
-        return f"select count(*) as n from ({source_rows_sql(kind)}) r where {_SELECTED}"
-    return (f"select r.server, r.src_database, r.src_schema, r.src_table, r.line, r.fields "
-            f"from ({source_rows_sql(kind)}) r where {_SELECTED} "
-            f"order by r.server, lower(r.src_database), r.line, lower(r.src_schema), lower(r.src_table)")
+def selected_count_sql(kind: str) -> str:
+    """How many tables a selection takes from a source. Params: the source's (see source_rows_sql), whole_server,
+    filter, database keys, table keys (selection_key)."""
+    return f"select count(*) as n from ({source_rows_sql(kind)}) r where {_SELECTED}"
+
+
+def selected_rows_page_sql(kind: str) -> str:
+    """One page of the tables a selection takes, in the order a plan reads them (server, database, line, schema, table),
+    after the key of the last row read. Keyset paging: each page starts where the last one ended, with no offset, so a
+    selection is read in pages of any size. Each row carries its key's lower-case parts (k_database, k_schema, k_table)
+    for the next page. Params: the source's, whole_server, filter, database keys, table keys, after server, after
+    k_database, after line, after k_schema, after k_table, limit (the first page's after values: '', '', -1, '', '')."""
+    return (f"select r.server, r.src_database, r.src_schema, r.src_table, r.line, r.fields, "
+            f"lower(r.src_database) as k_database, lower(r.src_schema) as k_schema, lower(r.src_table) as k_table "
+            f"from ({source_rows_sql(kind)}) r where ({_SELECTED}) "
+            f"and (r.server, lower(r.src_database), r.line, lower(r.src_schema), lower(r.src_table)) "
+            f"> (%s, %s, %s, %s, %s) "
+            f"order by r.server, lower(r.src_database), r.line, lower(r.src_schema), lower(r.src_table) limit %s")
 
 
 def source_databases_after_sql(kind: str) -> str:

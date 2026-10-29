@@ -583,7 +583,8 @@ class Selection(BaseModel):
 
 
 def _selection_params(selection: Selection) -> tuple:
-    """(kind, the parameter the source's queries take, source id, the parameters of selected_rows_sql after it)."""
+    """(kind, the parameter the source's queries take, source id, the parameters the selection queries take after
+    it)."""
     kind, param, source_id = selection.source()
     if kind == "upload" and not db.query(q.upload_sql(), (param,)):
         raise HTTPException(404, f"upload {param} not found")
@@ -601,6 +602,30 @@ def _selection_parts(selection: Selection, whole_servers: List[str]) -> list:
             + [("tables", t.server, t.database, list(t.tables), None) for t in selection.tables if not covered(t.database)])
 
 
+SELECTED_PAGE = 1000   # the tables a selection is read from Lakebase by, one keyset page at a time
+
+
+def _selected_rows(kind: str, param, selection: Selection) -> List[dict]:
+    """The tables a selection takes, read a page at a time in key order. The read stops, with a refusal, when the rows
+    passed BACKGROUND_ROWS: the count before it said fewer, so the selection grew while it was read, and the request
+    is sent again to be written in the background. The request holds at most BACKGROUND_ROWS rows, whatever the source
+    has."""
+    database_keys = [q.selection_key(d.server, d.database) for d in selection.databases]
+    table_keys = [q.selection_key(t.server, t.database, name) for t in selection.tables for name in t.tables]
+    rows, after = [], ("", "", -1, "", "")
+    while True:
+        page = db.query(q.selected_rows_page_sql(kind), (param, selection.whole_server, selection.filter, database_keys,
+                                                         table_keys, *after, SELECTED_PAGE))
+        if len(rows) + len(page) > BACKGROUND_ROWS:
+            raise HTTPException(422, {"errors": [f"the selection grew past {BACKGROUND_ROWS:,} tables while it was "
+                                                 "read: send it again, and it is written in the background"]})
+        rows += page
+        if len(page) < SELECTED_PAGE:
+            return rows
+        last = page[-1]
+        after = (last["server"], last["k_database"], last["line"], last["k_schema"], last["k_table"])
+
+
 def _selected(selection: Selection) -> dict:
     """What a selection takes, read back from Lakebase: {"text": the CSV a plan reads, "lines": each of its lines'
     line number in the uploaded file (or None), "parts": the job_selection rows to keep with the job, "kind",
@@ -613,9 +638,7 @@ def _selected(selection: Selection) -> dict:
         columns = list(upload[0]["columns"])
     else:
         columns = list(nj.DISCOVERY_COLUMNS)
-    database_keys = [q.selection_key(d.server, d.database) for d in selection.databases]
-    table_keys = [q.selection_key(t.server, t.database, name) for t in selection.tables for name in t.tables]
-    rows = db.query(q.selected_rows_sql(kind), (param, selection.whole_server, selection.filter, database_keys, table_keys))
+    rows = _selected_rows(kind, param, selection)
     if not rows:
         raise HTTPException(422, {"errors": ["the selection takes no tables"]})
     whole = ([s["server"] for s in db.query(q.source_servers_sql(kind), (param, selection.filter))]
@@ -1817,7 +1840,7 @@ def add_job_tables(job_id: int, body: JobTablesRequest, request: Request):
         return made
     if body.source is not None:
         kind, param, source_id, rest = _selection_params(body.source)
-        counted = db.query(q.selected_rows_sql(kind, count=True), (param, *rest))
+        counted = db.query(q.selected_count_sql(kind), (param, *rest))
         if counted and counted[0]["n"] > BACKGROUND_ROWS:
             return _add_by_database(job_id, body, request, kind, param, source_id, rest, int(counted[0]["n"]))
     job = _load_schedule(job_id)[0]
@@ -3095,7 +3118,7 @@ def create_ingestion_job(body: NewJobRequest, request: Request):
     than BACKGROUND_ROWS tables is written database by database in a background task (_create_by_database)."""
     if body.source is not None:
         kind, param, source_id, rest = _selection_params(body.source)
-        counted = db.query(q.selected_rows_sql(kind, count=True), (param, *rest))
+        counted = db.query(q.selected_count_sql(kind), (param, *rest))
         if counted and counted[0]["n"] > BACKGROUND_ROWS:
             return _create_by_database(body, request, body.source, kind, param, source_id, rest)
     if (made := _made_already(body)) is not None:

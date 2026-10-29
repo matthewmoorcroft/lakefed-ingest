@@ -227,7 +227,7 @@ def big(monkeypatch):
     store, tasks, fake = Store(), ByDatabaseTasks(), FakeDB()
 
     def query(sql, params=()):
-        if sql == q.selected_rows_sql("upload", count=True):
+        if sql == q.selected_count_sql("upload"):
             return [{"n": source.tables()}]
         if sql == q.selected_servers_sql("upload"):
             servers = {}

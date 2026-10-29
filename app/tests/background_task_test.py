@@ -319,6 +319,38 @@ def test_a_plan_of_an_upload_is_numbered_as_the_file_is():
     assert [line["line"] for line in main._file_lines(plan, {"kind": "upload", "lines": [7, 12]})["lines"]] == [7, 12]
 
 
+def test_a_selection_is_read_in_key_order_pages_and_refused_past_the_cap(monkeypatch):
+    rows = [{"server": "sql_a", "src_database": f"eng_{i // 3}", "src_schema": "gen", "src_table": f"T{i}",
+             "line": 10 + i, "fields": {"src_table": f"T{i}"}} for i in range(7)]
+    pages = []
+
+    def key(row):
+        return (row["server"], row["src_database"].lower(), row["line"], row["src_schema"].lower(),
+                row["src_table"].lower())
+
+    def query(sql, params=()):
+        assert sql == q.selected_rows_page_sql("upload")
+        after, limit = tuple(params[5:10]), params[10]
+        page = [dict(r, k_database=r["src_database"].lower(), k_schema=r["src_schema"].lower(),
+                     k_table=r["src_table"].lower())
+                for r in sorted(rows, key=key) if key(r) > after][:limit]
+        pages.append(len(page))
+        return page
+
+    monkeypatch.setattr(main.db, "query", query)
+    monkeypatch.setattr(main, "SELECTED_PAGE", 3)
+    monkeypatch.setattr(main, "BACKGROUND_ROWS", 7)
+    selection = main.Selection(upload_id="u1", whole_server=True)
+    read = main._selected_rows("upload", "u1", selection)
+    assert [r["fields"]["src_table"] for r in read] == [f"T{i}" for i in range(7)]
+    assert pages == [3, 3, 1]
+
+    monkeypatch.setattr(main, "BACKGROUND_ROWS", 5)
+    with pytest.raises(main.HTTPException) as refused:
+        main._selected_rows("upload", "u1", selection)
+    assert refused.value.status_code == 422 and "grew past 5 tables" in refused.value.detail["errors"][0]
+
+
 def test_create_by_reference_plans_the_lines_read_back_from_lakebase(client, monkeypatch):
     asked = []
 
@@ -326,7 +358,7 @@ def test_create_by_reference_plans_the_lines_read_back_from_lakebase(client, mon
         if sql == q.upload_sql():
             return [{"upload_id": "u1", "columns": ["src_connection", "src_database", "src_schema", "src_table", "select_list",
                                                     "primary_key"]}]
-        if sql == q.selected_rows_sql("upload"):
+        if sql == q.selected_rows_page_sql("upload"):
             asked.append(params)
             return [{"server": "sql_a", "src_database": "eng_001", "src_schema": "gen", "src_table": f"t{i}", "line": 10 + i,
                      "fields": {"src_connection": "sql_a", "src_database": "eng_001", "src_schema": "gen",
@@ -339,7 +371,7 @@ def test_create_by_reference_plans_the_lines_read_back_from_lakebase(client, mon
     r = client.post("/api/ingestion-jobs", json={"name": "Ref", "settings": FAN_IN, "source": source})
     assert r.status_code == 200 and r.json()["summary"]["tables"] == 3 and client.db.statements == []
     assert r.json()["summary"]["invalid"] == []
-    assert asked[0] == ("u1", False, "", ["sql_a\x1feng_001"], ["sql_a\x1feng_002\x1fgen.t9"])
+    assert asked[0][:5] == ("u1", False, "", ["sql_a\x1feng_001"], ["sql_a\x1feng_002\x1fgen.t9"])
     r = client.post("/api/ingestion-jobs", json={"name": "Ref", "settings": FAN_IN, "source": source, "dry_run": False})
     assert r.json()["created"] is True
     kept = client.db.of("insert into lakefed_ingest.job_selection")
