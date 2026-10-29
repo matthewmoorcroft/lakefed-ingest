@@ -1,7 +1,8 @@
-"""The operations app's steps at scale: creating an ingestion job by reference to a discovery, and uploading a CSV of
-tables. They call the app's own planning (new_job.plan, read_upload) and its write helpers (main._insert_controls,
-main._log_lines, main._keep_selection, ...) with the recording cursor from lakebase_fake. no_connections() is in force
-for all of it, so a step that tried to reach a database would raise.
+"""The operations app's steps at scale: creating an ingestion job by reference to a discovery (in the request, or
+database by database in the background, as the route chooses by the count), and uploading a CSV of tables. They call
+the app's own planning (new_job.plan, by_database.plan_database, read_upload) and its write helpers
+(main._insert_controls, main._log, main._keep_selection, ...) with the recording cursor from lakebase_fake.
+no_connections() is in force for all of it, so a step that tried to reach a database would raise.
 
 What is not measured here: the reads the route does from Lakebase (the selection's rows, the discovered rows) and the
 request's own JSON handling. Those come back as rows built in Python, and the report says so.
@@ -14,6 +15,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 import paths  # noqa: F401  (sys.path)
+import by_database
 import lakebase_fake
 import main as app
 import new_job as nj
@@ -40,6 +42,21 @@ class CreateRun:
     plan_s: float
     write_s: float
     summary: dict
+    connection: lakebase_fake.RecordingConnection
+
+
+@dataclass
+class ByDatabaseRun:
+    """One create by database: the check pass and the write pass over every database, and what the writes sent. read_s
+    is the time spent reading each database's rows (the harness re-runs discovery's reads for them), which is in neither
+    pass's time."""
+    databases: int
+    tables: int
+    groups: List[str]
+    errors: List[str]
+    check_s: float
+    write_s: float
+    read_s: float
     connection: lakebase_fake.RecordingConnection
 
 
@@ -82,10 +99,12 @@ def _answers(sql: str, params: tuple) -> List[tuple]:
     """What the reads and returning clauses of the create path give back: every collection is free, every control row
     is written, the schedule gets id 1, and no sink or database collides."""
     if "pg_try_advisory_xact_lock" in sql:
-        return [(True,)]
+        return [(key, True) for key in params[0]] if "unnest(" in sql else [(True,)]
     if sql.startswith(f"insert into {q.SCHEMA}.control ("):
         return _control_ids(params)
     if sql.startswith(f"insert into {q.SCHEMA}.schedule ("):
+        return [(1,)]
+    if sql.startswith(f"insert into {q.SCHEMA}.schedule_member ("):
         return [(1,)]
     return []
 
@@ -131,6 +150,200 @@ def create_by_reference(catalog: server_catalog.ServerCatalog, limit: Optional[i
     return CreateRun(tables=len(plan["lines"]), groups=len(plan["groups"]), csv_bytes=len(text.encode()),
                      errors=list(plan["errors"]), csv_s=csv_s, plan_s=plan_s, write_s=write_s, summary=summary,
                      connection=connection)
+
+
+def _database_rows(server: sim.SimulatedServer, spec: dict, database: str) -> List[dict]:
+    """One database's discovered rows, as a selection reads them from Lakebase ({server, src_database, src_schema,
+    src_table, line, fields}). The discovery's own reads of that database make them, one database at a time, so a
+    server's tables are never held whole. An unopenable database has none."""
+    with sim.discovery_boundary(server):
+        try:
+            found = sim.discover_one(server, spec, database)
+        except RuntimeError:
+            return []
+    return [{"server": spec["src_connection"], "src_database": database, "src_schema": table["src_schema"],
+             "src_table": table["src_table"], "line": None, "fields": _discovered_fields(spec, database, table)}
+            for table in found]
+
+
+SOURCE_KIND = "discovery"
+CADENCE_MINUTES = 60
+TIMEZONE = "UTC"
+TASK_ID = 1
+
+
+def _listed_databases(catalog: server_catalog.ServerCatalog) -> List[str]:
+    """The databases the source lists: the unopenable ones are not listed, so the page reads never see them."""
+    unopenable = set(catalog.unopenable_names())
+    return [name for name in catalog.database_names() if name not in unopenable]
+
+
+def _record_pages(connection: lakebase_fake.RecordingConnection, databases: int) -> None:
+    """The page reads one pass makes over a source's databases: a page is full until the last one, so N databases take
+    N // DATABASE_PAGE + 1 pages (queries.source_databases_after_sql)."""
+    connection.record(q.source_databases_after_sql(SOURCE_KIND), databases,
+                      count=databases // by_database.DATABASE_PAGE + 1)
+
+
+def _member_answers(members: set):
+    """What the member inserts give back: a group the job has no member for yet is added and returned, and a group it
+    has is skipped. Both the one-row insert (the database-by-database write) and the set insert (the packed write)."""
+    def answers(sql: str, params: tuple) -> List[tuple]:
+        if sql.startswith(f"insert into {q.SCHEMA}.schedule_member ("):
+            if "unnest(" in sql:
+                added = [group for group in params[1] if group not in members]
+                members.update(added)
+                return [(group,) for group in added]
+            if params[1] in members:
+                return []
+            members.add(params[1])
+        return _answers(sql, params)
+    return answers
+
+
+def _open_job(connection: lakebase_fake.RecordingConnection, selected: dict) -> int:
+    """The write before any database: the job's schedule, what it was chosen from, its touch, and the task's link to the
+    job, in one transaction. Returns the schedule's id."""
+    with connection.transaction() as cur:
+        cur.execute(q.insert_schedule_sql(), (None,) * (len(q.SCHEDULE_FIELDS) + 1))
+        schedule_id = cur.fetchone()[0]
+        app._keep_selection(cur, schedule_id, selected, SCALE_USER)
+        app._touch(cur, SCALE_USER, [schedule_id])
+        cur.execute(q.task_job_sql(), (schedule_id, TASK_ID))
+    return schedule_id
+
+
+def _by_database_setup(catalog: server_catalog.ServerCatalog):
+    """What both by-database paths start from: the source, the listed databases, the groups by server, the columns and
+    the selection the job keeps."""
+    spec = sim.connection_spec()
+    listed = _listed_databases(catalog)
+    groups_of = by_database.groups_by_server(
+        [{"server": spec["src_connection"], "databases": len(listed),
+          "tables": len(listed) * catalog.tables_per_database}])
+    selected = {"parts": [WHOLE_SERVER_PART], "kind": "discovery", "source_id": "scale-discovery"}
+    return spec, sim.SimulatedServer(catalog), listed, groups_of, list(nj.DISCOVERY_COLUMNS), selected
+
+
+def create_by_database(catalog: server_catalog.ServerCatalog) -> ByDatabaseRun:
+    """The by-database create as it ran before the writes were packed, kept as the baseline: a check pass that plans
+    every database and writes nothing, then the write pass, one transaction per database after the job's own. Each
+    database's rows are one statement in each pass, and the page listing is read in each pass too. Runs under
+    no_connections()."""
+    spec, server, listed, groups_of, columns, selected = _by_database_setup(catalog)
+    opened = len(listed)
+    reads = [0.0]
+    members: set = set()
+    connection = lakebase_fake.RecordingConnection(answers=_member_answers(members))
+
+    def rows_of(name: str) -> List[dict]:
+        started = time.perf_counter()
+        found = _database_rows(server, spec, name)
+        reads[0] += time.perf_counter() - started
+        connection.record(q.database_rows_sql(SOURCE_KIND), len(found))
+        return found
+
+    with lakebase_fake.no_connections():
+        started, reads_before = time.perf_counter(), reads[0]
+        errors, tables, groups = [], 0, set()
+        _record_pages(connection, opened)
+        for name in listed:
+            rows = rows_of(name)
+            if not rows:
+                continue
+            plan = by_database.plan_database(SCALE_JOB, CREATE_SETTINGS, rows, columns, groups_of, set(), set())
+            errors += plan["errors"]
+            tables += len(plan["lines"])
+            groups.update(plan["groups"])
+        check_s = time.perf_counter() - started - (reads[0] - reads_before)
+
+        written = 0
+        started, reads_before = time.perf_counter(), reads[0]
+        if not errors:
+            schedule_id = _open_job(connection, selected)
+            _record_pages(connection, opened)
+            for name in listed:
+                rows = rows_of(name)
+                if not rows:
+                    continue
+                plan = by_database.plan_database(SCALE_JOB, CREATE_SETTINGS, rows, columns, groups_of, set(), set())
+                database_groups = sorted(plan["groups"])
+                with connection.transaction() as cur:
+                    app._lock_collections(cur, database_groups)
+                    cur.execute(q.job_database_sinks_sql(), (database_groups, name))
+                    cur.fetchall()
+                    rows_todo = [line["row"] for line in plan["lines"]]
+                    app._insert_controls(cur, rows_todo, SCALE_USER, SCALE_BATCH)
+                    app._refuse_mixed_sinks(cur, rows_todo)
+                    app._refuse_split_databases(cur, rows_todo)
+                    for group in database_groups:
+                        cur.execute(q.insert_member_if_absent_sql(), (schedule_id, group, 0))
+                        if cur.fetchone():
+                            app._log(cur, SCALE_USER, "schedule_create", None, group, "schedule", None, SCALE_JOB,
+                                     None, SCALE_BATCH)
+                    written += 1
+                    progress = {"stage": "writing", "databases_total": opened, "databases_written": written,
+                                "tables_written": tables}
+                    cur.execute(q.task_progress_json_sql(), (json.dumps(progress), tables, TASK_ID))
+            with connection.transaction() as cur:
+                app._task_written(cur, TASK_ID, {"id": schedule_id}, schedule_id, tables)
+        write_s = time.perf_counter() - started - (reads[0] - reads_before)
+    return ByDatabaseRun(databases=written, tables=tables, groups=sorted(groups), errors=list(errors), check_s=check_s,
+                         write_s=write_s, read_s=reads[0], connection=connection)
+
+
+def create_by_chunk(catalog: server_catalog.ServerCatalog) -> ByDatabaseRun:
+    """The by-database create as the route now runs it: the same two passes, but the databases are read a batch at a
+    time (one statement for the batch's tables), and the writes are packed into transactions of up to
+    TABLES_PER_TRANSACTION tables, each written by app._write_chunk (the writer the route calls). Runs under
+    no_connections()."""
+    spec, server, listed, groups_of, columns, selected = _by_database_setup(catalog)
+    opened = len(listed)
+    units = [by_database.Unit(spec["src_connection"], name, True) for name in listed]
+    reads = [0.0]
+    members: set = set()
+    connection = lakebase_fake.RecordingConnection(answers=_member_answers(members))
+
+    def rows_of(batch: List[by_database.Unit]):
+        started = time.perf_counter()
+        found = [row for unit in batch for row in _database_rows(server, spec, unit.database)]
+        reads[0] += time.perf_counter() - started
+        connection.record(q.database_rows_chunk_sql(SOURCE_KIND), len(found))
+        return by_database.rows_by_unit(batch, found)
+
+    with lakebase_fake.no_connections():
+        started, reads_before = time.perf_counter(), reads[0]
+        errors, tables, groups, counted = [], 0, set(), []
+        _record_pages(connection, opened)
+        for batch in by_database.read_batches(units):
+            for unit, rows in rows_of(batch):
+                if not rows:
+                    continue
+                plan = by_database.plan_database(SCALE_JOB, CREATE_SETTINGS, rows, columns, groups_of, set(), set())
+                errors += plan["errors"]
+                tables += len(plan["lines"])
+                groups.update(plan["groups"])
+                counted.append((unit, len(rows)))
+        check_s = time.perf_counter() - started - (reads[0] - reads_before)
+
+        state = {"stage": "writing", "databases_total": opened, "databases_written": 0, "tables_written": 0}
+        started, reads_before = time.perf_counter(), reads[0]
+        if not errors:
+            schedule_id = _open_job(connection, selected)
+            job = app.ChunkJob(sid=schedule_id, name=SCALE_JOB, user=SCALE_USER, batch=SCALE_BATCH,
+                               cadence_minutes=CADENCE_MINUTES, timezone=TIMEZONE, offsets={}, task_id=TASK_ID)
+            _record_pages(connection, opened)
+            for chunk in by_database.transactions_of(counted):
+                plans = [by_database.plan_database(SCALE_JOB, CREATE_SETTINGS, rows, columns, groups_of, set(), set())
+                         for _, rows in rows_of(chunk) if rows]
+                if plans:
+                    with connection.transaction() as cur:
+                        app._write_chunk(cur, plans, job, state)
+            with connection.transaction() as cur:
+                app._task_written(cur, TASK_ID, {"id": schedule_id}, schedule_id, tables)
+        write_s = time.perf_counter() - started - (reads[0] - reads_before)
+    return ByDatabaseRun(databases=state["databases_written"], tables=tables, groups=sorted(groups),
+                         errors=list(errors), check_s=check_s, write_s=write_s, read_s=reads[0], connection=connection)
 
 
 def upload_by_reference(catalog: server_catalog.ServerCatalog, limit: Optional[int] = None) -> UploadRun:

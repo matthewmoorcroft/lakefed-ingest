@@ -9,15 +9,16 @@ from collections import Counter
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional
 
+import discovery
 import paths  # noqa: F401  (sys.path)
 import lakebase_fake
 import server_catalog
 import simulation as sim
 
-# discover_tables.ipynb runs at most 8 databases at once (ThreadPoolExecutor(max_workers=min(8, databases))), each one's
-# three catalog queries in turn. The design's cap is 32 queries at a time under the server's limit.
-NOTEBOOK_WORKERS = 8
-DESIGN_WORKERS = 32
+# discover_tables.ipynb ran 8 databases at once before the discovery fix (min(8, databases)), and runs
+# discovery.DEFAULT_WORKERS now (32, the design's cap). Both are kept, so one run shows the before and the after.
+PREVIOUS_WORKERS = 8
+NOTEBOOK_WORKERS = discovery.DEFAULT_WORKERS
 
 FoundCallback = Callable[[str, List[dict]], None]
 RefusalCallback = Callable[[str, str], None]
