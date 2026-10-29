@@ -1522,6 +1522,55 @@ select t.id, t.src_schema as schema, t.src_table as "table", t.load_type, t.prim
 group by t.id, cp.control_id order by lower(t.src_schema), lower(t.src_table) limit %s offset %s"""
 
 
+_TARGET = "t.sink_catalog || '.' || t.sink_schema || '.' || t.sink_table"
+# Rows the run records say each table wrote over the last 7 days: its ok events' merged or appended rows.
+_WRITTEN_7D = (f"(select e.control_id, sum(e.rows_merged) as rows_written, max(e.finished_at) as last_written "
+               f"from {SCHEMA}.ingest_event e where e.task_collection = any(%s) and e.status = 'ok' "
+               f"and e.finished_at >= now() - interval '7 days' group by e.control_id)")
+# A job's rows (alias t) with their checkpoints, database stamps and rows written ("written"), before the WHERE.
+_JOB_ROWS_WRITTEN = (f"from {SCHEMA}.control t left join {SCHEMA}.checkpoint cp on cp.control_id = t.id "
+                     f"{DATABASE_CHECK_JOIN} left join written w on w.control_id = t.id")
+
+
+def job_targets_sql() -> str:
+    """A job's target tables, one row each: how many of its source tables write it (and how many outside the job),
+    from how many databases, their states now, and the rows written over 7 days by the run records; fan_in_total
+    counts the matching targets written from more than one source table. Exact row counts would need a SQL warehouse,
+    which the app avoids. Params: groups, groups, groups, search pattern, limit, offset."""
+    return f"""
+with written as {_WRITTEN_7D},
+outside as (
+  select o.sink_catalog || '.' || o.sink_schema || '.' || o.sink_table as target, count(*) as n
+  from {SCHEMA}.control o where not (o.task_collection = any(%s)) group by 1)
+select {_TARGET} as target, t.sink_catalog as catalog, t.sink_schema as schema, t.sink_table as "table",
+       count(*) as sources, count(distinct ({SERVER}, coalesce(t.src_database, ''))) as databases,
+       count(*) filter (where t.client_id is not null) as with_client_id,
+       coalesce(max(x.n), 0) as outside_sources, {STATE_COUNTS},
+       sum(w.rows_written) as rows_written_7d, max(w.last_written) as last_written, count(*) over () as total,
+       sum(case when count(*) + coalesce(max(x.n), 0) > 1 then 1 else 0 end) over () as fan_in_total
+{_JOB_ROWS_WRITTEN}
+left join outside x on x.target = {_TARGET}
+where t.task_collection = any(%s) and {_TARGET} ilike %s
+group by t.sink_catalog, t.sink_schema, t.sink_table
+order by lower({_TARGET}) limit %s offset %s"""
+
+
+def job_target_sources_sql() -> str:
+    """The source tables of a job that write one target, with each one's state and its rows written over 7 days.
+    Params: groups, groups, catalog, schema, table, limit, offset."""
+    return f"""
+with written as {_WRITTEN_7D}
+select t.id, {SERVER} as server, t.src_database as database, t.src_schema as schema, t.src_table as "table",
+       t.client_id, t.task_collection, t.task_enabled as enabled, cp.status, cp.phase, cp.last_success_at,
+       {STATE_COUNTS}, max(w.rows_written) as rows_written_7d, max(w.last_written) as last_written,
+       count(*) over () as total
+{_JOB_ROWS_WRITTEN}
+where t.task_collection = any(%s) and t.sink_catalog = %s and t.sink_schema = %s and t.sink_table = %s
+group by t.id, cp.control_id
+order by lower({SERVER}), lower(coalesce(t.src_database, '')), lower(t.src_schema), lower(t.src_table)
+limit %s offset %s"""
+
+
 def job_row_ids_sql() -> str:
     """The ids of a job's rows on one server, optionally one database and one table (schema and table; blank =
     all). Params: groups, server ('' = every server), database, schema, table."""
