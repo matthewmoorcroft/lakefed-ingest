@@ -29,3 +29,11 @@ def test_a_dialogs_body_scrolls_and_its_title_and_actions_stay():
 
 def test_the_unread_databases_list_scrolls_in_its_own_area():
     assert "overflow: auto" in _rule(".unread-all ul") and "max-height" in _rule(".unread-all ul")
+
+
+def test_a_dialog_is_centred_by_margins_and_never_wider_than_the_window():
+    """Grid centring ran a dialog wider than its window off the left edge; auto margins start it at the edge instead."""
+    assert "display: flex" in _rule(".modal-backdrop") and "place-items" not in _rule(".modal-backdrop")
+    rule = _rule(".modal")
+    assert "margin: auto" in rule and re.search(r"max-width:\s*calc\(100vw", rule) and "overflow: hidden" in rule
+    assert "overflow-wrap: anywhere" in _rule(".modal-body")

@@ -395,7 +395,9 @@ test("Next on the connection step says it needs a passed test, and what the test
   assert.equal(connectionNextBlock(false, null), "Next needs a passed connection test: choose a connection, then Test connection");
   assert.equal(connectionNextBlock(false, "Waiting for compute: 5 s so far, since 20:42"),
                "Next needs a passed connection test. Testing now: Waiting for compute: 5 s so far, since 20:42");
+  // Said once, beside Next, in full: nothing else in the dialog repeats it.
   assert.equal(connectionNextBlock(false, discoveryWait({ state: "PENDING", since: ASKED }, ASKED, "Reading", LATER)),
-               "Next needs a passed connection test. Testing now: Waiting for compute: 2 min 44 s so far, since 20:42");
+               "Next needs a passed connection test. Testing now: Waiting for compute: 2 min 44 s so far, since 20:42. "
+               + "The discovery job's compute is starting (its cluster stops after an hour unused), which can take a few minutes");
   assert.equal(connectionNextBlock(true, null), undefined);
 });

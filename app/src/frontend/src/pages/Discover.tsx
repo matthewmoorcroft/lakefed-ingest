@@ -168,7 +168,6 @@ function Step1({ chosen, setChosen, tested, setTested, waiting, setWaiting }: { 
             <label className="inline">Databases matching<input className="search" placeholder="all, or e.g. lfc_eng_%" value={pattern}
               onChange={(e) => { setPattern(e.target.value); setTested(null); }} /></label>
             <button disabled={!chosen || testing} onClick={test}>{testing ? "Testing…" : "Test connection"}</button>
-            {testing && <span className="muted">{waiting ?? "Testing the connection"}.</span>}
             {!testing && !tested && <span className="muted">% matches any characters and _ any one, as in SQL Server; blank lists every database.</span>}
             {tested && <span><Tag tone="ok">{tested.typed ? "Typed" : "Connected"}</Tag> <span className="muted">{tested.typed ? "uses" : "reads"}{" "}
               {fmtInt(tested.databases.length)} {plural(tested.databases.length, "database")} through {chosen}</span></span>}
@@ -409,8 +408,7 @@ export function DiscoverDialog({ onClose }: { onClose: (pick: DiscoveredPick | n
           waiting={waitText} setWaiting={setWaiting} />}
         {step >= 2 && <Step2 connection={connection} discoveryId={discoveryId} typedNames={typedNames} picks={picks} setPicks={setPicks}
           wholeServer={wholeServer} setWholeServer={setWholeServer} read={read} setRead={setRead} failed={failed} setFailed={setFailed} />}
-        {step === 3 && <p className="muted">{waitText ?? "Reading the tables of what was chosen"}. The tables are added to the job's
-          page when it ends.</p>}
+        {step === 3 && <p className="muted">The tables are added to the job's page when the reading ends.</p>}
         {step === 2 && chosen > 0 && <p className="muted">{chosenWords} chosen.</p>}
         <ErrorBox error={error} />
       </div>

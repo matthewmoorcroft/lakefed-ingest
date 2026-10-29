@@ -279,9 +279,9 @@ export function discoveryWait(wait: RunWait | null, asked: Date, reading: string
 }
 
 /** Why Next is off on the connection step: it needs a passed connection test, and while the test runs, what it is
- *  doing (its first sentence: the rest is said beside the test). Nothing once the test has passed. */
+ *  doing. Said once, beside Next. Nothing once the test has passed. */
 export function connectionNextBlock(passed: boolean, testing: string | null): string | undefined {
   if (passed) return undefined;
-  if (testing) return `Next needs a passed connection test. Testing now: ${testing.split(". ")[0]}`;
+  if (testing) return `Next needs a passed connection test. Testing now: ${testing}`;
   return "Next needs a passed connection test: choose a connection, then Test connection";
 }
