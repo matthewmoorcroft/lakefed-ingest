@@ -25,3 +25,18 @@ def _run_poller_table_missing(monkeypatch):
     before the poller) and no test reaches Lakebase through the poller."""
     import run_poller
     monkeypatch.setattr(run_poller, "table_ready", lambda: False)
+
+
+@pytest.fixture(autouse=True)
+def _no_workspace(monkeypatch):
+    """No unit test reaches a Databricks workspace: the workspace client refuses, so a call a test forgot to stub fails
+    at once instead of authenticating against a real workspace. A test that needs one stubs its own call."""
+    import sys
+    import lakebase
+
+    def refuse():
+        raise RuntimeError("unit tests never reach a Databricks workspace: stub the call this test makes")
+    real = lakebase.workspace
+    for module in list(sys.modules.values()):
+        if module is not None and getattr(module, "workspace", None) is real:
+            monkeypatch.setattr(module, "workspace", refuse)

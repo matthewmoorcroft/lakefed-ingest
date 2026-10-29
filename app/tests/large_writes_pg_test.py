@@ -110,7 +110,7 @@ def test_a_task_whose_heartbeat_stopped_reads_failed_or_written(client):
                "where id in (%s, %s) returning id", (gone, committed))
     read = {t: client.get(f"/api/tasks/{t}").json() for t in (gone, committed, alive)}
     assert (read[gone]["status"], read[gone]["error"]) == ("failed", main.TASK_ROLLED_BACK)
-    assert (read[committed]["status"], read[committed]["error"]) == ("succeeded", main.TASK_UNSYNCED)
+    assert (read[committed]["status"], read[committed]["error"]) == ("failed", main.TASK_UNSYNCED)
     assert read[alive]["status"] == "running"
     assert [t["id"] for t in client.get("/api/ingestion-jobs/5/tasks").json()] == [committed]
     # A late finish leaves an ended task as it is.

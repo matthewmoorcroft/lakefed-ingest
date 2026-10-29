@@ -5,7 +5,7 @@ group runs of a window, and this module places and sums them, so it is tested wi
 A job run is one trigger of a schedule (schedules.job_runs places group runs by cadence slot). Placement is
 by the schedule as it is now, so it is exact for scheduled runs; a run started by hand inside a slot is an
 extra run, and a cluster start slower than the cadence can land a run in the next slot."""
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Dict, Iterable, List, Optional
 
 import queries as q
@@ -252,6 +252,55 @@ def status(job: dict, running: Optional[dict], last: Optional[dict], top_cause: 
     return {"label": "Current", "tone": "ok", "detail": [], "cause": None}
 
 
+DELETING, DELETE_FAILED, DELETE_GONE = "deleting", "failed", "gone"
+# A deleted job whose delete job run is not recorded yet is still starting for this long after the delete (the run is
+# recorded as the delete starts); after that, a missing run is a failure to show, not a start to wait for.
+DELETE_STARTING_S = 300
+
+
+def delete_state(job: dict, tables_left: bool, run: Optional[dict], now: datetime) -> dict:
+    """See _delete_state; adds whether the job's Delete drops its target tables, so Run again starts it the same way."""
+    return {**_delete_state(job, tables_left, run, now), "drop_targets": bool(sch.options_of(job).get("delete_drop_targets"))}
+
+
+def _delete_state(job: dict, tables_left: bool, run: Optional[dict], now: datetime) -> dict:
+    """Where a deleted job's Delete stands. ``deleting`` while its delete job runs (or is starting), ``failed`` with
+    the reason when the start or the run failed, ``gone`` once the delete job succeeded and no tables are left: only
+    then does the job leave the Ingestion jobs list. ``run_again`` says whether the Delete can be run again (only
+    while tables remain: a drop that failed after the rows were removed has nothing left to delete again)."""
+    start_error = sch.options_of(job).get("delete_start_error")
+    if start_error:
+        return {"state": DELETE_FAILED, "reason": start_error, "run_again": True, "run": None}
+    if run is None:
+        if not tables_left:
+            return {"state": DELETE_GONE, "reason": None, "run_again": False, "run": None}
+        deleted_at = _when(job.get("deleted_at"))
+        if deleted_at.tzinfo is None:
+            deleted_at = deleted_at.replace(tzinfo=timezone.utc)
+        if now - deleted_at < timedelta(seconds=DELETE_STARTING_S):
+            return {"state": DELETING, "reason": None, "run_again": False, "run": None}
+        return {"state": DELETE_FAILED, "reason": "its delete job run was never recorded", "run_again": True, "run": None}
+    if is_active(run):
+        return {"state": DELETING, "reason": None, "run_again": False, "run": run}
+    if run.get("state") == "TERMINATED" and run.get("result") == "SUCCESS":
+        if tables_left:
+            return {"state": DELETE_FAILED, "reason": "the delete job finished, but tables are still there",
+                    "run_again": True, "run": run}
+        return {"state": DELETE_GONE, "reason": None, "run_again": False, "run": run}
+    how = run.get("result") or run.get("state") or "without a result"
+    reason = run.get("message") or f"the delete job ended {how}"
+    return {"state": DELETE_FAILED, "reason": reason, "run_again": tables_left, "run": run}
+
+
+def delete_status(delete: dict) -> dict:
+    """A deleted job's Status cell while its Delete is pending or failed."""
+    if delete["state"] == DELETING:
+        starting = "starting its delete job" if delete.get("run") is None else "its delete job is running"
+        return {"label": "Deleting", "tone": "run", "detail": [starting], "cause": None}
+    return {"label": "Delete failed", "tone": "bad", "detail": [delete["reason"]] if delete.get("reason") else [],
+            "cause": None}
+
+
 def last_finished(summaries: List[dict]) -> Optional[dict]:
     """A job's last finished job run (newest first): the newest one that ran. A trigger that did not run (a paused
     job's, say) is never it; None when none of them ran."""
@@ -291,7 +340,7 @@ def consecutive_failed(summaries: List[dict]) -> int:
 def jobs_view(schedules: List[dict], members: List[dict], states: List[dict], running: List[dict],
               runs: List[dict], stats_by_group: Dict[str, dict], now: datetime,
               causes_by_job: Optional[Dict[int, List[dict]]] = None,
-              earlier_last_by_job: Optional[Dict[int, dict]] = None) -> dict:
+              earlier_last_by_job: Optional[Dict[int, dict]] = None, deleting: Iterable[str] = ()) -> dict:
     """Every ingestion job as a row (sums, cadence, next start, last finished job run, the running one, and
     Status), "Not in any job", the running job runs, and the jobs that need attention. `runs` are the group
     runs of the last RECENT_JOB_RUNS triggers of every job, with their work; `stats_by_group` each group's
@@ -302,7 +351,7 @@ def jobs_view(schedules: List[dict], members: List[dict], states: List[dict], ru
     job run."""
     causes_by_job, earlier_last_by_job = causes_by_job or {}, earlier_last_by_job or {}
     p50_by_group = {g: st.get("p50_s") for g, st in stats_by_group.items()}
-    job_sums, not_in_job = rollup.jobs(states, schedules, members)
+    job_sums, not_in_job = rollup.jobs(states, schedules, members, deleting)
     groups = rollup.groups(states)
     group_tables = {name: g["enabled_tables"] for name, g in groups.items()}
     running_by_run = {r["run_id"]: r for r in running}
@@ -331,6 +380,8 @@ def jobs_view(schedules: List[dict], members: List[dict], states: List[dict], ru
                                    else last.get("failed_in_a_row", 0)),
                "causes": causes[:3]}
         row["status"] = status(row, current, last, causes[0]["label"] if causes else None, warnings)
+        if s.get("delete"):
+            row.update(status=delete_status(s["delete"]), next_start=None, delete=s["delete"])
         rows.append(row)
         running_job_runs += [x for x in summaries if x["outcome"]["label"] == "Running"]
     rows.sort(key=lambda j: (-1 if j["running_job_run"] and j["state_failing"] else 0 if j["state_failing"] else
@@ -411,6 +462,40 @@ def check_run_of(run: dict, schedule_id: int, groups: Iterable[str]) -> bool:
         return str(params["schedule_id"]).strip() == str(schedule_id)
     named = {g.strip() for g in str(params.get("task_collections") or "").split(",") if g.strip()}
     return bool(named) and named <= set(groups)
+
+
+IDLE, STARTING, RUNNING, CANCELLING = "idle", "starting", "running", "cancelling"
+# How long Databricks may take to start a run, or to end the runs of a cancel, before the page says plainly that
+# Databricks has not confirmed it. The page keeps Run now off meanwhile: a run is never shown as ended before it is.
+START_CONFIRM_S = 15 * 60
+CANCEL_CONFIRM_S = 10 * 60
+
+
+def run_phase(active: List[dict], now: datetime) -> dict:
+    """Where a job's Run now and Cancel run stand, from its active Databricks runs as the poller records them: idle
+    when none is active; cancelling while any is terminating, until every one has ended; running once one is RUNNING;
+    starting while the rest are queued or pending. A run dict has state, started, seen (when its state last changed),
+    run_id and url. ``timed_out`` says Databricks has not confirmed the change within its limit."""
+    if not active:
+        return {"phase": IDLE, "since": None, "timed_out": False, "run_id": None, "run_url": None}
+    terminating = [r for r in active if r.get("state") == "TERMINATING"]
+    running = [r for r in active if r.get("state") == "RUNNING"]
+    if terminating:
+        phase, limit, runs = CANCELLING, CANCEL_CONFIRM_S, terminating
+        since_of = [r.get("seen") or r.get("started") for r in terminating]
+    elif running:
+        phase, limit, runs = RUNNING, None, running
+        since_of = [r.get("started") or r.get("seen") for r in running]
+    else:
+        phase, limit, runs = STARTING, START_CONFIRM_S, active
+        since_of = [r.get("started") or r.get("seen") for r in active]
+    moments = [_when(v) for v in since_of if v]
+    moments = [m if m.tzinfo else m.replace(tzinfo=timezone.utc) for m in moments]
+    since = min(moments, default=None)
+    first = min(runs, key=lambda r: r.get("started") or "")
+    timed_out = bool(limit and since is not None and (now - since).total_seconds() > limit)
+    return {"phase": phase, "since": since.isoformat() if since else None, "timed_out": timed_out,
+            "run_id": first.get("run_id"), "run_url": first.get("url")}
 
 
 def run_state_label(run: dict) -> dict:

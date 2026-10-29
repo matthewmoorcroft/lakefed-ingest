@@ -383,6 +383,8 @@ BACKGROUND_ROWS = int(os.environ.get("BACKGROUND_ROWS", "5000"))
 TASK_BEAT_S = float(os.environ.get("TASK_BEAT_S", "2"))
 # A running task's heartbeat older than this means its thread is gone: the app restarted while it wrote.
 TASK_STALE_S = int(os.environ.get("TASK_STALE_S", "120"))
+TASK_WRITTEN_NOT_SYNCED = ("The tables were written, but their Databricks jobs were not synced, so the task is not "
+                           "done:")
 TASK_ROLLED_BACK = ("the app restarted while writing these tables; its transaction was rolled back with it, so none "
                     "of them was written: send it again")
 TASK_UNSYNCED = ("the tables were written, but the app restarted before the job's Databricks jobs were synced: "
@@ -445,11 +447,12 @@ def _run_task(task_id: int, write, after) -> None:
     result, status, error = None, "failed", None
     try:
         result = write(progress, task_id)
-        status = "succeeded"
         try:
             result = after(result)
+            status = "succeeded"
         except Exception as e:
             result = {**result, "after_error": _error_text(e)}
+            error = f"{TASK_WRITTEN_NOT_SYNCED} {_error_text(e)}"
     except BaseException as e:
         error = _error_text(e)
     finally:
@@ -879,12 +882,40 @@ def collections():
 # ---- ingestion jobs and job runs ----------------------------------------------------------------
 
 def _schedules():
-    """Active schedules and all their members, removed ones included (a member's past runs still belong to
-    the job runs of its time in the schedule), shared like _running. _active keeps the current members."""
+    """Active schedules, the deleted ones whose Delete is pending, and all their members, removed ones included (a
+    member's past runs still belong to the job runs of its time in the schedule), shared like _running. _active keeps
+    the current members. A pending deleted job carries its delete state (ingestion_jobs.delete_state)."""
     def compute():
-        rows = db.query(q.schedules_sql())
+        rows = _with_delete_states(db.query(q.schedules_sql()), datetime.now(timezone.utc))
         return rows, db.query(q.schedule_members_sql(), ([r["id"] for r in rows],)) if rows else []
     return _shared("schedules", compute)
+
+
+def _with_delete_states(rows: List[dict], now: datetime) -> List[dict]:
+    """The rows with each deleted job's delete state. One whose delete is finished (the delete job succeeded and no
+    tables are left) is marked ``delete_finished`` and leaves the list: the Deleted jobs history keeps it."""
+    deleted = [r for r in rows if r.get("deleted_at") is not None]
+    if not deleted:
+        return rows
+    left = {r["schedule_id"] for r in db.query(q.deleted_tables_left_sql(), ([r["id"] for r in deleted],))}
+    out = []
+    for r in rows:
+        if r.get("deleted_at") is None:
+            out.append(r)
+            continue
+        state = ij.delete_state(r, r["id"] in left, _delete_run(r), now)
+        if state["state"] == ij.DELETE_GONE:
+            with db.transaction() as cur:
+                cur.execute(q.set_schedule_flag_sql(), (["delete_finished"], True, int(r["id"])))
+            continue
+        out.append({**r, "delete": state})
+    return out
+
+
+def _deleting() -> set:
+    """The groups of jobs being deleted (queries.deleting_groups_sql), shared like _schedules: they stay with their
+    job, under Deleted jobs, until the delete job removes them."""
+    return _shared("deleting", lambda: {r["task_collection"] for r in db.query(q.deleting_groups_sql())})
 
 
 def _active(members: List[dict]) -> List[dict]:
@@ -978,7 +1009,8 @@ def _jobs_view() -> dict:
         start = min([ij.window(int(s["cadence_minutes"]), ij.RECENT_JOB_RUNS + 1, now) for s in schedules]
                     + [q._when(r["started_at"]) - timedelta(days=1) for r in running if r.get("started_at")], default=now)
         runs = _group_runs(groups, start, now + timedelta(seconds=1))
-        view = ij.jobs_view(schedules, members, states, running, runs, stats, now)
+        deleting = _deleting()
+        view = ij.jobs_view(schedules, members, states, running, runs, stats, now, deleting=deleting)
         by_id = {s["id"]: s for s in schedules}
         # A job none of whose recent triggers ran (paused overnight, say): its last job run is found before them.
         earlier = _last_ran([by_id[j["id"]] for j in view["jobs"] if j["id"] is not None and not j["last_job_run"]], now)
@@ -994,7 +1026,7 @@ def _jobs_view() -> dict:
             causes = {job_id: q.group_errors([f for f in failures if f["run_id"] in ids]) for job_id, ids in latest_ids.items()}
         if causes or earlier:
             view = ij.jobs_view(schedules, members, states, running, runs, stats, now, causes_by_job=causes,
-                                earlier_last_by_job=earlier)
+                                earlier_last_by_job=earlier, deleting=deleting)
         return view
     return _shared("jobs_view", compute)
 
@@ -1052,7 +1084,7 @@ def groups_not_in_job():
     """The groups in no ingestion job, as a page of their own: their tables by state and each group's last run, so a
     deployment with no jobs (a read-only share) still opens its groups and tables from the jobs list."""
     schedules, members = _schedules()
-    _, not_in_job = rollup.jobs(_states(), schedules, members)
+    _, not_in_job = rollup.jobs(_states(), schedules, members, _deleting())
     not_in_job = not_in_job or {"groups": []}
     groups, stats, last_runs = rollup.groups(_states()), _group_stats(), _last_runs()
     rows = []
@@ -1164,10 +1196,10 @@ def ingestion_job(job_id: int, request: Request):
             # For the Run now button: why it can't start now (None when it can), whether a run is going (the button
             # is then Cancel run, which the run permission also gates), and what one run starts.
             "run_now": {"blocked": refusals["run"] or _run_now_blocker(job, mine), "refused": refusals["run"],
-                        "going": _recorded_running(mine),
-                        "groups": len(mine), "check": job.get("job_variant") == sch.CHECK_VARIANT},
+                        "groups": len(mine), "check": job.get("job_variant") == sch.CHECK_VARIANT,
+                        **_run_phase_of(job, mine, now)},
             "delete_blocked": refusals["delete"], "change_blocked": refusals["change"],
-            "rediscovery": rediscovery.view(sch.options_of(job)), **_audit(job)}
+            "delete": job.get("delete"), "rediscovery": rediscovery.view(sch.options_of(job)), **_audit(job)}
 
 
 def _job_groups(job_id: int) -> List[str]:
@@ -1200,9 +1232,21 @@ def _started_job(job: dict) -> Optional[str]:
 NO_IDENTITY = "the app can't tell who you are (the Databricks Apps proxy sent no user), so it refuses this"
 
 
+DELETED_JOB = ("this job is deleted: its runs and tables can't change while its delete runs or after it, and it "
+               "can't be run or edited; Run again on it starts its delete job again")
+
+
 def _permission_refusals(job: dict, user: str) -> dict:
     """{action: why the user may not take it, or None} for each action on an ingestion job (run, change, delete),
-    from their Databricks permission on the job its runs execute as."""
+    from their Databricks permission on the job its runs execute as. A deleted job can't be run or changed; its
+    delete stays open, for Run again."""
+    refusals = _job_permission_refusals(job, user)
+    if job.get("deleted_at") is None:
+        return refusals
+    return {**refusals, "run": DELETED_JOB, "change": DELETED_JOB}
+
+
+def _job_permission_refusals(job: dict, user: str) -> dict:
     if not (user or "").strip():
         return {action: NO_IDENTITY for action in jobs.ACTION_NEEDS}
     started = _started_job(job)
@@ -1355,12 +1399,35 @@ def run_ingestion_job(job_id: int, request: Request):
     return {"started": started}
 
 
+def _job_active_runs(job: dict, members: List[dict]) -> List[dict]:
+    """Every Databricks run of an ingestion job that is still active, from the poller's table: its wrapper runs, its
+    check job's run (check kind), and the group runs of its groups. Cancel run cancels all of them, so Cancelling
+    waits for all of them to end."""
+    groups = {m["task_collection"] for m in members}
+    runs = _active_wrapper_runs(members)
+    check_kind = (job.get("job_variant") or "default") == sch.CHECK_VARIANT
+    if check_kind and jobs.CHECK_JOB_ID:
+        runs += [r for r in run_poller.runs_of(jobs.CHECK_JOB_ID, active_only=True, limit=10)
+                 if ij.check_run_of(r, job["id"], groups)]
+    target = (sch.copy_job_id(job) or _ingest_job_id("default")) if check_kind else _wrapper_target(job)
+    if target and groups:
+        runs += [r for r in run_poller.runs_of(target, active_only=True, limit=50) if r.get("task_collection") in groups]
+    return runs
+
+
 def _active_wrapper_runs(members: List[dict]) -> List[dict]:
     """The job's wrapper jobs' runs going now (active only), newest first."""
     out = []
     for wrapper in sorted({int(m["job_id"]) for m in members if m.get("job_id")}):
         out += [r for r in run_poller.runs_of(wrapper, active_only=True, limit=5) if ij.is_active(r)]
     return sorted(out, key=lambda r: r.get("started") or "", reverse=True)
+
+
+def _run_phase_of(job: dict, members: List[dict], now: datetime) -> dict:
+    """Where Run now and Cancel run stand for a job (ingestion_jobs.run_phase), from its active runs. ``going`` is
+    true while any run is active, so a page that asks what is going reads the same thing as the buttons."""
+    phase = ij.run_phase(_job_active_runs(job, members), now)
+    return {**phase, "going": phase["phase"] != ij.IDLE}
 
 
 def _job_databricks_runs(job: dict, members: List[dict]) -> dict:
@@ -1984,7 +2051,8 @@ def job_runs_across(job: Optional[str] = None, outcome: Optional[str] = None, be
     limit = max(1, min(int(limit), 100))
     schedules, members = _schedules()
     if job == "none":
-        unscheduled = sorted({s["task_collection"] for s in _states()} - {m["task_collection"] for m in _active(members)})
+        unscheduled = sorted({s["task_collection"] for s in _states()} - {m["task_collection"] for m in _active(members)}
+                             - _deleting())
         rows = _with_rows_written(db.query(q.group_runs_before_sql(), (unscheduled, end, limit + 1))) if unscheduled else []
         more = len(rows) > limit
         rows = rows[:limit]
@@ -2026,7 +2094,7 @@ def sources():
             listed, listed_error = _connections(), None
         except Exception as e:
             listed, listed_error = [], str(e)
-        view = rollup.sources(_states(), listed, db.query(q.not_ingested_sql()), schedules, members)
+        view = rollup.sources(_states(), listed, db.query(q.not_ingested_sql()), schedules, members, _deleting())
         for instance in view["instances"]:
             for j in instance["jobs"]:
                 if j.get("cadence_minutes"):
@@ -2796,14 +2864,14 @@ def _skipped_counts(members: List[dict]) -> dict:
 @app.get("/api/schedules")
 def list_schedules(details: bool = True):
     """Schedules with their members: when each runs next, its wrapper job, recent runs and warnings."""
-    rows = db.query(q.schedules_sql())
+    now = datetime.now(timezone.utc)
+    rows = _with_delete_states(db.query(q.schedules_sql()), now)
     members = db.query(q.schedule_members_sql(), ([r["id"] for r in rows],)) if rows else []
     active = [m for m in members if m["removed_at"] is None]
     colls = sorted({m["task_collection"] for m in active})
     stats = {r["task_collection"]: r for r in
              (db.query(q.collection_run_stats_sql(), (colls, colls, colls, colls)) if colls else [])}
     skipped = _skipped_counts(active) if details else {}
-    now = datetime.now(timezone.utc)
     return [{**s, "description": sch.describe(int(s["cadence_minutes"]), sch.start_minute(s), s["timezone"]),
              "members": _members_view(s, [m for m in active if m["schedule_id"] == s["id"]], stats, skipped, now)}
             for s in rows]
@@ -3403,10 +3471,11 @@ def _delete_blocker(job: dict, active: List[dict], groups: List[str]):
 
 
 def _record_delete(cur, sid: int, drop: bool) -> None:
-    """Record that the job's Delete runs the delete job, and with which flag; the earlier run is forgotten, so a start
-    that fails shows as not started."""
+    """Record that the job's Delete runs the delete job, and with which flag. The earlier run, its start error and its
+    finished mark are forgotten, so the job shows Deleting until this run's state is known."""
     cur.execute(q.set_schedule_flag_sql(), (["delete_drop_targets"], bool(drop), int(sid)))
-    cur.execute(q.clear_schedule_option_sql(), ("delete_run_id", int(sid)))
+    for key in ("delete_run_id", "delete_start_error", "delete_finished"):
+        cur.execute(q.clear_schedule_option_sql(), (key, int(sid)))
 
 
 def _start_delete_job(sid: int, drop: bool) -> dict:
@@ -3415,7 +3484,10 @@ def _start_delete_job(sid: int, drop: bool) -> dict:
     try:
         run_id = jobs.start_delete_job(sid, drop)
     except Exception as e:
-        return {"run_id": None, "url": None, "error": f"the delete job didn't start: {str(e).split('. ')[0]}"}
+        error = f"the delete job didn't start: {str(e).split('. ')[0]}"
+        with _write() as cur:
+            cur.execute(q.set_schedule_text_option_sql(), (["delete_start_error"], error, int(sid)))
+        return {"run_id": None, "url": None, "error": error}
     with _write() as cur:
         cur.execute(q.set_schedule_option_sql(), (["delete_run_id"], run_id, int(sid)))
     host = jobs.workspace_url()
@@ -3438,7 +3510,9 @@ def _delete_run(job: dict) -> Optional[dict]:
 def sync_schedule(sid: int, request: Request):
     """Re-sync the wrapper jobs (recreates missing ones and undoes edits made outside the app)."""
     s = _load_schedule(sid)[0]
-    _refuse_job(s, request, "change")
+    # A deleted job keeps its sync: it is how a wrapper job whose delete failed is deleted again, so only the
+    # change permission is checked here, not the deleted-job refusal.
+    _refuse(_job_permission_refusals(s, _user(request))["change"])
     cluster = _apply_cluster(sid) if sch.own_cluster(s) else None     # copies the ingestion job again
     return {"id": sid, "sync": _sync(sid, _user(request)), "cluster_error": cluster}
 

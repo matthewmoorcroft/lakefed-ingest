@@ -4,7 +4,7 @@ The ingestion job ingests a whole task_collection inside **one** job task (threa
 pools), so there is no per-table task in the Jobs UI to watch. Visibility is re-created by writing
 per-table telemetry to **Lakebase**. The Lakebase database is already
 registered as a Unity Catalog catalog (`lakefed_ingest_lakebase`, via the `database_catalogs` resource
-in `lakefed_ingest_setup.yml`), so you query the telemetry **directly from DBSQL** — no sync job,
+in `lakefed_ingest_setup.yml`), so you query the telemetry **directly from DBSQL**, with no sync job,
 no copy. Writes go to Lakebase (point writes from the ingestion run); reads go through UC federation.
 
 ## Tables (Lakebase, UC path `lakefed_ingest_lakebase.lakefed_ingest`)
@@ -20,11 +20,11 @@ queries below.
 | `database_check` | per (collection, source database) | stamped when the whole database is unchanged, in place of each table's `last_success_at` |
 
 `ingest_event` carries `action` (seed/increment/reseed/full), `stage` (plan/detect/ensure_sink/read/
-seed/merge/load/checkpoint — pinpoints *where* a failure happened; `plan` = the row's
-`src_type`/`load_type` pair isn't supported), `status`, `duration_ms`, `rows_read`/`rows_merged`,
-`position_from`/`position_to` (checkpoint positions as text — the CT version for `ct`; NULL for
+seed/merge/load/checkpoint). It pinpoints *where* a failure happened; `plan` means the row's
+`src_type`/`load_type` pair isn't supported; `status`, `duration_ms`, `rows_read`/`rows_merged`,
+`position_from`/`position_to` (checkpoint positions as text, the CT version for `ct`; NULL for
 `full`), `pool`, and `error`. One row is INSERTed at start
-(status `running`) and UPDATEd at finish — concurrent workers touch distinct rows, so there is no
+(status `running`) and UPDATEd at finish; concurrent workers touch distinct rows, so there is no
 write contention. Tables in a batched append (`append_batch_size` > 1) are the exception: their rows
 are inserted, finished, when the batch ends, with `pool` = `batch<size>` and no row counts, so they
 don't appear among the in-flight tables. A `verify` stage is a run checking the sink for an append
@@ -45,7 +45,8 @@ one's Databricks run (`job_run_id`) and closes those that have ended (terminated
 one the API no longer has, once it began a day ago) the same way, with `closed_by_app` and the reason in
 `detail`. A run still going in Databricks, or one whose state can't be read, is left as it is, and the app never
 cancels anything on its own. Cancel run on an ingestion job's page cancels the job's wrapper, check and group
-runs, and closes the records of those it cancelled.
+runs, and closes the records of those it cancelled. The page shows Cancelling… until every one of those runs has ended
+in Databricks (as the poller records it), and Run now stays off until then.
 
 Table and column reference: [lakebase_schema.md](lakebase_schema.md).
 
@@ -204,7 +205,7 @@ HAVING coalesce(max(r.started_at), TIMESTAMP '1970-01-01') < current_timestamp()
 ## Optional: durable history beyond the OLTP store
 
 Lakebase is the live store; if you want run history retained in Delta (e.g. for long-term
-analysis or to offload the OLTP instance), run **one scheduled statement** — no notebook or job
+analysis or to offload the OLTP instance), run **one scheduled statement**, with no notebook or job
 needed. Simplest is a periodic snapshot (parameterize `<catalog>.<schema>`):
 
 ```sql
@@ -221,7 +222,7 @@ WHEN NOT MATCHED THEN INSERT *;
 ```
 
 Schedule either as a DBSQL query (or a one-statement task) at whatever cadence durable history
-needs. This is optional — the UC-federated reads above work without it.
+needs. This is optional: the UC-federated reads above work without it.
 
 ## The operations app
 

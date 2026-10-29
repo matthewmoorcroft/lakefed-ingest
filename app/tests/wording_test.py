@@ -118,5 +118,6 @@ def test_delete_says_what_goes_and_what_stays_and_offers_the_target_tables():
     assert "with their checkpoints. Run history and the change log stay." in page
     assert "another job also writes" in page and "kept_names" in page and "schemas stay" in page
     assert "move to Not in any job" not in page                    # groups always belong to a job: none are left behind
+    assert "Run again" in page and "Deleting…" in page             # a pending or failed delete is run again on its own page
     jobs_page = (FRONTEND / "pages" / "IngestionJobs.tsx").read_text()
-    assert "Deleted jobs" in jobs_page and "Run again" in jobs_page
+    assert "Deleted jobs" in jobs_page and "again.mutate" not in jobs_page

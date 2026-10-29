@@ -104,8 +104,16 @@ which runs as the deployer:
 - the delete job deletes the groups' control, checkpoint, reseed_queue, database_check and check_work rows in one
   transaction under their run locks, and keeps run history and the change log. Ticked, it then drops the target
   tables only those groups write (`DROP TABLE IF EXISTS`, never a schema);
-- Ingestion jobs lists the latest deleted jobs under **Deleted jobs**: the delete job's run (deleting, deleted, or
-  failed with why) and the tables left, with **Run again** for one that didn't finish.
+- the job stays listed on Ingestion jobs as **Deleting** until its delete job has finished and its groups are gone
+  (the app reads the delete job's run, and marks the job `delete_finished` on the list read that sees both); the job
+  page is read only meanwhile. A delete that failed, or whose delete job never started, shows **Delete failed** with
+  the reason and **Run again** on the job page (with the same tick box);
+- **Deleted jobs** on Ingestion jobs is history only: the finished deletes.
+
+**Run now and Cancel run.** Neither shows an end state before Databricks confirms it. **Run now** reads **Starting…**
+until the poller records a run going, and **Cancel run** reads **Cancelling…** until every run of the job has ended.
+Both read the `databricks_run` table the poller keeps, with no timer on the page. After 15 minutes without a start, or
+10 minutes without a cancel being confirmed, the page says Databricks has not confirmed it and keeps Run now off.
 
 ## Re-discovery
 

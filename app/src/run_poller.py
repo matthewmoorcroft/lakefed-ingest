@@ -129,7 +129,8 @@ def view(row: dict) -> dict:
     return {"run_id": row["run_id"], "job_id": row["job_id"], "parameters": parameter_values,
             "task_collection": parameter_values.get("task_collection"), "state": row["life_cycle_state"],
             "result": row.get("result_state"), "message": row.get("state_message"), "started": row.get("started_at"),
-            "ended": row.get("ended_at"), "trigger": row.get("trigger"), "url": row.get("run_page_url")}
+            "ended": row.get("ended_at"), "trigger": row.get("trigger"), "url": row.get("run_page_url"),
+            "seen": row.get("seen_at")}
 
 
 def state_view(row: dict) -> dict:

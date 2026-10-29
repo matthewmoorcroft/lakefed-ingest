@@ -1581,12 +1581,13 @@ def task_written_sql() -> str:
 
 
 def stale_tasks_sql() -> str:
-    """End the running tasks whose heartbeat stopped (the app restarted while writing). One with a result had committed
-    its tables and only missed what follows (unsynced is kept as its error). One with progress but no result is a
-    by-database write: the databases it committed are kept, and the error says to send the request again to finish it.
-    The rest were rolled back with the app (rolled_back). Params: unsynced, rolled_back, partial, seconds, id (or
-    null), job_id (or null)."""
-    return (f"update {SCHEMA}.app_task set status = case when result is null then 'failed' else 'succeeded' end, "
+    """End the running tasks whose heartbeat stopped (the app restarted while writing). Every one ends failed, never
+    succeeded, so nothing reads as done before what follows it has finished: one with a result had committed its tables
+    but missed the Databricks job sync that follows (unsynced is its error); one with progress but no result is a
+    by-database write whose committed databases are kept, and the error says to send the request again to finish it
+    (partial); the rest were rolled back with the app (rolled_back). Params: unsynced, rolled_back, partial, seconds,
+    id (or null), job_id (or null)."""
+    return (f"update {SCHEMA}.app_task set status = 'failed', "
             f"error = case when result is not null then %s when progress is null then %s else %s end, finished_at = now() "
             f"where status = 'running' and heartbeat_at < now() - make_interval(secs => %s) "
             f"and (id = %s or job_id = %s)")
@@ -2007,15 +2008,36 @@ JSON_SCHEDULE_FIELDS = ("parameters", "options")
 
 
 def schedules_sql() -> str:
-    """Active schedules, by name."""
+    """Schedules by name: the active ones, and the deleted ones whose Delete is still pending, so the Ingestion jobs
+    list, the Overview and the job page show them as Deleting (or Delete failed) until the app marks them finished
+    (ingestion_jobs.delete_state: the delete job succeeded and no tables are left). A deleted job whose start failed
+    stays too, under ``delete_start_error``. A deleted job with no tables never started a delete job, so never shows."""
     return (f"select id, {', '.join(SCHEDULE_FIELDS)}, created_by, created_at, updated_at, deleted_at "
-            f"from {SCHEMA}.schedule where deleted_at is null order by lower(name)")
+            f"from {SCHEMA}.schedule where deleted_at is null "
+            f"or options ? 'delete_start_error' "
+            f"or (options ? 'delete_drop_targets' and not options ? 'delete_finished') order by lower(name)")
+
+
+def deleted_tables_left_sql() -> str:
+    """Which deleted jobs still have tables a Delete would remove: a group of theirs with control rows that no other
+    live job holds (the same groups delete_groups_sql names). Param: schedule ids. Rows: schedule_id."""
+    return (f"select distinct m.schedule_id from {SCHEMA}.schedule_member m where m.schedule_id = any(%s) "
+            f"and exists (select 1 from {SCHEMA}.control c where c.task_collection = m.task_collection) "
+            f"and not exists (select 1 from {SCHEMA}.schedule_member o join {SCHEMA}.schedule s on s.id = o.schedule_id "
+            f"where o.task_collection = m.task_collection and o.removed_at is null and s.deleted_at is null "
+            f"and o.schedule_id <> m.schedule_id)")
 
 
 def set_schedule_option_sql() -> str:
     """Set one key of a schedule's options to a number. Params: key (as a one-element text array), value, id."""
     return (f"update {SCHEMA}.schedule set options = jsonb_set(coalesce(options, '{{}}'::jsonb), %s::text[], "
             f"to_jsonb(%s::bigint)) where id = %s")
+
+
+def set_schedule_text_option_sql() -> str:
+    """Set one key of a schedule's options to a text. Params: key (as a one-element text array), value, id."""
+    return (f"update {SCHEMA}.schedule set options = jsonb_set(coalesce(options, '{{}}'::jsonb), %s::text[], "
+            f"to_jsonb(%s::text)) where id = %s")
 
 
 def clear_schedule_option_sql() -> str:
@@ -2160,6 +2182,16 @@ def delete_groups_sql() -> str:
             f"and o.schedule_id <> %s) order by 1")
 
 
+def deleting_groups_sql() -> str:
+    """The groups of deleted jobs whose Delete runs the delete job (``options.delete_drop_targets`` set) and that no
+    live job holds: they belong to the deleted job, shown under Deleted jobs as deleting (or as a failed delete to run
+    again), until the delete job removes them, never as "Not in any job"."""
+    return (f"select distinct m.task_collection from {SCHEMA}.schedule_member m join {SCHEMA}.schedule d "
+            f"on d.id = m.schedule_id where d.deleted_at is not null and d.options ? 'delete_drop_targets' "
+            f"and not exists (select 1 from {SCHEMA}.schedule_member o join {SCHEMA}.schedule s on s.id = o.schedule_id "
+            f"where o.task_collection = m.task_collection and o.removed_at is null and s.deleted_at is null) order by 1")
+
+
 def delete_targets_sql() -> str:
     """The groups' tables and target tables, for the Delete dialog: how many tables (control rows), how many target
     tables only they write, and the target tables rows of any other group also write (kept; names compared without
@@ -2180,10 +2212,11 @@ def delete_targets_sql() -> str:
 
 
 def deletions_sql() -> str:
-    """The latest deleted jobs whose Delete started the delete job (``options.delete_drop_targets`` set), newest
-    first, for the Ingestion jobs page. Param: how many."""
+    """The latest deleted jobs whose Delete finished (the app marked them ``delete_finished``, once the delete job
+    succeeded and no tables were left), newest first: the Deleted jobs history on the Ingestion jobs page. Pending and
+    failed deletions are in the jobs list instead. Param: how many."""
     return (f"select id, name, options, deleted_at from {SCHEMA}.schedule where deleted_at is not null "
-            f"and options ? 'delete_drop_targets' order by deleted_at desc limit %s")
+            f"and options ? 'delete_finished' order by deleted_at desc limit %s")
 
 
 def member_synced_sql() -> str:
@@ -2406,7 +2439,7 @@ def job_selection_sql() -> str:
 # ---- Databricks runs the app tracks (lakefed_ingest.databricks_run, written by run_poller) ----------------------------
 
 DATABRICKS_RUN_COLUMNS = ("run_id, job_id, kind, schedule_id, task_collection, trigger, parameters, life_cycle_state, "
-                          "result_state, state_message, run_page_url, started_at, ended_at")
+                          "result_state, state_message, run_page_url, started_at, ended_at, seen_at")
 
 
 def databricks_run_params(row: dict) -> dict:

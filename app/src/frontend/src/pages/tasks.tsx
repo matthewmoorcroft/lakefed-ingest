@@ -37,7 +37,7 @@ const KINDS: Record<string, string> = { create: "Creating the job", tables: "Add
 export function TaskProgress({ task, onResume }: { task: Row | null; onResume?: () => void }) {
   if (!task) return null;
   const progress: Row | null = task.progress ?? null;
-  if (task.status === "failed" && progress) {
+  if (task.status === "failed" && progress && !task.result) {
     const total = Number(progress.databases_total);
     return (
       <Notice tone="bad">Stopped with {fmtInt(progress.databases_written)} of {fmtInt(total)} {plural(total, "database")} written
@@ -46,7 +46,7 @@ export function TaskProgress({ task, onResume }: { task: Row | null; onResume?: 
         {onResume && <div className="toolbar"><button onClick={onResume}>Finish the write</button></div>}</Notice>
     );
   }
-  if (task.status === "failed") return <Notice tone="bad">Nothing was written: {task.error}</Notice>;
+  if (task.status === "failed") return <Notice tone="bad">{task.result ? "Not done: " : "Nothing was written: "}{task.error}</Notice>;
   if (task.status === "succeeded") return <Notice tone="ok">Written: {fmtInt(task.total)} {plural(task.total, "table")}.</Notice>;
   if (progress) {
     const total = Number(progress.databases_total);
