@@ -73,9 +73,9 @@ secret). See `README.md`, `docs/deploy.md`, `docs/monitoring.md`, `docs/lakebase
 - `checkpoint` — generic: `strategy` + `position` (text; CT version for `ct`, JSON {col,type,value} for
   `cursor`), phase (`seeding → incremental` for ct and cursor, `loaded` for full), status, freshness,
   `ct_begin_version`, `pending_position`/`pending_run_id` (an append in flight). `reseed_queue` (ct, cursor).
-- `database_check` — one stamp per (collection, source database) found unchanged as a whole (CT version,
+- `database_check`: one stamp per (collection, source database) found unchanged as a whole (CT version,
   time), in place of each table's `last_success_at`; `planner.stamp_vouches` says which tables it covers.
-- `check_work` — the check job's work list: the databases with work per (work_id, collection).
+- `check_work`: the check job's work list: the databases with work per (work_id, collection).
 - `ingest_run`, `ingest_event` — telemetry (`run_id`, `position_from/to`). The DB is registered in UC
   (default catalog `lakefed_ingest_lakebase`) for DBSQL monitoring.
 - `schedule`, `schedule_member` — written by the operations app (cadence, members, wrapper `job_id`);
