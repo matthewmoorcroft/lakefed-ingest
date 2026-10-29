@@ -28,6 +28,7 @@ from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Resp
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+import action_states
 import compute
 import config_import as ci
 import ingestion_jobs as ij
@@ -393,6 +394,18 @@ TASK_PARTIAL = ("the app restarted while writing the job's databases: the ones w
                 "tables; send the same request again to finish the job")
 
 
+class NotSynced(HTTPException):
+    """A write that committed, but a wrapper job it changed did not sync: the write is not done, and the detail says
+    what failed. Raised by a write's `after` (in its task, or in the request when the write was small)."""
+
+
+def _synced(results: List[dict]) -> None:
+    """Refuse a write as not done when a Databricks job it changed did not sync (the tables are written already)."""
+    failures = action_states.sync_failures(results)
+    if failures:
+        raise NotSynced(500, f"{TASK_WRITTEN_NOT_SYNCED} {'; '.join(failures)}"[:4000])
+
+
 def _start_background(work) -> None:
     """Run work on its own thread (tests run it inline instead)."""
     threading.Thread(target=work, daemon=True, name="lakefed-app-task").start()
@@ -452,7 +465,7 @@ def _run_task(task_id: int, write, after) -> None:
             status = "succeeded"
         except Exception as e:
             result = {**result, "after_error": _error_text(e)}
-            error = f"{TASK_WRITTEN_NOT_SYNCED} {_error_text(e)}"
+            error = _error_text(e) if isinstance(e, NotSynced) else f"{TASK_WRITTEN_NOT_SYNCED} {_error_text(e)}"
     except BaseException as e:
         error = _error_text(e)
     finally:
@@ -1876,7 +1889,7 @@ def add_job_databases(job_id: int, body: JobDatabasesRequest, request: Request):
 
     def after(result):
         if result.pop("new_groups"):
-            _sync(job_id, user)
+            _synced(_sync(job_id, user))
         return result
 
     return _write_now_or_later("databases", body.request_id, job_id, len(plan["new"]), user, write, after)
@@ -1978,7 +1991,7 @@ def add_job_tables(job_id: int, body: JobTablesRequest, request: Request):
 
     def after(result):
         if result.pop("new_groups"):
-            _sync(job_id, user)
+            _synced(_sync(job_id, user))
         return result
 
     valid = sum(line["status"] == "valid" for line in plan["lines"])
@@ -2786,6 +2799,18 @@ def _apply_cluster(sid: int) -> Optional[str]:
     return None
 
 
+def _created(result: dict, user: str, options: dict) -> dict:
+    """A new job's wrapper jobs synced, and its own cluster copy started, once its rows are committed. Either failing is
+    not done (NotSynced): the job's rows are written, and the detail says what did not sync or start."""
+    sid = result["id"]
+    synced = _sync(sid, user)
+    cluster = _apply_cluster(sid) if sch.own_cluster({"options": options}) else None
+    _synced(synced)
+    if cluster:
+        raise NotSynced(500, f"{TASK_WRITTEN_NOT_SYNCED} {cluster}"[:4000])
+    return {**result, "sync": synced, "cluster_error": None}
+
+
 def _sync(sid: int, user: str) -> List[dict]:
     """Bring the schedule's wrapper jobs in line with Lakebase and record the results. Runs under the
     schedule's sync lock, with the members read after taking it, so concurrent syncs don't both create a
@@ -3100,10 +3125,7 @@ def _create_by_database(body: NewJobRequest, request: Request, selection: Select
         return result
 
     def after(result):
-        sid = result["id"]
-        synced = _sync(sid, user)
-        cluster = _apply_cluster(sid) if sch.own_cluster({"options": options}) else None
-        return {**result, "sync": synced, "cluster_error": cluster}
+        return _created(result, user, options)
 
     made = db.query(q.insert_task_sql(), ("create", body.request_id or uuid.uuid4().hex, None,
                                           summary["tables"], None, user or None))[0]
@@ -3202,7 +3224,7 @@ def _add_by_database(job_id: int, body: "JobTablesRequest", request: Request, ki
 
     def after(result):
         if result.pop("new_groups"):
-            _sync(job_id, user)
+            _synced(_sync(job_id, user))
         return result
 
     if body.dry_run:
@@ -3288,10 +3310,7 @@ def create_ingestion_job(body: NewJobRequest, request: Request):
         return result
 
     def after(result):
-        sid = result["id"]
-        synced = _sync(sid, user)
-        cluster = _apply_cluster(sid) if sch.own_cluster({"options": options}) else None
-        return {**result, "sync": synced, "cluster_error": cluster}
+        return _created(result, user, options)
 
     return _write_now_or_later("create", body.request_id, None, len(rows), user, write, after)
 

@@ -2,7 +2,8 @@
 // strips the types in pending.ts as it loads it). frontend_pending_test.py runs this file from pytest.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { changeInProgress, deleteNotice, runButton, runTimeoutNotice } from "../../src/frontend/src/pending.ts";
+import { changeInProgress, deleteNotice, isUnconfirmed, requestWriteNotice, runButton, runTimeoutNotice }
+  from "../../src/frontend/src/pending.ts";
 
 const IDLE = { phase: "idle", timed_out: false, run_url: null, blocked: null, refused: null };
 const NOTHING_PENDING = { starting: false, cancelling: false };
@@ -146,4 +147,30 @@ test("a failed delete with no reason still says it failed", () => {
 
 test("a gone delete has no notice: the job has left the list", () => {
   assert.equal(deleteNotice({ state: "gone", reason: null, run_again: false }), null);
+});
+
+test("a write sent as one request is pending until its answer, which comes after its jobs are synced", () => {
+  const notice = requestWriteNotice("Adding databases", { pending: true, error: null });
+  assert.equal(notice.tone, "info");
+  assert.match(notice.text, /^Adding databases: writing the tables, then syncing/);
+  assert.match(notice.text, /shows as done once both have finished/);
+});
+
+test("a write that finished or failed with its own message has no pending notice", () => {
+  assert.equal(requestWriteNotice("Adding tables", { pending: false, error: null }), null);
+  assert.equal(requestWriteNotice("Adding tables", { pending: false, error: { status: 500, message: "Not done" } }), null);
+});
+
+test("a gateway timeout is not confirmed: the write may have finished, so it is a warning and says to check first", () => {
+  const notice = requestWriteNotice("Adding tables", { pending: false, error: { status: 504, message: "timeout" } });
+  assert.equal(notice.tone, "warn");
+  assert.match(notice.text, /^Adding tables: not confirmed/);
+  assert.match(notice.text, /Check the job's tables before sending it again/);
+});
+
+test("a dropped connection is not confirmed either", () => {
+  assert.equal(isUnconfirmed(new TypeError("Failed to fetch")), true);
+  assert.equal(isUnconfirmed(new TypeError("Cannot read properties of undefined")), false);
+  assert.equal(isUnconfirmed({ status: 500 }), false);
+  assert.equal(isUnconfirmed(null), false);
 });

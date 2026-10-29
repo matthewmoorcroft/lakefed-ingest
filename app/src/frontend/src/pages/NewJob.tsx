@@ -8,6 +8,7 @@ import { DiscoverDialog } from "./Discover";
 import { ClusterFields, clusterSummary, ownCluster } from "./JobEdit";
 import { SourcePick, nothingPicked, pickedAny, pickedText, type Picked } from "./SourcePick";
 import { TaskProgress, finished, newRequestId, resumableWrite } from "./tasks";
+import { isUnconfirmed, requestWriteNotice } from "../pending";
 
 // New ingestion job: the Edit view, empty, with Create in place of Save. Its tables are added in What it ingests
 // (Add tables: a CSV uploaded once, or a discovery), the rest is set as in Edit, and nothing is written until Create,
@@ -91,6 +92,7 @@ export default function NewJob() {
     // and the same request finishes it.
     onError: (error) => { if (!resumableWrite(error)) setRequestId(newRequestId()); },
   });
+  const note = requestWriteNotice("Creating the job", { pending: create.isPending && !task, error: create.error });
   const summary: Row | undefined = preview.data?.summary;
   const blocked = !name.trim() ? "Name the job first" : !chosen ? "Add its tables first"
     : preview.isFetching || settled !== current ? "Checking the tables" : preview.error ? "Fix what the check found first"
@@ -112,10 +114,11 @@ export default function NewJob() {
           <button className="primary" disabled={!!blocked || create.isPending} title={blocked ?? undefined}
             onClick={() => create.mutate(body(false))}>{create.isPending ? "Creating…" : "Create"}</button></span>} />
       {confirm.dialog}
+      {note && <Notice tone={note.tone}>{note.text}</Notice>}
       {create.isPending && <TaskProgress task={task} />}
       {!create.isPending && resumableWrite(create.error)
         ? <TaskProgress task={task} onResume={() => create.mutate(create.variables as Row)} />
-        : <ErrorBox error={create.error} />}
+        : <ErrorBox error={isUnconfirmed(create.error) ? null : create.error} />}
       {create.data && !create.data.created && <Notice tone="warn">Not created: fix the invalid lines below first.</Notice>}
 
       <Section title="Name">

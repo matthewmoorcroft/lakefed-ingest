@@ -136,7 +136,8 @@ def view(row: dict) -> dict:
 def state_view(row: dict) -> dict:
     """A run's state in the shape the run endpoints return (the shape jobs.run_state returns)."""
     return {"run_id": row["run_id"], "job_id": row["job_id"], "state": row["life_cycle_state"],
-            "result": row.get("result_state"), "message": row.get("state_message"), "url": row.get("run_page_url")}
+            "result": row.get("result_state"), "message": row.get("state_message"), "url": row.get("run_page_url"),
+            "started": row.get("started_at")}
 
 
 def runs_of(job_id, active_only: bool = False, limit: int = 25) -> List[dict]:

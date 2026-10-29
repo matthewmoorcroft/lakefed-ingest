@@ -8,6 +8,7 @@ import { CADENCES, IdentityFields, ParameterFields, RunFields, WritesFields, par
 import { ImportCsvDialog } from "./NewJob";
 import { TaskProgress, finished, newRequestId, resumableWrite } from "./tasks";
 import { DiscoverDialog } from "./Discover";
+import { isUnconfirmed, requestWriteNotice } from "../pending";
 
 // Edit an ingestion job: what it ingests (a tree from its servers), how it writes, its identity columns, when it
 // runs and its advanced configuration. A change in the tree applies once its dialog is confirmed, as Catalog Explorer
@@ -207,6 +208,7 @@ function AddDatabases({ jobId, servers }: { jobId: string; servers: string[] }) 
     mutationFn: async () => finished(await api.post<Row>(`/ingestion-jobs/${jobId}/databases`, checked!), setTask),
     onSuccess: (r) => { setPreview(r.summary); qc.invalidateQueries({ queryKey: ["job-tree", jobId] }); },
   });
+  const note = requestWriteNotice("Adding databases", { pending: apply.isPending && !task, error: apply.error });
   return (
     <div className="add-databases">
       <div className="toolbar">
@@ -246,8 +248,9 @@ function AddDatabases({ jobId, servers }: { jobId: string; servers: string[] }) 
         {preview.applied ? "Added: " : "Would add: "}{fmtInt(preview.new_tables)} {plural(preview.new_tables, "table")} from {fmtInt(preview.databases)} {plural(preview.databases, "database")}
         {preview.skipped ? `, ${fmtInt(preview.skipped)} skipped (target taken)` : ""}; enable {fmtInt(preview.enable)}, disable {fmtInt(preview.disable)}
         {preview.new_groups?.length ? `; new groups ${preview.new_groups.join(", ")}` : ""}.</Notice>}
+      {note && <Notice tone={note.tone}>{note.text}</Notice>}
       {apply.isPending && <TaskProgress task={task} />}
-      <ErrorBox error={check.error || apply.error} />
+      <ErrorBox error={check.error || (isUnconfirmed(apply.error) ? null : apply.error)} />
     </div>
   );
 }
@@ -263,9 +266,15 @@ function useAddTables(jobId: string) {
   const [task, setTask] = useState<Row | null>(null);
   // The body of the write sent last: a write that stopped part way is finished by sending it again, as it was.
   const [sent, setSent] = useState<Row | null>(null);
+  const [writing, setWriting] = useState(false);
   const write = async (body: Row) => {
     setSent(body);
-    return finished(await api.post<Row>(`/ingestion-jobs/${jobId}/tables`, { ...body, dry_run: false }), setTask);
+    setWriting(true);
+    try {
+      return await finished(await api.post<Row>(`/ingestion-jobs/${jobId}/tables`, { ...body, dry_run: false }), setTask);
+    } finally {
+      setWriting(false);
+    }
   };
   const add = useMutation({
     mutationFn: async (request: { source: Row; loadType: string } | { resume: Row }) => {
@@ -286,16 +295,19 @@ function useAddTables(jobId: string) {
     onSuccess: (r) => { if (r) { setFound(r.summary); qc.invalidateQueries({ queryKey: ["job-tree", jobId] });
       qc.invalidateQueries({ queryKey: ["job-settings", jobId] }); qc.invalidateQueries({ queryKey: ["schedules"] }); } },
   });
+  // Pending only while the write itself is sent: the checks and the confirm before it show their own state.
+  const note = requestWriteNotice("Adding tables", { pending: add.isPending && writing && !task, error: add.error });
   const dialog = <>
     {open && <ImportCsvDialog loadType="ct" onClose={(next) => { setOpen(false); if (next) add.mutate(next); }} />}
     {discovering && <DiscoverDialog onClose={(pick) => { setDiscovering(false); if (pick) add.mutate({ source: pick.source, loadType: "ct" }); }} />}
     {confirm.dialog}
   </>;
   const result = <>
+    {note && <Notice tone={note.tone}>{note.text}</Notice>}
     {add.isPending && <TaskProgress task={task} />}
     {!add.isPending && resumableWrite(add.error)
       ? <TaskProgress task={task} onResume={() => add.mutate({ resume: sent as Row })} />
-      : <ErrorBox error={add.error} />}
+      : <ErrorBox error={isUnconfirmed(add.error) ? null : add.error} />}
     {found && found.invalid.length > 0 && <Notice tone="bad">Nothing was added: {fmtInt(found.invalid.length)} {plural(found.invalid.length, "line")} can't be
       added.<ul>{found.invalid.slice(0, 20).map((l: Row) => <li key={l.line}>line {l.line}, {l.table}: {l.errors.join("; ")}</li>)}</ul></Notice>}
     {add.data && <Notice tone="ok">Added {fmtInt(add.data.summary.tables)} {plural(add.data.summary.tables, "table")}.</Notice>}

@@ -6,10 +6,13 @@ export class ApiError extends Error {
   hint?: string;
   /** The server's detail as it came, for a refusal that carries more than its words (a link to the run going). */
   detail?: any;
-  constructor(message: string, hint?: string, detail?: any) {
+  /** The HTTP status of the answer (504 when the gateway gave up waiting for the app). */
+  status?: number;
+  constructor(message: string, hint?: string, detail?: any, status?: number) {
     super(message);
     this.hint = hint;
     this.detail = detail;
+    this.status = status;
   }
 }
 
@@ -29,7 +32,7 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
       : detail?.errors ? detail.errors.join("; ")
       : Array.isArray(detail) ? detail.map((d: any) => `${(d.loc || []).slice(1).join(".")}: ${d.msg}`).join("; ")
       : `${res.status} ${res.statusText}`;
-    throw new ApiError(message, data?.hint ?? undefined, detail);
+    throw new ApiError(message, data?.hint ?? undefined, detail, res.status);
   }
   return data as T;
 }

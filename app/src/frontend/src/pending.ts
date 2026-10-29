@@ -82,3 +82,24 @@ export function deleteNotice(deleteState: DeleteState | null | undefined): { ton
   }
   return null;
 }
+
+/** Whether a request got no answer the app can rely on: the gateway gave up (504), or the connection dropped. The write
+ * behind it may still have finished, so the page reads it as not confirmed, never as failed or done. */
+export function isUnconfirmed(error: unknown): boolean {
+  if ((error as { status?: number } | null)?.status === 504) return true;
+  return error instanceof TypeError && /fetch|network/i.test(error.message);
+}
+
+/** A write sent as one request (a small one, not a task). It is pending until its answer, which comes once its tables
+ * are written and the job's Databricks jobs are synced; an unconfirmed answer is a warning, not a failure. Null when the
+ * page has nothing to say (the write is done, or it failed with its own message). */
+export function requestWriteNotice(what: string, state: { pending: boolean; error: unknown }): { tone: "info" | "warn"; text: string } | null {
+  if (state.pending) {
+    return { tone: "info", text: `${what}: writing the tables, then syncing the job's Databricks jobs. It shows as done once both have finished.` };
+  }
+  if (isUnconfirmed(state.error)) {
+    return { tone: "warn", text: `${what}: not confirmed. The app did not answer in time, so the write may have finished. `
+             + "Check the job's tables before sending it again." };
+  }
+  return null;
+}

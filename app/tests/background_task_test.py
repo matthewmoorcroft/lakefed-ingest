@@ -193,6 +193,25 @@ def test_a_sync_that_fails_after_the_commit_ends_the_task_failed_with_its_result
     assert done["error"].startswith(main.TASK_WRITTEN_NOT_SYNCED) and done["error"].endswith("jobs API down")
 
 
+def test_a_create_whose_wrapper_sync_failed_is_not_done_though_its_rows_are_written(client, monkeypatch):
+    monkeypatch.setattr(main, "_sync", lambda sid, user: [_sync_error("sql_b", "jobs API down")])
+    task = _create(client, 120).json()["task"]
+    client.tasks.run()
+    done = client.get(f"/api/tasks/{task['id']}").json()
+    assert done["status"] == "failed" and done["error"] == f"{main.TASK_WRITTEN_NOT_SYNCED} sql_b: jobs API down"
+    assert len(client.db.of("insert into lakefed_ingest.control (")) == 120
+
+
+def test_a_create_whose_own_cluster_copy_did_not_start_is_not_done(client, monkeypatch):
+    monkeypatch.setattr(main, "_apply_cluster", lambda sid: "the cluster copies job didn't start: no room")
+    monkeypatch.setattr(main, "_refuse_unknown_node_types", lambda cluster: None)
+    body = {"name": "Small job", "csv": _csv(10), "settings": FAN_IN, "dry_run": False, "request_id": "r3",
+            "run": {"options": {"cluster": {"node_type_id": "i3.xlarge"}}}}
+    r = client.post("/api/ingestion-jobs", json=body)
+    assert r.status_code == 500
+    assert r.json()["detail"] == f"{main.TASK_WRITTEN_NOT_SYNCED} the cluster copies job didn't start: no room"
+
+
 def test_progress_is_recorded_by_the_beat_while_the_write_runs(monkeypatch):
     beats, gate = [], []
     monkeypatch.setattr(main, "TASK_BEAT_S", 0.01)
@@ -279,6 +298,29 @@ def test_adding_many_tables_runs_as_a_task_of_the_job(job_client):
     done = job_client.get(f"/api/tasks/{r.json()['task']['id']}").json()
     assert done["status"] == "succeeded" and done["result"]["applied"] is True and done["result"]["summary"]["tables"] == 80
     assert len(job_client.db.of("insert into lakefed_ingest.control (")) == 80 and job_client.synced == [7]
+
+
+def test_a_job_write_whose_wrapper_sync_failed_is_not_done_and_keeps_its_tables(job_client, monkeypatch):
+    monkeypatch.setattr(main, "_sync", lambda sid, user: [_sync_error("sql_b", "jobs API down")])
+    text = HEAD + "".join(f"sql_b,ops_{i % 5:02d},gen,t{i:04d},\"id, a\",id\n" for i in range(80))
+    r = job_client.post("/api/ingestion-jobs/7/tables", json={"csv": text, "dry_run": False, "request_id": "add-2"})
+    job_client.tasks.run()
+    done = job_client.get(f"/api/tasks/{r.json()['task']['id']}").json()
+    assert done["status"] == "failed" and done["result"]["applied"] is True
+    assert done["error"] == f"{main.TASK_WRITTEN_NOT_SYNCED} sql_b: jobs API down"
+    assert len(job_client.db.of("insert into lakefed_ingest.control (")) == 80
+
+
+def test_a_small_job_write_whose_wrapper_sync_failed_answers_not_done_in_the_request(job_client, monkeypatch):
+    monkeypatch.setattr(main, "_sync", lambda sid, user: [_sync_error("sql_b", "jobs API down")])
+    text = HEAD + "".join(f"sql_b,ops_{i % 5:02d},gen,t{i:04d},\"id, a\",id\n" for i in range(10))
+    r = job_client.post("/api/ingestion-jobs/7/tables", json={"csv": text, "dry_run": False})
+    assert r.status_code == 500 and r.json()["detail"] == f"{main.TASK_WRITTEN_NOT_SYNCED} sql_b: jobs API down"
+    assert len(job_client.db.of("insert into lakefed_ingest.control (")) == 10
+
+
+def _sync_error(collection, detail):
+    return {"task_collection": collection, "action": "error", "detail": detail, "job_id": None, "member_id": 1}
 
 
 def test_the_job_page_reads_its_tasks_after_ending_stale_ones(job_client):
