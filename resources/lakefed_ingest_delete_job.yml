@@ -20,8 +20,9 @@ resources:
             base_parameters:
               schedule_id: "{{job.parameters.schedule_id}}"
               drop_targets: "{{job.parameters.drop_targets}}"
-              db_instance: "{{job.parameters.db_instance}}"
-              db_name: "{{job.parameters.db_name}}"
+              # Fixed here, not job parameters: whoever may start a run (the app) can't point it at another database.
+              db_instance: ${var.lakebase_instance}
+              db_name: ${var.lakebase_database}
       environments:
         - environment_key: lakebase_client
           spec:
@@ -37,7 +38,3 @@ resources:
           default: ""
         - name: drop_targets
           default: "false"
-        - name: db_instance
-          default: ${var.lakebase_instance}
-        - name: db_name
-          default: ${var.lakebase_database}
