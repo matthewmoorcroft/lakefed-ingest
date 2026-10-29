@@ -303,6 +303,7 @@ details.advanced .compute h4 { margin: var(--db-space-3) 0 var(--db-space-2); }
 .menu-items > button { display: block; width: 100%; text-align: left; border: 0; border-radius: 0; background: transparent; padding: 6px 12px; }
 .menu-items > button:hover:not(:disabled) { background: var(--db-color-table-background-selected-default); }
 .menu-items > button.danger-text { color: var(--bad); }
+.menu-items > button:has(.sub) { height: auto; padding: 8px 12px; }
 .menu-items > button .sub { display: block; color: var(--muted); font-size: var(--db-font-size-sm); white-space: normal; }
 .menu-items.wide, .menu-items:has(.sub) { min-width: 320px; }
 .page-sub { font-size: var(--db-font-size-lg, 16px); margin: var(--db-space-4) 0 var(--db-space-2); }

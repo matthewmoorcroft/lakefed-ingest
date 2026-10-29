@@ -32,7 +32,7 @@ function JobRow({ job }: { job: Row }) {
   return (
     <tr>
       <td className="name"><Link to={`/ingestion-jobs/${job.id}`}><b>{job.name}</b></Link></td>
-      <td>{job.description} <span className="sub">{job.timezone}</span></td>
+      <td>{job.description}</td>
       <td>{job.paused ? <Badge value="paused" /> : <Badge value="ok" />}</td>
       <td>{next(job)}</td>
       <td>{recent ? <>{statusName(recent.last_status)}<span className="sub">{fmtTime(recent.last_started)}</span></> : <span className="muted">never run</span>}</td>
