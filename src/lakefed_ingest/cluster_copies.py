@@ -8,7 +8,10 @@ like ``lakefed_ingest``, so the copy runs with exactly the ingestion job's right
 the bundle's job, and its copy, if any, is deleted.
 
 The bundle's job is copied again on every run, so a redeploy reaches the copies the next time the job runs (the app
-starts it on every cluster change and every Sync jobs)."""
+starts it on every cluster change and every Sync jobs).
+
+A copy is found by its tags before a new one is made (``adoptable``), so a copy whose id was never recorded is
+adopted rather than duplicated."""
 import copy
 import uuid
 from typing import Dict, List, Optional
@@ -34,6 +37,38 @@ def cluster_of(schedule: dict) -> Optional[dict]:
 
 def copy_name(schedule_name: str) -> str:
     return f"lakefed_ingest: {schedule_name}"
+
+
+def matching_copies(found_jobs: List[dict], schedule_id: int, owner: str) -> List[int]:
+    """The job ids, lowest first, of the found jobs whose tags say they are this schedule's copy for this owner.
+
+    ``found_jobs`` are Jobs API list entries from a lookup by ``copy_name``. The name only narrows that lookup, so the
+    tags decide: a job with the same name that belongs to another schedule or another deployment, or that has no tags
+    of ours, is not a match."""
+    matches = []
+    for job in found_jobs:
+        tags = (job.get("settings") or {}).get("tags") or {}
+        if tags.get(TAG_SCHEDULE) == str(schedule_id) and tags.get(TAG_OWNER) == owner[:255]:
+            matches.append(int(job["job_id"]))
+    return sorted(matches)
+
+
+def adoptable(found_jobs: List[dict], schedule_id: int, owner: str) -> Optional[int]:
+    """The copy to adopt instead of making a new one: the lowest-id match (see matching_copies), or None.
+
+    Adopting it means the plan updates it and records its id, so a copy whose id was never recorded (its run stopped
+    before the record was written) is picked up rather than duplicated. A schedule is looked up by name only when it
+    has no recorded copy of its own, so a schedule renamed after its copy was made keeps that copy by its recorded
+    id."""
+    matches = matching_copies(found_jobs, schedule_id, owner)
+    return matches[0] if matches else None
+
+
+def surplus(found_jobs: List[dict], schedule_id: int, owner: str) -> List[int]:
+    """The matches that are not adopted, for the notebook to delete. Every match is an unrecorded copy (a schedule
+    with a recorded copy is not looked up), and the app starts only the recorded copy, so a second one is idle and
+    only leaves a stray job behind."""
+    return matching_copies(found_jobs, schedule_id, owner)[1:]
 
 
 def copy_settings(bundle_job: dict, schedule: dict, cluster: dict, owner: str) -> dict:

@@ -24,6 +24,45 @@ def schedule(sid, name="Hourly", cluster=None, deleted=False):
             "deleted_at": "2026-10-28" if deleted else None}
 
 
+def found_copy(job_id, schedule_id="7", owner="inst/db"):
+    """A Jobs API list entry, as the lookup by copy_name returns it."""
+    return {"job_id": job_id, "settings": {"name": cc.copy_name("Hourly"),
+                                           "tags": {cc.TAG_SCHEDULE: schedule_id, cc.TAG_OWNER: owner}}}
+
+
+def test_a_copy_of_this_schedule_and_owner_is_adopted():
+    assert cc.adoptable([found_copy(902)], 7, "inst/db") == 902
+
+
+def test_a_copy_of_another_schedule_with_the_same_name_is_not_adopted():
+    assert cc.adoptable([found_copy(902, schedule_id="8")], 7, "inst/db") is None
+
+
+def test_a_copy_of_another_deployment_is_not_adopted():
+    assert cc.adoptable([found_copy(902, owner="other/db")], 7, "inst/db") is None
+
+
+def test_with_no_copy_found_nothing_is_adopted_and_a_job_without_our_tags_is_left_alone():
+    untagged = {"job_id": 905, "settings": {"name": cc.copy_name("Hourly")}}
+    assert cc.adoptable([], 7, "inst/db") is None
+    assert cc.adoptable([untagged], 7, "inst/db") is None
+    assert cc.surplus([untagged], 7, "inst/db") == []
+
+
+def test_two_copies_adopt_the_lowest_id_and_the_other_is_surplus():
+    found = [found_copy(904), found_copy(902), found_copy(903, schedule_id="8")]
+    assert cc.adoptable(found, 7, "inst/db") == 902
+    assert cc.surplus(found, 7, "inst/db") == [904]
+
+
+def test_the_notebook_finds_a_copy_by_name_and_tags_before_it_creates_one():
+    code = "\n".join(c["source"] for c in json.loads(NOTEBOOK.read_text(encoding="utf-8"))["cells"]
+                     if c["cell_type"] == "code")
+    lookup = code.index("w.jobs.list(name=cc.copy_name(")
+    assert lookup < code.index("cc.plan(") < code.index('"/api/2.2/jobs/create"')
+    assert code.index("cc.adoptable(") < code.index("cc.plan(")
+
+
 def test_a_copy_is_the_bundle_job_with_only_its_cluster_changed_and_no_trigger_of_its_own():
     s = cc.copy_settings(BUNDLE, schedule(7, cluster=BIG), BIG, "inst/db")
     cluster = s["job_clusters"][0]["new_cluster"]
