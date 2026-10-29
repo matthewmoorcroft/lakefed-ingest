@@ -20,6 +20,9 @@ CHECK_JOB_ID = os.environ.get("CHECK_JOB_ID")
 # cluster run. The app passes its own service principal (DATABRICKS_CLIENT_ID, set by Databricks Apps) for Can Manage.
 CLUSTER_COPIES_JOB_ID = os.environ.get("CLUSTER_COPIES_JOB_ID")
 APP_PRINCIPAL = os.environ.get("DATABRICKS_CLIENT_ID")
+# The delete job (lakefed_ingest_delete_job): deletes a deleted app job's groups and, if asked, their target tables,
+# as the deployer, since the app has no DELETE privilege on the Lakebase tables.
+DELETE_JOB_ID = os.environ.get("DELETE_JOB_ID")
 # Group given CAN_VIEW on the wrapper jobs the app creates for schedules (blank = owner and admins only).
 SCHEDULE_JOB_VIEW_GROUP = os.environ.get("SCHEDULE_JOB_VIEW_GROUP", "users") or None
 
@@ -227,6 +230,11 @@ def run_now(job_id, job_parameters: dict) -> int:
 def start_cluster_copies(schedule_id) -> int:
     """Start the copies job for one schedule: it makes, updates or deletes that job's copy of the ingestion job."""
     return run_now(CLUSTER_COPIES_JOB_ID, {"schedule_id": str(int(schedule_id)), "app_service_principal": APP_PRINCIPAL or ""})
+
+
+def start_delete_job(schedule_id, drop_targets: bool) -> int:
+    """Start the delete job for one deleted app job: its groups' rows go, and its target tables too when asked."""
+    return run_now(DELETE_JOB_ID, {"schedule_id": str(int(schedule_id)), "drop_targets": "true" if drop_targets else "false"})
 
 
 _node_types: dict = {}

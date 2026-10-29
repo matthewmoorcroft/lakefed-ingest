@@ -6,7 +6,7 @@ import { Refused } from "../permissions";
 import { Tree } from "./JobEdit";
 import { TargetTables } from "./TargetTables";
 import { OutLink,
-  Crumbs, Badge, ErrorBox, Menu, Name, Notice, PageHead, ProgressBar, RunStatus, Section, StateBar, fmtClock, fmtDuration, fmtInt,
+  Crumbs, Badge, ErrorBox, Menu, Modal, Name, Notice, PageHead, ProgressBar, RunStatus, Section, StateBar, fmtClock, fmtDuration, fmtInt,
   fmtSlot, fmtSpeed, fmtTime, jobRunPath, plural, progressFrom, useConfirm, type ConfirmRequest
 } from "../components";
 
@@ -171,8 +171,9 @@ export default function IngestionJob() {
     mutationFn: () => api.post<Row>(`/ingestion-jobs/${encodeURIComponent(id)}/run`, {}),
     onSuccess: () => { qc.invalidateQueries({ queryKey: ["ingestion-job", id] }); qc.invalidateQueries({ queryKey: ["ingestion-job-live", id] }); },
   });
+  const [deleting, setDeleting] = useState(false);
   const remove = useMutation({
-    mutationFn: () => api.post<Row>(`/schedules/${encodeURIComponent(id)}/delete`, {}),
+    mutationFn: (dropTargets: boolean) => api.post<Row>(`/schedules/${encodeURIComponent(id)}/delete`, { drop_targets: dropTargets }),
     onSuccess: () => { qc.invalidateQueries(); navigate("/ingestion-jobs"); },
   });
   const job = useQuery({ queryKey: ["ingestion-job", id], queryFn: () => api.get<Row>(`/ingestion-jobs/${encodeURIComponent(id)}`),
@@ -204,7 +205,7 @@ export default function IngestionJob() {
           {/* As a Databricks job page: Delete in the more-actions menu, Edit beside Run now, Run now the primary action. */}
           <Menu label="⋮" title="More actions">
             <button className="danger-text" disabled={!!j.delete_blocked || remove.isPending} title={j.delete_blocked ?? undefined}
-              onClick={() => confirm.ask(deleteJobRequest(j.name, j.groups?.length, j.enabled_tables)).then((ok) => ok && remove.mutate())}>{remove.isPending ? "Deleting…" : "Delete job"}</button>
+              onClick={() => setDeleting(true)}>{remove.isPending ? "Deleting…" : "Delete job"}</button>
           </Menu>
           <button disabled={!!j.change_blocked} title={j.change_blocked ?? undefined}
             onClick={() => navigate(`/ingestion-jobs/${id}/edit`)}>Edit</button>
@@ -214,6 +215,7 @@ export default function IngestionJob() {
       {j && <p className="muted small">Created by {j.created_by ?? "unknown"}{j.created_at ? `, ${fmtTime(j.created_at)}` : ""} ·
         Last updated by {j.updated_by ?? "unknown"}{j.updated_at ? `, ${fmtTime(j.updated_at)}` : ""}</p>}
       {confirm.dialog}
+      {deleting && j && <DeleteJobDialog job={j} onClose={(drop) => { setDeleting(false); if (drop !== null) remove.mutate(drop); }} />}
       <Refused action="Run now" refusal={j?.run_now?.blocked} />
       <Refused action="Edit and Delete" refusal={j?.change_blocked} />
       <ErrorBox error={remove.error} />
@@ -273,11 +275,53 @@ function runNowRequest(j: Row): ConfirmRequest {
       <p>Clusters and the sources' load cost money while they run.</p></> };
 }
 
-/** What deleting a job does, for its dialog (the job page and the Schedules card): the job goes, everything it
- * loaded stays. */
-export function deleteJobRequest(name: unknown, groups: unknown, tables: unknown): ConfirmRequest {
-  return { title: `Delete ${name}?`, action: "Delete", danger: true,
-    body: <><p>Its schedule and its Databricks jobs are deleted.</p>
-      <p>Its {fmtInt(groups)} {plural(groups, "group")} move to Not in any job, and their {fmtInt(tables)} {plural(tables, "table")},
-        target tables, checkpoints and run history all stay.</p></> };
+/** Delete's dialog: what goes (the job, its Databricks jobs, its groups' tables and their state), what stays (run
+ * history and the change log, and any group another job also runs), and the tick box that also drops the target
+ * tables only this job writes. Read from the delete preview, so the counts are those the delete job acts on. */
+function DeleteJobDialog({ job, onClose }: { job: Row; onClose: (dropTargets: boolean | null) => void }) {
+  const [drop, setDrop] = useState(false);
+  const preview = useQuery({ queryKey: ["delete-preview", job.id],
+    queryFn: () => api.get<Row>(`/ingestion-jobs/${encodeURIComponent(job.id)}/delete-preview`) });
+  const p = preview.data;
+  const disabled = preview.error ? "Can't read what Delete removes" : !p ? "Reading what Delete removes…" : p.blocked ?? undefined;
+  return (
+    <Modal title={`Delete ${job.name}?`} action="Delete" danger actionDisabled={disabled} onClose={(ok) => onClose(ok ? drop : null)}>
+      <ErrorBox error={preview.error} />
+      {!p && !preview.error && <p className="muted">Reading what Delete removes…</p>}
+      {p && <>
+        {p.blocked && <Notice tone="warn">{p.blocked}</Notice>}
+        {deleteJobText(p).map((line) => <p key={line}>{line}</p>)}
+        {Number(p.targets) + Number(p.kept) > 0 && <>
+          <label className="checkbox"><input type="checkbox" checked={drop} onChange={(e) => setDrop(e.target.checked)} />{" "}
+            Also delete the target tables</label>
+          <p className="muted small">{targetTablesText(p, drop)}</p>
+        </>}
+      </>}
+    </Modal>
+  );
+}
+
+/** What Delete removes and keeps, line by line, from the delete preview. */
+export function deleteJobText(p: Row): string[] {
+  const groups = Number(p.groups?.length ?? 0), tables = Number(p.tables ?? 0), kept = p.groups_kept ?? [];
+  return [
+    "Its schedule and its Databricks jobs are deleted.",
+    ...(groups ? [`Its ${fmtInt(groups)} ${plural(groups, "group")} and their ${fmtInt(tables)} ${plural(tables, "table")} are deleted, `
+      + "with their checkpoints. Run history and the change log stay."] : []),
+    ...(kept.length ? [`${fmtInt(kept.length)} ${plural(kept.length, "group")} another job also runs ${kept.length === 1 ? "stays" : "stay"}, `
+      + `with ${kept.length === 1 ? "its" : "their"} tables: ${kept.join(", ")}.`] : []),
+  ];
+}
+
+/** The tick box's note: how many target tables it drops, and the ones another job also writes, which it keeps. */
+export function targetTablesText(p: Row, drop: boolean): string {
+  const targets = Number(p.targets ?? 0), kept = Number(p.kept ?? 0), names: string[] = p.kept_names ?? [];
+  const more = kept > names.length ? `, and ${fmtInt(kept - names.length)} more` : "";
+  const keeps = kept ? ` ${fmtInt(kept)} ${plural(kept, "target table")} another job also writes ${kept === 1 ? "is" : "are"} kept: `
+    + `${names.join(", ")}${more}.` : "";
+  return (drop
+    ? `${fmtInt(targets)} ${plural(targets, "target table")} only this job writes ${targets === 1 ? "is" : "are"} dropped, with `
+      + "their data, after its tables are deleted. This can't be undone; schemas stay."
+    : `Unticked, its ${fmtInt(targets)} ${plural(targets, "target table")} ${targets === 1 ? "stays" : "stay"} in Unity Catalog, with `
+      + "their data.") + keeps;
 }

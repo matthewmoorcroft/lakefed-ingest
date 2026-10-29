@@ -1605,6 +1605,10 @@ def update_control_sql(fields: List[str]) -> str:
     return f"update {SCHEMA}.control set " + ", ".join(f"{f} = %s" for f in fields) + " where id = %s"
 
 
+# The kept target tables the Delete dialog names (the rest are counted).
+DELETE_KEPT_LISTED = 20
+
+
 def collection_lock_sql() -> str:
     """Take a collection's run lock for this transaction (the same key the ingestion job holds for a
     whole run). False = a run of that collection is in progress. Param: lock key."""
@@ -1780,6 +1784,47 @@ def update_member_offset_sql() -> str:
 def remove_members_sql() -> str:
     """Soft-remove members (their jobs are deleted by the next sync). Param: list of member ids."""
     return f"update {SCHEMA}.schedule_member set removed_at = now() where id = any(%s) and removed_at is null"
+
+
+def set_schedule_flag_sql() -> str:
+    """Set one key of a schedule's options to true or false. Params: key (as a one-element text array), value, id."""
+    return (f"update {SCHEMA}.schedule set options = jsonb_set(coalesce(options, '{{}}'::jsonb), %s::text[], "
+            f"to_jsonb(%s::boolean)) where id = %s")
+
+
+def delete_groups_sql() -> str:
+    """The groups a job's Delete removes: every member it had, removed or not, that no other live job holds (the
+    delete job's delete_job.groups_sql, read the same way). Params: schedule id, schedule id."""
+    return (f"select distinct m.task_collection from {SCHEMA}.schedule_member m where m.schedule_id = %s "
+            f"and not exists (select 1 from {SCHEMA}.schedule_member o join {SCHEMA}.schedule s on s.id = o.schedule_id "
+            f"where o.task_collection = m.task_collection and o.removed_at is null and s.deleted_at is null "
+            f"and o.schedule_id <> %s) order by 1")
+
+
+def delete_targets_sql() -> str:
+    """The groups' tables and target tables, for the Delete dialog: how many tables (control rows), how many target
+    tables only they write, and the target tables rows of any other group also write (kept; names compared without
+    case, as delete_job.targets_sql does), at most ``DELETE_KEPT_LISTED`` of them by name. Params: groups, groups,
+    groups."""
+    return (f"with mine as (select distinct sink_catalog, sink_schema, sink_table from {SCHEMA}.control "
+            f"where task_collection = any(%s)), "
+            f"theirs as (select distinct lower(sink_catalog) c, lower(sink_schema) s, lower(sink_table) t "
+            f"from {SCHEMA}.control where not (task_collection = any(%s))), "
+            f"marked as (select m.*, exists (select 1 from theirs where c = lower(m.sink_catalog) "
+            f"and s = lower(m.sink_schema) and t = lower(m.sink_table)) as shared from mine m) "
+            f"select (select count(*) from {SCHEMA}.control where task_collection = any(%s)) as tables, "
+            f"(select count(*) from marked where not shared) as targets, "
+            f"(select count(*) from marked where shared) as kept, "
+            f"(select coalesce(json_agg(k order by k), '[]'::json) from (select sink_catalog || '.' || sink_schema "
+            f"|| '.' || sink_table as k from marked where shared order by 1 limit {DELETE_KEPT_LISTED}) named) "
+            f"as kept_names")
+
+
+def deletions_sql() -> str:
+    """The latest deleted jobs whose Delete started the delete job (``options.delete_drop_targets`` set), newest
+    first, for the Ingestion jobs page. Param: how many."""
+    return (f"select id, name, options, deleted_at from {SCHEMA}.schedule where deleted_at is not null "
+            f"and options ? 'delete_drop_targets' order by deleted_at desc limit %s")
 
 
 def member_synced_sql() -> str:

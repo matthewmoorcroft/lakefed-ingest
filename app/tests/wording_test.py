@@ -92,3 +92,13 @@ def test_discover_lists_by_a_name_filter_and_says_which_databases_it_couldnt_rea
 def test_the_target_schema_field_says_a_new_schema_is_made_by_the_first_run():
     form = (FRONTEND / "pages" / "jobForm.tsx").read_text()
     assert "A new schema is made by the first run" in form and "CREATE SCHEMA on the catalog" in form
+
+
+def test_delete_says_what_goes_and_what_stays_and_offers_the_target_tables():
+    page = (FRONTEND / "pages" / "IngestionJob.tsx").read_text()
+    assert "Also delete the target tables" in page and "drop_targets: dropTargets" in page
+    assert "with their checkpoints. Run history and the change log stay." in page
+    assert "another job also writes" in page and "kept_names" in page and "schemas stay" in page
+    assert "move to Not in any job" not in page                    # groups always belong to a job: none are left behind
+    jobs_page = (FRONTEND / "pages" / "IngestionJobs.tsx").read_text()
+    assert "Deleted jobs" in jobs_page and "Run again" in jobs_page
