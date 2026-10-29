@@ -46,6 +46,7 @@ import run_poller
 import schedules as sch
 import source_catalog
 import warehouse
+import warehouse_reads
 
 
 @asynccontextmanager
@@ -2751,6 +2752,10 @@ class SourceDiscoverRequest(BaseModel):
     azure_credential: str = Field(default="", max_length=255, pattern=r"^[A-Za-z0-9_\-]*$")
     azure_resource_id: str = Field(default="", max_length=512, pattern=r"^(/subscriptions/[0-9A-Za-z-]+/resourceGroups/"
                                    r"[-\w.()]+/providers/Microsoft\.Sql/(servers|managedInstances)/[a-z0-9][a-z0-9-]*)?$")
+    # Reading a whole server through the SQL warehouse: the discovery its Test connection listed, and the filter the
+    # whole-server tick was made under (in the database's name).
+    listing_id: str = Field(default="", max_length=64, pattern=r"^[0-9a-f]*$")
+    filter: str = Field(default="", max_length=128)
 
 
 def _connection_unseen(name: str, listing_error: Optional[str]) -> str:
@@ -2805,6 +2810,86 @@ def warehouse_listing(discovery_id: str, statement_id: str, connection: str, req
     return _listing_answer(discovery_id, connection, _user(request), warehouse.read(statement_id))
 
 
+class WarehouseReadStore:
+    """Lakebase's side of warehouse_reads: where a discovery's checks and reads stand, on its discovery rows."""
+
+    def in_flight(self, kind: str, discovery_id: str) -> List[tuple]:
+        return [(r["src_database"], r["statement_id"]) for r in db.query(q.warehouse_in_flight_sql(kind), (discovery_id,))]
+
+    def claim(self, kind: str, discovery_id: str, first: List[str], limit: int, claim_s: int) -> List[str]:
+        if limit <= 0:
+            return []
+        with db.transaction() as cur:
+            return [r["src_database"] for r in db.fetch(cur, q.warehouse_claim_sql(kind), (discovery_id, claim_s, first, limit))]
+
+    def started(self, kind: str, discovery_id: str, database: str, statement_id: str) -> None:
+        db.execute(q.warehouse_started_sql(), (statement_id, discovery_id, database))
+
+    def clear(self, kind: str, discovery_id: str, database: str) -> None:
+        db.execute(q.warehouse_clear_sql(), (discovery_id, database))
+
+    def finish_check(self, discovery_id: str, database: str, ok: bool, tables: Optional[int], why: Optional[str]) -> None:
+        db.execute(q.warehouse_check_done_sql(), (ok, why, tables, discovery_id, database))
+
+    def finish_read(self, discovery_id: str, database: str, rows: Optional[List[tuple]], error: Optional[str]) -> None:
+        """A database's tables replaced and its row finished, in one transaction; or its row failed with why."""
+        if rows is None:
+            db.execute(q.warehouse_read_done_sql(), ("failed", None, error, discovery_id, database))
+            return
+        columns = warehouse_reads.TABLE_COLUMNS
+        with db.transaction() as cur:
+            cur.execute(q.delete_discovered_tables_sql(), (discovery_id, database))
+            for at in range(0, len(rows), q.CONTROL_BATCH):
+                chunk = rows[at:at + q.CONTROL_BATCH]
+                cur.execute(q.insert_discovered_tables_sql(columns, len(chunk)), tuple(v for row in chunk for v in row))
+            cur.execute(q.warehouse_read_done_sql(), ("ok", len(rows), None, discovery_id, database))
+
+    def progress(self, kind: str, discovery_id: str) -> dict:
+        row = db.query(q.warehouse_progress_sql(kind), (discovery_id,))[0]
+        return {k: int(v or 0) for k, v in row.items()}
+
+
+class AccessCheckRequest(BaseModel):
+    """The databases on the page shown now, checked before the rest."""
+    first: List[str] = Field(default=[], max_length=500)
+
+
+@app.post("/api/discoveries/{discovery_id}/access")
+def check_access(discovery_id: str, body: AccessCheckRequest, connection: str):
+    """One step of checking whether the connection's login can open each listed database (warehouse_reads.advance):
+    the page asks while some aren't checked yet, the databases it shows first. The answers are on the listing."""
+    _require_connection(connection)
+    return warehouse_reads.advance(WarehouseReadStore(), warehouse, warehouse_reads.CHECK, discovery_id, connection,
+                                   body.first)
+
+
+@app.get("/api/discoveries/{discovery_id}/reads")
+def warehouse_reads_step(discovery_id: str, connection: str):
+    """One step of reading the chosen databases' tables through the warehouse: the page asks until it has ended."""
+    _require_connection(connection)
+    return {"discovery_id": discovery_id, "via": "warehouse",
+            **warehouse_reads.advance(WarehouseReadStore(), warehouse, warehouse_reads.READ, discovery_id, connection)}
+
+
+def _start_warehouse_read(body: "SourceDiscoverRequest", names: List[str], user: Optional[str]) -> dict:
+    """Start reading tables through the warehouse: the whole server (the databases of its listing that the filter keeps
+    and the login wasn't found unable to open) or the databases named, then the first step of the reads."""
+    did = uuid.uuid4().hex[:12]
+    left_out = 0
+    if body.whole_server:
+        if not body.listing_id:
+            raise HTTPException(422, "reading the whole server through the warehouse takes the listing its test made "
+                                     "(listing_id)")
+        db.execute(q.warehouse_read_rows_sql(), (did, user, body.listing_id, body.filter))
+        left_out = int(db.query(q.warehouse_left_out_sql(), (body.listing_id, body.filter))[0]["left_out"])
+    for at in range(0, len(names), q.CONTROL_BATCH):
+        chunk = names[at:at + q.CONTROL_BATCH]
+        db.execute(q.warehouse_named_rows_sql(len(chunk)),
+                   tuple(v for name in chunk for v in (did, body.src_connection, name, user)))
+    step = warehouse_reads.advance(WarehouseReadStore(), warehouse, warehouse_reads.READ, did, body.src_connection)
+    return {"discovery_id": did, "via": "warehouse", "left_out": left_out, **step}
+
+
 @app.post("/api/discoveries/source")
 def start_source_discovery(body: SourceDiscoverRequest, request: Request):
     names = list(dict.fromkeys(d.strip() for d in body.databases if d.strip()))
@@ -2819,6 +2904,8 @@ def start_source_discovery(body: SourceDiscoverRequest, request: Request):
         statement, parameters = warehouse.remote_query_statement(body.src_connection, SERVER_DATABASE,
                                                                  source_catalog.databases_sql(""))
         return _listing_answer(did, body.src_connection, _user(request), warehouse.start(statement, parameters))
+    if body.kind == "tables" and warehouse.configured() and not body.azure_credential:
+        return _start_warehouse_read(body, names, _user(request))
     job_id = _require(jobs.DISCOVER_JOB_ID, "discovery")
     _refuse_run_of(job_id, request)
     did = uuid.uuid4().hex[:12]
@@ -4128,6 +4215,9 @@ def spa(path: str):
 REDISCOVERY_TICK_S = float(os.environ.get("REDISCOVERY_TICK_S", "300"))   # 0 turns the scheduler off
 REDISCOVERY_POLL_S = float(os.environ.get("REDISCOVERY_POLL_S", "30"))
 REDISCOVERY_MAX_WAIT_S = float(os.environ.get("REDISCOVERY_MAX_WAIT_S", str(6 * 3600)))
+# How often re-discovery takes a step of its warehouse reads: short, since each step starts only as many statements as
+# have ended (warehouse_reads.IN_FLIGHT going at once).
+REDISCOVERY_WAREHOUSE_POLL_S = float(os.environ.get("REDISCOVERY_WAREHOUSE_POLL_S", "2"))
 REDISCOVERY_USER = "re-discovery"
 
 
@@ -4238,9 +4328,15 @@ def _rediscover(sid: int, report=lambda **fields: None) -> dict:
     new_ids = []
     for server, spec in readings:
         discovery_id = uuid.uuid4().hex[:12]
+        new_ids.append(discovery_id)
+        if _through_warehouse(spec):
+            report(phase=rediscovery.DISCOVERING, run_id=None, server=server)
+            failed = _discover_through_warehouse(spec, discovery_id)
+            if failed:
+                errors.append(f"{server}: {failed}")
+            continue
         run_id = jobs.run_now(_require(jobs.DISCOVER_JOB_ID, "discovery"),
                               {"discovery_id": discovery_id, "spec": json.dumps(spec)})
-        new_ids.append(discovery_id)
         report(phase=rediscovery.DISCOVERING, run_id=run_id, server=server)
         ended = _wait_for_run(run_id)
         if ended.get("result") != "SUCCESS":
@@ -4282,6 +4378,46 @@ def _rediscover(sid: int, report=lambda **fields: None) -> dict:
     if new_groups:
         _sync(sid, user)
     return outcome
+
+
+def _through_warehouse(spec: dict) -> bool:
+    """A discovery the SQL warehouse can run: through a Unity Catalog connection, not listed through Azure (which takes
+    a service credential only Databricks compute holds). A source read by host and password stays on the discovery
+    job."""
+    return warehouse.configured() and bool(spec.get("src_connection")) and not spec.get("azure_credential")
+
+
+def _discover_through_warehouse(spec: dict, discovery_id: str) -> Optional[str]:
+    """Re-discovery's read of one server through the SQL warehouse, as Add tables reads it: its databases listed again
+    (under the listing's pattern) when the selection takes the whole server, then each database's tables. Returns why
+    it failed, or nothing; a database that couldn't be read is on its discovery row, as the discovery job leaves it."""
+    connection = spec["src_connection"]
+    names = spec.get("databases") or []
+    if names == "*":
+        statement, parameters = warehouse.remote_query_statement(connection, SERVER_DATABASE,
+                                                                 source_catalog.databases_sql(spec.get("pattern") or ""))
+        answer = warehouse.start(statement, parameters)
+        waited = 0.0
+        while answer["state"] not in warehouse.ENDED:
+            if waited >= REDISCOVERY_MAX_WAIT_S:
+                return f"listing its databases is still going after {int(waited)} seconds"
+            time.sleep(REDISCOVERY_WAREHOUSE_POLL_S)
+            waited += REDISCOVERY_WAREHOUSE_POLL_S
+            answer = warehouse.read(answer["statement_id"])
+        if answer["state"] != "SUCCEEDED":
+            return f"listing its databases ended {answer['state']}: {warehouse_reads.first_line(answer.get('error'))}"
+        names = sorted({str(r["name"]) for r in answer["rows"] or []}, key=lambda n: (n.lower(), n))
+    for at in range(0, len(names), q.CONTROL_BATCH):
+        chunk = names[at:at + q.CONTROL_BATCH]
+        db.execute(q.warehouse_named_rows_sql(len(chunk)),
+                   tuple(v for name in chunk for v in (discovery_id, connection, name, spec.get("requested_by"))))
+    waited = 0.0
+    while warehouse_reads.advance(WarehouseReadStore(), warehouse, warehouse_reads.READ, discovery_id, connection)["pending"]:
+        if waited >= REDISCOVERY_MAX_WAIT_S:
+            return f"its tables are still being read after {int(waited)} seconds"
+        time.sleep(REDISCOVERY_WAREHOUSE_POLL_S)
+        waited += REDISCOVERY_WAREHOUSE_POLL_S
+    return None
 
 
 def _wait_for_run(run_id: int) -> dict:

@@ -1386,16 +1386,20 @@ def discovery_databases_sql() -> str:
 
 
 def discovery_totals_sql() -> str:
-    """How many databases a discovery has, and how many of them match a filter (in their name). Params: filter,
-    discovery_id."""
-    return (f"select count(*) as total, count(*) filter (where position(lower(%s) in lower(src_database)) > 0) as matched "
+    """How many databases a discovery has, how many of them match a filter (in their name), how many the login was
+    found able and unable to open, and the tables of those it can. Params: filter, discovery_id."""
+    return (f"select count(*) as total, count(*) filter (where position(lower(%s) in lower(src_database)) > 0) as matched, "
+            f"count(*) filter (where (listing ->> 'open')::boolean) as open, "
+            f"count(*) filter (where not (listing ->> 'open')::boolean) as closed, "
+            f"coalesce(sum(tables) filter (where (listing ->> 'open')::boolean), 0) as tables "
             f"from {SCHEMA}.discovery where discovery_id = %s")
 
 
 def discovery_listing_sql() -> str:
     """One page of a discovery's databases matching a filter (in their name), by name, with each one's status and
     error: the page the Discover step lists, so it never holds all of them. Params: discovery_id, filter, limit, offset."""
-    return (f"select src_database, status, error from {SCHEMA}.discovery "
+    return (f"select src_database, status, error, tables, (listing ->> 'open')::boolean as open, listing ->> 'why' as why "
+            f"from {SCHEMA}.discovery "
             f"where discovery_id = %s and position(lower(%s) in lower(src_database)) > 0 "
             f"order by src_database limit %s offset %s")
 
@@ -1412,6 +1416,114 @@ def insert_discovery_rows_sql(count: int) -> str:
     one_row = "(" + ", ".join(["%s"] * (len(DISCOVERY_ROW_COLUMNS) - 1)) + ", %s::jsonb, now())"
     return (f"insert into {SCHEMA}.discovery ({', '.join(DISCOVERY_ROW_COLUMNS)}, finished_at) "
             f"values {', '.join([one_row] * count)} on conflict (discovery_id, src_database) do nothing")
+
+
+# A discovery's checks and reads through the SQL warehouse (warehouse_reads.py) keep their place on the discovery row:
+# a check works on the listed databases not checked yet, a read on the databases still running. listing holds the
+# statement going (statement_id), when a request claimed the database (claimed_at), and a check's answer (open, why).
+WAREHOUSE_WORK = {"check": "status = 'listed' and (listing -> 'open') is null", "read": "status = 'running'"}
+
+
+def warehouse_in_flight_sql(kind: str) -> str:
+    """The databases of a discovery with a statement going for them. Param: discovery_id."""
+    return (f"select src_database, listing ->> 'statement_id' as statement_id from {SCHEMA}.discovery "
+            f"where discovery_id = %s and {WAREHOUSE_WORK[kind]} and listing ? 'statement_id' order by src_database")
+
+
+def warehouse_claim_sql(kind: str) -> str:
+    """Claim up to a number of a discovery's databases with no statement yet (the names asked for first, then by
+    name), skipping those another request holds or claimed less than a while ago. Params: discovery_id, the age in
+    seconds after which a claim with no statement is free again, the names first (text[]), limit."""
+    return (f"update {SCHEMA}.discovery d set listing = coalesce(d.listing, '{{}}'::jsonb) "
+            f"|| jsonb_build_object('claimed_at', now()::text) "
+            f"from (select discovery_id, src_database from {SCHEMA}.discovery "
+            f"      where discovery_id = %s and {WAREHOUSE_WORK[kind]} and not (coalesce(listing, '{{}}'::jsonb) ? 'statement_id') "
+            f"      and (listing ->> 'claimed_at' is null "
+            f"           or (listing ->> 'claimed_at')::timestamptz < now() - make_interval(secs => %s)) "
+            f"      order by (src_database = any(%s::text[])) desc, src_database limit %s for update skip locked) c "
+            f"where d.discovery_id = c.discovery_id and d.src_database = c.src_database returning d.src_database")
+
+
+def warehouse_started_sql() -> str:
+    """Record the statement started for a database. Params: statement_id, discovery_id, src_database."""
+    return (f"update {SCHEMA}.discovery set listing = coalesce(listing, '{{}}'::jsonb) || jsonb_build_object('statement_id', %s::text) "
+            f"where discovery_id = %s and src_database = %s")
+
+
+def warehouse_clear_sql() -> str:
+    """Forget a database's statement and claim, so it is started again. Params: discovery_id, src_database."""
+    return (f"update {SCHEMA}.discovery set listing = coalesce(listing, '{{}}'::jsonb) - 'statement_id' - 'claimed_at' "
+            f"where discovery_id = %s and src_database = %s")
+
+
+def warehouse_check_done_sql() -> str:
+    """A check's answer on a listed database: whether the login can open it, its table count, and why not. Params:
+    open (boolean), tables, why, discovery_id, src_database."""
+    return (f"update {SCHEMA}.discovery set listing = (coalesce(listing, '{{}}'::jsonb) - 'statement_id' - 'claimed_at') "
+            f"|| jsonb_build_object('open', %s::boolean, 'why', %s::text), tables = %s, finished_at = now() "
+            f"where discovery_id = %s and src_database = %s and status = 'listed'")
+
+
+def warehouse_read_done_sql() -> str:
+    """A read's end on a database: ok with its table count, or failed with why. Params: status, tables, error,
+    discovery_id, src_database. Only a database still running is changed, so a second answer writes nothing."""
+    return (f"update {SCHEMA}.discovery set status = %s, tables = %s, error = %s, finished_at = now(), "
+            f"listing = coalesce(listing, '{{}}'::jsonb) - 'statement_id' - 'claimed_at' "
+            f"where discovery_id = %s and src_database = %s and status = 'running'")
+
+
+def delete_discovered_tables_sql() -> str:
+    """Params: discovery_id, src_database."""
+    return f"delete from {SCHEMA}.discovered_table where discovery_id = %s and src_database = %s"
+
+
+def insert_discovered_tables_sql(columns, count: int) -> str:
+    """Insert ``count`` discovered_table rows of the given columns."""
+    one_row = "(" + ", ".join(["%s"] * len(columns)) + ")"
+    return (f"insert into {SCHEMA}.discovered_table ({', '.join(columns)}) values {', '.join([one_row] * count)} "
+            f"on conflict (discovery_id, src_database, src_schema, src_table) do nothing")
+
+
+def warehouse_progress_sql(kind: str) -> str:
+    """Where a discovery's checks or reads stand: its databases, those still to do (pending), and by outcome. A check
+    counts the databases open, closed and their tables; a read those read (done), failed, and their tables. Param:
+    discovery_id."""
+    if kind == "check":
+        return (f"select count(*) as databases, count(*) filter (where (listing -> 'open') is null) as pending, "
+                f"count(*) filter (where (listing ->> 'open')::boolean) as open, "
+                f"count(*) filter (where not (listing ->> 'open')::boolean) as closed, "
+                f"coalesce(sum(tables) filter (where (listing ->> 'open')::boolean), 0) as tables "
+                f"from {SCHEMA}.discovery where discovery_id = %s and status = 'listed'")
+    return (f"select count(*) as databases, count(*) filter (where status = 'running') as pending, "
+            f"count(*) filter (where status = 'ok') as done, count(*) filter (where status = 'failed') as failed, "
+            f"coalesce(sum(tables) filter (where status = 'ok'), 0) as tables "
+            f"from {SCHEMA}.discovery where discovery_id = %s")
+
+
+def warehouse_read_rows_sql() -> str:
+    """Start a read of a listed server's databases: one running row per database of the listing the filter keeps (in
+    its name) that the login wasn't found unable to open, for a new discovery. Params: new discovery_id, requested_by,
+    the listing's discovery_id, filter."""
+    return (f"insert into {SCHEMA}.discovery (discovery_id, src_type, src_connection, src_database, status, requested_by, "
+            f"listing) select %s, src_type, src_connection, src_database, 'running', %s, "
+            f"jsonb_build_object('via', 'warehouse') from {SCHEMA}.discovery "
+            f"where discovery_id = %s and status = 'listed' and coalesce((listing ->> 'open')::boolean, true) "
+            f"and position(lower(%s) in lower(src_database)) > 0 on conflict (discovery_id, src_database) do nothing")
+
+
+def warehouse_named_rows_sql(count: int) -> str:
+    """Start a read of named databases: one running row each. Params per row: discovery_id, src_connection,
+    src_database, requested_by."""
+    one_row = "(%s, 'sqlserver', %s, %s, 'running', %s, jsonb_build_object('via', 'warehouse'))"
+    return (f"insert into {SCHEMA}.discovery (discovery_id, src_type, src_connection, src_database, status, requested_by, "
+            f"listing) values {', '.join([one_row] * count)} on conflict (discovery_id, src_database) do nothing")
+
+
+def warehouse_left_out_sql() -> str:
+    """How many of a listing's databases the filter keeps that the login can't open: what a whole-server read leaves
+    out. Params: discovery_id, filter."""
+    return (f"select count(*) as left_out from {SCHEMA}.discovery where discovery_id = %s and status = 'listed' "
+            f"and not coalesce((listing ->> 'open')::boolean, true) and position(lower(%s) in lower(src_database)) > 0")
 
 
 def discovered_tables_sql() -> str:

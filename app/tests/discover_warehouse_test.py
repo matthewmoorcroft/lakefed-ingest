@@ -151,3 +151,82 @@ def test_with_no_warehouse_set_the_listing_runs_the_discovery_job_as_before(clie
     monkeypatch.setattr(main.jobs, "run_now", lambda job_id, params: started.append(params) or 42)
     assert client.post("/api/discoveries/source", json={"src_connection": "sql_a", "kind": "list"}).json()["run_id"] == 42
     assert fake.sent == []
+
+
+def _advance_recorded(monkeypatch, answer=None):
+    calls = []
+
+    def advance(store, fake, kind, discovery_id, connection, first=()):
+        calls.append((kind, discovery_id, connection, list(first)))
+        return answer or {"databases": 2, "pending": 2, "done": 0, "failed": 0, "tables": 0, "state": "RUNNING",
+                          "warehouse": "STARTING"}
+    monkeypatch.setattr(main.warehouse_reads, "advance", advance)
+    return calls
+
+
+def test_reading_named_databases_goes_through_the_warehouse_one_running_row_each(client, monkeypatch):
+    client.use([_answer("SUCCEEDED", rows=[])])
+    calls = _advance_recorded(monkeypatch)
+    body = client.post("/api/discoveries/source", json={"src_connection": "sql_a", "databases": ["eng_002", "eng_001"]}).json()
+    assert body["via"] == "warehouse" and body["state"] == "RUNNING" and body["left_out"] == 0
+    sql, params = client.written[0]
+    assert sql.startswith(f"insert into {q.SCHEMA}.discovery ") and "'running'" in sql
+    assert params == (body["discovery_id"], "sql_a", "eng_002", "op@example.com",
+                      body["discovery_id"], "sql_a", "eng_001", "op@example.com")
+    assert calls == [("read", body["discovery_id"], "sql_a", [])]
+
+
+def test_reading_the_whole_server_takes_its_listing_less_the_databases_the_login_cant_open(client, monkeypatch):
+    client.use([_answer("SUCCEEDED", rows=[])])
+    _advance_recorded(monkeypatch)
+    monkeypatch.setattr(main.db, "query", lambda sql, params=(): [{"left_out": 101}])
+    body = client.post("/api/discoveries/source", json={"src_connection": "sql_a", "whole_server": True,
+                                                        "listing_id": "abc123", "filter": "eng"}).json()
+    assert body["left_out"] == 101
+    sql, params = client.written[0]
+    assert sql == q.warehouse_read_rows_sql() and params == (body["discovery_id"], "op@example.com", "abc123", "eng")
+    assert "coalesce((listing ->> 'open')::boolean, true)" in sql
+
+
+def test_reading_the_whole_server_through_the_warehouse_needs_its_listing(client, monkeypatch):
+    client.use([_answer("SUCCEEDED", rows=[])])
+    _advance_recorded(monkeypatch)
+    answer = client.post("/api/discoveries/source", json={"src_connection": "sql_a", "whole_server": True})
+    assert answer.status_code == 422 and "listing_id" in answer.json()["detail"]
+
+
+def test_the_page_checks_access_with_the_databases_it_shows_first(client, monkeypatch):
+    client.use([_answer("SUCCEEDED", rows=[])])
+    calls = _advance_recorded(monkeypatch, {"databases": 2, "pending": 0, "open": 1, "closed": 1, "tables": 5,
+                                            "state": "SUCCEEDED", "warehouse": "RUNNING"})
+    body = client.post("/api/discoveries/abc123/access?connection=sql_a", json={"first": ["eng_001"]}).json()
+    assert body["closed"] == 1 and calls == [("check", "abc123", "sql_a", ["eng_001"])]
+    assert client.post("/api/discoveries/abc123/access?connection=sql_other", json={}).status_code == 404
+
+
+def test_the_page_asks_for_the_reads_until_they_end(client, monkeypatch):
+    client.use([_answer("SUCCEEDED", rows=[])])
+    calls = _advance_recorded(monkeypatch, {"databases": 1, "pending": 0, "done": 1, "failed": 0, "tables": 3,
+                                            "state": "SUCCEEDED", "warehouse": "RUNNING"})
+    body = client.get("/api/discoveries/abc123/reads?connection=sql_a").json()
+    assert body["state"] == "SUCCEEDED" and body["via"] == "warehouse" and calls == [("read", "abc123", "sql_a", [])]
+
+
+def test_rediscovery_reads_a_connections_server_through_the_warehouse_not_the_job(client, monkeypatch):
+    client.use([_answer("SUCCEEDED", rows=[{"name": "eng_002"}, {"name": "eng_001"}])])
+    steps = iter([{"pending": 2}, {"pending": 0}])
+    monkeypatch.setattr(main.warehouse_reads, "advance", lambda *a, **k: next(steps))
+    monkeypatch.setattr(main, "REDISCOVERY_WAREHOUSE_POLL_S", 0)
+    assert main._through_warehouse({"src_connection": "sql_a", "databases": "*"})
+    assert not main._through_warehouse({"src_connection": "sql_a", "azure_credential": "reader"})
+    assert not main._through_warehouse({"src_host": "h", "secret_key": "k"})
+    assert main._discover_through_warehouse({"src_connection": "sql_a", "databases": "*", "pattern": "eng%",
+                                             "requested_by": "re-discovery"}, "d7") is None
+    sql, params = client.written[0]
+    assert params == ("d7", "sql_a", "eng_001", "re-discovery", "d7", "sql_a", "eng_002", "re-discovery")
+
+
+def test_rediscovery_through_the_warehouse_says_why_a_listing_failed(client, monkeypatch):
+    client.use([_answer("FAILED", error="Login failed for user 'x'.\nmore")])
+    assert main._discover_through_warehouse({"src_connection": "sql_a", "databases": "*"}, "d7") == \
+        "listing its databases ended FAILED: Login failed for user 'x'."
