@@ -85,12 +85,13 @@ STATE_COUNTS = (
 
 # ---- overview -----------------------------------------------------------------------------------
 
-def database_states_sql() -> str:
+def database_states_sql(only_groups: bool = False) -> str:
     """One row per (server, connection, host, ingestion group, database, instance-group label): enabled tables by
     state (STATE_COUNTS), tables without a freshness target, the oldest and newest success of its enabled tables,
-    and the newest of any table (what a UC connection's databases show). The one scan
-    the monitoring views share: rollup.py sums it into groups, servers and connections. The label rides along so
-    Sources can say where it differs from the server."""
+    and the newest of any table (what a UC connection's databases show). A scan of the control table, so the
+    monitoring views read it only for a group with no rollup row yet (only_groups: param task_collection list).
+    The label rides along so Sources can say where it differs from the server."""
+    where = "where t.task_collection = any(%s)" if only_groups else ""
     return f"""
 select {SERVER} as server, t.src_connection, lower(t.src_host) as src_host, t.task_collection,
        coalesce(t.src_database, '') as src_database, t.source_instance_group as instance_label,
@@ -103,7 +104,162 @@ select {SERVER} as server, t.src_connection, lower(t.src_host) as src_host, t.ta
 from {SCHEMA}.control t
 left join {SCHEMA}.checkpoint cp on cp.control_id = t.id
 {DATABASE_CHECK_JOIN}
+{where}
 group by 1, 2, 3, 4, 5, 6"""
+
+
+# ---- monitoring rollups ---------------------------------------------------------------------------
+# The engine rewrites these rows (state_store.rollup_database_rewrite_sql, rollup_group_rewrite_sql) after each
+# database's work, and the app rewrites the same rows after its own edits. The two statements are the engine's
+# text, copied here; app/tests/rollup_sql_test.py keeps them equal. Parameters: the collection and the database
+# name of each database to rewrite (a list each), then the collection of each group (a list).
+
+ROLLUP_CHUNK = 200
+_ROLLUP_DATABASE_REWRITE = """
+with keys as (
+    select k.task_collection, k.src_database
+    from unnest(%s::text[], %s::text[]) as k(task_collection, src_database)),
+states as (
+    select t.task_collection, coalesce(t.src_database, '') as src_database, (case when t.src_connection is not null and (t.use_remote_query or t.src_host is null) then lower(t.src_connection) when t.src_host is not null then lower(t.src_host) || ':' || coalesce(nullif(t.src_port, 0)::text, case lower(coalesce(t.src_type, 'sqlserver')) when 'oracle' then '1521' when 'postgresql' then '5432' when 'mysql' then '3306' else '1433' end) else '' end) as server,
+           coalesce(t.src_connection, '') as src_connection, coalesce(lower(t.src_host), '') as src_host,
+           coalesce(t.source_instance_group, '') as instance_label, t.task_enabled, t.freshness_sla_minutes,
+           t.created_at, coalesce(cp.status = 'failed', false) as failing,
+           (cp.control_id is null or cp.phase = 'seeding') as first_load,
+           greatest(cp.last_success_at, case when cp.strategy = 'ct' and cp.phase = 'incremental'
+                    and cp.position ~ '^[0-9]+$' then case when cp.position::bigint >= dc.checked_version
+                    then dc.checked_at end end) as last_success_at
+    from keys k
+    join lakefed_ingest.control t on t.task_collection = k.task_collection and coalesce(t.src_database, '') = k.src_database
+    left join lakefed_ingest.checkpoint cp on cp.control_id = t.id
+    left join lakefed_ingest.database_check dc on dc.task_collection = t.task_collection
+        and dc.src_database = t.src_database and dc.source = lower(coalesce(nullif(t.src_host, ''), nullif(t.src_connection, ''), '')) || '|' || coalesce(nullif(t.src_port, 0), case when (nullif(t.src_host, '') is null and nullif(t.src_connection, '') is not null) then 0 else (case coalesce(nullif(lower(trim(t.src_type)), ''), 'sqlserver') when 'sqlserver' then 1433 when 'oracle' then 1521 when 'postgresql' then 5432 when 'mysql' then 3306 else 0 end) end) || '|' || coalesce(nullif(t.secret_key, ''), nullif(t.src_connection, ''), '')),
+agg as (
+    select task_collection, src_database, server, src_connection, src_host, instance_label,
+           count(*) as control_rows, count(*) filter (where task_enabled) as tables,
+           count(*) filter (where task_enabled and freshness_sla_minutes is null) as no_sla_tables,
+           count(*) filter (where task_enabled and failing) as failing,
+           count(*) filter (where task_enabled and not failing and first_load) as first_load,
+           count(*) filter (where task_enabled and not failing and not first_load) as loaded,
+           min(last_success_at) filter (where task_enabled) as oldest_success_at,
+           max(last_success_at) filter (where task_enabled) as newest_success_at,
+           max(last_success_at) as newest_any_success_at,
+           min(coalesce(last_success_at, created_at) + make_interval(mins => freshness_sla_minutes))
+               filter (where task_enabled and freshness_sla_minutes is not null and not failing
+                       and not first_load) as earliest_due_at
+    from states
+    group by task_collection, src_database, server, src_connection, src_host, instance_label),
+written as (
+    insert into lakefed_ingest.rollup_database (task_collection, src_database, server, src_connection, src_host,
+        instance_label, tables, no_sla_tables, failing, first_load, loaded, oldest_success_at, newest_success_at,
+        newest_any_success_at, earliest_due_at, updated_at, control_rows)
+    select task_collection, src_database, server, src_connection, src_host, instance_label, tables, no_sla_tables,
+           failing, first_load, loaded, oldest_success_at, newest_success_at, newest_any_success_at,
+           earliest_due_at, now(), control_rows
+    from agg
+    on conflict (task_collection, src_database, server, src_connection, src_host, instance_label) do update set
+        tables = excluded.tables, no_sla_tables = excluded.no_sla_tables, failing = excluded.failing,
+        first_load = excluded.first_load, loaded = excluded.loaded,
+        oldest_success_at = excluded.oldest_success_at, newest_success_at = excluded.newest_success_at,
+        newest_any_success_at = excluded.newest_any_success_at, earliest_due_at = excluded.earliest_due_at,
+        control_rows = excluded.control_rows, updated_at = now()
+    returning 1),
+zeroed as (
+    update lakefed_ingest.rollup_database r set tables = 0, no_sla_tables = 0, failing = 0, first_load = 0, loaded = 0,
+           oldest_success_at = null, newest_success_at = null, newest_any_success_at = null,
+           earliest_due_at = null, control_rows = 0, updated_at = now()
+    from keys k
+    where r.task_collection = k.task_collection and r.src_database = k.src_database
+      and not exists (select 1 from agg a where a.task_collection = r.task_collection
+                      and a.src_database = r.src_database and a.server = r.server
+                      and a.src_connection = r.src_connection and a.src_host = r.src_host
+                      and a.instance_label = r.instance_label)
+    returning 1)
+select (select count(*) from written) as written, (select count(*) from zeroed) as zeroed"""
+_ROLLUP_GROUP_REWRITE = """
+with groups as (
+    select g.task_collection from unnest(%s::text[]) as g(task_collection)),
+agg as (
+    select g.task_collection,
+           coalesce(sum(r.tables), 0) as tables, coalesce(sum(r.no_sla_tables), 0) as no_sla_tables,
+           coalesce(sum(r.failing), 0) as failing, coalesce(sum(r.first_load), 0) as first_load,
+           coalesce(sum(r.loaded), 0) as loaded,
+           count(distinct (r.server, r.src_database)) filter (where r.tables > 0) as databases,
+           count(distinct r.server) filter (where r.tables > 0) as servers,
+           min(r.oldest_success_at) as oldest_success_at, max(r.newest_success_at) as newest_success_at
+    from groups g
+    left join lakefed_ingest.rollup_database r on r.task_collection = g.task_collection
+    group by g.task_collection)
+insert into lakefed_ingest.rollup_group (task_collection, tables, no_sla_tables, failing, first_load, loaded, databases,
+    servers, oldest_success_at, newest_success_at, updated_at)
+select task_collection, tables, no_sla_tables, failing, first_load, loaded, databases, servers,
+       oldest_success_at, newest_success_at, now()
+from agg
+on conflict (task_collection) do update set
+    tables = excluded.tables, no_sla_tables = excluded.no_sla_tables, failing = excluded.failing,
+    first_load = excluded.first_load, loaded = excluded.loaded, databases = excluded.databases,
+    servers = excluded.servers, oldest_success_at = excluded.oldest_success_at,
+    newest_success_at = excluded.newest_success_at, updated_at = now()"""
+
+
+def rollup_database_rewrite_sql() -> str:
+    """Recompute the rollup rows of some databases of their collections, in one statement."""
+    return _ROLLUP_DATABASE_REWRITE
+
+
+def rollup_group_rewrite_sql() -> str:
+    """Recompute the rollup rows of some ingestion groups from their database rows, in one statement."""
+    return _ROLLUP_GROUP_REWRITE
+
+
+def rollup_states_sql() -> str:
+    """Every database's rollup row, one per grain (server, connection, host, instance label), as the monitoring views
+    read them in place of a scan of the control table. late_database is whether an enabled table with a freshness
+    target is past its due time now: the rewrite keeps the earliest due time, so this is live without a scan.
+    Rows with no control row left (a table moved to another grain) are not read."""
+    return f"""
+select r.server, nullif(r.src_connection, '') as src_connection, nullif(r.src_host, '') as src_host,
+       r.task_collection, r.src_database, nullif(r.instance_label, '') as instance_label,
+       r.tables, r.no_sla_tables, r.failing as state_failing, r.first_load as state_first_load,
+       r.loaded as state_loaded, coalesce(r.earliest_due_at < now(), false) as late_database,
+       r.oldest_success_at, r.newest_success_at, r.newest_any_success_at
+from {SCHEMA}.rollup_database r
+where r.control_rows > 0"""
+
+
+def rollup_group_names_sql() -> str:
+    """The ingestion groups that have a rollup row (a group written by a rewrite, a check or an edit)."""
+    return f"select task_collection from {SCHEMA}.rollup_group"
+
+
+def control_group_names_sql() -> str:
+    """Every ingestion group with a control row. A scan of the control index: read at most once per few minutes."""
+    return f"select distinct task_collection from {SCHEMA}.control"
+
+
+def database_states_for_groups_sql() -> str:
+    """database_states_sql for some groups only (param: task_collection list), for a group with no rollup row yet."""
+    return database_states_sql(only_groups=True)
+
+
+def control_databases_sql(by: str) -> str:
+    """The (collection, database name) of the control rows of some ids (by="ids") or some groups (by="groups").
+    Param: the list of ids or of group names."""
+    where = "t.id = any(%s)" if by == "ids" else "t.task_collection = any(%s)"
+    return (f"select distinct t.task_collection, coalesce(t.src_database, '') from {SCHEMA}.control t where {where}")
+
+
+def database_counts_sql() -> str:
+    """One database's enabled tables by state, read live (the database page): the same counts as STATE_COUNTS over its
+    control rows. Params: group, server, database. control_rows is 0 when the database has no row."""
+    return f"""
+select count(*) as control_rows,
+       count(*) filter (where t.task_enabled) as tables,
+       count(*) filter (where t.task_enabled and t.freshness_sla_minutes is null) as no_sla_tables,
+       {STATE_COUNTS}
+from {SCHEMA}.control t
+left join {SCHEMA}.checkpoint cp on cp.control_id = t.id
+{DATABASE_CHECK_JOIN}
+where t.task_collection = %s and {SERVER} = %s and coalesce(t.src_database, '') = %s"""
 
 
 def not_a_check(alias: str = "") -> str:

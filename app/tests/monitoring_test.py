@@ -159,13 +159,15 @@ def api(monkeypatch):
     from fastapi.testclient import TestClient
 
     answers = {
-        q.database_states_sql(): [
+        q.rollup_states_sql(): [
             dict(server="s1", src_connection="sql_b", src_host=None, task_collection="c1", src_database="db1", tables=2,
-                 state_current=2, state_late=0, state_first_load=0, state_failing=0, no_sla_tables=0),
+                 state_loaded=2, late_database=False, state_first_load=0, state_failing=0, no_sla_tables=0),
             dict(server="s1", src_connection="sql_b", src_host=None, task_collection="c2", src_database="db1", tables=2,
-                 state_current=2, state_late=0, state_first_load=0, state_failing=0, no_sla_tables=0),
+                 state_loaded=2, late_database=False, state_first_load=0, state_failing=0, no_sla_tables=0),
             dict(server="s1", src_connection=None, src_host="other", task_collection="c1", src_database="db2", tables=6,
-                 state_current=6, state_late=0, state_first_load=0, state_failing=0, no_sla_tables=0)],
+                 state_loaded=6, late_database=False, state_first_load=0, state_failing=0, no_sla_tables=0)],
+        q.rollup_group_names_sql(): [dict(task_collection="c1"), dict(task_collection="c2")],
+        q.control_group_names_sql(): [dict(task_collection="c1"), dict(task_collection="c2")],
         q.last_runs_sql(): [dict(task_collection="c1", run_id=9, status="running")],
         q.running_progress_sql(): [dict(run_id=9, task_collection="c1", enabled_tables=10, tables_checked=4)],
         q.run_batch_rows_sql(): [dict(run_id=8, task_collection="c1", detail=json.dumps({"batch_rows": 50}))],

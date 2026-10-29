@@ -6,11 +6,21 @@ A database is its server and its name: two servers' databases of the same name a
 database counts once it has an enabled table."""
 from typing import Dict, Iterable, List, Optional
 
-STATES = ("state_current", "state_late", "state_first_load", "state_failing")
+# Tables by state: loaded (current or late), waiting for a first load, failing. A late database (one with a late
+# table) is counted per database, not per table: the top-level views say so, and the database page counts tables.
+STATES = ("state_loaded", "state_first_load", "state_failing")
 
 
 def _count(row: dict, key: str) -> int:
     return int(row.get(key) or 0)
+
+
+def from_scan(row: dict) -> dict:
+    """A database_states row (a scan of the control table, for a group with no rollup row yet) in the shape of a
+    rollup row: its loaded tables are the current and the late ones, and it is late when any of its tables is."""
+    late = _count(row, "state_late")
+    return {**{k: v for k, v in row.items() if k not in ("state_current", "state_late")},
+            "state_loaded": _count(row, "state_current") + late, "late_database": late > 0}
 
 
 def _later(a, b):
@@ -29,7 +39,7 @@ def groups(states: Iterable[dict]) -> Dict[str, dict]:
     for s in states:
         name = s["task_collection"]
         g = out.setdefault(name, {"task_collection": name, "enabled_tables": 0, "no_sla_tables": 0,
-                                  **{k: 0 for k in STATES}, "_databases": set(), "_servers": set(),
+                                  **{k: 0 for k in STATES}, "_databases": set(), "_servers": set(), "_late": set(),
                                   "newest_success_at": None})
         g["enabled_tables"] += _count(s, "tables")
         g["no_sla_tables"] += _count(s, "no_sla_tables")
@@ -38,10 +48,13 @@ def groups(states: Iterable[dict]) -> Dict[str, dict]:
         if _count(s, "tables"):
             g["_databases"].add((s["server"], s["src_database"]))
             g["_servers"].add(s["server"])
+        if s.get("late_database"):
+            g["_late"].add((s["server"], s["src_database"]))
         g["newest_success_at"] = _later(g["newest_success_at"], s.get("newest_success_at"))
     for g in out.values():
         servers = sorted(g.pop("_servers"))
         g["databases"] = len(g.pop("_databases"))
+        g["late_databases"] = len(g.pop("_late"))
         g["servers"] = len(servers)
         g["server"] = servers[0] if servers else None
     return out
@@ -55,13 +68,15 @@ def servers(states: Iterable[dict], running_groups: Optional[set] = None) -> Lis
     out: Dict[str, dict] = {}
     for s in states:
         v = out.setdefault(s["server"], {"server": s["server"], "tables": 0, **{k: 0 for k in STATES},
-                                         "_databases": set(), "_groups": set(),
+                                         "_databases": set(), "_late": set(), "_groups": set(),
                                          "oldest_success_at": None, "newest_success_at": None})
         v["tables"] += _count(s, "tables")
         for k in STATES:
             v[k] += _count(s, k)
         if _count(s, "tables"):
             v["_databases"].add(s["src_database"])
+        if s.get("late_database"):
+            v["_late"].add(s["src_database"])
         v["_groups"].add(s["task_collection"])
         v["oldest_success_at"] = _earlier(v["oldest_success_at"], s.get("oldest_success_at"))
         v["newest_success_at"] = _later(v["newest_success_at"], s.get("newest_success_at"))
@@ -69,6 +84,7 @@ def servers(states: Iterable[dict], running_groups: Optional[set] = None) -> Lis
     for v in sorted(out.values(), key=lambda v: str(v["server"])):
         group_names = v.pop("_groups")
         v["databases"] = len(v.pop("_databases"))
+        v["late_databases"] = len(v.pop("_late"))
         v["collections"] = len(group_names)
         v["running_collections"] = len(group_names & running_groups)
         rows.append(v)
@@ -124,7 +140,7 @@ def _job_sums(name_fields: dict, group_names, states: List[dict]) -> dict:
     rows = [s for s in states if s["task_collection"] in group_names]
     out = {**name_fields, "groups": sorted(group_names), "enabled_tables": 0, "no_sla_tables": 0,
            **{k: 0 for k in STATES}, "newest_success_at": None}
-    databases, server_names = set(), set()
+    databases, server_names, late = set(), set(), set()
     for s in rows:
         out["enabled_tables"] += _count(s, "tables")
         out["no_sla_tables"] += _count(s, "no_sla_tables")
@@ -133,8 +149,10 @@ def _job_sums(name_fields: dict, group_names, states: List[dict]) -> dict:
         if _count(s, "tables"):
             databases.add((s["server"], s["src_database"]))
             server_names.add(s["server"])
+        if s.get("late_database"):
+            late.add((s["server"], s["src_database"]))
         out["newest_success_at"] = _later(out["newest_success_at"], s.get("newest_success_at"))
-    out["databases"], out["servers"] = len(databases), len(server_names)
+    out["databases"], out["servers"], out["late_databases"] = len(databases), len(server_names), len(late)
     return out
 
 

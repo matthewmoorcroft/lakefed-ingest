@@ -7,7 +7,7 @@ root doesn't depend on it, and everything the app does can also be done with SQL
 
 | Page | What it does |
 |---|---|
-| **Overview** | Ingestion jobs (a schedule and its ingestion groups) with their tables by state, last job run and Status (running, failing, late, paused); groups in no job; job runs going now (progress over all the job's tables, speed, expected end); jobs needing attention, with their failures grouped by cause |
+| **Overview** | Ingestion jobs (a schedule and its ingestion groups) with their tables by state, late databases (a database with a late table; its database page lists the tables), last job run and Status (running, failing, late, paused); groups in no job; job runs going now (progress over all the job's tables, speed, expected end); jobs needing attention, with their failures grouped by cause |
 | **Ingestion jobs** | Every ingestion job, filtered (running, failing, late, paused) and searched; one job's details with its job runs (one per trigger: outcome, took, speed, parallelism, clusters) and its groups; one job run with its group runs, databases and failures |
 | **Runs** | Job runs of every ingestion job, running first; group runs of groups in no job. A group run's page shows its outcome, speed, time left, tables in flight, databases and table events |
 | **Sources** | Each source instance: how it is read (UC connection or JDBC host), its ingestion jobs, its tables by state, and tables discovered and not registered yet; UC connections with nothing registered |

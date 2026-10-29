@@ -188,19 +188,24 @@ def test_failed_tables_are_one_row_per_table_with_its_failures(pg):
 def test_the_shared_per_database_pass_adds_up_to_the_overview_and_servers(pg):
     import rollup
     with pg.transaction():
-        states = rows(pg, q.database_states_sql())
+        states = [rollup.from_scan(r) for r in rows(pg, q.database_states_sql())]
         old_groups = {r["task_collection"]: r for r in rows(pg, q.collections_overview_sql())}
         old_servers = rows(pg, q.servers_sql())
+    # The rollup counts a late table's database as loaded with its table, so loaded is current plus late.
     new_groups = rollup.groups(states)
     assert set(new_groups) == set(old_groups)
     for name, old in old_groups.items():
         new = new_groups[name]
-        for k in ("enabled_tables", "no_sla_tables", "databases", "servers", "server") + rollup.STATES:
+        assert new["state_loaded"] == old["state_current"] + old["state_late"], name
+        for k in ("enabled_tables", "no_sla_tables", "databases", "servers", "server", "state_first_load",
+                  "state_failing"):
             assert new[k] == old[k], (name, k)
     new_servers = rollup.servers(states)
     assert [s["server"] for s in new_servers] == [s["server"] for s in old_servers]
     for new, old in zip(new_servers, old_servers):
-        for k in ("databases", "tables", "collections", "oldest_success_at", "newest_success_at") + rollup.STATES:
+        assert new["state_loaded"] == old["state_current"] + old["state_late"], old["server"]
+        for k in ("databases", "tables", "collections", "oldest_success_at", "newest_success_at", "state_first_load",
+                  "state_failing"):
             assert new[k] == old[k], (old["server"], k)
 
 

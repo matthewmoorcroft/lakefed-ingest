@@ -198,6 +198,7 @@ def _insert_controls(cur, rows, user, batch, skip_taken=False, progress=None) ->
         written += now
         if progress:
             progress(at + len(chunk))
+    _rewrite_rollups(cur, [(row["task_collection"], row.get("src_database")) for row, _ in written])
     return written
 
 
@@ -211,11 +212,41 @@ def _touch(cur, user, jobs_changed=(), groups=()):
         cur.execute(q.touch_group_jobs_sql(), (user or None, wanted))
 
 
+def _rewrite_rollups(cur, databases) -> None:
+    """Recompute the monitoring rollups of the databases a transaction changed, given as (ingestion group, source
+    database name) pairs, and of their groups, inside the caller's transaction. Each database is counted from its own
+    control rows, so the rows are exact after the edit and need no deltas."""
+    by_group = {}
+    for group, src_database in databases:
+        by_group.setdefault(group, set()).add(src_database or "")
+    pairs = [(group, name) for group in sorted(by_group) for name in sorted(by_group[group])]
+    for at in range(0, len(pairs), q.ROLLUP_CHUNK):
+        chunk = pairs[at:at + q.ROLLUP_CHUNK]
+        cur.execute(q.rollup_database_rewrite_sql(), ([group for group, _ in chunk], [name for _, name in chunk]))
+    if by_group:
+        cur.execute(q.rollup_group_rewrite_sql(), (sorted(by_group),))
+
+
+def _rewrite_rollups_for_ids(cur, ids) -> None:
+    """_rewrite_rollups for the databases of some control rows, by id."""
+    if ids:
+        cur.execute(q.control_databases_sql("ids"), (list(ids),))
+        _rewrite_rollups(cur, cur.fetchall())
+
+
+def _rewrite_rollups_for_groups(cur, groups) -> None:
+    """_rewrite_rollups for every database of some ingestion groups."""
+    if groups:
+        cur.execute(q.control_databases_sql("groups"), (sorted(groups),))
+        _rewrite_rollups(cur, cur.fetchall())
+
+
 def _apply_plans(cur, rows, plans, user, batch):
     """Write planned edits (queries.plan_edit) inside the caller's transaction: each changed field, its change log
     line, a reseed where the plan needs one, then the mixed-sink and split-database checks over the rows as they
     now are."""
     by_id = {r["id"]: r for r in rows}
+    before = [(by_id[p["id"]]["task_collection"], by_id[p["id"]].get("src_database")) for p in plans]
     for p in plans:
         if not p["changes"]:
             continue
@@ -229,6 +260,7 @@ def _apply_plans(cur, rows, plans, user, batch):
             cur.execute(q.flip_to_seeding_sql(), (f"reseed after edit: {p['reseed']}", [p["id"]]))
             cur.execute(q.log_reseed_sql(), (f"edit:{p['reseed']}", [p["id"]]))
     edited = [dict(by_id[p["id"]], **{f: v[1] for f, v in p["changes"].items()}) for p in plans]
+    _rewrite_rollups(cur, before + [(row["task_collection"], row.get("src_database")) for row in edited])
     _refuse_mixed_sinks(cur, edited)
     _refuse_split_databases(cur, edited)
 
@@ -617,12 +649,31 @@ def job_selection(job_id: int):
 
 # Table states change at run cadence, so the one per-database scan they come from is shared for longer
 # than running progress is.
-STATES_CACHE_S = max(0, int(os.environ.get("STATES_CACHE_S", "60")))
+STATES_CACHE_S = max(0, int(os.environ.get("STATES_CACHE_S", "15")))
+# How often the group names with a control row are re-read (a scan of the control index), for groups with no rollup yet.
+CONTROL_GROUPS_S = 600
 
 
 def _states() -> List[dict]:
-    """queries.database_states_sql, shared: the one scan of the control table the monitoring views sum."""
-    return _shared("database_states", lambda: db.query(q.database_states_sql()), ttl=STATES_CACHE_S)
+    """The database rows the monitoring views sum: each database's rollup row (queries.rollup_states_sql), read once
+    and shared for STATES_CACHE_S. A group with no rollup row yet (its rows predate the rollups and no write or check
+    has touched it) is counted from its control rows until one does."""
+    return _shared("database_states", _load_states, ttl=STATES_CACHE_S)
+
+
+def _load_states() -> List[dict]:
+    rows = db.query(q.rollup_states_sql())
+    written = {r["task_collection"] for r in db.query(q.rollup_group_names_sql())}
+    unwritten = sorted(_control_groups() - written)
+    if unwritten:
+        rows += [rollup.from_scan(r) for r in db.query(q.database_states_for_groups_sql(), (unwritten,))]
+    return rows
+
+
+def _control_groups() -> set:
+    """Every ingestion group with a control row, re-read at most every CONTROL_GROUPS_S seconds."""
+    return _shared("control_groups",
+                   lambda: {r["task_collection"] for r in db.query(q.control_group_names_sql())}, ttl=CONTROL_GROUPS_S)
 
 
 def _last_runs() -> dict:
@@ -921,11 +972,13 @@ def _jobs_view() -> dict:
 
 
 JOB_FILTERS = ("all", "running", "failing", "late", "paused")
+# The sums a group row shows: its databases, enabled tables, late databases, and its tables by state (rollup.STATES).
+GROUP_SUMS = ("databases", "enabled_tables", "late_databases") + rollup.STATES
 
 
 def _job_filter(job: dict, name: str) -> bool:
     return {"all": True, "running": bool(job.get("running_job_run")), "failing": bool(job["state_failing"]),
-            "late": bool(job["state_late"]), "paused": bool(job.get("paused"))}[name]
+            "late": bool(job["late_databases"]), "paused": bool(job.get("paused"))}[name]
 
 
 # Columns the Ingestion jobs list sorts by, besides its own order (failing first, then late, then by name).
@@ -977,7 +1030,7 @@ def groups_not_in_job():
     rows = []
     for name in sorted(not_in_job["groups"]):
         g, st, last = groups.get(name) or {}, stats.get(name) or {}, last_runs.get(name)
-        rows.append({"task_collection": name, **{k: g.get(k) for k in ("databases", "enabled_tables") + rollup.STATES},
+        rows.append({"task_collection": name, **{k: g.get(k) for k in GROUP_SUMS},
                      "last_run": dict(last, outcome=q.run_outcome(last)) if last else None,
                      "p95_s": st.get("p95_s"), "p50_s": st.get("p50_s")})
     return {**not_in_job, "name": "Not in any job", "groups_detail": rows}
@@ -1060,7 +1113,7 @@ def ingestion_job(job_id: int, request: Request):
         g, st, last = groups.get(m["task_collection"]) or {}, stats.get(m["task_collection"]) or {}, last_runs.get(m["task_collection"])
         group_rows.append({"task_collection": m["task_collection"], "offset_minutes": m["offset_minutes"],
                            "starts": sch.member_start(cadence, int(m["offset_minutes"])),
-                           **{k: g.get(k) for k in ("databases", "enabled_tables") + rollup.STATES},
+                           **{k: g.get(k) for k in GROUP_SUMS},
                            "last_run": dict(last, outcome=q.run_outcome(last)) if last else None,
                            "p95_s": st.get("p95_s"), "p50_s": st.get("p50_s"),
                            "job_url": (f"{db.workspace().config.host.rstrip('/')}/jobs/{m['job_id']}"
@@ -1495,6 +1548,7 @@ def edit_ingestion_job_settings(job_id: int, body: JobSettingsRequest, request: 
             if not found["summary"]["changed"]:
                 return found
             result = jss.apply(cur, groups, body.settings, now, _user(request), uuid.uuid4().hex[:12])
+            _rewrite_rollups_for_groups(cur, groups)
             _touch(cur, _user(request), [job_id])
             mixed = jss.mixed_sinks(fetch, groups)
             if mixed:
@@ -1600,6 +1654,7 @@ def enable_job_tables(job_id: int, body: JobEnableRequest, request: Request):
         rows = _locked_rows(cur, ids)
         _lock_collections(cur, [r["task_collection"] for r in rows])
         cur.execute(q.set_enabled_sql(), (body.enabled, ids))
+        _rewrite_rollups_for_ids(cur, ids)
         for r in rows:
             if bool(r["task_enabled"]) != body.enabled:
                 _log(cur, _user(request), "enable" if body.enabled else "disable", r["id"], r["task_collection"],
@@ -1701,9 +1756,11 @@ def add_job_databases(job_id: int, body: JobDatabasesRequest, request: Request):
             off = [control_id for row, control_id in written if not row["task_enabled"]]
             if off:
                 cur.execute(q.set_enabled_sql(), (False, off))
+                _rewrite_rollups_for_ids(cur, off)
             for enabled, ids in ((True, plan["enable"]), (False, plan["disable"])):
                 if ids:
                     cur.execute(q.set_enabled_sql(), (enabled, ids))
+                    _rewrite_rollups_for_ids(cur, ids)
                     _log_lines(cur, [(user, "enable" if enabled else "disable", i, None, "task_enabled", not enabled,
                                       enabled, None, batch) for i in ids])
             _refuse_mixed_sinks(cur, plan["new"])
@@ -1943,11 +2000,11 @@ def one_database(name: str, server: str, database: str, search: str = "", offset
     run, and its tables (DATABASE_TABLES_PAGE a page, failing first, then in flight, then to go) with their
     part in that run. The server "-" stands for a blank one."""
     server = "" if server == "-" else server
-    states = [s for s in _states() if s["task_collection"] == name and s["server"] == server
-              and s["src_database"] == database]
-    if not states:
+    counts = db.query(q.database_counts_sql(), (name, server, database))[0]
+    if not counts["control_rows"]:
         raise HTTPException(404, f"no database {database} on {server or '(no server)'} in ingestion group {name}")
-    sums = {k: sum(q._count(s, k) for s in states) for k in ("tables", "no_sla_tables") + rollup.STATES}
+    sums = {k: counts[k] for k in ("tables", "no_sla_tables", "state_current", "state_late", "state_first_load",
+                                    "state_failing")}
     running = next((r for r in _running() if r["task_collection"] == name), None)
     schedules, members = _schedules()
     job_names = [{"id": s["id"], "name": s["name"]} for s in schedules
@@ -2080,6 +2137,7 @@ def set_enabled(body: EnableRequest, request: Request):
         _recheck_locked_rows(rows, checked, request)
         _lock_collections(cur, [r["task_collection"] for r in rows])
         cur.execute(q.set_enabled_sql(), (body.enabled, body.ids))
+        _rewrite_rollups_for_ids(cur, body.ids)
         for r in rows:
             if bool(r["task_enabled"]) != body.enabled:
                 _log(cur, _user(request), "enable" if body.enabled else "disable", r["id"], r["task_collection"],
@@ -2097,6 +2155,7 @@ def reseed(body: Ids, request: Request):
         _recheck_locked_rows(rows, checked, request)
         _lock_collections(cur, [r["task_collection"] for r in rows])
         cur.execute(q.force_reseed_sql(), (body.ids,))
+        _rewrite_rollups_for_ids(cur, body.ids)
         n = cur.rowcount
         cur.execute(q.log_reseed_sql(), ("manual", body.ids))
         for r in rows:
@@ -2116,6 +2175,7 @@ def add_table(row: dict, request: Request):
         _lock_collections(cur, [row.get("task_collection")])
         cur.execute(q.insert_control_sql(), q.control_params(row))
         new_id = cur.fetchone()[0]
+        _rewrite_rollups(cur, [(row.get("task_collection"), row.get("src_database"))])
         _refuse_mixed_sinks(cur, [row])
         _refuse_split_databases(cur, [row])
         _log(cur, _user(request), "add", new_id, row.get("task_collection"))
@@ -2398,6 +2458,7 @@ def register(discovery_id: str, body: RegisterRequest, request: Request):
                 results.append({"table": name, "status": "registered" if res else "skipped",
                                 "id": res[0] if res else None,
                                 "errors": [] if res else ["sink already used by another control row"]})
+            _rewrite_rollups(cur, [(row.get("task_collection"), row.get("src_database")) for _, row in valid])
             _refuse_mixed_sinks(cur, [row for _, row in valid])     # all or nothing, like an edit
             _refuse_split_databases(cur, [row for _, row in valid])
             _touch(cur, _user(request), groups=[body.task_collection])
@@ -2471,6 +2532,7 @@ def import_csv(body: ImportRequest, request: Request):
                 else:
                     line["errors"] = ["sink already used by another control row"]
             imported = [line["row"] for line in plan["lines"] if line["status"] == "imported"]
+            _rewrite_rollups(cur, [(row.get("task_collection"), row.get("src_database")) for row in imported])
             _refuse_mixed_sinks(cur, imported)
             _refuse_split_databases(cur, imported)
             _touch(cur, _user(request), groups=[group])
