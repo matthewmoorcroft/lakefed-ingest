@@ -250,7 +250,8 @@ function AddDatabases({ jobId, servers }: { jobId: string; servers: string[] }) 
         {preview.new_groups?.length ? `; new groups ${preview.new_groups.join(", ")}` : ""}.</Notice>}
       {note && <Notice tone={note.tone}>{note.text}</Notice>}
       {apply.isPending && <TaskProgress task={task} />}
-      <ErrorBox error={check.error || (isUnconfirmed(apply.error) ? null : apply.error)} />
+      {!apply.isPending && resumableWrite(apply.error) && <TaskProgress task={task} onResume={() => apply.mutate()} />}
+      <ErrorBox error={check.error || (isUnconfirmed(apply.error) || resumableWrite(apply.error) ? null : apply.error)} />
     </div>
   );
 }

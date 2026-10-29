@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, type Row } from "../api";
 import { Tip, OutLink, PageHead, Stamp, readAt, Badge, ConfirmButton, ErrorBox, Grid, Metric, Notice, Section, autoColumns, statusName } from "../components";
@@ -37,6 +37,14 @@ export default function Jobs({ embedded }: { embedded?: boolean }) {
     },
   });
   const [setupRunId, setSetupRunId] = useState<number | null>(null);
+  // A setup run Databricks lists going (read from the run table) is this page's run too: a page reloaded during it keeps
+  // the button off, and shows the run's outcome once it ends.
+  const activeSetup = useQuery({
+    queryKey: ["setup-run-active"],
+    queryFn: () => api.get<{ run_id: number | null }>("/jobs/setup/runs/active"),
+    refetchInterval: 15_000,
+  });
+  useEffect(() => { if (activeSetup.data?.run_id != null) setSetupRunId(Number(activeSetup.data.run_id)); }, [activeSetup.data]);
   const runSetup = useMutation({
     mutationFn: () => api.post<Row>("/jobs/setup/run"),
     onSuccess: (r) => setSetupRunId(Number(r.run_id)),

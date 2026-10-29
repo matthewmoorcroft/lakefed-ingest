@@ -26,9 +26,13 @@ export async function finished(answer: Row, onTask: (task: Row) => void): Promis
   }
 }
 
-/** Whether a failed write stopped part way (its task has progress): the databases written before it are kept, and the
- *  same request finishes it. */
-export const resumableWrite = (error: unknown): boolean => Boolean((error as { task?: Row } | null)?.task?.progress);
+/** Whether a failed write can be finished by sending it again with the same request id: one that stopped part way (its
+ *  task has progress, and the databases written before it are kept), or one whose rows committed but whose Databricks
+ *  jobs did not sync (its task keeps its result). */
+export const resumableWrite = (error: unknown): boolean => {
+  const task = (error as { task?: Row } | null)?.task;
+  return Boolean(task?.progress || task?.result);
+};
 
 const KINDS: Record<string, string> = { create: "Creating the job", tables: "Adding tables", databases: "Adding databases" };
 
@@ -46,7 +50,11 @@ export function TaskProgress({ task, onResume }: { task: Row | null; onResume?: 
         {onResume && <div className="toolbar"><button onClick={onResume}>Finish the write</button></div>}</Notice>
     );
   }
-  if (task.status === "failed") return <Notice tone="bad">{task.result ? "Not done: " : "Nothing was written: "}{task.error}</Notice>;
+  if (task.status === "failed") return (
+    <Notice tone="bad">{task.result ? "Not done: " : "Nothing was written: "}{task.error}
+      {task.result && onResume && <div className="toolbar"><button onClick={onResume}>Finish the write</button>
+        <span className="sub">Sending the same write again syncs its Databricks jobs and writes nothing twice.</span></div>}</Notice>
+  );
   if (task.status === "succeeded") return <Notice tone="ok">Written: {fmtInt(task.total)} {plural(task.total, "table")}.</Notice>;
   if (progress) {
     const total = Number(progress.databases_total);
