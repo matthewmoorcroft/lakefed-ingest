@@ -18,7 +18,10 @@ import { isUnconfirmed, requestWriteNotice } from "../pending";
 // whose progress the page shows before it opens the job.
 
 const LOAD_TYPES: [string, string][] = [["ct", "Change tracking"], ["cursor", "Cursor column"], ["full", "Full reload"]];
-const CSV_EXAMPLE = "src_connection,src_database,src_schema,src_table,select_list,primary_key\nsql_01,sales_01,dbo,orders,\"id, amount\",id";
+const CSV_EXAMPLE = "src_database,src_schema,src_table,select_list,primary_key\nsales_01,dbo,orders,\"id, amount\",id";
+// One line per table, and one per database: every table of a database line is found by name when the job is created.
+const CSV_TEMPLATE = "src_database,src_schema,src_table,select_list,primary_key,cursor_column,client_id,load_type\n"
+  + "sales_01,dbo,orders,\"id, amount\",id,,,ct\n" + "sales_02,,,,,,,\n";
 
 /** Tables chosen by reference: what Create sends as its source, and how the page names it. */
 export type Chosen = { source: Row; label: string };
@@ -80,6 +83,8 @@ export default function NewJob() {
   const preview = useQuery({
     queryKey: ["new-job-preview", settled], enabled: !!chosen && !!name.trim(), retry: false,
     queryFn: () => api.post<Row>("/ingestion-jobs", previewBody),
+    // A file's database-only lines are discovered by name before the preview can count them: asked again until they are.
+    refetchInterval: (query) => (query.state.data?.discovering ? 3000 : false),
   });
   // The body is the variables, so a Create that stopped part way is finished by sending the same body again.
   const create = useMutation({
@@ -94,7 +99,9 @@ export default function NewJob() {
   });
   const note = requestWriteNotice("Creating the job", { pending: create.isPending && !task, error: create.error });
   const summary: Row | undefined = preview.data?.summary;
+  const discoveringDatabases: number | null = preview.data?.discovering ? Number(preview.data.databases) : null;
   const blocked = !name.trim() ? "Name the job first" : !chosen ? "Add its tables first"
+    : discoveringDatabases !== null ? `Discovering the tables of ${fmtInt(discoveringDatabases)} ${plural(discoveringDatabases, "database")}`
     : preview.isFetching || settled !== current ? "Checking the tables" : preview.error ? "Fix what the check found first"
     : summary?.invalid?.length ? "Fix the invalid lines first" : null;
   const confirm = useConfirm();
@@ -108,7 +115,9 @@ export default function NewJob() {
     <>
       <PageHead crumb={<Crumbs steps={[["Ingestion jobs", "/ingestion-jobs"], ["New"]]} />} title="New ingestion job"
         lead={summary ? <><strong>{fmtInt(summary.tables)}</strong> {plural(summary.tables, "table")} in{" "}
-          <strong>{fmtInt(summary.groups.length)}</strong> {plural(summary.groups.length, "group")}.</> : "No tables yet: add them in What it ingests."}
+          <strong>{fmtInt(summary.groups.length)}</strong> {plural(summary.groups.length, "group")}.</>
+          : discoveringDatabases !== null ? `Discovering the tables of ${fmtInt(discoveringDatabases)} ${plural(discoveringDatabases, "database")}…`
+          : "No tables yet: add them in What it ingests."}
         right={<span className="card-actions">
           <button onClick={cancel}>Cancel</button>
           <button className="primary" disabled={!!blocked || create.isPending} title={blocked ?? undefined}
@@ -128,12 +137,15 @@ export default function NewJob() {
 
       <Section title="What it ingests" note="The servers, databases and tables this job ingests."
         actions={<Menu label="Add tables ▾" buttonClass="ghost" title="Add tables">
-          <button onClick={() => setImporting(true)}>Import a CSV<span className="sub">one line per table: where it is; uploaded once, then choose from it</span></button>
-          <button onClick={() => setDiscovering(true)}>Discover on a source<span className="sub">a UC connection, tested first; then the whole server, whole databases or single tables</span></button>
+          <button onClick={() => setDiscovering(true)}>Discover on a source<span className="sub">the first choice: a UC connection, tested first; then the whole server, whole databases or single tables</span></button>
+          <button onClick={() => setImporting(true)}>Import a CSV<span className="sub">the fallback: one line per table or database, read through a connection; uploaded once, then choose from it</span></button>
         </Menu>}>
-        {!chosen ? <p className="empty-drop">No tables yet. <b>Add tables</b>: import a CSV of where each table is, or discover them on a source.</p> : (
+        {!chosen ? <p className="empty-drop">No tables yet. <b>Add tables</b>: discover them on a source, the first choice, or import a CSV
+          of where each table or database is, the fallback.</p> : (
           <>
             <p className="muted">From {chosen.label}.</p>
+            {discoveringDatabases !== null && <Notice>Discovering the tables of {fmtInt(discoveringDatabases)} {plural(discoveringDatabases, "database")} by name through
+              the connection. This page checks again every few seconds, and Create is ready when it ends.</Notice>}
             <div className="table-wrap"><table className="data">
               <thead><tr><th>Server</th><th>Read through · load type</th><th className="num">Databases · tables</th><th className="num">Groups</th></tr></thead>
               <tbody>
@@ -145,6 +157,9 @@ export default function NewJob() {
                 ))}
               </tbody>
             </table></div>
+            {summary && Number(summary.discovered) > 0 && <p className="muted">{fmtInt(summary.discovered)} {plural(summary.discovered, "table")}
+              found by name for the file's database lines{Number(summary.covered) > 0
+                ? `; ${fmtInt(summary.covered)} the file names in a row of its own, whose settings are used` : ""}.</p>}
             {!name.trim() && <p className="muted">Name the job to check its tables.</p>}
             {(summary?.invalid ?? []).length > 0 && <Notice tone="bad">{fmtInt(summary!.invalid.length)} {plural(summary!.invalid.length, "line")} can't be
               added:<ul>{summary!.invalid.slice(0, 20).map((l: Row) => <li key={l.line}>line {l.line}, {l.table}: {l.errors.join("; ")}</li>)}</ul>
@@ -187,40 +202,78 @@ export default function NewJob() {
   );
 }
 
-/** Import a CSV: a file of where each table is, and how its tables load, uploaded once (POST /api/uploads); then its
- *  servers and databases to choose from (SourcePick). New and Edit both use it. */
+/** A template for the CSV: its header, and one line per table and one per database. */
+function downloadTemplate() {
+  const url = URL.createObjectURL(new Blob([CSV_TEMPLATE], { type: "text/csv" }));
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = "tables-template.csv";
+  link.click();
+  URL.revokeObjectURL(url);
+}
+
+/** The Unity Catalog connection a file is read through, chosen before the file: the connections the app can read. */
+function ConnectionPick({ value, onChange }: { value: string; onChange: (name: string) => void }) {
+  const list = useQuery({ queryKey: ["connections"], queryFn: () => api.get<Row>("/connections") });
+  const found: Row[] = (list.data?.connections ?? []).filter((c: Row) => c.discoverable);
+  return (
+    <>
+      <label>Connection
+        <select value={value} onChange={(e) => onChange(e.target.value)}>
+          <option value="">Choose a connection</option>
+          {found.map((c: Row) => <option key={c.name} value={c.name}>{c.name}</option>)}
+        </select>
+        <span className="help">Chosen first: every line of the file is read through it. A connection made in Catalog Explorer shows
+          after Refresh on the Discover page, once the app has USE CONNECTION on it.</span></label>
+      {list.data?.error && <div className="wide"><Notice tone="warn">The app can't list connections: {list.data.error}</Notice></div>}
+      <div className="wide"><ErrorBox error={list.error} /></div>
+    </>
+  );
+}
+
+/** Import a CSV: the connection the file is read through, then the file of its tables and databases, uploaded once
+ *  (POST /api/uploads); then its servers and databases to choose from (SourcePick). New and Edit both use it. */
 export function ImportCsvDialog({ loadType, onClose }: { loadType: string;
                          onClose: (next: (Chosen & { loadType: string }) | null) => void }) {
+  const [connection, setConnection] = useState("");
   const [text, setText] = useState("");
   const [fileName, setFileName] = useState<string | null>(null);
   const [load, setLoad] = useState(loadType);
   const [upload, setUpload] = useState<Row | null>(null);
   const [picked, setPicked] = useState<Picked>(nothingPicked);
   const send = useMutation({
-    mutationFn: () => api.post<Row>("/uploads", { csv: text, file_name: fileName }),
+    mutationFn: () => api.post<Row>("/uploads", { csv: text, file_name: fileName, connection }),
     onSuccess: (r) => { setUpload(r); setText(""); },
   });
   const step1 = !upload;
+  const databases = Number(upload?.databases ?? 0);
+  const invalid = Number(upload?.invalid ?? 0);
   return (
-    <Modal title={step1 ? "Import a CSV · Step 1 of 2: the file" : "Import a CSV · Step 2 of 2: choose its tables"}
+    <Modal title={step1 ? "Import a CSV · Step 1 of 2: the connection and the file" : "Import a CSV · Step 2 of 2: choose its tables"}
       action={step1 ? (send.isPending ? "Uploading…" : "Next: choose tables") : "Add the tables chosen"}
-      actionDisabled={step1 ? (send.isPending ? "Uploading the file" : text.trim() ? undefined : "Choose a file or paste its lines first")
-        : pickedAny(picked) ? undefined : "Choose the server, databases or tables first"}
+      actionDisabled={step1 ? (send.isPending ? "Uploading the file" : !connection ? "Choose the connection first"
+          : text.trim() ? undefined : "Choose a file or paste its lines first")
+        : pickedAny(picked) || databases > 0 ? undefined : "Choose the server, databases or tables first"}
       onClose={(ok) => {
         if (!ok) return onClose(null);
         if (step1) return send.mutate();
+        const databaseWords = databases ? `${fmtInt(databases)} ${plural(databases, "database")} discovered at Create` : "";
+        const chosenWords = [pickedAny(picked) ? pickedText(picked) : "", databaseWords].filter(Boolean).join(", ");
         onClose({ source: { upload_id: upload!.upload_id, ...picked }, loadType: load,
-                  label: `${upload!.file_name ?? "the uploaded file"}: ${pickedText(picked)}` });
+                  label: `${upload!.file_name ?? "the uploaded file"}: ${chosenWords}` });
       }}>
       {step1 ? (
         <>
-          <p>One line per table: where it is. Columns: <span className="mono">src_connection</span> (a UC connection) or{" "}
-            <span className="mono">src_host</span>, <span className="mono">src_port</span> and <span className="mono">secret_key</span>;
-            then <span className="mono">src_database</span>, <span className="mono">src_schema</span>, <span className="mono">src_table</span>,{" "}
-            <span className="mono">select_list</span> and <span className="mono">primary_key</span>; optionally <span className="mono">cursor_column</span>,{" "}
-            <span className="mono">client_id</span>, <span className="mono">load_type</span> and <span className="mono">attr:&lt;column&gt;</span> identity
-            values. The file is uploaded once and kept; then you choose its servers, databases or tables.</p>
+          <p>One line per table or per database, read through the connection chosen here. Columns: <span className="mono">src_database</span>{" "}
+            (required); <span className="mono">src_schema</span> and <span className="mono">src_table</span> together for one table, or neither
+            for every table of that database, found by name when the job is created. Then, optionally, <span className="mono">select_list</span>,{" "}
+            <span className="mono">primary_key</span>, <span className="mono">cursor_column</span>, <span className="mono">client_id</span> and{" "}
+            <span className="mono">load_type</span>, and <span className="mono">attr:&lt;column&gt;</span> identity values. The file has no
+            connection column: a row that names another connection refuses the file. The file is uploaded once and kept; then you choose its
+            databases or tables.</p>
+          <div className="toolbar"><button className="ghost" onClick={downloadTemplate}>Download template</button></div>
           <div className="form-grid">
+            <ConnectionPick value={connection} onChange={setConnection} />
             <label className="wide">File<input type="file" accept=".csv,text/csv" onChange={async (e) => {
                 const f = e.target.files?.[0]; if (f) { setText(await f.text()); setFileName(f.name); } }} />
               <textarea rows={6} value={text.length > 20000 ? `${text.slice(0, 20000)}\n…` : text} placeholder={CSV_EXAMPLE}
@@ -233,8 +286,10 @@ export function ImportCsvDialog({ loadType, onClose }: { loadType: string;
         </>
       ) : (
         <div className="discover">
-          <p className="muted">Uploaded: {fmtInt(upload!.tables)} {plural(upload!.tables, "table")}
-            {upload!.invalid ? `, ${fmtInt(upload!.invalid)} ${plural(upload!.invalid, "line")} that can't be taken` : ""}.</p>
+          <p className="muted">Uploaded: {fmtInt(upload!.tables)} {plural(upload!.tables, "table")}, {fmtInt(databases)}{" "}
+            {plural(databases, "database")} (discovered at Create){invalid ? `, ${fmtInt(invalid)} ${plural(invalid, "line")} that can't be taken` : ""}.</p>
+          {databases > 0 && <p className="muted">Its database lines are always taken: each database's tables are found by name through{" "}
+            {upload!.connection} when the job is created. The table lines are taken as chosen below.</p>}
           <SourcePick kind="upload" sourceId={upload!.upload_id} picked={picked} setPicked={setPicked} />
           <p className="muted">Chosen: {pickedText(picked)}.</p>
         </div>

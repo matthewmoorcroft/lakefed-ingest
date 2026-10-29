@@ -236,12 +236,24 @@ function AddDatabases({ jobId, servers }: { jobId: string; servers: string[] }) 
 
 /** Add tables from an uploaded CSV or a discovery, by reference: checked first, then added after a confirm, with the
  *  job's settings; a large add is written by a background task, whose progress shows here. */
+/** A database-only file's tables are discovered by name before a check can count them: the check is asked again every few
+ *  seconds until they are, and onDiscovering hears how many databases are still being read (null once none is). */
+async function checkedWhenDiscovered(check: () => Promise<Row>, onDiscovering: (databases: number | null) => void): Promise<Row> {
+  for (;;) {
+    const answer = await check();
+    if (!answer.discovering) { onDiscovering(null); return answer; }
+    onDiscovering(Number(answer.databases));
+    await new Promise((resolve) => setTimeout(resolve, 3000));
+  }
+}
+
 function useAddTables(jobId: string) {
   const qc = useQueryClient();
   const confirm = useConfirm();
   const [open, setOpen] = useState(false);
   const [discovering, setDiscovering] = useState(false);
   const [found, setFound] = useState<Row | null>(null);
+  const [discoveringDatabases, setDiscoveringDatabases] = useState<number | null>(null);
   const [task, setTask] = useState<Row | null>(null);
   // The body of the write sent last: a write that stopped part way is finished by sending it again, as it was.
   const [sent, setSent] = useState<Row | null>(null);
@@ -260,7 +272,8 @@ function useAddTables(jobId: string) {
       setTask(null);
       if ("resume" in request) return write(request.resume);
       const body = { source: request.source, load_type: request.loadType, request_id: newRequestId() };
-      const preview = (await api.post<Row>(`/ingestion-jobs/${jobId}/tables`, { ...body, dry_run: true })).summary;
+      const preview = (await checkedWhenDiscovered(() => api.post<Row>(`/ingestion-jobs/${jobId}/tables`, { ...body, dry_run: true }),
+        setDiscoveringDatabases)).summary;
       setFound(preview);
       if (preview.invalid.length || !preview.tables) return null;
       const servers = (preview.servers as Row[]).map((s) => `${fmtInt(s.tables)} on ${s.server}`).join(", ");
@@ -283,6 +296,8 @@ function useAddTables(jobId: string) {
   </>;
   const result = <>
     {note && <Notice tone={note.tone}>{note.text}</Notice>}
+    {discoveringDatabases !== null && <Notice>Discovering the tables of {fmtInt(discoveringDatabases)} {plural(discoveringDatabases, "database")}
+      by name through the connection, before the tables can be counted.</Notice>}
     {add.isPending && <TaskProgress task={task} />}
     {!add.isPending && resumableWrite(add.error)
       ? <TaskProgress task={task} onResume={() => add.mutate({ resume: sent as Row })} />
