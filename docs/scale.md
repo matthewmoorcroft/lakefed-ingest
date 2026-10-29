@@ -7,7 +7,7 @@ discovery reads go to a simulated server at the discovery boundary, and Lakebase
 
 This is a plain Python run on a laptop. It shows the code's call counts, statement counts and row counts, its
 Python time on this machine, and the wall time a given per-call latency would give. It does not measure Lakebase or
-SQL Server latency. The numbers that need the real stable-app test are listed at the end.
+SQL Server latency. The numbers that need a test on a real deployment are listed at the end.
 
 ## Running it
 
@@ -80,7 +80,7 @@ databases.
 
 At 22,000 databases (5,279,280 tables), the before run was measured once with the pre-packing runner: 176,404 statements,
 21,999 transactions, 220,402 round trips, about 441 s at 2 ms. The after run was not made on the Mac: database-shaped
-runs are left to the deployed app. Packing predicts about 1,056 transactions and about 15,000 round trips at 5,000 tables a
+runs are left to a real deployment. Packing predicts about 1,056 transactions and about 15,000 round trips at 5,000 tables a
 transaction, which is the same factor again, but that is an estimate until main's Databricks run measures it.
 
 ### Each statement of a database, at 1,000 tables a database
@@ -221,7 +221,7 @@ The kinds are the statement verb and table, with the `lakefed_ingest.` schema le
 - **Re-discovery.** Writes a new discovery per run and follows `job_selection`. Rerun the discovery rows, and the
   selection's rows at the create.
 
-## Numbers only the real stable-app test can give
+## Numbers only a test on a real deployment can give
 
 - Lakebase statement and round-trip time, for the discovery writes (100,608 at 417 databases; 5,345,277 at 22,000), the
   create's writes, the upload's lines and each monitoring page.
