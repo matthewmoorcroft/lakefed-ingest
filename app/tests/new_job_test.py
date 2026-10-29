@@ -43,13 +43,13 @@ def _server(databases: int, tables: int) -> str:
 
 
 def test_a_whole_server_of_100000_tables_fits_one_job():
-    plan = nj.plan("KPMG", _server(100, 1000), {"fan_in": True, "sink_catalog": "main", "sink_schema": "s"}, 8, set())
+    plan = nj.plan("Big job", _server(100, 1000), {"fan_in": True, "sink_catalog": "main", "sink_schema": "s"}, 8, set())
     assert plan["errors"] == [] and len(plan["lines"]) == 100_000 and len(plan["groups"]) == 8
 
 
 def test_more_lines_than_a_job_takes_at_once_are_refused(monkeypatch):
     monkeypatch.setattr(nj, "MAX_LINES", 10)
-    plan = nj.plan("KPMG", _server(1, 11), {"sink_catalog": "main", "sink_schema": "s"}, 4, set())
+    plan = nj.plan("Big job", _server(1, 11), {"sink_catalog": "main", "sink_schema": "s"}, 4, set())
     assert plan["errors"] == ["11 lines: at most 10 in one import"]
 
 

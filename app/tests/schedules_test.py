@@ -437,9 +437,9 @@ def _tag_problems(tags: dict) -> list:
 
 
 def test_every_tag_the_app_writes_meets_the_databricks_tag_rules():
-    group = "kpmg_1k_try_lfc_sqlserver_test_c01"            # as new_job.group_name names a group
-    default = sch.job_settings(SCHED, group, 0, 555, owner="mm-kpmg-lakefed-test/lakefed_ingest_kpmg_clean")
-    check = sch.group_job_settings(GROUP, [group, "calib_1db"], 777, owner="mm-kpmg-lakefed-test/lakefed_ingest_kpmg_clean")
+    group = "lab_1k_try_lfc_sqlserver_test_c01"            # as new_job.group_name names a group
+    default = sch.job_settings(SCHED, group, 0, 555, owner="lakefed-ingest/lakefed_ingest")
+    check = sch.group_job_settings(GROUP, [group, "calib_1db"], 777, owner="lakefed-ingest/lakefed_ingest")
     assert _tag_problems(default["tags"]) == [] and _tag_problems(check["tags"]) == []
     assert _tag_problems({sch.TAG_COLLECTION: "*"}) == ["value '*' of lakefed_ingest_collection"]   # what AWS refused
 

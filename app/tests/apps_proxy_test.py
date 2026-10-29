@@ -11,7 +11,7 @@ from fastapi.testclient import TestClient  # noqa: E402
 import main  # noqa: E402
 
 PROXY_HEADERS = {"Authorization": "Bearer dapi-token", "X-Forwarded-Email": "op@example.com",
-                 "X-Forwarded-User": "1234567890@7405607423759409", "X-Forwarded-Preferred-Username": "op@example.com",
+                 "X-Forwarded-User": "1234567890@1234567890123456", "X-Forwarded-Preferred-Username": "op@example.com",
                  "X-Forwarded-Host": "app.example.databricksapps.com", "X-Forwarded-Proto": "https",
                  "X-Real-Ip": "10.0.0.1", "X-Request-Id": "req-1"}
 

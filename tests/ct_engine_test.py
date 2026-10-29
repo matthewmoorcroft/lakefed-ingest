@@ -540,11 +540,11 @@ def test_a_missing_target_schema_is_made_once_per_run_before_its_first_table(mon
     spark = _FakeSpark()
     spark.catalog.tableExists = lambda name: False
     cfg = {"src_schema": "dbo", "src_table": "t", "select_list": "id, v", "sink_catalog": "main",
-           "sink_schema": "kpmg_lakefed_100k", "sink_table": "t0001"}
+           "sink_schema": "lakefed_100k", "sink_table": "t0001"}
     ce.ensure_sink_table(spark, cfg, ce.sink_fqn(cfg))
     ce.ensure_sink_table(spark, dict(cfg, sink_table="t0002"), ce.sink_fqn(dict(cfg, sink_table="t0002")))
     schemas = [x for x in spark.statements if x.startswith("CREATE SCHEMA")]
-    assert schemas == ["CREATE SCHEMA IF NOT EXISTS `main`.`kpmg_lakefed_100k` COMMENT 'Target of lakefed ingestion jobs'"]
+    assert schemas == ["CREATE SCHEMA IF NOT EXISTS `main`.`lakefed_100k` COMMENT 'Target of lakefed ingestion jobs'"]
     assert spark.statements.index(schemas[0]) < next(i for i, x in enumerate(spark.statements) if x.startswith("CREATE TABLE"))
     ce.forget_sinks()                                              # a new run asks again
     ce.ensure_sink_table(spark, dict(cfg, sink_table="t0003"), ce.sink_fqn(dict(cfg, sink_table="t0003")))

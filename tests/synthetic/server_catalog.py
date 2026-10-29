@@ -1,6 +1,6 @@
 """A synthetic SQL Server instance with many databases, for the scale runs in tests/scale/.
 
-One server holds ``databases`` user databases of ``tables_per_database`` tables each: 22,000 x 240 is the KPMG-scale
+One server holds ``databases`` user databases of ``tables_per_database`` tables each: 22,000 x 240 is the large-estate
 case, about 5.3 million tables. Nothing is stored. A database's catalog is derived from the seed and the database's
 index when it is asked for, so the whole server costs no memory until a database is read. The rows match what the
 catalog queries of discovery.py return (its TABLES_SQL, COLUMNS_SQL and PK_SQL), the database listing through master,
