@@ -216,7 +216,7 @@ p.small { margin: 0 0 var(--db-space-2); }
 p.right { text-align: right; max-width: none; }
 .empty { color: var(--muted); padding: var(--db-space-4) 0; }
 
-/* Drawers, change marks, checklists, timeline (Chris's pages) */
+/* Drawers, change marks, checklists, timeline */
 .drawer { position: fixed; top: 0; right: 0; width: min(920px, 92vw); height: 100vh; overflow-y: auto; background: var(--db-surface-base);
   border-left: 1px solid var(--border); box-shadow: var(--db-elevation-high); padding: var(--db-space-5, 20px); z-index: 50; }
 .drawer-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }

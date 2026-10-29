@@ -552,7 +552,9 @@ team will help on a best-effort basis.
 | ag-grid-community | Data grid (operations app) | MIT | https://github.com/ag-grid/ag-grid |
 | ag-grid-react | React wrapper for AG Grid (operations app) | MIT | https://github.com/ag-grid/ag-grid |
 | certifi | Mozilla CA bundle (live SQL Server validation tests) | MPL-2.0 | https://pypi.org/project/certifi/ |
+| @databricks/design-system | The Databricks design system's CSS tokens, copied into the operations app (`app/src/frontend/src/dbui/tokens.css`) | ISC | https://www.npmjs.com/package/@databricks/design-system |
 | databricks-sdk | Databricks SDK for Python | Apache-2.0 | https://pypi.org/project/databricks-sdk/ |
+| DM Sans | Font of the operations app (`app/src/frontend/src/dbui/DMSans-variable.woff2`, from the design system) | SIL Open Font License 1.1 | https://github.com/googlefonts/dm-fonts |
 | fastapi | Web framework for APIs (operations app) | MIT | https://pypi.org/project/fastapi/ |
 | httpx | HTTP client (operations app API tests) | BSD-3-Clause | https://pypi.org/project/httpx/ |
 | ibm_db | IBM Db2 driver (Db2 test data generator, job orchestration version) | Apache-2.0 | https://pypi.org/project/ibm-db/ |
@@ -576,3 +578,15 @@ team will help on a best-effort basis.
 | uvicorn | ASGI web server (operations app) | BSD-3-Clause | https://pypi.org/project/uvicorn/ |
 | vite | Frontend build tool (operations app, build only) | MIT | https://github.com/vitejs/vite |
 | @vitejs/plugin-react | React support for Vite (operations app, build only) | MIT | https://github.com/vitejs/vite-plugin-react |
+
+Notices for the files the operations app ships with it:
+- **@databricks/design-system** (ISC): Copyright (c) Databricks, Inc. Permission to use, copy, modify, and/or
+  distribute this software for any purpose with or without fee is hereby granted, provided that the above copyright
+  notice and this permission notice appear in all copies. THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS
+  ALL WARRANTIES WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS. IN NO
+  EVENT SHALL THE AUTHOR BE LIABLE FOR ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+  WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER
+  TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+- **DM Sans** (SIL Open Font License, Version 1.1): Copyright 2014 The DM Sans Project Authors
+  (https://github.com/googlefonts/dm-fonts). This Font Software is licensed under the SIL Open Font License,
+  Version 1.1, available with a FAQ at https://openfontlicense.org.
