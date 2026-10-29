@@ -216,7 +216,7 @@ function RecentRuns({ jobs }: { jobs: Row[] }) {
  * the tables are, what runs next and what ran last, each item linking to its job or run. The jobs themselves are
  * listed on Ingestion jobs. */
 export default function OverviewPage() {
-  const ov = useQuery({ queryKey: ["overview"], queryFn: () => api.get<Overview>("/overview"), refetchInterval: 30_000 });
+  const ov = useQuery({ queryKey: ["overview"], queryFn: () => api.get<Overview>("/overview"), refetchInterval: 15_000 });
   const d = ov.data;
   const t = d?.totals ?? {};
   const enabled = Number(t.enabled_tables || 0);

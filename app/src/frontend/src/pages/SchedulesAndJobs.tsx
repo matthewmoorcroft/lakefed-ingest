@@ -51,7 +51,7 @@ function JobRow({ job }: { job: Row }) {
 }
 
 export default function SchedulesAndJobs() {
-  const list = useQuery({ queryKey: ["schedules"], queryFn: () => api.get<Row[]>("/schedules"), refetchInterval: 30_000 });
+  const list = useQuery({ queryKey: ["schedules"], queryFn: () => api.get<Row[]>("/schedules"), refetchInterval: 15_000 });
   return (
     <>
       <PageHead title="Schedules and jobs" lead="When each ingestion job runs, as set in its Edit view; then the Databricks jobs the app runs them with."

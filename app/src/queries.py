@@ -1917,3 +1917,68 @@ def database_checks_since_sql() -> str:
     since (timestamptz)."""
     return (f"select count(*) as databases from {SCHEMA}.database_check where task_collection = any(%s) "
             f"and checked_at >= %s")
+
+
+# ---- Databricks runs the app tracks (lakefed_ingest.databricks_run, written by run_poller) ----------------------------
+
+DATABRICKS_RUN_COLUMNS = ("run_id, job_id, kind, schedule_id, task_collection, trigger, parameters, life_cycle_state, "
+                          "result_state, state_message, run_page_url, started_at, ended_at")
+
+
+def databricks_run_params(row: dict) -> dict:
+    """A run's row as the named parameters of databricks_run_upsert_sql."""
+    keys = ("run_id", "job_id", "kind", "schedule_id", "task_collection", "trigger", "parameters", "life_cycle_state",
+            "result_state", "state_message", "run_page_url", "started_at", "ended_at")
+    return {k: row.get(k) for k in keys}
+
+
+def databricks_run_upsert_sql() -> str:
+    """Insert or update one Databricks run as the poller sees it. Params: the named fields of databricks_run_params."""
+    columns = ("run_id, job_id, kind, schedule_id, task_collection, trigger, parameters, life_cycle_state, "
+               "result_state, state_message, run_page_url, started_at, ended_at, seen_at")
+    values = ("%(run_id)s, %(job_id)s, %(kind)s, %(schedule_id)s, %(task_collection)s, %(trigger)s, "
+              "%(parameters)s::jsonb, %(life_cycle_state)s, %(result_state)s, %(state_message)s, %(run_page_url)s, "
+              "%(started_at)s, %(ended_at)s, now()")
+    return (f"insert into {SCHEMA}.databricks_run ({columns}) values ({values}) "
+            "on conflict (run_id) do update set job_id = excluded.job_id, kind = excluded.kind, "
+            "schedule_id = excluded.schedule_id, task_collection = excluded.task_collection, trigger = excluded.trigger, "
+            "parameters = excluded.parameters, life_cycle_state = excluded.life_cycle_state, "
+            "result_state = excluded.result_state, state_message = excluded.state_message, "
+            "run_page_url = excluded.run_page_url, started_at = excluded.started_at, ended_at = excluded.ended_at, "
+            "seen_at = now()")
+
+
+def databricks_run_states_sql() -> str:
+    """The recorded state of some Databricks runs. Param: list of run ids."""
+    return f"select {DATABRICKS_RUN_COLUMNS} from {SCHEMA}.databricks_run where run_id = any(%s)"
+
+
+def active_databricks_runs_sql() -> str:
+    """Every recorded Databricks run still in one of the given life cycle states. Param: list of states."""
+    return f"select {DATABRICKS_RUN_COLUMNS} from {SCHEMA}.databricks_run where life_cycle_state = any(%s)"
+
+
+def mark_terminating_sql() -> str:
+    """Show runs the app cancelled as terminating, while they are still active. Params: run ids, active states."""
+    return (f"update {SCHEMA}.databricks_run set life_cycle_state = 'TERMINATING', seen_at = now() "
+            "where run_id = any(%s) and life_cycle_state = any(%s)")
+
+
+def databricks_runs_of_job_sql() -> str:
+    """A job's recorded runs, newest first: its active ones only when active_only is true. Params: job_id,
+    active_only, active states, limit."""
+    return (f"select {DATABRICKS_RUN_COLUMNS} from {SCHEMA}.databricks_run where job_id = %(job_id)s "
+            "and (not %(active_only)s or life_cycle_state = any(%(active_states)s)) "
+            "order by started_at desc nulls last, run_id desc limit %(limit)s")
+
+
+def skipped_databricks_runs_sql() -> str:
+    """When a wrapper job's skipped runs started, in a window. Params: job_id, since, until."""
+    return (f"select started_at from {SCHEMA}.databricks_run where job_id = %s "
+            "and (life_cycle_state = 'SKIPPED' or result_state = 'SKIPPED') "
+            "and started_at >= %s and started_at <= %s order by started_at")
+
+
+def databricks_run_table_sql() -> str:
+    """1 when the poller's table exists yet (the app reads the Jobs API until it does)."""
+    return f"select to_regclass('{SCHEMA}.databricks_run') is not null as ready"

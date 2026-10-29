@@ -40,7 +40,7 @@ next run of the same collection holds the collection's lock, so it closes them a
 run's `ingest_run` row and its `running` events become `failed`, with the run's `detail` naming the
 run that closed it (`closed_by_run`). So does the last `retried` event of a table that was waiting for
 its retry, keeping its error with the reason added. Until then the dead run still reads `running`,
-unless the operations app is open: when a page reads the running runs, the app asks the Jobs API about each
+unless the operations app is running: its run poller, every 15 seconds, asks the Jobs API about each
 one's Databricks run (`job_run_id`) and closes those that have ended (terminated, skipped or an internal error;
 one the API no longer has, once it began a day ago) the same way, with `closed_by_app` and the reason in
 `detail`. A run still going in Databricks, or one whose state can't be read, is left as it is, and the app never

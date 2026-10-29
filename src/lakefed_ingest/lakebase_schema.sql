@@ -520,3 +520,26 @@ create unique index if not exists schedule_member_uq
     on lakefed_ingest.schedule_member (schedule_id, task_collection) where removed_at is null;
 create index if not exists schedule_member_collection_idx
     on lakefed_ingest.schedule_member (task_collection);
+
+-- The Databricks runs the operations app tracks (app/src/run_poller.py): the ingestion job and its variants, the
+-- check job, the cluster copies, the app's wrapper jobs, and its setup, discovery and delete jobs. One row per run,
+-- written by the app's poller only when a run's state changes. The app has no DELETE, so rows are never removed:
+-- prune old ones as the owner, like ingest_run.
+create table if not exists lakefed_ingest.databricks_run (
+    run_id           bigint      primary key,                  -- the Databricks run id
+    job_id           bigint      not null,                     -- the Databricks job the run belongs to
+    kind             text        not null check (kind in ('wrapper', 'check', 'group', 'setup', 'discover', 'delete', 'copies')),
+    schedule_id      bigint,                                   -- wrapper and check runs: their schedule
+    task_collection  text,                                     -- group runs: the collection they ingest
+    trigger          text,                                     -- PERIODIC, RUN_JOB_TASK, ONE_TIME, ...
+    parameters       jsonb       not null default '{}'::jsonb, -- the run's job parameters
+    life_cycle_state text        not null,                     -- QUEUED ... TERMINATED, SKIPPED, INTERNAL_ERROR, NOT_FOUND
+    result_state     text,
+    state_message    text,
+    run_page_url     text,
+    started_at       timestamptz,
+    ended_at         timestamptz,
+    seen_at          timestamptz not null default now()        -- when the poller last saw this state change
+);
+create index if not exists databricks_run_job_started_idx
+    on lakefed_ingest.databricks_run (job_id, started_at desc);

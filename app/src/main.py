@@ -14,7 +14,7 @@ from __future__ import annotations
 import json
 import os
 import re
-from contextlib import contextmanager
+from contextlib import asynccontextmanager, contextmanager
 import threading
 import time
 import uuid
@@ -37,9 +37,21 @@ import lakebase as db
 import new_job as nj
 import queries as q
 import rollup
+import run_poller
 import schedules as sch
 
-app = FastAPI(title="lakefed_ingest operations", docs_url="/api/docs", openapi_url="/api/openapi.json")
+
+@asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    """Keep the databricks_run table current while the app runs (see run_poller). Every instance runs one poller, and
+    only the one holding the poller's lock polls. RUN_POLLER=0 turns it off on this instance."""
+    if os.environ.get("RUN_POLLER", "1") != "0":
+        run_poller.POLLER.start(on_change=_forget_shared_reads)
+    yield
+
+
+app = FastAPI(title="lakefed_ingest operations", docs_url="/api/docs", openapi_url="/api/openapi.json",
+              lifespan=_lifespan)
 STATIC = Path(__file__).parent / "static"
 
 # The routes that take a CSV of tables, and the most a request to one may carry: a whole server of 120,000 lines
@@ -208,7 +220,7 @@ def _locked_rows(cur, ids):
 def open_databricks_run(run_id: int):
     """Open a Databricks job run's own page (a group run's job_run_id), as its run page link in the Jobs UI does."""
     try:
-        url = jobs.run_state(run_id)["url"]
+        url = run_poller.run_state_of(run_id)["url"]
     except Exception as e:
         raise HTTPException(404, f"can't find Databricks job run {run_id}: {str(e).split('. ')[0]}")
     if not url:
@@ -275,10 +287,12 @@ def _forget_shared_reads() -> None:
 @contextmanager
 def _write():
     """db.transaction, then the shared reads forgotten once it has committed: every write the app makes (tables,
-    settings, jobs, schedules, imports) goes through it."""
+    settings, jobs, schedules, imports) goes through it. The run poller polls again at once, so a new job's runs
+    show within a poll."""
     with db.transaction() as cur:
         yield cur
     _forget_shared_reads()
+    run_poller.POLLER.wake()
 
 
 # Table states change at run cadence, so the one per-database scan they come from is shared for longer
@@ -305,30 +319,16 @@ def _read_at(key) -> str:
 
 def _running() -> List[dict]:
     """queries.running_progress_sql, shared: every running group run's progress, read once per
-    MONITOR_CACHE_S however many pages ask. Runs whose Databricks run has ended are closed first
-    (_close_ended_runs), so a run cancelled in Databricks never stays running here."""
+    MONITOR_CACHE_S however many pages ask. Until the run poller's table exists, runs whose Databricks run has
+    ended are closed here first (_close_ended_runs); after that the poller closes them."""
     def compute():
-        try:
-            _close_ended_runs()
-        except Exception:           # the pages still show what is recorded; the next read tries again
-            pass
+        if not run_poller.table_ready():
+            try:
+                _close_ended_runs()
+            except Exception:           # the pages still show what is recorded; the next read tries again
+                pass
         return db.query(q.running_progress_sql())
     return _shared("running", compute)
-
-
-def ended_reason(ended: dict) -> str:
-    """Why the app closed a run, in the run's own words: how its Databricks run ended, and when."""
-    if ended["state"] == "NOT_FOUND":
-        return "its Databricks run no longer exists, so it ended without finishing"
-    how = ended.get("result") or ended["state"]
-    at = f" at {ended['ended']}" if ended.get("ended") else ""
-    why = f" ({ended['message']})" if ended.get("message") else ""
-    return f"its Databricks run ended {how}{at} without finishing{why}"[:1000]
-
-
-# A run the Jobs API doesn't know is closed only once it began this long ago: a run of another workspace sharing the
-# state database, or one the API briefly can't find, is never taken for ended while it may still be going.
-NOT_FOUND_AFTER = timedelta(hours=24)
 
 
 def _older_than(started_at, age: timedelta) -> bool:
@@ -353,9 +353,10 @@ def _close_ended_runs(user: Optional[str] = None) -> int:
             ended = jobs.run_ended(job_run)
         except Exception:
             continue
-        if not ended or (ended["state"] == "NOT_FOUND" and not _older_than(r.get("started_at"), NOT_FOUND_AFTER)):
+        if not ended or (ended["state"] == "NOT_FOUND" and not _older_than(r.get("started_at"),
+                                                                         run_poller.NOT_FOUND_AFTER)):
             continue
-        reason = ended_reason(ended)
+        reason = run_poller.ended_reason(ended)
         detail = json.dumps({"closed_by_app": user or "reconcile", "reason": reason, "databricks_run": int(job_run),
                              "databricks_state": ended["state"], "databricks_result": ended.get("result")})
         with _write() as cur:
@@ -940,10 +941,10 @@ def run_ingestion_job(job_id: int, request: Request):
 
 
 def _active_wrapper_runs(members: List[dict]) -> List[dict]:
-    """The job's wrapper jobs' runs going now (Jobs API, active only), newest first."""
+    """The job's wrapper jobs' runs going now (active only), newest first."""
     out = []
     for wrapper in sorted({int(m["job_id"]) for m in members if m.get("job_id")}):
-        out += [r for r in jobs.runs(wrapper, active_only=True, limit=5) if ij.is_active(r)]
+        out += [r for r in run_poller.runs_of(wrapper, active_only=True, limit=5) if ij.is_active(r)]
     return sorted(out, key=lambda r: r.get("started") or "", reverse=True)
 
 
@@ -952,10 +953,10 @@ def _job_databricks_runs(job: dict, members: List[dict]) -> dict:
     job's recent runs (check kind) and the ingestion job's recent runs, of every group (main filters to the job's)."""
     groups = sorted({m["task_collection"] for m in members})
     check_kind = (job.get("job_variant") or "default") == sch.CHECK_VARIANT
-    checks = [r for r in jobs.runs(jobs.CHECK_JOB_ID, limit=10) if ij.check_run_of(r, job["id"], groups)] \
+    checks = [r for r in run_poller.runs_of(jobs.CHECK_JOB_ID, limit=10) if ij.check_run_of(r, job["id"], groups)] \
         if check_kind and jobs.CHECK_JOB_ID else []
     target = (sch.copy_job_id(job) or _ingest_job_id("default")) if check_kind else _wrapper_target(job)
-    ingest = jobs.runs(target, limit=max(25, 3 * len(groups))) if target else []
+    ingest = run_poller.runs_of(target, limit=max(25, 3 * len(groups))) if target else []
     return {"groups": groups, "wrappers": _active_wrapper_runs(members), "checks": checks, "ingest": ingest}
 
 
@@ -1004,7 +1005,7 @@ def stop_ingestion_job(job_id: int, request: Request):
         if not job_run.isdigit() or int(job_run) in listed:
             continue
         try:        # a run the list missed (an older one on a busy ingestion job) is cancelled too
-            if jobs.run_ended(job_run):
+            if run_poller.ended_of(job_run):
                 over.add(int(job_run))
             else:
                 going.append({"kind": "group", "run_id": int(job_run),
@@ -1070,7 +1071,7 @@ def ingestion_job_cluster(job_id: int, request: Request):
     applying, error = None, None
     run_id = sch.options_of(s).get("cluster_copy_run_id")
     if run_id:
-        state = jobs.run_state(run_id)
+        state = run_poller.run_state_of(run_id)
         applying = {"run_id": run_id, "state": state["state"], "result": state["result"], "url": state["url"]}
         if state["state"] in ("TERMINATED", "SKIPPED", "INTERNAL_ERROR"):
             with _write() as cur:
@@ -1821,7 +1822,7 @@ def _require(job_id, name):
 @app.get("/api/jobs/ingest")
 def ingest_job():
     jid = _require(jobs.INGEST_JOB_ID, "ingestion")
-    active, recent = jobs.runs(jid, active_only=True, limit=50), jobs.runs(jid, active_only=False, limit=25)
+    active, recent = run_poller.runs_of(jid, active_only=True, limit=50), run_poller.runs_of(jid, limit=25)
     # A run a wrapper job started (trigger RUN_JOB_TASK) came from a schedule its collection was in
     # when the run started.
     joined = _scheduled_collections(with_added=True)
@@ -1849,7 +1850,7 @@ def run_ingest(body: RunRequest, request: Request):
 @app.post("/api/jobs/runs/{run_id}/cancel")
 def cancel_run(run_id: int, request: Request):
     """Cancel a run of one of the app's own Databricks jobs, for a user with Can Manage Run on that job."""
-    job_id = jobs.run_state(run_id)["job_id"]
+    job_id = run_poller.run_state_of(run_id)["job_id"]
     if str(job_id) not in {str(j) for j in _bundle_job_ids() if j}:
         raise HTTPException(403, "the app only cancels runs of its own Databricks jobs")
     _refuse_run_of(job_id, request)
@@ -1954,7 +1955,7 @@ def discovery_tables(discovery_id: str):
 def discovery_run(run_id: int):
     """State of a discovery job run, so the page can tell a run that ended without results from one
     still starting. Only runs of the discovery job."""
-    st = jobs.run_state(run_id)
+    st = run_poller.run_state_of(run_id)
     if str(st["job_id"]) != str(jobs.DISCOVER_JOB_ID):
         raise HTTPException(404, f"run {run_id} is not a discovery run")
     return st
@@ -2278,7 +2279,13 @@ _skipped = sch.SkippedRuns()
 
 
 def _skipped_starts(job_id, since: datetime, now: datetime, client=None) -> Optional[List[int]]:
-    """Start times (ms) of a wrapper job's skipped runs since `since`; None if the Jobs API failed."""
+    """Start times (ms) of a wrapper job's skipped runs since `since`; None if they can't be read. From the run
+    poller's table, or from the Jobs API until the table exists."""
+    if run_poller.table_ready():
+        try:
+            return run_poller.skipped_starts_of(job_id, since, now)
+        except Exception:
+            return None
     try:
         return _skipped.starts(client or jobs.schedule_client(), job_id, int(since.timestamp() * 1000),
                                int(now.timestamp() * 1000))
@@ -2656,7 +2663,7 @@ def _delete_run(job: dict) -> Optional[dict]:
     if not run_id:
         return None
     try:
-        return jobs.run_state(run_id)
+        return run_poller.run_state_of(run_id)
     except Exception as e:
         return {"run_id": run_id, "state": None, "result": None, "url": None,
                 "message": f"can't read the delete job's run: {str(e).split('. ')[0]}"}
