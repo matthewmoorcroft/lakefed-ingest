@@ -65,8 +65,9 @@ PK_SQL = (
 # master; system databases (ids 1 to 4) are left out. Listed by name, not by HAS_DBACCESS: on Azure SQL a session in
 # master can't reach another database (no cross-database access), so HAS_DBACCESS there is 0 for every user database,
 # even for a login with a user in each; and a contained user has no login at all. A database the login can name but
-# not open is listed, and fails when its tables are read.
-DATABASES_SQL = "SELECT name FROM sys.databases WHERE database_id > 4 AND state_desc = 'ONLINE'{name} ORDER BY name"
+# not open is listed, and fails when its tables are read. No ORDER BY: the query may be read as a subquery (remote_query,
+# Spark JDBC's query option), where SQL Server refuses one, so list_databases sorts the names instead.
+DATABASES_SQL = "SELECT name FROM sys.databases WHERE database_id > 4 AND state_desc = 'ONLINE'{name}"
 SERVER_DATABASE = "master"
 # A name filter as SQL Server's LIKE reads it (% any run of characters, _ any one character, [ ] a set), as typed in
 # Test connection: letters, digits and those marks only, so it can go into the query as a literal.
@@ -351,7 +352,8 @@ def list_databases(spec: dict, query=None, credential=None, get=None) -> List[st
         if credential is None:
             raise ValueError(f"listing through Azure needs the service credential '{spec['azure_credential']}'")
         return azure_databases(spec, credential, get=get)
-    return [str(r["name"]) for r in (query or _query)(cfg, databases_sql(spec.get("pattern") or ""))]
+    names = [str(r["name"]) for r in (query or _query)(cfg, databases_sql(spec.get("pattern") or ""))]
+    return sorted(names, key=lambda n: (n.lower(), n))
 
 
 def discover_database(cfg: dict, slots=None, sleep=None, rand=None) -> List[dict]:

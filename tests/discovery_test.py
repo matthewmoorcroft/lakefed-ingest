@@ -181,7 +181,7 @@ def test_databases_are_listed_by_name_not_by_access_through_master():
     seen = []
     d.list_databases({"src_connection": "sql_a", "pattern": "lfc_eng_%"}, query=lambda cfg, sql: seen.append(sql) or [])
     assert seen == ["SELECT name FROM sys.databases WHERE database_id > 4 AND state_desc = 'ONLINE' "
-                    "AND name LIKE N'lfc_eng_%' ORDER BY name"]
+                    "AND name LIKE N'lfc_eng_%'"]
 
 
 @pytest.mark.parametrize("pattern", ["x' OR 1=1 --", "a b", "a;drop", "x" * 129])
@@ -387,7 +387,8 @@ def test_a_listing_through_azure_says_what_it_lacks(change, error):
 
 def test_without_both_settings_the_server_is_listed_through_master_as_before():
     assert not d.lists_through_azure({"src_connection": "sql_a", "kind": "list"})
-    assert d.list_databases({"src_connection": "lfc_sqlserver_discover", "kind": "list"}, query=_server_login) == LAB
+    listed = d.list_databases({"src_connection": "lfc_sqlserver_discover", "kind": "list"}, query=_server_login)
+    assert listed == sorted(LAB)
     with pytest.raises(ValueError, match="service credential 'lab_reader'"):
         d.list_databases(THROUGH_AZURE)
 
