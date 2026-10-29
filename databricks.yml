@@ -69,6 +69,9 @@ variables:
   max_queries_per_source:
     description: Concurrent queries per source server across all runs, shared between them (at least 1 per run; see README "Concurrency"; "0" = no cap).
     default: "0"
+  discover_workers:
+    description: Databases the discovery job (lakefed_ingest_discover) reads at once, each taking its three catalog queries in turn. Capped by max_queries_per_source when that is set.
+    default: "32"
   detection_chunk:
     description: Tables per batched change-detection query.
     default: "200"

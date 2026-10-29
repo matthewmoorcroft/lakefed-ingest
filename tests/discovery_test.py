@@ -390,3 +390,11 @@ def test_without_both_settings_the_server_is_listed_through_master_as_before():
     assert d.list_databases({"src_connection": "lfc_sqlserver_discover", "kind": "list"}, query=_server_login) == LAB
     with pytest.raises(ValueError, match="service credential 'lab_reader'"):
         d.list_databases(THROUGH_AZURE)
+
+
+def test_workers_are_the_requested_count_bounded_by_the_databases_and_the_source_cap():
+    assert d.workers_for(d.DEFAULT_WORKERS, 22_000) == 32
+    assert d.workers_for(32, 5) == 5
+    assert d.workers_for(32, 22_000, max_queries_per_source=8) == 8
+    assert d.workers_for(32, 22_000, max_queries_per_source=0) == 32
+    assert d.workers_for(0, 10) == 1 and d.workers_for(32, 0) == 1

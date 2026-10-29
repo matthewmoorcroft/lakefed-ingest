@@ -361,6 +361,22 @@ def discover_database(cfg: dict, slots=None, sleep=None, rand=None) -> List[dict
     return assemble(*(_query(cfg, sql, slots, sleep, rand) for sql in (TABLES_SQL, COLUMNS_SQL, PK_SQL)))
 
 
+# Databases the discover job reads at once (the discover_workers job parameter): 32 is the design's count of concurrent
+# queries on a server, each database taking its three catalog queries in turn.
+DEFAULT_WORKERS = 32
+
+
+def workers_for(requested: int, databases: int, max_queries_per_source: int = 0) -> int:
+    """How many databases the discover job reads at once: the requested count, no more than the databases there are,
+    and no more than max_queries_per_source when that is set (0 = no cap). The discover job does not take part in the
+    ingest runs' shares of that cap (they are counted from advisory locks it never takes), so here it is a ceiling of
+    its own."""
+    workers = max(1, int(requested))
+    if max_queries_per_source > 0:
+        workers = min(workers, max_queries_per_source)
+    return max(1, min(workers, databases))
+
+
 def secret_key_for(spec: dict, database: str) -> str:
     """The secret key for a database: ``secret_key_template`` with {database} filled in, else
     ``secret_key``."""
