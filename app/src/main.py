@@ -53,8 +53,10 @@ class UploadLimit:
     gives one, else by counting the body as it arrives. Past the limit the rest is never read: the route sees an
     empty end of body, and its answer is replaced with the refusal (FastAPI would turn a raised error into a 400)."""
 
-    def __init__(self, inner, limit: int):
-        self.inner, self.limit = inner, limit
+    # Starlette builds middleware as cls(app=app, ...) in the versions Databricks Apps installs (0.38) and as
+    # cls(app, ...) in later ones, so the first parameter must be named app.
+    def __init__(self, app, limit: int):
+        self.inner, self.limit = app, limit
 
     async def __call__(self, scope, receive, send):
         if scope["type"] != "http" or scope["method"] != "POST" or not UPLOAD_ROUTES.match(scope["path"]):
