@@ -49,10 +49,19 @@ def test_with_no_copy_found_nothing_is_adopted_and_a_job_without_our_tags_is_lef
     assert cc.surplus([untagged], 7, "inst/db") == []
 
 
-def test_two_copies_adopt_the_lowest_id_and_the_other_is_surplus():
+def test_two_copies_adopt_the_lowest_id_and_the_other_is_listed_for_removal_by_hand():
     found = [found_copy(904), found_copy(902), found_copy(903, schedule_id="8")]
     assert cc.adoptable(found, 7, "inst/db") == 902
-    assert cc.surplus(found, 7, "inst/db") == [904]
+    assert cc.surplus(found, 7, "inst/db") == [
+        {"job_id": 904, "name": cc.copy_name("Hourly"), "tags": {cc.TAG_SCHEDULE: "7", cc.TAG_OWNER: "inst/db"}}]
+
+
+def test_the_plan_lists_an_extra_copy_and_never_deletes_it():
+    extra = cc.surplus([found_copy(902), found_copy(904)], 7, "inst/db")
+    actions = cc.plan([schedule(7, cluster=BIG)], {"7": 902}, BUNDLE, "inst/db", extras={"7": extra})
+    assert [a["action"] for a in actions] == ["update", "extra"]
+    assert actions[1] == {"action": "extra", "schedule_id": 7, "job_id": 904, "name": cc.copy_name("Hourly"),
+                          "tags": {cc.TAG_SCHEDULE: "7", cc.TAG_OWNER: "inst/db"}}
 
 
 def test_the_notebook_finds_a_copy_by_name_and_tags_before_it_creates_one():
@@ -61,6 +70,13 @@ def test_the_notebook_finds_a_copy_by_name_and_tags_before_it_creates_one():
     lookup = code.index("w.jobs.list(name=cc.copy_name(")
     assert lookup < code.index("cc.plan(") < code.index('"/api/2.2/jobs/create"')
     assert code.index("cc.adoptable(") < code.index("cc.plan(")
+
+
+def test_the_notebook_only_lists_extra_copies_and_deletes_only_a_planned_delete():
+    code = "\n".join(c["source"] for c in json.loads(NOTEBOOK.read_text(encoding="utf-8"))["cells"]
+                     if c["cell_type"] == "code")
+    assert code.count("w.jobs.delete(") == 1 and 'w.jobs.delete(action["job_id"])' in code
+    assert '"extra"' in code and "by hand" in code
 
 
 def test_a_copy_is_the_bundle_job_with_only_its_cluster_changed_and_no_trigger_of_its_own():

@@ -64,11 +64,15 @@ def adoptable(found_jobs: List[dict], schedule_id: int, owner: str) -> Optional[
     return matches[0] if matches else None
 
 
-def surplus(found_jobs: List[dict], schedule_id: int, owner: str) -> List[int]:
-    """The matches that are not adopted, for the notebook to delete. Every match is an unrecorded copy (a schedule
-    with a recorded copy is not looked up), and the app starts only the recorded copy, so a second one is idle and
-    only leaves a stray job behind."""
-    return matching_copies(found_jobs, schedule_id, owner)[1:]
+def surplus(found_jobs: List[dict], schedule_id: int, owner: str) -> List[dict]:
+    """The matches that are not adopted, each as {"job_id", "name", "tags"}, to be listed for someone to remove by
+    hand. Every match is an unrecorded copy (a schedule with a recorded copy is not looked up), and the app starts only
+    the recorded copy, so a second one is idle; it is never deleted here, as a job in someone's workspace is theirs to
+    remove."""
+    extra = set(matching_copies(found_jobs, schedule_id, owner)[1:])
+    return sorted(({"job_id": int(job["job_id"]), "name": (job.get("settings") or {}).get("name"),
+                    "tags": (job.get("settings") or {}).get("tags") or {}}
+                   for job in found_jobs if int(job["job_id"]) in extra), key=lambda e: e["job_id"])
 
 
 def copy_settings(bundle_job: dict, schedule: dict, cluster: dict, owner: str) -> dict:
@@ -89,10 +93,13 @@ def copy_settings(bundle_job: dict, schedule: dict, cluster: dict, owner: str) -
     return settings
 
 
-def plan(schedules: List[dict], copies: Dict[str, int], bundle_job: dict, owner: str) -> List[dict]:
-    """What to do: {"action": create | update | delete, "schedule_id", "job_id" (update, delete), "settings"
-    (create, update)}. ``schedules`` are every schedule to consider (a deleted one has ``deleted_at``); ``copies``
-    maps a schedule id (text) to its copy's job id, as found by its tags."""
+def plan(schedules: List[dict], copies: Dict[str, int], bundle_job: dict, owner: str,
+         extras: Optional[Dict[str, List[dict]]] = None) -> List[dict]:
+    """What to do: {"action": create | update | delete | extra, "schedule_id", "job_id" (update, delete, extra),
+    "settings" (create, update), "name" and "tags" (extra)}. ``schedules`` are every schedule to consider (a deleted
+    one has ``deleted_at``); ``copies`` maps a schedule id (text) to its copy's job id, as found by its tags;
+    ``extras`` maps a schedule id to its unrecorded copies that were not adopted (``surplus``): each is listed as an
+    "extra" action, for removal by hand, and nothing is done to it."""
     out = []
     wanted = {str(s["id"]): s for s in schedules if s.get("deleted_at") is None and cluster_of(s)}
     for sid, schedule in sorted(wanted.items()):
@@ -105,6 +112,8 @@ def plan(schedules: List[dict], copies: Dict[str, int], bundle_job: dict, owner:
     for sid, job_id in sorted(copies.items()):
         if sid in considered and sid not in wanted:
             out.append({"action": "delete", "schedule_id": int(sid), "job_id": job_id})
+    for sid, found in sorted((extras or {}).items()):
+        out += [{"action": "extra", "schedule_id": int(sid), **extra} for extra in found]
     return out
 
 
