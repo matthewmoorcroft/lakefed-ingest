@@ -16,6 +16,9 @@ import queries as q
 
 LOAD_TYPES = ("ct", "cursor", "full")
 DEFAULT_GROUPS_PER_SERVER = 4
+# A whole server at once: the 100 lab databases of 1,000 tables each, with room to spare. Import CSV keeps its own
+# 5,000-line cap (config_import.MAX_LINES).
+MAX_LINES = 120_000
 MAX_GROUPS_PER_SERVER = 64
 DEFAULTS = {"src_type": "sqlserver", "load_type": "ct", "fan_in": False, "write_mode_changes": "merge",
             "write_mode_full": "merge", "sink_catalog": "", "sink_schema": "", "sink_table": "{table}",
@@ -108,7 +111,8 @@ def plan(job_name: str, text: str, given: dict, groups_per_server: int = DEFAULT
     read = ci.plan_import(text, "_new", {"src_type": settings["src_type"], "load_type": settings["load_type"],
                                          "use_remote_query": False, "write_mode": "merge", "fan_in": False,
                                          "sink_catalog": "c", "sink_schema": "s", "sink_table": "{table}_{database}",
-                                         "freshness_sla_minutes": settings["freshness_sla_minutes"]}, [])
+                                         "freshness_sla_minutes": settings["freshness_sla_minutes"]}, [],
+                         max_lines=MAX_LINES)
     if read["errors"]:
         out["errors"] = read["errors"]
         return out

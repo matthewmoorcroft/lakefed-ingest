@@ -37,6 +37,29 @@ def test_a_mistyped_setting_is_refused_and_the_words_for_yes_and_no_are_read():
     assert nj.plan("Job", CSV, {**FAN_IN, "lowercase": "no"}, 4)["settings"]["lowercase"] is False
 
 
+def _server(databases: int, tables: int) -> str:
+    return "src_connection,src_database,src_schema,src_table,select_list,primary_key\n" + "".join(
+        f"sql_lab,eng_{d:03d},gen,t{t:04d},\"id, v\",id\n" for d in range(1, databases + 1) for t in range(1, tables + 1))
+
+
+def test_a_whole_server_of_100000_tables_fits_one_job():
+    plan = nj.plan("KPMG", _server(100, 1000), {"fan_in": True, "sink_catalog": "main", "sink_schema": "s"}, 8, set())
+    assert plan["errors"] == [] and len(plan["lines"]) == 100_000 and len(plan["groups"]) == 8
+
+
+def test_more_lines_than_a_job_takes_at_once_are_refused(monkeypatch):
+    monkeypatch.setattr(nj, "MAX_LINES", 10)
+    plan = nj.plan("KPMG", _server(1, 11), {"sink_catalog": "main", "sink_schema": "s"}, 4, set())
+    assert plan["errors"] == ["11 lines: at most 10 in one import"]
+
+
+def test_import_csv_keeps_its_own_cap_of_5000_lines():
+    import config_import as ci
+    read = ci.plan_import(_server(1, 5001), "g", {"src_type": "sqlserver", "load_type": "ct", "use_remote_query": True,
+                                                  "sink_catalog": "c", "sink_schema": "s", "sink_table": "{table}"}, [])
+    assert read["errors"] == ["5,001 lines: at most 5,000 in one import"]
+
+
 def test_the_same_database_always_joins_the_same_group():
     first = nj.plan("Job", CSV, FAN_IN, 4)["lines"][0]["group"]
     assert first == nj.group_name("Job", "sql_a", "eng_001", 4) == nj.plan("Job", CSV, FAN_IN, 4)["lines"][0]["group"]

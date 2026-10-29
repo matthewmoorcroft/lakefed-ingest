@@ -162,7 +162,7 @@ def _source_errors(row: dict, settings: dict) -> List[str]:
     return errors
 
 
-def plan_import(text: str, group: str, given: dict, group_rows: List[dict]) -> dict:
+def plan_import(text: str, group: str, given: dict, group_rows: List[dict], max_lines: int = MAX_LINES) -> dict:
     """What importing this CSV into the group would write: {"errors": the file's own problems, "lines": one per
     line, with its file line number, the control row it makes, its status (valid, invalid or registered, for a
     table the group already has) and its errors}. Nothing is valid while the file has errors."""
@@ -173,8 +173,8 @@ def plan_import(text: str, group: str, given: dict, group_rows: List[dict]) -> d
     if errors:
         return {"errors": errors, "lines": [], "settings": {}}
     lines = [dict(r) for r in reader if any(not _blank(v) for v in r.values())]
-    if len(lines) > MAX_LINES:
-        return {"errors": [f"{len(lines):,} lines: at most {MAX_LINES:,} in one import"], "lines": [], "settings": {}}
+    if len(lines) > max_lines:
+        return {"errors": [f"{len(lines):,} lines: at most {max_lines:,} in one import"], "lines": [], "settings": {}}
     settings, errors = effective_settings(given, group_rows)
     if errors:
         return {"errors": errors, "lines": [], "settings": settings}

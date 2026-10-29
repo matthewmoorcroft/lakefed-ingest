@@ -42,9 +42,9 @@ import schedules as sch
 app = FastAPI(title="lakefed_ingest operations", docs_url="/api/docs", openapi_url="/api/openapi.json")
 STATIC = Path(__file__).parent / "static"
 
-# The routes that take a CSV of tables, and the most a request to one may carry: 5,000 lines (config_import.MAX_LINES)
-# of long select lists fit well within it, and a larger upload is refused before it is read, not after.
-MAX_UPLOAD_BYTES = int(os.environ.get("MAX_UPLOAD_BYTES", str(16 * 1024 * 1024)))
+# The routes that take a CSV of tables, and the most a request to one may carry: a whole server of 120,000 lines
+# (new_job.MAX_LINES) of long select lists fits within it, and a larger upload is refused before it is read, not after.
+MAX_UPLOAD_BYTES = int(os.environ.get("MAX_UPLOAD_BYTES", str(64 * 1024 * 1024)))
 UPLOAD_ROUTES = re.compile(r"^/api/(import|ingestion-jobs|ingestion-jobs/\d+/(tables|databases))/?$")
 
 

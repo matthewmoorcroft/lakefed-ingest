@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "react-router-dom";
 import { api, type Row } from "../api";
@@ -13,6 +13,20 @@ import { ClusterFields, clusterSummary, ownCluster } from "./JobEdit";
 
 const LOAD_TYPES: [string, string][] = [["ct", "Change tracking"], ["cursor", "Cursor column"], ["full", "Full reload"]];
 const CSV_EXAMPLE = "src_connection,src_database,src_schema,src_table,select_list,primary_key\nsql_01,sales_01,dbo,orders,\"id, amount\",id";
+
+/** A short fingerprint of a large text (its length and a 32-bit FNV-1a hash), cheap to compare on every change. */
+function fingerprint(text: string): string {
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < text.length; i++) hash = Math.imul(hash ^ text.charCodeAt(i), 0x01000193);
+  return `${text.length}:${(hash >>> 0).toString(16)}`;
+}
+
+/** The value once it has stayed the same for `ms`, so typing in a field doesn't ask for a preview per key. */
+function useSettled<T>(value: T, ms: number): T {
+  const [settled, setSettled] = useState(value);
+  useEffect(() => { const timer = setTimeout(() => setSettled(value), ms); return () => clearTimeout(timer); }, [value, ms]);
+  return settled;
+}
 
 export default function NewJob() {
   const navigate = useNavigate();
@@ -53,10 +67,15 @@ export default function NewJob() {
              parameters: Object.fromEntries(Object.entries(params).filter(([, v]) => v.trim() !== "").map(([k, v]) => [k, v.trim()])) },
     };
   };
-  // The preview follows every change, so the page always says what Create would write.
+  // The preview follows every change, so the page always says what Create would write. A whole server is 100,000
+  // lines (9 MB), so the file is keyed by a fingerprint, not by its text, and a preview is asked for only once the
+  // changes have settled.
   const previewBody = body(true);
+  const csvKey = useMemo(() => fingerprint(csv), [csv]);
+  const current = JSON.stringify({ ...previewBody, csv: csvKey });
+  const settled = useSettled(current, 600);
   const preview = useQuery({
-    queryKey: ["new-job-preview", previewBody], enabled: !!csv.trim() && !!name.trim(), retry: false,
+    queryKey: ["new-job-preview", settled], enabled: !!csv.trim() && !!name.trim(), retry: false,
     queryFn: () => api.post<Row>("/ingestion-jobs", previewBody),
   });
   const create = useMutation({
@@ -68,7 +87,7 @@ export default function NewJob() {
   });
   const summary: Row | undefined = preview.data?.summary;
   const blocked = !name.trim() ? "Name the job first" : !csv.trim() ? "Add its tables first"
-    : preview.isFetching ? "Checking the tables" : preview.error ? "Fix what the check found first"
+    : preview.isFetching || settled !== current ? "Checking the tables" : preview.error ? "Fix what the check found first"
     : summary?.invalid?.length ? "Fix the invalid lines first" : null;
   const confirm = useConfirm();
   const cancel = () => {
