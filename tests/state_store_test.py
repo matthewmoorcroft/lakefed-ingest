@@ -720,13 +720,25 @@ def test_ddl_check_accepts_the_idempotent_forms():
     ]) == []
 
 
-class MigrationDb:
-    """A scripted Postgres for migrate(): answers the catalog queries, records statements and
-    whether they ran inside the transaction."""
+class FakeLockTimeout(Exception):
+    """What psycopg raises when lock_timeout runs out: SQLSTATE 55P03 (LockNotAvailable)."""
+    sqlstate = "55P03"
 
-    def __init__(self, version=None, schemas=("lakefed_ingest",), relations=(), columns=(), fail_on=None):
+
+class MigrationDb:
+    """A scripted Postgres for migrate(): answers the catalog queries, records statements and whether they
+    ran inside the transaction. ``lock_timeouts`` makes the first attempts fail on their first DDL statement,
+    as a lock wait that runs out does; ``probe_rows`` are substrings of the UPDATE_PROBES queries that find a row."""
+
+    def __init__(self, version=None, schemas=("lakefed_ingest",), relations=(), columns=(), fail_on=None,
+                 catalog=None, probe_rows=(), lock_timeouts=0):
         self.version, self.schemas, self.relations, self.columns = version, set(schemas), set(relations), set(columns)
-        self.fail_on, self.statements, self.in_tx, self.committed, self.rows = fail_on, [], False, None, []
+        self.catalog = catalog or ss.SchemaCatalog(
+            schema_exists=bool(schemas), relations=set(relations), tables=set(relations),
+            columns={(table, column): ("text", None, False) for table, column in columns})
+        self.fail_on, self.probe_rows, self.lock_timeouts = fail_on, probe_rows, lock_timeouts
+        self.statements, self.in_tx, self.committed, self.rows = [], False, None, []
+        self.attempts, self.outcomes = 0, []
         self.connection = self
 
     def cursor(self):
@@ -744,9 +756,11 @@ class MigrationDb:
         class Tx:
             def __enter__(self):
                 db.in_tx = True
+                db.attempts += 1
 
             def __exit__(self, exc_type, *exc):
                 db.in_tx, db.committed = False, exc_type is None
+                db.outcomes.append(db.committed)
                 return False
         return Tx()
 
@@ -756,19 +770,31 @@ class MigrationDb:
         if sql.startswith("select pg_advisory_xact_lock"):
             self.lock = params
         self.statements.append((sql, self.in_tx))
+        if self.attempts <= self.lock_timeouts and sql.startswith(("alter", "create", "update", "insert")):
+            raise FakeLockTimeout("canceling statement due to lock timeout")
+        self.rows = []
         if sql.startswith("select to_regclass"):
             self.rows = [(None if self.version is None else "schema_version",)]
         elif sql.startswith("select coalesce(max(version)"):
             self.rows = [(self.version,)]
         elif sql.startswith("select nspname"):
             self.rows = [(s,) for s in self.schemas]
-        elif sql.startswith("select c.relname"):
-            self.rows = [(r,) for r in self.relations]
+        elif "c.relkind" in sql:
+            self.rows = [(name, "r" if name in self.catalog.tables else "i") for name in sorted(self.catalog.relations)]
+        elif sql.startswith("select c.relname from"):
+            self.rows = [(r,) for r in sorted(self.relations)]
+        elif "a.attname" in sql:
+            self.rows = [(t, c, typ, default, not_null)
+                         for (t, c), (typ, default, not_null) in self.catalog.columns.items()]
+        elif "con.conname" in sql:
+            self.rows = sorted(self.catalog.constraints)
         elif sql.startswith("select table_name"):
             self.rows = list(self.columns)
+        elif sql.startswith("select 1 from") and any(p in sql for p in self.probe_rows):
+            self.rows = [(1,)]
 
     def fetchone(self):
-        return self.rows[0]
+        return self.rows[0] if self.rows else None
 
     def fetchall(self):
         return self.rows
@@ -785,15 +811,16 @@ def test_schema_version_is_zero_before_versions_were_recorded():
 def test_migrate_from_an_unversioned_database_applies_renames_ddl_and_version_in_one_transaction():
     db = MigrationDb(relations={"ct_checkpoint", "checkpoint_control_pk"}, columns={("ct_checkpoint", "ct_version")})
     out = ss.StateStore(db).migrate("create table if not exists lakefed_ingest.x (a int); alter table lakefed_ingest.x add b int;")
-    assert out == {"from": 0, "renames": ["alter table lakefed_ingest.ct_checkpoint rename to checkpoint",
-                                          "alter table lakefed_ingest.checkpoint rename column ct_version to position"]}
+    assert out == {"from": 0, "ran": 2, "skipped": 0,
+                   "renames": ["alter table lakefed_ingest.ct_checkpoint rename to checkpoint",
+                               "alter table lakefed_ingest.checkpoint rename column ct_version to position"]}
     assert db.ran()[2:] == ["create table if not exists lakefed_ingest.x (a int)", "alter table lakefed_ingest.x add b int",
                             "insert into lakefed_ingest.schema_version (version) values (%s) on conflict (version) "
                             "do update set applied_at = now(), applied_by = current_user"]
     assert all(in_tx for _, in_tx in db.statements) and db.committed is True
-    # Serialized by the schema lock, taken before the version is read; DDL waits are bounded.
+    # Serialized by the schema lock, taken before the version is read; every wait (the lock too) is bounded.
     first = [s for s, _ in db.statements[:3]]
-    assert first[0] == "select pg_advisory_xact_lock(%s::int, %s::int)" and first[1] == "set local lock_timeout = '60s'"
+    assert first[0] == "set local lock_timeout = '3s'" and first[1] == "select pg_advisory_xact_lock(%s::int, %s::int)"
     assert first[2].startswith("select to_regclass")
     # Two int keys: never the one-key lock of a collection (even one named "schema"), nor a source lock.
     assert db.lock == ss.SCHEMA_LOCK and len(db.lock) == 2 and db.lock[0] != ss.SOURCE_LOCK_CLASS
@@ -802,8 +829,9 @@ def test_migrate_from_an_unversioned_database_applies_renames_ddl_and_version_in
 def test_migrate_is_a_noop_at_the_current_version_unless_forced():
     db = MigrationDb(version=ss.SCHEMA_VERSION)
     assert ss.StateStore(db).migrate("create table t (a int);") is None and db.ran() == []
-    out = ss.StateStore(db).migrate("create table t (a int);", force=True)      # the setup job
-    assert out == {"from": ss.SCHEMA_VERSION, "renames": []} and "create table t (a int)" in db.ran()
+    out = ss.StateStore(db).migrate("create table t (a int);", force=True)  # the setup job
+    assert out == {"from": ss.SCHEMA_VERSION, "renames": [], "ran": 1, "skipped": 0}
+    assert "create table t (a int)" in db.ran()
 
 
 def test_migrate_moves_the_preview_schema_first():
@@ -821,6 +849,199 @@ def test_migrate_failure_rolls_back_and_a_newer_database_is_refused():
     with pytest.raises(RuntimeError, match="newer than this code"):
         ss.StateStore(newer).migrate("create table t (a int);", force=True)
     assert newer.ran() == [] and newer.committed is False
+
+
+# ---- skipping statements the catalog shows are already in place ----------------------------------------------------
+
+def test_a_fresh_database_gets_the_whole_file():
+    statements = ss.split_sql_statements(_DDL)
+    assert ss.pending_statements(statements, ss.SchemaCatalog()) == (statements, [])
+
+
+def test_a_migrated_database_reruns_only_the_constraint_re_declarations():
+    # A re-declared constraint can't be compared with its stored definition from the catalog, so it always runs.
+    statements = ss.split_sql_statements(_DDL)
+    to_run, left_out = ss.pending_statements(statements, _migrated_catalog(statements), has_rows=lambda query: False)
+    # The drops of old names (absent now) are left out; the drops and adds of the names the file declares run.
+    declared = {name for s in statements for name in re.findall(r"add constraint (\w+)", s)}
+    expected = [s for s in statements if " add constraint " in s
+                or any(name in declared for name in re.findall(r"drop constraint if exists (\w+)", s))]
+    assert to_run == expected and len(left_out) == len(statements) - len(expected) and len(expected) == 28
+    assert all(s not in to_run for s in statements if s.startswith("create"))
+
+
+def test_skips_objects_and_columns_the_catalog_shows_in_place():
+    catalog = ss.SchemaCatalog(
+        schema_exists=True, relations={"t", "t_idx"}, tables={"t"},
+        columns={("t", "a"): ("integer", None, False), ("t", "b"): ("text", "'x'::text", True)},
+        constraints={("t", "c_old")})
+    stmts = ["create schema if not exists lakefed_ingest",
+             "create table if not exists lakefed_ingest.t (a int)",
+             "create unique index if not exists t_idx on lakefed_ingest.t (a)",
+             "alter table lakefed_ingest.t add column if not exists a int",
+             "alter table lakefed_ingest.t add column if not exists a int, add column if not exists b text",
+             "alter table lakefed_ingest.t drop constraint if exists c_gone",
+             "alter table lakefed_ingest.t drop constraint if exists c_old",
+             "alter table lakefed_ingest.t add column if not exists c int"]
+    to_run, left_out = ss.pending_statements(stmts, catalog)
+    assert left_out == stmts[:6] and to_run == [stmts[6], stmts[7]]
+
+
+def test_column_states_decide_the_alter_column_statements():
+    catalog = ss.SchemaCatalog(
+        schema_exists=True, relations={"t"}, tables={"t"},
+        columns={("t", "d"): ("text", None, True), ("t", "e"): ("text", "false", False),
+                 ("t", "f"): ("integer", "'x'::text", False), ("t", "g"): ("text", None, False)})
+    stmts = [
+        "alter table lakefed_ingest.t alter column d drop default",          # no default: skip
+        "alter table lakefed_ingest.t alter column d drop not null",         # not null: runs
+        "alter table lakefed_ingest.t alter column e drop not null",         # nullable: skip
+        "alter table lakefed_ingest.t alter column e set default false",     # already false: skip
+        "alter table lakefed_ingest.t alter column f set default false",     # runs
+        "alter table lakefed_ingest.t alter column f drop default",          # runs
+        "alter table lakefed_ingest.t alter column g type text using g::text",   # already text: skip
+        "alter table lakefed_ingest.t alter column f type bigint using f::bigint",  # runs
+        "alter table lakefed_ingest.t alter column missing drop default",    # no such column: runs
+    ]
+    to_run, _ = ss.pending_statements(stmts, catalog)
+    assert to_run == [stmts[1], stmts[4], stmts[5], stmts[7], stmts[8]]
+
+
+def test_a_statement_that_runs_changes_what_later_statements_see():
+    catalog = ss.SchemaCatalog(schema_exists=True, relations={"t"}, tables={"t"},
+                               columns={("t", "e"): ("text", "false", False)})
+    stmts = ["alter table lakefed_ingest.t alter column e drop default",
+             "alter table lakefed_ingest.t alter column e set default false"]
+    # The column's default is false now, but the first statement removes it: the second must run.
+    assert ss.pending_statements(stmts, catalog) == (stmts, [])
+
+
+def test_an_unrecognized_statement_runs_and_everything_after_it_runs_too():
+    catalog = ss.SchemaCatalog(schema_exists=True, relations={"t"}, tables={"t"})
+    stmts = ["grant select on lakefed_ingest.t to reader",
+             "create table if not exists lakefed_ingest.t (a int)"]
+    assert ss.pending_statements(stmts, catalog) == (stmts, [])
+
+
+def test_update_probes_are_statements_of_the_ddl():
+    normalized = {" ".join(s.split()).lower() for s in ss.split_sql_statements(_DDL)}
+    assert [key for key in ss.UPDATE_PROBES if key not in normalized] == []
+
+
+def test_an_update_runs_only_when_its_probe_finds_rows():
+    catalog = ss.SchemaCatalog(schema_exists=True, relations={"checkpoint"}, tables={"checkpoint"})
+    update = "update lakefed_ingest.checkpoint set phase = 'incremental' where phase = 'cdc'"
+    probes = []
+
+    def has_rows(query):
+        probes.append(query)
+        return False
+    assert ss.pending_statements([update], catalog, has_rows=has_rows) == ([], [update])
+    assert probes == [ss.UPDATE_PROBES[update.lower()]]
+    assert ss.pending_statements([update], catalog) == ([update], [])        # no probe answer: runs
+    absent = ss.SchemaCatalog(schema_exists=True)
+    assert ss.pending_statements([update], absent, has_rows=has_rows) == ([update], [])   # table not there: runs
+    assert len(probes) == 1
+
+
+def test_a_migration_that_finds_the_schema_done_runs_only_the_constraints_and_records_the_counts():
+    statements = ss.split_sql_statements(_DDL)
+    db = MigrationDb(version=ss.SCHEMA_VERSION - 1, catalog=_migrated_catalog(statements))
+    out = ss.StateStore(db).migrate(_DDL)
+    assert out["ran"] == 28 and out["skipped"] == len(statements) - 28 and out["renames"] == []
+    assert db.committed is True
+
+
+# ---- the lock wait: bounded per statement, retried with backoff, then a plain message -----------------------------
+
+def test_a_lock_timeout_is_retried_with_backoff_until_the_migration_commits():
+    db = MigrationDb(version=ss.SCHEMA_VERSION - 1, lock_timeouts=2)
+    sleeps = []
+    out = ss.StateStore(db).migrate("create table t (a int);", sleep=sleeps.append)
+    assert out is not None and sleeps == [5.0, 10.0]
+    assert db.outcomes == [False, False, True] and db.attempts == 3
+    assert db.ran()[-1].startswith("insert into lakefed_ingest.schema_version")
+
+
+def test_a_migration_that_keeps_timing_out_gives_up_with_a_plain_message_and_changes_nothing():
+    db = MigrationDb(version=ss.SCHEMA_VERSION - 1, lock_timeouts=ss.MIGRATE_ATTEMPTS)
+    sleeps = []
+    with pytest.raises(ss.MigrationLockTimeout, match="a running load held the lakefed_ingest tables") as caught:
+        ss.StateStore(db).migrate("create table t (a int);", sleep=sleeps.append)
+    assert "Run the setup job again." in str(caught.value) and isinstance(caught.value.__cause__, FakeLockTimeout)
+    assert len(sleeps) == ss.MIGRATE_ATTEMPTS - 1 and db.outcomes == [False] * ss.MIGRATE_ATTEMPTS
+    assert not any("schema_version (version)" in s for s in db.ran())
+
+
+def test_the_retries_wait_about_five_minutes_in_all():
+    waits = [ss.migrate_backoff_s(attempt) for attempt in range(1, ss.MIGRATE_ATTEMPTS)]
+    total = sum(waits) + ss.MIGRATE_ATTEMPTS * ss.LOCK_TIMEOUT_S
+    assert waits[:4] == [5.0, 10.0, 20.0, 40.0] and max(waits) == 40.0
+    assert 240 <= total <= 330
+
+
+def test_only_a_lock_timeout_is_retried():
+    assert ss.is_lock_timeout(FakeLockTimeout()) is True
+    assert ss.is_lock_timeout(RuntimeError("boom")) is False
+    error = RuntimeError("check constraint violated")
+    error.sqlstate = "23514"
+    assert ss.is_lock_timeout(error) is False
+    sleeps = []
+    db = MigrationDb(fail_on="valid_remote_query")
+    with pytest.raises(RuntimeError, match="check constraint violated"):
+        ss.StateStore(db).migrate("alter table c add constraint valid_remote_query check (x);", sleep=sleeps.append)
+    assert sleeps == [] and db.attempts == 1
+
+
+def _migrated_catalog(statements):
+    """The catalog of a database that has the whole file applied, in the order the file applies it: each object
+    it creates, each column with the default, nullability and type the file leaves it with, each constraint."""
+    catalog = ss.SchemaCatalog(schema_exists=True)
+    for raw in statements:
+        s = " ".join(raw.split())
+        created = re.match(r"create table if not exists lakefed_ingest\.(\w+) \((.*)\)$", s)
+        if created:
+            catalog.relations.add(created.group(1))
+            catalog.tables.add(created.group(1))
+            for part in created.group(2).split(","):
+                words = part.split()
+                if len(words) > 1 and words[0] not in ("primary", "constraint", "unique", "check"):
+                    catalog.columns[(created.group(1), words[0])] = _column_state(" ".join(words[1:]))
+            continue
+        index = re.match(r"create (?:unique )?index if not exists (\w+)", s)
+        if index:
+            catalog.relations.add(index.group(1))
+            continue
+        added = re.match(r"alter table lakefed_ingest\.(\w+) add column if not exists (\w+) (.*)$", s)
+        if added:
+            catalog.columns.setdefault((added.group(1), added.group(2)), _column_state(added.group(3)))
+            continue
+        constraint = re.match(r"alter table lakefed_ingest\.(\w+) add constraint (\w+)", s)
+        if constraint:
+            catalog.constraints.add((constraint.group(1), constraint.group(2)))
+            continue
+        altered = re.match(r"alter table lakefed_ingest\.(\w+) alter column (\w+) (.*)$", s)
+        if altered:
+            key, change = (altered.group(1), altered.group(2)), altered.group(3)
+            data_type, default, not_null = catalog.columns[key]
+            if change == "drop default":
+                default = None
+            elif change == "drop not null":
+                not_null = False
+            elif change.startswith("set default "):
+                default = change[len("set default "):]
+            elif change.startswith("type "):
+                data_type = change.split()[1]
+            catalog.columns[key] = (data_type, default, not_null)
+    return catalog
+
+
+def _column_state(definition: str) -> tuple:
+    """(data type, default or None, not null) of a column definition's words after its name."""
+    words = definition.split()
+    default = re.search(r"\bdefault (\S+)", definition)
+    return ({"int": "integer"}.get(words[0], words[0]), default.group(1) if default else None, "not null" in definition)
+
 
 
 def test_ddl_generic_checkpoint_and_telemetry_columns():

@@ -26,7 +26,9 @@ from __future__ import annotations
 import json
 import re
 import threading
+import time
 import zlib
+from dataclasses import dataclass, field
 from typing import Callable, List, Optional
 
 SCHEMA = "lakefed_ingest"
@@ -137,6 +139,12 @@ SCHEMA_VERSION = 9
 # int keys, so it can't collide with a collection's one-key lock whatever the collection is named,
 # and a class of its own (not SOURCE_LOCK_CLASS).
 SCHEMA_LOCK = (0x6C667363, 0)
+# A migration statement that waits for a table's lock gives up after LOCK_TIMEOUT_S, and the whole transaction is
+# rolled back. The migration then tries again after a backoff (migrate_backoff_s), up to MIGRATE_ATTEMPTS times
+# (about five minutes), so a waiting ALTER never holds up the loads queued behind it for long.
+LOCK_TIMEOUT_S = 3
+MIGRATE_ATTEMPTS = 10
+LOCK_NOT_AVAILABLE = "55P03"  # SQLSTATE: lock_timeout expired (psycopg's LockNotAvailable)
 
 
 def schema_fingerprint(ddl: str) -> str:
@@ -145,6 +153,195 @@ def schema_fingerprint(ddl: str) -> str:
     import hashlib
     body = "\n".join(" ".join(s.split()) for s in split_sql_statements(ddl)) + "\n" + repr(RENAMES)
     return hashlib.sha256(body.encode()).hexdigest()
+
+
+def migrate_backoff_s(attempt: int) -> float:
+    """Seconds to wait after the ``attempt``-th attempt failed on a lock: 5, 10, 20, then 40 at most."""
+    return min(40.0, 5.0 * 2 ** (attempt - 1))
+
+
+def is_lock_timeout(error) -> bool:
+    """True for a lock wait that ran out of ``lock_timeout`` (SQLSTATE 55P03), which a retry can outlast."""
+    return getattr(error, "sqlstate", None) == LOCK_NOT_AVAILABLE
+
+
+class MigrationLockTimeout(RuntimeError):
+    """The migration gave up: a running load kept holding the schema's tables. The transaction was rolled back."""
+
+
+# Updates that backfill or rename once, keyed by the whole statement (lower case, whitespace collapsed) with a
+# query that returns a row when the update would change one. The query must find every row the update would
+# touch: an update with no rows to change is left out. A statement edited away from its key runs as before.
+UPDATE_PROBES = {
+    "update lakefed_ingest.checkpoint cc set control_id = m.id from (select src_database, src_schema, src_table, "
+    "min(id) as id from lakefed_ingest.control group by src_database, src_schema, src_table having count(*) = 1) m "
+    "where cc.control_id is null and cc.src_database = m.src_database and cc.src_schema = m.src_schema "
+    "and cc.src_table = m.src_table":
+        "select 1 from lakefed_ingest.checkpoint where control_id is null limit 1",
+    "update lakefed_ingest.checkpoint set phase = 'incremental' where phase = 'cdc'":
+        "select 1 from lakefed_ingest.checkpoint where phase = 'cdc' limit 1",
+    "update lakefed_ingest.ingest_event set phase = 'incremental' where phase = 'cdc'":
+        "select 1 from lakefed_ingest.ingest_event where phase = 'cdc' limit 1",
+}
+ALTER_TYPE_NAMES = {"text": "text", "bigint": "bigint", "int": "integer"}   # as the catalog spells them
+ANY_OBJECT = ("*",)   # what a statement the rules don't recognize may change: nothing after it is left out
+
+
+@dataclass(slots=True, kw_only=True)
+class SchemaCatalog:
+    """The lakefed_ingest schema as the catalog shows it before a migration's statements run."""
+    schema_exists: bool = False
+    relations: set = field(default_factory=set)     # names of tables, indexes and sequences
+    tables: set = field(default_factory=set)        # names of tables
+    columns: dict = field(default_factory=dict)     # (table, column) -> (data type, default or None, not null)
+    constraints: set = field(default_factory=set)   # (table, constraint name)
+
+
+_CREATE = re.compile(r"^create (?:unique )?(schema|table|index) if not exists ([\w.]+)")
+_UPDATE = re.compile(r"^update ([\w.]+) ")
+_ALTER_TABLE = re.compile(r"^alter table ([\w.]+) (.+)$")
+_ADD_COLUMN = re.compile(r"\badd column if not exists (\w+)")
+_ADD = re.compile(r"\badd\b")
+_DROP_CONSTRAINT = re.compile(r"^drop constraint if exists (\w+)$")
+_ADD_CONSTRAINT = re.compile(r"^add constraint (\w+)\b")
+_ALTER_COLUMN = re.compile(r"^alter column (\w+) (.+)$")
+_SET_DEFAULT = re.compile(r"^set default (.+)$")
+_ALTER_TYPE = re.compile(r"^type (\w+)( using .+)?$")
+
+
+def pending_statements(statements, catalog: SchemaCatalog, has_rows=lambda query: True) -> tuple:
+    """Split the DDL ``statements`` into (to run, left out) for a database with this ``catalog``.
+
+    A statement is left out only when the catalog shows it already done, so a database that is fully
+    migrated runs just the constraint re-declarations and a fresh database runs the whole file. The
+    statements are judged in order: one that runs changes the objects it names, and a later statement
+    about any of them runs too. ``has_rows(query)`` answers an UPDATE_PROBES query.
+    """
+    changed = set()
+    to_run, left_out = [], []
+    for statement in statements:
+        skip, touched = _judge(" ".join(statement.split()).lower(), catalog, changed, has_rows)
+        if skip:
+            left_out.append(statement)
+        else:
+            to_run.append(statement)
+            changed |= touched
+    return to_run, left_out
+
+
+def _judge(text: str, catalog: SchemaCatalog, changed: set, has_rows) -> tuple:
+    """(left out, objects the statement changes when it runs) for one normalized, lower-case statement."""
+    if ANY_OBJECT in changed:
+        return False, set()
+    created = _CREATE.match(text)
+    if created:
+        kind, name = created.group(1), _bare(created.group(2))
+        if kind == "schema":
+            return catalog.schema_exists, set()
+        return name in catalog.relations and ("relation", name) not in changed, {("relation", name)}
+    updated = _UPDATE.match(text)
+    if updated:
+        probe = UPDATE_PROBES.get(text)
+        skip = probe is not None and _bare(updated.group(1)) in catalog.tables and not has_rows(probe)
+        return skip, set()
+    altered = _ALTER_TABLE.match(text)
+    if altered:
+        return _judge_alter_table(_bare(altered.group(1)), altered.group(2), catalog, changed)
+    return False, {ANY_OBJECT}
+
+
+def _judge_alter_table(table: str, body: str, catalog: SchemaCatalog, changed: set) -> tuple:
+    exists = table in catalog.tables
+    dropped = _DROP_CONSTRAINT.match(body)
+    if dropped:
+        key = ("constraint", table, dropped.group(1))
+        return exists and (table, dropped.group(1)) not in catalog.constraints and key not in changed, {key}
+    added = _ADD_CONSTRAINT.match(body)
+    if added:
+        # Re-declared on every upgrade: whether an existing definition matches can't be read from the catalog.
+        return False, {("constraint", table, added.group(1))}
+    columns = _ADD_COLUMN.findall(body)
+    if columns and len(columns) == len(_ADD.findall(body)):
+        skip = exists and all((table, column) in catalog.columns and ("column", table, column) not in changed
+                              for column in columns)
+        return skip, {("column", table, column) for column in columns}
+    altered = _ALTER_COLUMN.match(body)
+    if altered:
+        key = ("column", table, altered.group(1))
+        state = catalog.columns.get((table, altered.group(1)))
+        skip = exists and state is not None and key not in changed and _already_set(altered.group(2), state)
+        return skip, {key}
+    return False, {ANY_OBJECT}
+
+
+def _already_set(change: str, state: tuple) -> bool:
+    """True when the column already has the default, nullability or type that ``change`` would give it."""
+    data_type, default, not_null = state
+    if change == "drop default":
+        return default is None
+    if change == "drop not null":
+        return not not_null
+    value = _SET_DEFAULT.match(change)
+    if value:
+        return default == value.group(1)
+    kind = _ALTER_TYPE.match(change)
+    if kind:
+        return data_type == ALTER_TYPE_NAMES.get(kind.group(1))
+    return False
+
+
+def _bare(name: str) -> str:
+    """A schema-qualified name's object name (``lakefed_ingest.control`` -> ``control``)."""
+    return name.split(".")[-1]
+
+
+def catalog_relations_sql() -> str:
+    """Every relation of the schema, with its kind (r = table, p = partitioned table). Param: schema."""
+    return ("select c.relname, c.relkind from pg_catalog.pg_class c "
+            "join pg_catalog.pg_namespace n on n.oid = c.relnamespace where n.nspname = %s")
+
+
+def catalog_columns_sql() -> str:
+    """Every column of the schema's relations: name, type as the catalog spells it, default and not-null.
+    pg_catalog rather than information_schema, which hides the columns the role has no privilege on.
+    Param: schema."""
+    return ("select c.relname, a.attname, pg_catalog.format_type(a.atttypid, a.atttypmod), "
+            "pg_catalog.pg_get_expr(d.adbin, d.adrelid), a.attnotnull from pg_catalog.pg_attribute a "
+            "join pg_catalog.pg_class c on c.oid = a.attrelid "
+            "join pg_catalog.pg_namespace n on n.oid = c.relnamespace "
+            "left join pg_catalog.pg_attrdef d on d.adrelid = a.attrelid and d.adnum = a.attnum "
+            "where n.nspname = %s and a.attnum > 0 and not a.attisdropped")
+
+
+def catalog_constraints_sql() -> str:
+    """Every constraint of the schema's tables. Param: schema."""
+    return ("select c.relname, con.conname from pg_catalog.pg_constraint con "
+            "join pg_catalog.pg_class c on c.oid = con.conrelid "
+            "join pg_catalog.pg_namespace n on n.oid = c.relnamespace where n.nspname = %s")
+
+
+def _read_catalog(cur, schema_exists: bool) -> SchemaCatalog:
+    """The schema's catalog, in three queries on the open migration transaction."""
+    cur.execute(catalog_relations_sql(), (SCHEMA,))
+    kinds = cur.fetchall()
+    cur.execute(catalog_columns_sql(), (SCHEMA,))
+    columns = cur.fetchall()
+    cur.execute(catalog_constraints_sql(), (SCHEMA,))
+    constraints = cur.fetchall()
+    return SchemaCatalog(
+        schema_exists=schema_exists,
+        relations={name for name, _ in kinds},
+        tables={name for name, kind in kinds if kind in ("r", "p")},
+        columns={(table, column): (data_type, default, bool(not_null))
+                 for table, column, data_type, default, not_null in columns},
+        constraints={(table, name) for table, name in constraints},
+    )
+
+
+def _has_rows(cur, query: str) -> bool:
+    """True when an UPDATE_PROBES query finds a row."""
+    cur.execute(query)
+    return cur.fetchone() is not None
 
 
 # --------------------------------------------------------------------------------------
@@ -750,21 +947,40 @@ class StateStore:
         with self._cursor() as cur:
             return self._applied_version(cur)
 
-    def migrate(self, ddl: str, force: bool = False, lock_timeout_s: int = 60) -> Optional[dict]:
-        """Bring the schema to SCHEMA_VERSION: the pending RENAMES, then every statement of
-        lakebase_schema.sql (``ddl``), then record the version, all in ONE transaction, so a failure
-        (a constraint existing rows violate, a lock timeout) leaves the database as it was.
+    def migrate(self, ddl: str, force: bool = False, lock_timeout_s: int = LOCK_TIMEOUT_S,
+                sleep: Callable[[float], None] = time.sleep) -> Optional[dict]:
+        """Bring the schema to SCHEMA_VERSION: the pending RENAMES, then the statements of
+        lakebase_schema.sql (``ddl``) that the catalog doesn't show already in place (``pending_statements``),
+        then record the version, all in ONE transaction, so a failure (a constraint existing rows violate)
+        leaves the database as it was.
 
         Returns None when the database is already at SCHEMA_VERSION, unless ``force`` (the setup job,
-        which re-applies every time); else {'from': version before, 'renames': [statements run]}.
-        A transaction-level advisory lock serializes migrators: one that waited finds the version
-        recorded and returns None. The DDL waits at most ``lock_timeout_s`` per table for statements
-        of running jobs or the app. Refuses a database newer than this code: re-applying older DDL
-        could undo the newer migration.
+        which re-applies every time); else {'from': version before, 'renames': [statements run],
+        'ran': statements run, 'skipped': statements left out}. Every statement waits at most
+        ``lock_timeout_s`` for a table's lock. A wait that runs out rolls the transaction back and the
+        migration tries again after a backoff, up to MIGRATE_ATTEMPTS times; then it raises
+        MigrationLockTimeout (nothing changed). A transaction-level advisory lock serializes migrators:
+        one that waited finds the version recorded and returns None. Refuses a database newer than this
+        code: re-applying older DDL could undo the newer migration.
         """
+        for attempt in range(1, MIGRATE_ATTEMPTS + 1):
+            try:
+                return self._migrate_once(ddl, force, lock_timeout_s)
+            except Exception as error:
+                if not is_lock_timeout(error):
+                    raise
+                if attempt == MIGRATE_ATTEMPTS:
+                    raise MigrationLockTimeout(
+                        f"could not migrate the Lakebase schema to version {SCHEMA_VERSION}: a running load held "
+                        f"the lakefed_ingest tables (each of {MIGRATE_ATTEMPTS} attempts waited "
+                        f"{int(lock_timeout_s)} s for them). Nothing changed. Run the setup job again.") from error
+                sleep(migrate_backoff_s(attempt))
+
+    def _migrate_once(self, ddl: str, force: bool, lock_timeout_s: int) -> Optional[dict]:
+        """One migration attempt, in one transaction (see ``migrate``)."""
         with self._cursor() as cur, cur.connection.transaction():
-            cur.execute("select pg_advisory_xact_lock(%s::int, %s::int)", SCHEMA_LOCK)
             cur.execute(f"set local lock_timeout = '{int(lock_timeout_s)}s'")
+            cur.execute("select pg_advisory_xact_lock(%s::int, %s::int)", SCHEMA_LOCK)
             before = self._applied_version(cur)
             if before > SCHEMA_VERSION:
                 raise RuntimeError(f"the Lakebase schema is at version {before}, newer than this code's "
@@ -785,11 +1001,15 @@ class StateStore:
             renames = rename_statements(relations, {(r[0], r[1]) for r in cur.fetchall()})
             for stmt in renames:
                 cur.execute(stmt)
-            for stmt in split_sql_statements(ddl):
+            # Read after the renames, so the catalog names what the DDL below refers to.
+            catalog = _read_catalog(cur, schema_exists=bool(present))
+            to_run, left_out = pending_statements(split_sql_statements(ddl), catalog,
+                                                  has_rows=lambda query: _has_rows(cur, query))
+            for stmt in to_run:
                 cur.execute(stmt)
             cur.execute(f"insert into {SCHEMA}.schema_version (version) values (%s) on conflict (version) "
                         "do update set applied_at = now(), applied_by = current_user", (SCHEMA_VERSION,))
-        return {"from": before, "renames": renames}
+        return {"from": before, "renames": renames, "ran": len(to_run), "skipped": len(left_out)}
 
     def get_task(self, task_id) -> dict:
         """Return one config row as a dict keyed by CONTROL_COLUMNS (empty dict if not found)."""

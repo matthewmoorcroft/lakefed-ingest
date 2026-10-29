@@ -308,6 +308,7 @@ def _engine():
         sys.path.insert(0, str(engine_dir))
     spec = importlib.util.spec_from_file_location("engine_state_store", engine_dir / "state_store.py")
     engine = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = engine
     spec.loader.exec_module(engine)
     return engine
 
