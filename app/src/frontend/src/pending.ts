@@ -193,3 +193,54 @@ export function saveNotice(state: {
   }
   return { tone: "ok", text: state.savedText };
 }
+
+/** A re-discovery's progress as the server reports it (rediscovery.progress): pending while its discovery run goes,
+ * adding while its tables are written, then done, failed, or a timeout that is not done. */
+export interface RediscoveryProgress {
+  state: "pending" | "adding" | "done" | "failed" | "timeout";
+  found?: number;
+  added?: number;
+  note?: string | null;
+  reason?: string | null;
+  server?: string | null;
+  url?: string | null;
+}
+
+/** Whether a re-discovery is still going: its request in flight, its discovery run or table writes not ended, or a
+ * timeout (not confirmed, so not done). While it is, Run it now stays off and the page polls. */
+export function rediscoveryBusy(progress: RediscoveryProgress | null | undefined, requesting: boolean): boolean {
+  return requesting || progress?.state === "pending" || progress?.state === "adding" || progress?.state === "timeout";
+}
+
+/** The job page's Run it now for a re-discovery: off while one is going, with the reason in its title. */
+export function rediscoveryButton(progress: RediscoveryProgress | null | undefined, requesting: boolean, refused?: string | null):
+  { label: string; disabled: boolean; title: string | null } {
+  if (requesting) return { label: "Starting…", disabled: true, title: "Waiting for the re-discovery to start" };
+  if (progress?.state === "pending") return { label: "Running…", disabled: true, title: "Waiting for Databricks to report the discovery run ended" };
+  if (progress?.state === "adding") return { label: "Adding tables…", disabled: true, title: "Waiting for the tables to be written" };
+  if (progress?.state === "timeout") return { label: "Run it now", disabled: true, title: "Not confirmed yet: it stays off until the re-discovery ends" };
+  return { label: "Run it now", disabled: !!refused, title: refused ?? null };
+}
+
+/** The re-discovery's line on the job page: what it is doing, or how it ended. Null when none has run. */
+export function rediscoveryNotice(progress: RediscoveryProgress | null | undefined, requesting: boolean, error: unknown):
+  { tone: "info" | "ok" | "warn" | "bad"; text: string } | null {
+  if (requesting) return { tone: "info", text: "Starting the re-discovery. It shows as done once its tables are added." };
+  if (error) return { tone: "bad", text: `Re-discovery did not start: ${error instanceof Error ? error.message : String(error)}.` };
+  if (!progress) return null;
+  switch (progress.state) {
+    case "pending":
+      return { tone: "info", text: `Re-discovery running: reading ${progress.server ?? "the job's servers"} for new databases and tables. `
+               + "It shows as done once Databricks reports its discovery run ended." };
+    case "adding":
+      return { tone: "info", text: "Re-discovery adding tables. It shows as done once the tables are written." };
+    case "timeout":
+      return { tone: "warn", text: `Re-discovery not confirmed: ${progress.reason || "Databricks has not reported it ended"}. `
+               + "Run it now stays off until it ends." };
+    case "failed":
+      return { tone: "bad", text: `Re-discovery failed: ${progress.reason || "no reason was recorded"}.` };
+    case "done":
+      if (progress.note) return { tone: "ok", text: `Re-discovery done: ${progress.note}.` };
+      return { tone: "ok", text: `Re-discovery done: found ${progress.found ?? 0} to add, added ${progress.added ?? 0}.` };
+  }
+}

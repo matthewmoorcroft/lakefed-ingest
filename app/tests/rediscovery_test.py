@@ -48,8 +48,9 @@ def test_an_hour_must_be_a_whole_hour_of_the_day(value):
 
 def test_the_job_page_shows_the_hour_and_the_last_record():
     options = {"rediscover_hour": 3, "rediscovery": {"status": "done", "added": 2}}
-    assert rd.view(options) == {"hour": 3, "last": {"status": "done", "added": 2}}
-    assert rd.view({}) == {"hour": None, "last": None}
+    assert rd.view(options, NOW) == {"hour": 3, "last": {"status": "done", "added": 2},
+                                     "progress": {"state": "done", "found": 0, "added": 2, "note": None}}
+    assert rd.view({}, NOW) == {"hour": None, "last": None, "progress": None}
 
 
 # ---- the rules, per selection part ----------------------------------------------------------------------------------
@@ -295,3 +296,91 @@ def _fake_run(monkeypatch, fake: FakeDB, records: list, syncs: list) -> None:
     monkeypatch.setattr(main.jobs, "run_ended", lambda run_id: {"state": "TERMINATED", "result": "SUCCESS",
                                                                "message": None, "ended": None})
     monkeypatch.setattr(main, "REDISCOVERY_POLL_S", 0)
+
+
+# ---- what the job page shows while a re-discovery runs --------------------------------------------------------------
+
+def test_a_re_discovery_that_has_not_read_a_server_yet_is_pending():
+    assert rd.progress(rd.running_record(NOW), NOW) == {"state": "pending", "url": None, "server": None}
+
+
+def test_while_a_discovery_run_goes_the_page_is_pending_with_its_run_and_server():
+    last = {"status": "running", "started_at": "2026-10-29T03:50:00+00:00", "phase": rd.DISCOVERING, "run_id": 5,
+            "server": "h1"}
+    assert rd.progress(last, NOW, {"state": "pending", "url": "https://h/run/5"}) == {
+        "state": "pending", "url": "https://h/run/5", "server": "h1"}
+
+
+def test_a_discovery_run_past_its_wait_is_a_timeout_and_not_done():
+    last = {"status": "running", "started_at": "2026-10-29T03:50:00+00:00", "phase": rd.DISCOVERING, "run_id": 5,
+            "server": "h1"}
+    outcome = {"state": "timeout", "url": "https://h/run/5",
+               "reason": "Databricks has not reported it ended after 360 minutes: it is still listed as running"}
+    progress = rd.progress(last, NOW, outcome)
+    assert progress["state"] == "timeout" and progress["reason"] == outcome["reason"]
+
+
+def test_while_the_tables_are_written_the_page_says_adding():
+    last = {"status": "running", "started_at": "2026-10-29T03:50:00+00:00", "phase": rd.ADDING}
+    assert rd.progress(last, NOW) == {"state": rd.ADDING, "server": None}
+
+
+def test_a_finished_re_discovery_says_what_it_found_and_added():
+    last = {"status": "done", "found": 3, "added": 2, "note": None, "started_at": YESTERDAY}
+    assert rd.progress(last, NOW) == {"state": "done", "found": 3, "added": 2, "note": None}
+
+
+def test_a_re_discovery_that_failed_or_was_deferred_says_why():
+    assert rd.progress({"status": "failed", "error": "discovery run ended FAILED: no route"}, NOW) == {
+        "state": "failed", "reason": "discovery run ended FAILED: no route"}
+    deferred = {"status": "deferred", "error": "ingestion group 'g1' is running; try again after the run finishes"}
+    assert rd.progress(deferred, NOW)["state"] == "failed"
+    assert "is running" in rd.progress(deferred, NOW)["reason"]
+
+
+def test_a_run_with_no_end_recorded_for_more_than_six_hours_is_a_timeout():
+    last = {"status": "running", "started_at": "2026-10-28T20:00:00+00:00", "phase": rd.DISCOVERING, "run_id": 5}
+    assert rd.progress(last, NOW, {"state": "pending"})["state"] == "timeout"
+
+
+def test_no_record_has_no_progress():
+    assert rd.progress(None, NOW) is None
+
+
+def test_a_run_records_each_phase_as_it_starts_and_its_outcome_last(monkeypatch):
+    fake, records, syncs = FakeDB(), [], []
+    _fake_run(monkeypatch, fake, records, syncs)
+    main._run_rediscovery(7, NOW)
+    written = [json.loads(params[0]) for sql, params in records if sql == q.set_rediscovery_sql()]
+    assert [w.get("phase") for w in written] == [rd.DISCOVERING, rd.ADDING, None]
+    assert written[0] == {"status": "running", "started_at": NOW.isoformat(), "phase": rd.DISCOVERING,
+                              "run_id": 99, "server": "h1"}
+    assert written[-1]["status"] == "done" and "run_id" not in written[-1] and "server" not in written[-1]
+
+
+def test_run_now_starts_a_re_discovery_unless_one_holds_the_job(monkeypatch):
+    from fastapi.testclient import TestClient
+    started = []
+    monkeypatch.setattr(main, "_load_schedule", lambda sid, cur=None: ([{"id": 7, "options": {}}], []))
+    monkeypatch.setattr(main, "_job_permission_refusals", lambda s, user: {"change": None})
+    monkeypatch.setattr(main, "_start_background", lambda work: work())
+    monkeypatch.setattr(main, "_run_rediscovery", lambda sid, when: started.append(sid))
+    client = TestClient(main.app, headers={"X-Forwarded-Email": "op@example.com"})
+
+    monkeypatch.setattr(main.db, "query", lambda sql, params=(): [{"id": 7}])
+    assert client.post("/api/ingestion-jobs/7/rediscover").status_code == 200 and started == [7]
+
+    monkeypatch.setattr(main.db, "query", lambda sql, params=(): [])
+    refused = client.post("/api/ingestion-jobs/7/rediscover")
+    assert refused.status_code == 409 and "already running" in refused.json()["detail"]
+    assert started == [7]
+
+
+def test_run_now_is_refused_when_the_job_cannot_change(monkeypatch):
+    from fastapi.testclient import TestClient
+    monkeypatch.setattr(main, "_load_schedule", lambda sid, cur=None: ([{"id": 7, "options": {}}], []))
+    monkeypatch.setattr(main, "_job_permission_refusals", lambda s, user: {"change": "the job is being deleted"})
+    claims = []
+    monkeypatch.setattr(main.db, "query", lambda sql, params=(): claims.append(sql) or [{"id": 7}])
+    response = TestClient(main.app, headers={"X-Forwarded-Email": "op@example.com"}).post("/api/ingestion-jobs/7/rediscover")
+    assert response.status_code >= 400 and claims == []

@@ -3,7 +3,8 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import { api, qs, type ApiError, type Row } from "../api";
 import { Refused } from "../permissions";
-import { changeInProgress, deleteNotice, runButton, runTimeoutNotice } from "../pending";
+import { changeInProgress, deleteNotice, rediscoveryBusy, rediscoveryButton, rediscoveryNotice, runButton, runTimeoutNotice,
+  type RediscoveryProgress } from "../pending";
 import { Tree } from "./JobEdit";
 import { TargetTables } from "./TargetTables";
 import { RunningTasks } from "./tasks";
@@ -185,8 +186,17 @@ export default function IngestionJob() {
     mutationFn: (dropTargets: boolean) => api.post<Row>(`/schedules/${encodeURIComponent(id)}/delete`, { drop_targets: dropTargets }),
     onSuccess: () => { qc.invalidateQueries(); },
   });
+  // Run it now for the daily re-discovery: its request, then the server's progress (the discovery run, then the tables).
+  const rediscover = useMutation({
+    mutationFn: () => api.post<Row>(`/ingestion-jobs/${encodeURIComponent(id)}/rediscover`, {}),
+    onSuccess: () => refresh(),
+  });
   const job = useQuery({ queryKey: ["ingestion-job", id], queryFn: () => api.get<Row>(`/ingestion-jobs/${encodeURIComponent(id)}`),
-                         refetchInterval: (q) => (changeInProgress((q.state.data as Row | undefined)?.run_now, runNow.isPending || stop.isPending) ? 3_000 : 15_000) });
+                         refetchInterval: (q) => {
+                           const row = q.state.data as Row | undefined;
+                           if (changeInProgress(row?.run_now, runNow.isPending || stop.isPending)) return 3_000;
+                           return rediscoveryBusy(row?.rediscovery?.progress, rediscover.isPending) ? 5_000 : 15_000;
+                         } });
   const busy = changeInProgress(job.data?.run_now, runNow.isPending || stop.isPending);
   const live = useQuery({ queryKey: ["ingestion-job-live", id], queryFn: () => api.get<Row>(`/ingestion-jobs/${encodeURIComponent(id)}/live`),
                           refetchInterval: (q) => (busy ? 3_000 : (q.state.data as Row | undefined)?.active ? 5_000 : 15_000) });
@@ -275,7 +285,8 @@ export default function IngestionJob() {
         </div>
       )}
       {live.data?.active && <RunningNow live={live.data} />}
-      {j && <RediscoveryRecord rediscovery={j.rediscovery} />}
+      {j && <RediscoveryRecord rediscovery={j.rediscovery} requesting={rediscover.isPending} error={rediscover.error}
+        refused={j.change_blocked} onRunNow={() => rediscover.mutate()} />}
       <Section title="Job runs" note="Newest first; one row per trigger. Open a run for the groups it ran."
         actions={<span className="pager-buttons">
           <button className="ghost" disabled={!pages.length} onClick={() => setPages(pages.slice(0, -1))}>Newer</button>
@@ -296,15 +307,22 @@ export default function IngestionJob() {
 
 const REDISCOVERY_STATUS: Record<string, string> = { running: "Running", done: "Done", deferred: "Deferred", failed: "Failed" };
 
-/** The job's daily look for new databases and tables: whether it is on (and when), and what the last one did. */
-function RediscoveryRecord({ rediscovery }: { rediscovery?: Row }) {
+/** The job's daily look for new databases and tables: whether it is on (and when), what the last one is doing or did, and
+ * Run it now, which stays off until the re-discovery has ended. */
+function RediscoveryRecord({ rediscovery, requesting, error, refused, onRunNow }: { rediscovery?: Row; requesting: boolean;
+  error: unknown; refused?: string | null; onRunNow: () => void }) {
   const last = rediscovery?.last as Row | null | undefined;
+  const progress = rediscovery?.progress as RediscoveryProgress | null | undefined;
   const hour = rediscovery?.hour;
   if (hour == null && !last) return null;
   const note = hour == null ? "Off. Turn it on from Edit, under When it runs."
     : `Daily at ${String(hour).padStart(2, "0")}:00 UTC, set from Edit under When it runs.`;
+  const button = rediscoveryButton(progress, requesting, refused);
+  const line = rediscoveryNotice(progress, requesting, error);
   return (
-    <Section title="Adding new databases and tables" note={note}>
+    <Section title="Adding new databases and tables" note={note}
+      actions={<button disabled={button.disabled} title={button.title ?? undefined} onClick={onRunNow}>{button.label}</button>}>
+      {line && <Notice tone={line.tone}>{line.text}</Notice>}
       {last ? <RediscoveryLast last={last} /> : <p className="muted">It has not run yet.</p>}
     </Section>
   );
@@ -322,10 +340,8 @@ function RediscoveryLast({ last }: { last: Row }) {
         {last.started_at && <>, started {fmtTime(last.started_at)}</>}
         {last.finished_at && <>, finished {fmtTime(last.finished_at)}</>}
       </p>
-      {last.error && <Notice tone="warn">{last.error}</Notice>}
       {last.status === "deferred" && <p className="muted small">A group of the job was running, so nothing was added. The next
         attempt is the next day's.</p>}
-      {last.note && <p className="muted">{last.note}.</p>}
       {last.status === "done" && !last.note && <ul>
         <li>Found <b>{fmtInt(last.found)}</b> {plural(last.found, "table")} to add: added <b>{fmtInt(last.added)}</b>, skipped{" "}
           <b>{fmtInt(last.skipped)}</b> <span className="muted small">(their target was already written by another table)</span></li>

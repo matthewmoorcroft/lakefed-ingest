@@ -1212,7 +1212,7 @@ def ingestion_job(job_id: int, request: Request):
                         "groups": len(mine), "check": job.get("job_variant") == sch.CHECK_VARIANT,
                         **_run_phase_of(job, mine, now)},
             "delete_blocked": refusals["delete"], "change_blocked": refusals["change"],
-            "delete": job.get("delete"), "rediscovery": rediscovery.view(sch.options_of(job)), **_audit(job)}
+            "delete": job.get("delete"), "rediscovery": _rediscovery_view(job, now), **_audit(job)}
 
 
 def _job_groups(job_id: int) -> List[str]:
@@ -3731,24 +3731,61 @@ def _rediscovery_tick(now: Optional[datetime] = None) -> List[int]:
     return started
 
 
+@app.post("/api/ingestion-jobs/{job_id}/rediscover")
+def rediscover_now(job_id: int, request: Request):
+    """Re-discover a job now, the run the daily hour starts, on its own thread. It takes the same claim as the daily run,
+    so a run already going (not yet stale) refuses it: the job page's Run now stays off until that run has ended."""
+    s = _load_schedule(job_id)[0]
+    _refuse(_job_permission_refusals(s, _user(request))["change"])
+    now = datetime.now(timezone.utc)
+    claimed = db.query(q.claim_rediscovery_sql(),
+                       (json.dumps(rediscovery.running_record(now)), int(job_id), rediscovery.RUN_STALE_S))
+    if not claimed:
+        raise HTTPException(409, "a re-discovery of this job is already running")
+    _start_background(lambda: _run_rediscovery(int(job_id), now))
+    return {"id": int(job_id), "started_at": now.isoformat()}
+
+
 def _run_rediscovery(sid: int, started: datetime) -> None:
     """A job's re-discovery on its own thread. Its outcome (what was found and added, what vanished, the errors) or why
     it did not run is recorded on the job, even when it failed. A 409 because a group is running is 'deferred': the
-    next re-discovery is the next day's."""
-    record = {"started_at": started.astimezone(timezone.utc).isoformat()}
+    next re-discovery is the next day's. Each phase is recorded as it starts, so the job page can show where it is."""
+    record = {"status": "running", "started_at": started.astimezone(timezone.utc).isoformat()}
+
+    def report(**fields) -> None:
+        record.update(fields)
+        db.execute(q.set_rediscovery_sql(), (json.dumps(record, default=str), int(sid)))
+
     try:
-        record.update(status="done", **_rediscover(sid))
+        record.update(status="done", **_rediscover(sid, report))
     except HTTPException as e:
         deferred = e.status_code == 409 and "running" in str(e.detail)
         record.update(status="deferred" if deferred else "failed", error=_error_text(e))
     except Exception as e:
         record.update(status="failed", error=_error_text(e))
+    for progress_key in ("phase", "run_id", "server"):
+        record.pop(progress_key, None)
     record["finished_at"] = datetime.now(timezone.utc).isoformat()
     db.execute(q.set_rediscovery_sql(), (json.dumps(record, default=str), int(sid)))
     _forget_shared_reads()
 
 
-def _rediscover(sid: int) -> dict:
+def _rediscovery_view(job: dict, now: datetime) -> dict:
+    """The job page's re-discovery: the hour, the last record and its progress. While a discovery run goes, the run
+    poller's state for it decides whether that is pending or past its wait (a timeout, not done)."""
+    options = sch.options_of(job)
+    last = (options or {}).get(rediscovery.RECORD) or None
+    outcome = None
+    if last and last.get("phase") == rediscovery.DISCOVERING and last.get("run_id"):
+        try:
+            run = run_poller.run_state_of(last["run_id"])
+        except Exception:
+            run = None
+        outcome = action_states.run_outcome(run, now, REDISCOVERY_MAX_WAIT_S)
+    return rediscovery.view(options, now, outcome)
+
+
+def _rediscover(sid: int, report=lambda **fields: None) -> dict:
     """Read a job's selection's servers again (one discovery run each), then add what the rules allow: in one
     transaction under the job's lock and its groups' run locks, through the path Add tables takes. The job's new groups
     are synced after the commit."""
@@ -3769,6 +3806,7 @@ def _rediscover(sid: int) -> dict:
         run_id = jobs.run_now(_require(jobs.DISCOVER_JOB_ID, "discovery"),
                               {"discovery_id": discovery_id, "spec": json.dumps(spec)})
         new_ids.append(discovery_id)
+        report(phase=rediscovery.DISCOVERING, run_id=run_id, server=server)
         ended = _wait_for_run(run_id)
         if ended.get("result") != "SUCCESS":
             errors.append(f"{server}: its discovery run ended {ended.get('result') or ended.get('state')}"
@@ -3776,6 +3814,7 @@ def _rediscover(sid: int) -> dict:
     statuses = db.query(q.discovery_statuses_sql(), (new_ids,)) if new_ids else []
     found = db.query(q.source_rows_sql("discovery"), (new_ids,)) if new_ids else []
     taken = {r["task_collection"] for r in db.query(q.collections_sql())}
+    report(phase=rediscovery.ADDING, run_id=None, server=None)
     user, batch = REDISCOVERY_USER, uuid.uuid4().hex[:12]
 
     def write() -> tuple:

@@ -22,6 +22,8 @@ RECORD = "rediscovery"
 RUN_STALE_S = 6 * 3600
 LISTING_KEYS = ("pattern", "azure_credential", "azure_resource_id")
 REPORT_LIMIT = 20
+# The phases a running re-discovery records: reading a server again (its discovery run goes), then writing the tables.
+DISCOVERING, ADDING = "discovering", "adding"
 
 
 def hour_of(options: Optional[dict]) -> Optional[int]:
@@ -51,9 +53,34 @@ def is_due(options: Optional[dict], now: datetime, paused: bool = False) -> bool
     return started is None or started.date() < now.date()
 
 
-def view(options: Optional[dict]) -> dict:
-    """What the job page shows: the hour (or None when off) and the last re-discovery's record (or None)."""
-    return {"hour": hour_of(options), "last": (options or {}).get(RECORD) or None}
+def view(options: Optional[dict], now: datetime, discovery_outcome: Optional[dict] = None) -> dict:
+    """What the job page shows: the hour (or None when off), the last re-discovery's record (or None), and its progress."""
+    last = (options or {}).get(RECORD) or None
+    return {"hour": hour_of(options), "last": last, "progress": progress(last, now, discovery_outcome)}
+
+
+def progress(last: Optional[dict], now: datetime, discovery_outcome: Optional[dict] = None) -> Optional[dict]:
+    """Where the last re-discovery stands, for the job page. ``pending`` while its discovery run goes (the outcome is
+    the run's, from the run poller: its page, or a timeout once it is past its wait) or while the record has not moved
+    on yet; ``adding`` while the tables are written; ``done`` with what was found and added; ``failed`` with the reason
+    (a deferred run included); ``timeout`` when a run has gone on past the stale limit with no end recorded."""
+    if not last:
+        return None
+    status = last.get("status")
+    if status == "done":
+        return {"state": "done", "found": last.get("found", 0), "added": last.get("added", 0), "note": last.get("note")}
+    if status in ("failed", "deferred"):
+        return {"state": "failed", "reason": last.get("error") or "no reason was recorded"}
+    started = _as_utc(last.get("started_at"))
+    if started and (now.astimezone(timezone.utc) - started).total_seconds() > RUN_STALE_S:
+        return {"state": "timeout", "reason": "it has gone on for more than 6 hours with no end recorded: the app may "
+                                              "have restarted while it ran"}
+    if last.get("phase") == ADDING:
+        return {"state": ADDING, "server": None}
+    outcome = discovery_outcome or {}
+    if outcome.get("state") == "timeout":
+        return {"state": "timeout", "reason": outcome.get("reason"), "url": outcome.get("url"), "server": last.get("server")}
+    return {"state": "pending", "url": outcome.get("url"), "server": last.get("server")}
 
 
 def server_key(server: Optional[str]) -> str:

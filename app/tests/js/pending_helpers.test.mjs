@@ -2,7 +2,7 @@
 // strips the types in pending.ts as it loads it). frontend_pending_test.py runs this file from pytest.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { changeInProgress, deleteNotice, isUnconfirmed, requestWriteNotice, runButton, runTimeoutNotice, saveNotice, setupRunBlocks, setupRunNotice, syncFailureLines }
+import { changeInProgress, deleteNotice, isUnconfirmed, requestWriteNotice, runButton, runTimeoutNotice, rediscoveryBusy, rediscoveryButton, rediscoveryNotice, saveNotice, setupRunBlocks, setupRunNotice, syncFailureLines }
   from "../../src/frontend/src/pending.ts";
 
 const IDLE = { phase: "idle", timed_out: false, run_url: null, blocked: null, refused: null };
@@ -285,4 +285,74 @@ test("a save whose answer never came is not confirmed, and never a failure", () 
 
 test("a save the server refused shows no notice here, the error box carries it", () => {
   assert.equal(saveNotice({ pending: false, done: false, savedText: SAVED, applying: false, error: new Error("422") }), null);
+});
+
+const RUNNING_HERE = { state: "pending", server: "h1", url: "https://h/run/5" };
+
+test("a re-discovery is busy from its request until its tables are written, and through a timeout", () => {
+  assert.equal(rediscoveryBusy(undefined, true), true);
+  assert.equal(rediscoveryBusy(RUNNING_HERE, false), true);
+  assert.equal(rediscoveryBusy({ state: "adding" }, false), true);
+  assert.equal(rediscoveryBusy({ state: "timeout", reason: "still listed as running" }, false), true);
+  assert.equal(rediscoveryBusy({ state: "done", found: 1, added: 1 }, false), false);
+  assert.equal(rediscoveryBusy({ state: "failed", reason: "no" }, false), false);
+  assert.equal(rediscoveryBusy(null, false), false);
+});
+
+test("Run it now is off while the discovery run goes, and says so", () => {
+  const button = rediscoveryButton(RUNNING_HERE, false);
+  assert.deepEqual(button, { label: "Running…", disabled: true, title: "Waiting for Databricks to report the discovery run ended" });
+});
+
+test("Run it now is off while the tables are written", () => {
+  assert.equal(rediscoveryButton({ state: "adding" }, false).label, "Adding tables…");
+  assert.equal(rediscoveryButton({ state: "adding" }, false).disabled, true);
+});
+
+test("Run it now stays off after a timeout until the re-discovery ends", () => {
+  const button = rediscoveryButton({ state: "timeout", reason: "still listed as running" }, false);
+  assert.equal(button.disabled, true);
+  assert.match(button.title, /stays off until the re-discovery ends/);
+});
+
+test("Run it now is on once the re-discovery is done or failed, and off when the job cannot change", () => {
+  assert.deepEqual(rediscoveryButton({ state: "done", found: 0, added: 0 }, false), { label: "Run it now", disabled: false, title: null });
+  assert.equal(rediscoveryButton({ state: "failed", reason: "x" }, false).disabled, false);
+  assert.deepEqual(rediscoveryButton(null, false, "the job is being deleted"),
+    { label: "Run it now", disabled: true, title: "the job is being deleted" });
+});
+
+test("a re-discovery whose discovery run goes shows pending with its server and no end state", () => {
+  const notice = rediscoveryNotice(RUNNING_HERE, false, null);
+  assert.equal(notice.tone, "info");
+  assert.equal(notice.text, "Re-discovery running: reading h1 for new databases and tables. It shows as done once Databricks reports its discovery run ended.");
+});
+
+test("a re-discovery that is adding tables says so", () => {
+  assert.deepEqual(rediscoveryNotice({ state: "adding" }, false, null),
+    { tone: "info", text: "Re-discovery adding tables. It shows as done once the tables are written." });
+});
+
+test("a finished re-discovery says what it found and added", () => {
+  assert.deepEqual(rediscoveryNotice({ state: "done", found: 3, added: 2 }, false, null),
+    { tone: "ok", text: "Re-discovery done: found 3 to add, added 2." });
+  assert.deepEqual(rediscoveryNotice({ state: "done", found: 0, added: 0, note: "the job's selection is specific tables, which add nothing" }, false, null),
+    { tone: "ok", text: "Re-discovery done: the job's selection is specific tables, which add nothing." });
+});
+
+test("a failed re-discovery says why", () => {
+  assert.deepEqual(rediscoveryNotice({ state: "failed", reason: "discovery run ended FAILED: no route" }, false, null),
+    { tone: "bad", text: "Re-discovery failed: discovery run ended FAILED: no route." });
+});
+
+test("a timed-out re-discovery is not confirmed, not failed", () => {
+  const notice = rediscoveryNotice({ state: "timeout", reason: "it has gone on for more than 6 hours" }, false, null);
+  assert.equal(notice.tone, "warn");
+  assert.match(notice.text, /^Re-discovery not confirmed: it has gone on for more than 6 hours\. Run it now stays off/);
+});
+
+test("a re-discovery whose start failed says so, and nothing when none has run", () => {
+  assert.deepEqual(rediscoveryNotice(null, false, new Error("409 already running")),
+    { tone: "bad", text: "Re-discovery did not start: 409 already running." });
+  assert.equal(rediscoveryNotice(null, false, null), null);
 });
