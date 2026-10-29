@@ -159,7 +159,7 @@ export default function RunDetail() {
           {live ? (
             <div className="metrics">
               <Figure label="Speed now" value={r.live_speed ? `${fmtSpeed(r.live_speed.tables_per_min)} tables/min` : ""}
-                sub={r.live_speed ? "over the last 5 minutes of loading" : "shown after 3 minutes of loading"} />
+                sub={r.live_speed ? "tables loaded over the last 5 minutes" : "shown after 3 minutes of loading"} />
               <Figure label="Time left" value={r.time_left && !pastTypical(r) ? fmtLeft(r.time_left.seconds) : ""}
                 sub={pastTypical(r) ? "past its typical run time" : r.time_left?.basis === "typical" ? "from its typical run"
                   : r.time_left ? "at the speed now" : "no typical run yet"} />
@@ -172,7 +172,7 @@ export default function RunDetail() {
               <Figure label="Took" value={r.duration_s === null ? "" : fmtDuration(r.duration_s)}
                 sub={r.duration_s === null ? "it ended without finishing" : `ended ${fmtWhen(r.finished_at)}`} />
               <Figure label="Speed" value={r.speed_tables_per_min != null ? `${fmtSpeed(r.speed_tables_per_min)} tables/min` : ""}
-                sub={r.speed_tables_per_min != null ? "while loading tables" : "no table was loaded"} />
+                sub={r.speed_tables_per_min != null ? "tables loaded, failed ones not counted" : "no table was loaded"} />
               <Figure label="Rows written" value={rows} />
             </div>
           )}

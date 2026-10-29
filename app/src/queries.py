@@ -662,6 +662,31 @@ def _detail(run: dict) -> dict:
     return d if isinstance(d, dict) else {}
 
 
+def open_runs_sql() -> str:
+    """Every run still recorded as running, group runs and checks, with the Databricks run that ran it: what the app
+    reconciles with Databricks (main._close_ended_runs)."""
+    return f"select run_id, task_collection, job_run_id, started_at from {SCHEMA}.ingest_run where status = 'running'"
+
+
+def close_ended_run_sql() -> str:
+    """Close one run still 'running' whose Databricks run has ended, and its events still running (or waiting for a
+    retry that never came), as failed: what the engine's close_abandoned_runs does when the group's next run starts,
+    done by the app when it finds the Databricks run over, so a run cancelled in Databricks doesn't stay running.
+    Params: detail, run_id, error (appended to a retried attempt's), error. Returns (runs closed, events closed)."""
+    return (
+        f"with dead as (update {SCHEMA}.ingest_run set status = 'failed', finished_at = now(), detail = %s "
+        "where run_id = %s and status = 'running' returning run_id), "
+        f"events as (update {SCHEMA}.ingest_event e set status = 'failed', finished_at = coalesce(e.finished_at, now()), "
+        "duration_ms = coalesce(e.duration_ms, (extract(epoch from (now() - e.started_at)) * 1000)::bigint), "
+        "error = case when e.status = 'retried' then concat(e.error, ' | ', %s) else %s end "
+        "from dead where e.run_id = dead.run_id and (e.status = 'running' or ("
+        f"e.status = 'retried' and not exists (select 1 from {SCHEMA}.ingest_event later "
+        "where later.run_id = e.run_id and later.control_id = e.control_id and later.id > e.id))) "
+        "returning e.id) "
+        "select (select count(*) from dead), (select count(*) from events)"
+    )
+
+
 def run_outcome(run: dict, progress: Optional[dict] = None) -> dict:
     """What a group run's engine record means, as the pages show it: a label, a tone and an optional note.
     The engine records a run that loaded with some table failures as failed, and a run another run closed
@@ -680,6 +705,8 @@ def run_outcome(run: dict, progress: Optional[dict] = None) -> dict:
     closed_by = _detail(run).get("closed_by_run")
     if closed_by is not None:
         return {"label": "Ended without finishing", "tone": "bad", "note": f"closed by run {closed_by}"}
+    if _detail(run).get("closed_by_app"):
+        return {"label": "Ended without finishing", "tone": "bad", "note": _detail(run).get("reason")}
     if status in ("failed", "completed") and failed:
         return {"label": "Succeeded with failures", "tone": "warn", "note": f"{failed:,} {'table' if failed == 1 else 'tables'} failed"}
     return {"label": "Failed", "tone": "bad", "note": None}

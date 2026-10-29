@@ -39,7 +39,13 @@ A run that ends without finishing (cancelled, or its cluster went away) can't cl
 next run of the same collection holds the collection's lock, so it closes them at launch: the dead
 run's `ingest_run` row and its `running` events become `failed`, with the run's `detail` naming the
 run that closed it (`closed_by_run`). So does the last `retried` event of a table that was waiting for
-its retry, keeping its error with the reason added. Until then the dead run still reads `running`.
+its retry, keeping its error with the reason added. Until then the dead run still reads `running`,
+unless the operations app is open: when a page reads the running runs, the app asks the Jobs API about each
+one's Databricks run (`job_run_id`) and closes those that have ended (terminated, skipped or an internal error;
+one the API no longer has, once it began a day ago) the same way, with `closed_by_app` and the reason in
+`detail`. A run still going in Databricks, or one whose state can't be read, is left as it is, and the app never
+cancels anything on its own. Cancel run on an ingestion job's page cancels the job's wrapper, check and group
+runs, and closes the records of those it cancelled.
 
 Table and column reference: [lakebase_schema.md](lakebase_schema.md).
 

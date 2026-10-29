@@ -248,7 +248,8 @@ def test_the_job_page_says_why_run_now_or_delete_cannot_start(client, monkeypatc
     monkeypatch.setattr(main.jobs, "user_job_permission", lambda job_id, user: "CAN_MANAGE_RUN")
     signed_in = {"X-Forwarded-Email": "op@example.com"}
     body = client.get("/api/ingestion-jobs/1", headers=signed_in).json()
-    assert body["run_now"] == {"blocked": "the job's Databricks jobs are not synced yet", "groups": 2, "check": False}
+    assert body["run_now"] == {"blocked": "the job's Databricks jobs are not synced yet", "refused": None, "going": False,
+                              "groups": 2, "check": False}
     assert body["delete_blocked"] == "deleting needs Can Manage on the Databricks job 555; you have Can Manage Run"
     # With no user from the Apps proxy, nothing is allowed, whatever the job's access list says.
     anonymous = client.get("/api/ingestion-jobs/1").json()
