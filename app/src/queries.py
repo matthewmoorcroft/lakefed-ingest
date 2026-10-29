@@ -2176,10 +2176,10 @@ def insert_member_if_absent_sql() -> str:
 
 
 def job_database_sinks_chunk_sql() -> str:
-    """The sinks (and client ids) of the given databases' control rows in the given groups, one row per (database, sink,
-    client id, group), so a by-database write skips the rows a committed transaction already wrote on a resume. The
-    databases match exactly (control_database_idx), so pass each one both as the source names it and in lower case: the
-    rows an earlier transaction wrote carry one of those. Params: groups (list), databases (list)."""
+    """job_database_sinks_sql for a chunk of databases at once: one row per (database, sink, client id, group) that
+    their control rows already write, so a resumed write skips the rows a committed transaction wrote. The databases
+    match exactly (control_database_idx), so pass each one both as the source names it and in lower case: the rows
+    an earlier transaction wrote carry one of those. Params: groups (list), databases (list)."""
     return (f"select lower(src_database) as src, "
             f"lower(sink_catalog || '.' || sink_schema || '.' || sink_table) as sink, "
             f"coalesce(client_id, '') as client_id, task_collection from {SCHEMA}.control "
@@ -2194,6 +2194,13 @@ def insert_members_if_absent_sql() -> str:
             f"select %s, g.task_collection, g.offset_minutes "
             f"from unnest(%s::text[], %s::int[]) as g(task_collection, offset_minutes) "
             f"on conflict do nothing returning task_collection")
+
+
+def job_database_sinks_sql() -> str:
+    """The sinks (and client ids) the control rows of one database already write in the given groups: what a
+    by-database write checks before it writes the database again. Params: groups (list), database (lower case compared)."""
+    return (f"select lower(sink_catalog || '.' || sink_schema || '.' || sink_table) as sink, coalesce(client_id, '') as client_id "
+            f"from {SCHEMA}.control where task_collection = any(%s) and lower(src_database) = lower(%s)")
 
 
 def insert_member_sql() -> str:
@@ -2463,10 +2470,9 @@ def source_databases_after_sql(kind: str) -> str:
 
 
 def database_rows_chunk_sql(kind: str) -> str:
-    """The table rows of several databases of a source at once, ordered by database and then table. Params: the
-    source's, then keys: a list of lower case server + chr(31) + database, one per database. Matches
-    case-insensitively, so it reads the whole source; a page of the source listing takes database_rows_exact_sql
-    instead."""
+    """database_rows_sql for several databases at once, ordered by database and then table. Params: the source's,
+    then keys: a list of lower case server + chr(31) + database, one per database. Matches case-insensitively, so it
+    reads the whole source; a page of the source listing takes database_rows_exact_sql instead."""
     return (f"select r.server, r.src_database, r.src_schema, r.src_table, r.line, r.fields "
             f"from ({source_rows_sql(kind)}) r "
             f"where lower(r.server) || chr(31) || lower(r.src_database) = any(%s) "
@@ -2484,6 +2490,14 @@ def database_rows_exact_sql() -> str:
             f"from {SCHEMA}.table_upload_line where upload_id = %s and status = 'ok' "
             f"and server = k.server and src_database = k.src_database) t "
             f"order by lower(t.server), lower(t.src_database), lower(t.src_schema), lower(t.src_table)")
+
+
+def database_rows_sql(kind: str) -> str:
+    """Every table of one database of a source, in the order a plan reads them, with the fields its CSV line takes.
+    Params: the source's, server, database (both compared lower case)."""
+    return (f"select r.server, r.src_database, r.src_schema, r.src_table, r.line, r.fields from ({source_rows_sql(kind)}) r "
+            f"where lower(r.server) = lower(%s) and lower(r.src_database) = lower(%s) "
+            f"order by lower(r.src_schema), lower(r.src_table)")
 
 
 def selected_servers_sql(kind: str) -> str:
