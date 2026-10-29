@@ -32,7 +32,8 @@ function scheduleForm(schedule: Row) {
 
 const startMinute = (hhmm: string) => { const [h, m] = String(hhmm || "00:00").split(":").map(Number); return (h || 0) * 60 + (m || 0); };
 const value = (s?: Row) => (s && "value" in s ? s.value : undefined);
-function TableRows({ jobId, server, database, locked }: { jobId: string; server: string; database: string; locked: Locked }) {
+function TableRows({ jobId, server, database, locked, readOnly }: { jobId: string; server: string; database: string; locked: Locked;
+                    readOnly?: boolean }) {
   const [offset, setOffset] = useState(0);
   const qc = useQueryClient();
   const tables = useQuery({
@@ -68,15 +69,15 @@ function TableRows({ jobId, server, database, locked }: { jobId: string; server:
       {(tables.data?.items ?? []).map((t: Row) => (
         <tr key={t.id} className="l3">
           <td className="name">{t.schema}.{t.table}</td>
-          <td><select value={t.load_type} disabled={edit.isPending || !!locked} title={locked ?? "Changes this table in every database of the job"}
-            onChange={(e) => edit.mutate({ t, load_type: e.target.value })}>
+          <td>{readOnly ? LOAD_TYPES[t.load_type] ?? t.load_type : <select value={t.load_type} disabled={edit.isPending || !!locked}
+            title={locked ?? "Changes this table in every database of the job"} onChange={(e) => edit.mutate({ t, load_type: e.target.value })}>
             <option value="ct">Change tracking</option><option value="cursor">Cursor column</option>
-            <option value="full">Full reload</option></select></td>
+            <option value="full">Full reload</option></select>}</td>
           <td className="mono">{t.primary_key}</td>
           <td className="num">{fmtInt(t.columns)} columns</td>
           <td className="mono">{t.target}</td>
-          <td><input type="checkbox" checked={!!t.enabled} disabled={enable.isPending || !!locked} title={locked ?? undefined}
-            onChange={() => enable.mutate(t)} /></td>
+          <td>{readOnly ? (t.enabled ? "on" : <span className="muted">off</span>) : <input type="checkbox" checked={!!t.enabled}
+            disabled={enable.isPending || !!locked} title={locked ?? undefined} onChange={() => enable.mutate(t)} />}</td>
           <td><StateBar row={t} /></td>
         </tr>
       ))}
@@ -89,7 +90,7 @@ function TableRows({ jobId, server, database, locked }: { jobId: string; server:
   );
 }
 
-function DatabaseRows({ jobId, server, locked }: { jobId: string; server: string; locked: Locked }) {
+function DatabaseRows({ jobId, server, locked, readOnly }: { jobId: string; server: string; locked: Locked; readOnly?: boolean }) {
   const [offset, setOffset] = useState(0);
   const [search, setSearch] = useState("");
   const [open, setOpen] = useState<string | null>(null);
@@ -124,11 +125,12 @@ function DatabaseRows({ jobId, server, locked }: { jobId: string; server: string
             <td></td>
             <td className="num">{fmtInt(d.tables)} {Number(d.missing) > 0 && <span className="tag warn">{fmtInt(d.missing)} missing</span>}</td>
             <td></td>
-            <td><input type="checkbox" checked={Number(d.enabled_tables) > 0} disabled={enable.isPending || !!locked}
-              title={locked ?? "Enables or disables every table of this database"} onChange={() => enable.mutate(d)} /></td>
+            <td>{readOnly ? <span className="muted">{fmtInt(d.enabled_tables)} on</span> : <input type="checkbox"
+              checked={Number(d.enabled_tables) > 0} disabled={enable.isPending || !!locked}
+              title={locked ?? "Enables or disables every table of this database"} onChange={() => enable.mutate(d)} />}</td>
             <td>{Number(d.enabled_tables) > 0 ? <StateBar row={d} /> : <span className="muted">disabled</span>}</td>
           </tr>
-          {open === d.database && <TableRows jobId={jobId} server={server} database={d.database} locked={locked} />}
+          {open === d.database && <TableRows jobId={jobId} server={server} database={d.database} locked={locked} readOnly={readOnly} />}
         </Fragment>
       ))}
       {(dbs.data?.total ?? 0) > PAGE && (
@@ -140,7 +142,8 @@ function DatabaseRows({ jobId, server, locked }: { jobId: string; server: string
   );
 }
 
-function Tree({ jobId, locked }: { jobId: string; locked: Locked }) {
+/** What a job ingests, as a tree from its servers; read only on the job page, editable in Edit. */
+export function Tree({ jobId, locked, readOnly }: { jobId: string; locked: Locked; readOnly?: boolean }) {
   const [open, setOpen] = useState<string | null>(null);
   const servers = useQuery({ queryKey: ["job-tree", jobId], queryFn: () => api.get<Row>(`/ingestion-jobs/${jobId}/tree${qs({ limit: 200 })}`) });
   return (
@@ -161,10 +164,10 @@ function Tree({ jobId, locked }: { jobId: string; locked: Locked }) {
                 <td className="muted">{fmtInt(s.enabled_tables)} on</td>
                 <td><StateBar row={s} /></td>
               </tr>
-              {open === s.server && <DatabaseRows jobId={jobId} server={s.server} locked={locked} />}
+              {open === s.server && <DatabaseRows jobId={jobId} server={s.server} locked={locked} readOnly={readOnly} />}
             </Fragment>
           ))}
-          {servers.data && !servers.data.items.length && <tr><td colSpan={7} className="muted">No tables yet: import one database's tables (Import CSV) into one of the job's groups, then add databases here.</td></tr>}
+          {servers.data && !servers.data.items.length && <tr><td colSpan={7} className="muted">No tables yet: Add tables adds them.</td></tr>}
         </tbody>
       </table>
       <ErrorBox error={servers.error} />

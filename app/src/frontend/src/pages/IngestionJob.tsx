@@ -3,6 +3,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import { api, qs, type Row } from "../api";
 import { Refused } from "../permissions";
+import { Tree } from "./JobEdit";
 import { TargetTables } from "./TargetTables";
 import { OutLink,
   Crumbs, Badge, ErrorBox, Menu, Name, Notice, PageHead, RunStatus, Section, StateBar, StateKey, fmtClock, fmtDuration, fmtInt, fmtSlot, fmtSpeed,
@@ -146,6 +147,11 @@ export default function IngestionJob() {
         <ErrorBox error={runs.error} />
         {runs.data && <JobRunsTable runs={runs.data.job_runs} />}
       </Section>
+      {j && <Section title={`What it ingests: ${fmtInt(j.enabled_tables)} ${plural(j.enabled_tables, "table")}`}
+        note="From each server, its databases and their tables, for information. Edit changes them.">
+        <Tree jobId={id} locked={null} readOnly />
+      </Section>}
+      {j && <TargetTables jobId={id} />}
       {j && (
         <Section title={`Ingestion groups: ${fmtInt(j.groups_detail.length)}`} actions={<StateKey />}>
           <div className="table-wrap"><table className="data">
@@ -168,7 +174,6 @@ export default function IngestionJob() {
           </table></div>
         </Section>
       )}
-      {j && <TargetTables jobId={id} />}
     </>
   );
 }
