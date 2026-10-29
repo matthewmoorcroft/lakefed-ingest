@@ -109,6 +109,12 @@ The one-time and ad hoc jobs shouldn't wait several minutes for a job cluster to
   you already have, override the task's `existing_cluster_id` in your target. A source that is paused
   or resuming (Azure SQL serverless) is retried three times, with pauses doubling from 15-30 s.
 - **Ingestion** runs on job clusters with the source network path (scheduled, recurring work).
+- **The check** (`lakefed_ingest_check`) runs on serverless and reads every source database it checks, so
+  serverless compute needs a network path to the sources, not only to Lakebase: for example private
+  endpoints through a network connectivity configuration (NCC), or source firewall rules that allow the
+  serverless egress. Check this before choosing the check variant: a source that only a job cluster can
+  reach can't be checked, and its group should use the default variant. A job-cluster option for the check
+  is not built yet.
 
 If the workspace doesn't have serverless jobs (or serverless can't reach Lakebase there), run setup
 on an all-purpose cluster instead, such as the utility cluster. It's a one-time or ad hoc job, often
@@ -195,7 +201,7 @@ job per collection), or the check job, `lakefed_ingest_check`: it checks a group
 serverless and starts the ingestion job only for those with work. Its own schedule (paused) checks every
 collection; a schedule of the app's `check` variant starts it with that schedule's members. It reads the
 sources like the ingest does, so serverless needs the same network path to them (a UC connection, or
-serverless network connectivity to the servers).
+serverless network connectivity to the servers; see [Compute](#compute-for-the-setup-and-discovery-jobs)).
 
 ## Schema changes
 

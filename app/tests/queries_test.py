@@ -1,4 +1,6 @@
 """Operations app SQL: parameterized everywhere, filters build the expected predicates, form checks."""
+from pathlib import Path
+
 import pytest
 
 import queries as q
@@ -202,6 +204,16 @@ def test_sla_breach_rule_uses_control_sla_and_creation_for_never_succeeded():
     assert rule in q.collections_overview_sql()
     sql, _ = q.tables_sql(None, None, "all", 5)
     assert "as sla_breached" in sql and "as sla_min" in sql
+
+
+def test_the_documented_sla_alert_counts_database_check_stamps_as_the_app_does():
+    # A quiet database checked and found unchanged stamps the database, not each table: the alert query in
+    # docs/monitoring.md must count that stamp, as LAST_SUCCESS does, or a quiet table alerts while the app shows it current.
+    doc = (Path(__file__).parents[2] / "docs" / "monitoring.md").read_text()
+    alert = doc.split("Freshness SLA breaches.")[1].split("```sql")[1].split("```")[0]
+    assert "database_check dc" in alert and "dc.checked_at" in alert and "greatest(cp.last_success_at" in alert
+    assert "coalesce(last_success_at, created_at)" in alert and "c.freshness_sla_minutes IS NOT NULL" in alert
+    assert "dc.checked_at" in q.LAST_SUCCESS
 
 
 @pytest.mark.parametrize("value,ok", [(None, True), ("", True), (15, True), ("30", True),

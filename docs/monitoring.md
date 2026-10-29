@@ -102,16 +102,33 @@ FROM t ORDER BY last_success_at NULLS FIRST;
 
 Freshness SLA breaches. The SLA is per table, in `control.freshness_sla_minutes` (NULL = no SLA). An
 enabled table breaches it when its last success, or its creation if it has never succeeded, is older
-than the SLA. The operations app applies the same rule, so an alert on this query (trigger when it
-returns rows) matches what the app shows:
+than the SLA. Its last success counts its database's check stamp, as in the query above: a quiet
+database checked and found unchanged stamps the database, not each table. The operations app applies
+the same rule (`queries.SLA_BREACHED`), so an alert on this query (trigger when it returns rows) matches
+what the app shows:
 ```sql
-SELECT c.task_collection, c.src_database, c.src_schema, c.src_table, c.freshness_sla_minutes,
-       cp.last_success_at,
-       timestampdiff(MINUTE, coalesce(cp.last_success_at, c.created_at), current_timestamp()) AS lag_minutes
-FROM lakefed_ingest_lakebase.lakefed_ingest.control c
-LEFT JOIN lakefed_ingest_lakebase.lakefed_ingest.checkpoint cp ON cp.control_id = c.id
-WHERE c.task_enabled AND c.freshness_sla_minutes IS NOT NULL
-  AND timestampdiff(MINUTE, coalesce(cp.last_success_at, c.created_at), current_timestamp()) > c.freshness_sla_minutes
+WITH t AS (
+  SELECT c.task_collection, c.src_database, c.src_schema, c.src_table, c.freshness_sla_minutes, c.created_at,
+         greatest(cp.last_success_at,
+                  CASE WHEN cp.strategy = 'ct' AND cp.phase = 'incremental'
+                        AND CAST(cp.position AS BIGINT) >= dc.checked_version THEN dc.checked_at END) AS last_success_at
+  FROM lakefed_ingest_lakebase.lakefed_ingest.control c
+  LEFT JOIN lakefed_ingest_lakebase.lakefed_ingest.checkpoint cp ON cp.control_id = c.id
+  LEFT JOIN lakefed_ingest_lakebase.lakefed_ingest.database_check dc
+    ON dc.task_collection = c.task_collection AND dc.src_database = c.src_database
+   AND dc.source = concat_ws('|', lower(coalesce(nullif(c.src_host, ''), nullif(c.src_connection, ''), '')),
+                             coalesce(nullif(c.src_port, 0),
+                                      CASE WHEN nullif(c.src_host, '') IS NULL
+                                                AND nullif(c.src_connection, '') IS NOT NULL THEN 0
+                                           ELSE CASE coalesce(nullif(lower(trim(c.src_type)), ''), 'sqlserver')
+                                                  WHEN 'sqlserver' THEN 1433 WHEN 'oracle' THEN 1521
+                                                  WHEN 'postgresql' THEN 5432 WHEN 'mysql' THEN 3306
+                                                  ELSE 0 END END),
+                             coalesce(nullif(c.secret_key, ''), nullif(c.src_connection, ''), '')))
+  WHERE c.task_enabled AND c.freshness_sla_minutes IS NOT NULL)
+SELECT *, timestampdiff(MINUTE, coalesce(last_success_at, created_at), current_timestamp()) AS lag_minutes
+FROM t
+WHERE timestampdiff(MINUTE, coalesce(last_success_at, created_at), current_timestamp()) > freshness_sla_minutes
 ORDER BY lag_minutes DESC;
 ```
 

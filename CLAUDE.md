@@ -105,7 +105,9 @@ secret). See `README.md`, `docs/deploy.md`, `docs/monitoring.md`, `docs/lakebase
   `db_instance`, `db_name`.
   The tuning parameters' defaults are bundle variables of the same name (`databricks.yml`).
 - `lakefed_ingest_check` → `check_launch.ipynb` (serverless): checks a group of collections
-  (`task_collections`, blank = every collection with enabled rows; `initial_check.run_check`), stamps
+  (`task_collections`, blank = every collection with enabled rows; or `schedule_id`, an app job's groups read
+  from Lakebase; `initial_check.run_check`, each collection's errors apart; its source queries count under
+  `max_queries_per_source`, `initial_check.SourceCap`), stamps
   unchanged databases, records each collection's databases with work in `check_work`, starts
   `lakefed_ingest` once per collection with work by run-now (`work_id`; `launcher.py`), watches the
   runs for `confirm_s` (a run Databricks skips fails the check) and ends. No For each. Its own schedule
@@ -119,7 +121,9 @@ secret). See `README.md`, `docs/deploy.md`, `docs/monitoring.md`, `docs/lakebase
   single-node all-purpose cluster `lakefed_ingest utility` (`resources.clusters.lakefed_ingest_utility`,
   auto-terminates after 60 min) so repeated runs skip cluster start; transient connection errors
   (paused sources) retry with backoff (`discovery.CONNECT_RETRIES`).
-- Setup and the app's grant job run on serverless (job `environments`); ingestion on job clusters.
+- Setup and the app's grant job run on serverless (job `environments`); ingestion on job clusters. The check job
+  also runs on serverless and reads the sources, so serverless needs a network path to them (NCC private
+  endpoints or firewall rules); a source only a job cluster reaches belongs in a default-variant schedule.
 - `lakefed_ingest_setup` → `apply_lakebase_schema.ipynb`; plus bundle resources for the Lakebase
   instance, its UC catalog, and the secret scope (`database_instances.lakebase`,
   `database_catalogs.lakebase_catalog`, `secret_scopes.secret_scope`).
