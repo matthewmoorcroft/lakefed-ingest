@@ -63,11 +63,11 @@ export default function JobRun() {
           <div className="metrics">
             {live ? <>
               <Figure label="Speed now" value={r.speed_now ? `${fmtSpeed(r.speed_now.tables_per_min)} tables/min` : ""}
-                sub={r.speed_now ? `${fmtInt(Math.round(r.speed_now.rows_per_min))} rows/min, last 5 minutes` : "shown after 3 minutes of loading"} />
+                sub={r.speed_now ? `tables loaded, last 5 minutes; ${fmtInt(Math.round(r.speed_now.rows_per_min))} rows/min` : "shown after 3 minutes of loading"} />
               <Figure label="Expected end" value={r.expected_end ? fmtClock(r.expected_end) : ""} sub="its last group's start plus its typical run" />
             </> : <>
               <Figure label="Took" value={r.took_s != null ? fmtDuration(r.took_s) : ""} sub="first group run start to last finish" />
-              <Figure label="Speed" value={r.speed_tables_per_min != null ? `${fmtSpeed(r.speed_tables_per_min)} tables/min` : ""} sub="while loading tables" />
+              <Figure label="Speed" value={r.speed_tables_per_min != null ? `${fmtSpeed(r.speed_tables_per_min)} tables/min` : ""} sub="tables loaded, failed ones not counted" />
             </>}
             <Figure label="Clusters" value={fmtInt(r.clusters)} sub="each group run starts its own" />
             <Figure label="Failed tables" value={fmtInt(r.failed_tables)} sub={Number(r.failed_before) ? `the ${fmtInt(r.failed_before)} job ${plural(r.failed_before, "run")} before also had failed tables` : undefined} />

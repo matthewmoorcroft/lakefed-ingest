@@ -253,6 +253,9 @@ input.search-wide { width: 280px; }
 table.data.fit .status-cell { min-width: 0; }
 table.data.fit .bar { min-width: 80px; }
 table.data.fit th, table.data.fit td { padding-left: 6px; padding-right: 6px; }
+/* A wide table's two-word headers take two lines, so its last column stays in view at 1200 px. */
+table.data.wrap-head th { white-space: normal; vertical-align: bottom; }
+table.data.wrap-head td.name { min-width: 110px; }
 table.data td.mono { white-space: nowrap; }
 .pager { display: flex; align-items: center; justify-content: space-between; gap: var(--db-space-3); flex-wrap: wrap; margin: var(--db-space-2) 0; }
 .pager-buttons { display: inline-flex; gap: var(--db-space-2); }

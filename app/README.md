@@ -179,7 +179,7 @@ The app runs as its own service principal (created with the app):
 - **Who can act:** every action on an existing ingestion job follows the signed-in user's own Databricks
   permission on the job its runs execute as (the check job on a check schedule, else the ingestion job), as the
   Jobs UI does:
-  - running it (Run now), or a new job that isn't paused: `CAN_MANAGE_RUN`;
+  - running it (Run now), cancelling its run (Cancel run), or a new job that isn't paused: `CAN_MANAGE_RUN`;
   - changing it (Edit and Save, Pause, Resume, Sync jobs), its groups' tables (edit, enable, disable, reseed,
     Add table, Import CSV, Bulk import's register), or deleting it: `CAN_MANAGE` or owner;
   - a change to tables needs `CAN_MANAGE` on every ingestion job that runs one of their groups, since a group

@@ -269,3 +269,38 @@ def run_state(run_id) -> dict:
 
 def cancel(run_id) -> None:
     workspace().jobs.cancel_run(run_id=int(run_id))
+
+
+# A run's life cycle as the Jobs API ends it; a run recorded as running whose Databricks run is in one of these
+# never finishes its record, so the app closes it (main._close_ended_runs).
+ENDED_STATES = ("TERMINATED", "SKIPPED", "INTERNAL_ERROR")
+# How long a run's state is kept: a page asks every few seconds while a run is going.
+RUN_STATE_CACHE_S = 15
+_run_states: dict = {}
+
+
+def run_ended(run_id) -> Optional[dict]:
+    """How a Databricks run ended ({state, result, message, ended}), or None while it is still going. A run the
+    Jobs API no longer has counts as ended (state NOT_FOUND). Any other error reading it is raised, so a run is
+    never taken for ended on a guess. Read at most every RUN_STATE_CACHE_S seconds per run."""
+    from databricks.sdk.errors import NotFound
+    now = time.monotonic()
+    hit = _run_states.get(str(run_id))
+    if hit and now - hit[0] < RUN_STATE_CACHE_S:
+        return hit[1]
+    try:
+        r = workspace().jobs.get_run(int(run_id))
+        st = r.state
+        state = st.life_cycle_state.value if st and st.life_cycle_state else None
+        ended = None if state not in ENDED_STATES else {
+            "state": state, "result": st.result_state.value if st.result_state else None,
+            "message": st.state_message or None, "ended": ts(r.end_time)}
+    except NotFound:
+        ended = {"state": "NOT_FOUND", "result": None, "message": None, "ended": None}
+    _run_states[str(run_id)] = (now, ended)
+    return ended
+
+
+def forget_run_states() -> None:
+    """Read every run's state again next time: after a cancel, so the page shows it at once."""
+    _run_states.clear()

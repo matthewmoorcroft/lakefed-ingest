@@ -73,7 +73,7 @@ export default function Runs() {
       <ErrorBox error={runs.error} />
       {job === "none" ? (
         <Section title="Group runs of groups in no job" note={<>Started by Run now on Databricks jobs, or by the Databricks job's own schedule.
-          Speed: tables loaded a minute, from the first table's start to the last one's finish. Took is blank for a run another
+          Speed: tables loaded (failed ones not counted) a minute, from the first table's start to the last one's finish. Took is blank for a run another
           run closed: it ended without finishing. Rows written: "at least" when some loads recorded none.</>}>
           <Grid rows={d?.group_runs} columns={COLUMNS.map((c) => ({ ...c, filter: false }))} getRowId={(r) => String(r.run_id)} options={{ autoSizeStrategy: { type: "fitGridWidth" } }} />
         </Section>
@@ -91,7 +91,7 @@ export default function Runs() {
               <JobRunsTable runs={running} showJob />
             </Section>
           )}
-          <Section title="Finished, newest first" note="Tables/min: tables loaded a minute over the job run's work span, so planning and change detection are left out."
+          <Section title="Finished, newest first" note="Tables/min: tables loaded a minute over the job run's work span, so planning and change detection are left out; failed tables are not counted, and show under Failed."
             actions={<span className="pager-buttons">
               <button className="ghost" disabled={!pages.length} onClick={() => setPages(pages.slice(0, -1))}>Newer</button>
               <button className="ghost" disabled={!d?.next_before} onClick={() => setPages([...pages, d!.next_before])}>Older</button>

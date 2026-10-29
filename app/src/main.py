@@ -305,8 +305,63 @@ def _read_at(key) -> str:
 
 def _running() -> List[dict]:
     """queries.running_progress_sql, shared: every running group run's progress, read once per
-    MONITOR_CACHE_S however many pages ask."""
-    return _shared("running", lambda: db.query(q.running_progress_sql()))
+    MONITOR_CACHE_S however many pages ask. Runs whose Databricks run has ended are closed first
+    (_close_ended_runs), so a run cancelled in Databricks never stays running here."""
+    def compute():
+        try:
+            _close_ended_runs()
+        except Exception:           # the pages still show what is recorded; the next read tries again
+            pass
+        return db.query(q.running_progress_sql())
+    return _shared("running", compute)
+
+
+def ended_reason(ended: dict) -> str:
+    """Why the app closed a run, in the run's own words: how its Databricks run ended, and when."""
+    if ended["state"] == "NOT_FOUND":
+        return "its Databricks run no longer exists, so it ended without finishing"
+    how = ended.get("result") or ended["state"]
+    at = f" at {ended['ended']}" if ended.get("ended") else ""
+    why = f" ({ended['message']})" if ended.get("message") else ""
+    return f"its Databricks run ended {how}{at} without finishing{why}"[:1000]
+
+
+# A run the Jobs API doesn't know is closed only once it began this long ago: a run of another workspace sharing the
+# state database, or one the API briefly can't find, is never taken for ended while it may still be going.
+NOT_FOUND_AFTER = timedelta(hours=24)
+
+
+def _older_than(started_at, age: timedelta) -> bool:
+    if started_at is None:
+        return False
+    when = q._when(started_at)
+    return (when if when.tzinfo else when.replace(tzinfo=timezone.utc)) < datetime.now(timezone.utc) - age
+
+
+def _close_ended_runs(user: Optional[str] = None) -> int:
+    """Close each run recorded as running whose Databricks run has ended (cancelled in Databricks, or its cluster
+    gone): failed, with how its Databricks run ended, and its events still running, as the engine closes an abandoned
+    run. A run with no job run id (run by hand outside a job), whose state can't be read now, or still going in
+    Databricks (queued, pending, running, terminating, or retrying) is left as it is; nothing is ever cancelled here.
+    Returns how many were closed."""
+    closed = 0
+    for r in db.query(q.open_runs_sql()):
+        job_run = str(r.get("job_run_id") or "").strip()
+        if not job_run.isdigit():
+            continue
+        try:
+            ended = jobs.run_ended(job_run)
+        except Exception:
+            continue
+        if not ended or (ended["state"] == "NOT_FOUND" and not _older_than(r.get("started_at"), NOT_FOUND_AFTER)):
+            continue
+        reason = ended_reason(ended)
+        detail = json.dumps({"closed_by_app": user or "reconcile", "reason": reason, "databricks_run": int(job_run),
+                             "databricks_state": ended["state"], "databricks_result": ended.get("result")})
+        with _write() as cur:
+            cur.execute(q.close_ended_run_sql(), (detail, int(r["run_id"]), reason, reason))
+        closed += 1
+    return closed
 
 
 # The most running job runs, and jobs needing attention, the Overview lists; Runs and Ingestion jobs list all.
@@ -691,8 +746,10 @@ def ingestion_job(job_id: int, request: Request):
             "median_speed_tables_per_min": speeds[len(speeds) // 2] if speeds else None, "speed_job_runs": len(speeds),
             "p95_took_s": sorted(week)[min(len(week) - 1, int(0.95 * len(week)))] if week else None,
             "groups_detail": group_rows, "read_at": now.isoformat(),
-            # For the Run now button: why it can't start now (None when it can), and what one run starts.
-            "run_now": {"blocked": refusals["run"] or _run_now_blocker(job, mine),
+            # For the Run now button: why it can't start now (None when it can), whether a run is going (the button
+            # is then Cancel run, which the run permission also gates), and what one run starts.
+            "run_now": {"blocked": refusals["run"] or _run_now_blocker(job, mine), "refused": refusals["run"],
+                        "going": _recorded_running(mine),
                         "groups": len(mine), "check": job.get("job_variant") == sch.CHECK_VARIANT},
             "delete_blocked": refusals["delete"], "change_blocked": refusals["change"], **_audit(job)}
 
@@ -841,13 +898,19 @@ def _refuse_groups_outside_jobs(groups: Iterable[str]) -> None:
 
 
 def _run_now_blocker(job: dict, members: List[dict]) -> Optional[str]:
-    """Why the job can't be started by hand right now (a run of it is going, or its wrapper jobs aren't synced)."""
-    groups = {m["task_collection"] for m in members}
-    if any(r["task_collection"] in groups for r in _running()):
-        return "a run of this job is already running"
+    """Why the job can't be started by hand right now (a run of it is going, or its wrapper jobs aren't synced). The
+    running runs are read after the app has closed those whose Databricks run ended (_running)."""
+    if _recorded_running(members):
+        return "a run of this job is already running: cancel it, or wait for it to end"
     if not members or any(not m.get("job_id") for m in members):
         return "the job's Databricks jobs are not synced yet"
     return None
+
+
+def _recorded_running(members: List[dict]) -> bool:
+    """Whether Lakebase has a run of one of these groups going, after closing those whose Databricks run ended."""
+    groups = {m["task_collection"] for m in members}
+    return any(r["task_collection"] in groups for r in _running())
 
 
 @app.post("/api/ingestion-jobs/{job_id}/run")
@@ -884,6 +947,18 @@ def _active_wrapper_runs(members: List[dict]) -> List[dict]:
     return sorted(out, key=lambda r: r.get("started") or "", reverse=True)
 
 
+def _job_databricks_runs(job: dict, members: List[dict]) -> dict:
+    """The Databricks runs of one ingestion job, as the Jobs API has them: its wrapper jobs' runs going now, its check
+    job's recent runs (check kind) and the ingestion job's recent runs, of every group (main filters to the job's)."""
+    groups = sorted({m["task_collection"] for m in members})
+    check_kind = (job.get("job_variant") or "default") == sch.CHECK_VARIANT
+    checks = [r for r in jobs.runs(jobs.CHECK_JOB_ID, limit=10) if ij.check_run_of(r, job["id"], groups)] \
+        if check_kind and jobs.CHECK_JOB_ID else []
+    target = (sch.copy_job_id(job) or _ingest_job_id("default")) if check_kind else _wrapper_target(job)
+    ingest = jobs.runs(target, limit=max(25, 3 * len(groups))) if target else []
+    return {"groups": groups, "wrappers": _active_wrapper_runs(members), "checks": checks, "ingest": ingest}
+
+
 @app.get("/api/ingestion-jobs/{job_id}/live")
 def ingestion_job_live(job_id: int):
     """The job run going now, as its Databricks runs are: the wrapper runs, the check run and what it found (check
@@ -891,20 +966,75 @@ def ingestion_job_live(job_id: int):
     from the Jobs API, which sees a run from its start, joined with Lakebase. Nothing is going: active is false."""
     job, members = _load_schedule(job_id)
     members = [m for m in members if m.get("removed_at") is None]
-    groups = sorted({m["task_collection"] for m in members})
     now = datetime.now(timezone.utc)
-    wrappers = _active_wrapper_runs(members)
-    check_kind = (job.get("job_variant") or "default") == sch.CHECK_VARIANT
-    checks = [r for r in jobs.runs(jobs.CHECK_JOB_ID, limit=10) if ij.check_run_of(r, job_id, groups)] \
-        if check_kind and jobs.CHECK_JOB_ID else []
-    target = (sch.copy_job_id(job) or _ingest_job_id("default")) if check_kind else _wrapper_target(job)
-    ingest = jobs.runs(target, limit=max(25, 3 * len(groups))) if target else []
+    found_runs = _job_databricks_runs(job, members)
+    groups, wrappers, checks, ingest = (found_runs[k] for k in ("groups", "wrappers", "checks", "ingest"))
     check = max(checks, key=lambda r: r.get("started") or "", default=None)
     work_ids = sorted({(r.get("parameters") or {}).get("work_id") for r in ingest} - {None, ""})
     found = db.query(q.check_work_found_sql(), (work_ids,)) if check and work_ids else []
     stamped = db.query(q.database_checks_since_sql(), (groups, check["started"]))[0]["databases"] \
         if check and check.get("started") and groups else None
     return ij.live_view(wrappers, checks, ingest, groups, found, stamped, _running(), now)
+
+
+@app.post("/api/ingestion-jobs/{job_id}/stop")
+def stop_ingestion_job(job_id: int, request: Request):
+    """Stop the job's run going now, as the Databricks job run page's Cancel run does: cancel its wrapper runs, its
+    check run and the group runs of its groups (those the Jobs API lists, and any its groups' records name), then
+    close the records of the runs it cancelled or found already over (the cancel itself takes Databricks a moment).
+    A record whose run it could neither cancel nor read stays running. Needs what Run now needs. Nothing going: 409."""
+    job, members = _load_schedule(job_id)
+    _refuse_job(job, request, "run")
+    members = [m for m in members if m.get("removed_at") is None]
+    user = _user(request)
+    found_runs = _job_databricks_runs(job, members)
+    groups = set(found_runs["groups"])
+    going = [dict(r, kind="wrapper") for r in found_runs["wrappers"]] + \
+        [dict(r, kind="check") for r in found_runs["checks"] if ij.is_active(r)] + \
+        [dict(r, kind="group") for r in found_runs["ingest"]
+         if ij.is_active(r) and (r.get("parameters") or {}).get("task_collection") in groups]
+    recorded = [r for r in db.query(q.open_runs_sql()) if r["task_collection"] in groups]
+    if not going and not recorded:
+        raise HTTPException(409, "no run of this job is going")
+    jobs.forget_run_states()
+    errors, over = [], set()
+    listed = {int(r["run_id"]) for r in going}
+    for r in recorded:
+        job_run = str(r.get("job_run_id") or "").strip()
+        if not job_run.isdigit() or int(job_run) in listed:
+            continue
+        try:        # a run the list missed (an older one on a busy ingestion job) is cancelled too
+            if jobs.run_ended(job_run):
+                over.add(int(job_run))
+            else:
+                going.append({"kind": "group", "run_id": int(job_run),
+                              "parameters": {"task_collection": r["task_collection"]}})
+                listed.add(int(job_run))
+        except Exception as e:
+            errors.append(f"run {job_run}: {str(e).split('. ')[0][:200]}")
+    cancelled = []
+    for r in {int(r["run_id"]): r for r in going}.values():
+        try:
+            jobs.cancel(r["run_id"])
+            cancelled.append({"kind": r["kind"], "run_id": r["run_id"], "job_id": r.get("job_id"), "url": r.get("url"),
+                              "task_collection": (r.get("parameters") or {}).get("task_collection")})
+        except Exception as e:      # one that ended meanwhile, or a refusal: the others are still stopped
+            errors.append(f"run {r['run_id']}: {str(e).split('. ')[0][:200]}")
+    stopped = over | {int(r["run_id"]) for r in cancelled}
+    closing = [r for r in recorded
+               if str(r.get("job_run_id") or "").strip().isdigit() and int(r["job_run_id"]) in stopped]
+    reason = f"stopped from the app by {user}"
+    detail = json.dumps({"closed_by_app": user, "reason": reason})
+    batch = uuid.uuid4().hex[:12]
+    with _write() as cur:
+        for r in closing:
+            cur.execute(q.close_ended_run_sql(), (detail, int(r["run_id"]), reason, reason))
+        for group in sorted({r.get("task_collection") for r in cancelled if r.get("task_collection")} |
+                            {r["task_collection"] for r in closing}) or [None]:
+            _log(cur, user, "job_stop", None, group, "run", None, f"{job['name']}: {len(cancelled)} Databricks runs cancelled",
+                 batch=batch)
+    jobs.forget_run_states()
+    return {"cancelled": cancelled, "closed": len(closing), "errors": errors}
 
 
 @app.get("/api/ingestion-jobs/{job_id}/compute")
