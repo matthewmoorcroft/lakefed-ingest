@@ -1,8 +1,7 @@
 import { type ReactNode } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { Link } from "react-router-dom";
-import { api, qs, type Row } from "../api";
-import { pausedNotRun } from "./IngestionJob";
+import { api, type Row } from "../api";
 import {
   ErrorBox, FillBox, JobStatus, Name, Notice, PageHead, Pager, ProgressBar, RunStatus, Section, Stamp, StateBar,
   fmtClock, fmtDuration, fmtInt, fmtShort, fmtSlot, fmtSpeed, fmtTime, jobRunName, jobRunPath, plural, progressFrom, progressText
@@ -190,24 +189,25 @@ function NextScheduled({ triggers, paused }: { triggers: Row[]; paused: number }
   );
 }
 
-/** The latest finished job runs across every job, newest first, each opening its job run; triggers a paused job
- * skipped are left out, as the Runs list leaves them out of Finished. */
-function RecentRuns() {
-  const runs = useQuery({ queryKey: ["overview-recent-runs"], queryFn: () => api.get<Row>(`/job-runs${qs({ limit: 8 })}`),
-                          refetchInterval: 60_000 });
-  const finished = (runs.data?.job_runs ?? []).filter((r: Row) => r.outcome?.label !== "Running" && !pausedNotRun(r)).slice(0, 6);
+/** Each job's last job run that ran, however long ago, newest first, each opening its job run, as the Jobs list
+ * shows each job's last run. A trigger that did not run is never shown here; the job's own page lists every trigger. */
+function RecentRuns({ jobs }: { jobs: Row[] }) {
+  const last = jobs.filter((j) => j.last_job_run).sort((a, b) => String(b.last_job_run.slot).localeCompare(String(a.last_job_run.slot)))
+    .slice(0, 6);
   return (
-    <Section title="Recent runs" actions={<Link to="/runs">All runs</Link>}>
-      <ErrorBox error={runs.error} />
-      {runs.data && !finished.length && <p className="muted">No job run has finished yet.</p>}
-      {finished.map((r: Row) => (
-        <div key={`${r.job_id}-${r.slot}`} className="attention-row">
-          <div className="title"><Link to={jobRunPath(r.job_id, r.slot)}><RunStatus status={null} outcome={r.outcome} /></Link>{" "}
-            <Link to={jobPath(r.job_id)}>{r.job_name}</Link></div>
-          <div className="kv"><span>{fmtSlot(r.slot)}</span>{r.took_s != null && <span>took {fmtDuration(r.took_s)}</span>}
-            {Number(r.failed_tables) > 0 && <span>{fmtInt(r.failed_tables)} {plural(r.failed_tables, "table")} failed</span>}</div>
-        </div>
-      ))}
+    <Section title="Recent runs" note="Each job's last job run." actions={<Link to="/runs">All runs</Link>}>
+      {!last.length && <p className="muted">No job run has finished yet.</p>}
+      {last.map((j) => {
+        const r = j.last_job_run;
+        return (
+          <div key={j.id} className="attention-row">
+            <div className="title"><Link to={jobRunPath(j.id, r.slot)}><RunStatus status={null} outcome={r.outcome} /></Link>{" "}
+              <Link to={jobPath(j.id)}>{j.name}</Link></div>
+            <div className="kv"><span>{fmtSlot(r.slot)}</span>{r.took_s != null && <span>took {fmtDuration(r.took_s)}</span>}
+              {Number(r.failed_tables) > 0 && <span>{fmtInt(r.failed_tables)} {plural(r.failed_tables, "table")} failed</span>}</div>
+          </div>
+        );
+      })}
     </Section>
   );
 }
@@ -229,7 +229,7 @@ export default function OverviewPage() {
     ["Databases", "/sources", <>{fmtInt(t.databases)}<small>{plural(t.databases, "database")}</small></>,
       <>on {fmtInt(t.servers)} {plural(t.servers, "server")}</>],
     ["Tables", "/tables", <>{fmtInt(enabled)}<small>enabled</small></>, <>{pct}% current</>],
-    ["Rows written, 24 hours", "/runs", <>{d.rows_24h.partial ? "at least " : ""}{fmtShort(d.rows_24h.rows)}<small>rows</small></>,
+    ["Rows written, 24 hours", "/runs", <>{d.rows_24h.partial ? "at least " : ""}{fmtInt(d.rows_24h.rows)}<small>rows</small></>,
       <>by every job's runs</>]] : [];
   return (
     <>
@@ -261,7 +261,7 @@ export default function OverviewPage() {
         </div>
         <div>
           <NextScheduled triggers={d.next_triggers} paused={d.paused_jobs} />
-          <RecentRuns />
+          <RecentRuns jobs={d.jobs} />
         </div>
       </div>}
     </>
