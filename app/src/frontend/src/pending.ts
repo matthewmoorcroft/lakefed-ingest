@@ -271,6 +271,8 @@ export function discoveryWait(wait: RunWait | null, asked: Date, reading: string
   const since = wait?.since ?? asked;
   const time = `${elapsed(since, now)} so far, since ${clock(since)}`;
   if (!wait) return `Starting the discovery job: ${time}`;
+  if (wait.state === "WAREHOUSE_STARTING") return `The SQL warehouse is starting: ${time}. It usually takes a few seconds`;
+  if (wait.state === "WAREHOUSE_QUEUED") return `Waiting for the SQL warehouse: ${time}. Other statements are ahead of this one`;
   if (COMPUTE_WAIT.has(wait.state)) {
     return `Waiting for compute: ${time}. The discovery job's compute is starting (its cluster stops after an hour unused), `
            + "which can take a few minutes";
@@ -284,4 +286,11 @@ export function connectionNextBlock(passed: boolean, testing: string | null): st
   if (passed) return undefined;
   if (testing) return `Next needs a passed connection test. Testing now: ${testing}`;
   return "Next needs a passed connection test: choose a connection, then Test connection";
+}
+
+/** A warehouse statement's state as the wait reads it: a statement not started yet waits for the warehouse to start
+ *  (it is starting or stopped) or for room on it (it is running); once running, it reads. */
+export function warehouseRunState(answer: { state?: string; warehouse?: string }): string {
+  if (answer.state === "PENDING") return answer.warehouse === "RUNNING" ? "WAREHOUSE_QUEUED" : "WAREHOUSE_STARTING";
+  return String(answer.state ?? "");
 }

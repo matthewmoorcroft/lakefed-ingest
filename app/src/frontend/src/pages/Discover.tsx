@@ -4,8 +4,8 @@ import { api, qs, type Row } from "../api";
 import { ErrorBox, Modal, Notice, OutLink, Pager, Tag, fmtInt, plural, Twisty } from "../components";
 import { useSettings } from "../App";
 import { DatabaseTables } from "./SourcePick";
-import { serverRowPick, underFilter, type Pick } from "./pickState";
-import { connectionNextBlock, discoveryWait, waitingSince, type RunWait } from "../pending";
+import { likeContaining, serverRowPick, underFilter, type Pick } from "./pickState";
+import { connectionNextBlock, discoveryWait, warehouseRunState, waitingSince, type RunWait } from "../pending";
 
 // Add tables, Discover on a source: as Lakeflow Connect's Connection and Source steps. Step 1 is the Unity Catalog
 // connection, tested before anything is discovered; step 2 picks the whole server, whole databases or single tables in
@@ -37,6 +37,19 @@ function useNow(on: boolean): Date {
 async function discover(connection: string, request: Row, onWait?: (wait: RunWait) => void): Promise<string> {
   const started = await api.post<Row>("/discoveries/source", { src_connection: connection, ...request });
   let waiting: RunWait | null = null;
+  if (started.via === "warehouse") {
+    // Through the SQL warehouse: the answer is the statement's state; ask again each second until it ends.
+    let answer = started;
+    for (;;) {
+      if (answer.state === "SUCCEEDED") return started.discovery_id;
+      if (answer.state === "FAILED") throw new Error(String(answer.error ?? "the listing failed").split("\n")[0]);
+      const next = waitingSince(waiting, warehouseRunState(answer), new Date());
+      if (next !== waiting) { waiting = next; onWait?.(next); }
+      await wait(1000);
+      answer = await api.get<Row>(`/discoveries/${encodeURIComponent(started.discovery_id)}/warehouse/`
+                                  + `${encodeURIComponent(answer.statement_id)}${qs({ connection })}`);
+    }
+  }
   for (;;) {
     const run = await api.get<Row>(`/discoveries/runs/${started.run_id}`);
     const next = waitingSince(waiting, String(run.state ?? ""), new Date());
@@ -107,7 +120,6 @@ function Step1({ chosen, setChosen, tested, setTested, waiting, setWaiting }: { 
   const [how, setHow] = useState<"existing" | "create">("existing");
   const [search, setSearch] = useState("");
   const [testing, setTesting] = useState(false);
-  const [pattern, setPattern] = useState("");
   // For an Azure SQL server: a service credential with Reader on it and its resource id, so the discovery job lists
   // the databases through Azure instead of master. Both or neither.
   const [azureCredential, setAzureCredential] = useState("");
@@ -131,11 +143,9 @@ function Step1({ chosen, setChosen, tested, setTested, waiting, setWaiting }: { 
     const reading = "Reading the server's databases";
     setWaiting({ wait: null, asked, reading });
     try {
-      const id = await discover(chosen, { kind: "list", ...(pattern.trim() ? { pattern: pattern.trim() } : {}), ...azure },
-                                (wait) => setWaiting({ wait, asked, reading }));
+      const id = await discover(chosen, { kind: "list", ...azure }, (wait) => setWaiting({ wait, asked, reading }));
       const rows = await api.get<Row[]>(`/discoveries/${id}/databases`);
-      setTested({ discovery_id: id, databases: rows.filter((r) => r.status === "listed").map((r) => r.src_database),
-                  pattern: pattern.trim(), azure });
+      setTested({ discovery_id: id, databases: rows.filter((r) => r.status === "listed").map((r) => r.src_database), azure });
     } catch (e) { setError(e); } finally { setTesting(false); setWaiting(null); }
   };
   return (
@@ -165,10 +175,8 @@ function Step1({ chosen, setChosen, tested, setTested, waiting, setWaiting }: { 
             </tbody>
           </table></div>
           <div className="toolbar">
-            <label className="inline">Databases matching<input className="search" placeholder="all, or e.g. lfc_eng_%" value={pattern}
-              onChange={(e) => { setPattern(e.target.value); setTested(null); }} /></label>
             <button disabled={!chosen || testing} onClick={test}>{testing ? "Testing…" : "Test connection"}</button>
-            {!testing && !tested && <span className="muted">% matches any characters and _ any one, as in SQL Server; blank lists every database.</span>}
+            {!testing && !tested && <span className="muted">Lists every database on the server; you filter them on the next step.</span>}
             {tested && <span><Tag tone="ok">{tested.typed ? "Typed" : "Connected"}</Tag> <span className="muted">{tested.typed ? "uses" : "reads"}{" "}
               {fmtInt(tested.databases.length)} {plural(tested.databases.length, "database")} through {chosen}</span></span>}
           </div>
@@ -336,7 +344,7 @@ export function DiscoverDialog({ onClose }: { onClose: (pick: DiscoveredPick | n
   const [tested, setTested] = useState<Row | null>(null);
   const [picks, setPicks] = useState<Picks>({});
   const [wholeServer, setWholeServer] = useState<WholeServer>({ on: false, filter: "" });
-  // The whole server's discovery, read once as tested (same pattern and Azure); its databases are never listed here.
+  // The whole server's discovery, read once (under its filter, through Azure if tested so); its databases aren't listed here.
   const [serverRead, setServerRead] = useState<string | null>(null);
   const [read, setRead] = useState<Record<string, string>>({});
   const [failed, setFailed] = useState<[string, string][]>([]);
@@ -353,9 +361,9 @@ export function DiscoverDialog({ onClose }: { onClose: (pick: DiscoveredPick | n
   const chosenWords = [wholeServer.on ? (wholeServer.filter ? `every database matching "${wholeServer.filter}"` : "the whole server") : "",
     whole.length ? `${fmtInt(whole.length)} whole ${plural(whole.length, "database")}` : "",
     handPicked.length ? `tables from ${fmtInt(handPicked.length)} more` : ""].filter(Boolean).join(", ");
-  // Databases chosen whole whose tables aren't read yet are discovered on Add. The whole server is read once, as tested;
-  // its filter is applied to the job's selection, not to the read. A whole server's read lists every database under the
-  // tested pattern, so the databases picked one by one are in it already.
+  // Databases chosen whole whose tables aren't read yet are discovered on Add. The whole server is read once, only the
+  // databases its filter keeps (likeContaining), and the filter also goes with the job's selection. The databases picked
+  // one by one outside that filter are read by name.
   const finish = async () => {
     setStep(3); setError(null);
     const asked = new Date();
@@ -365,12 +373,13 @@ export function DiscoverDialog({ onClose }: { onClose: (pick: DiscoveredPick | n
     try {
       let readServer = serverRead;
       if (wholeServer.on && !readServer) {
-        const got = await readTables(connection, { whole_server: true, ...(tested?.pattern ? { pattern: tested.pattern } : {}), ...(tested?.azure ?? {}) },
+        const pattern = likeContaining(wholeServer.filter);
+        const got = await readTables(connection, { whole_server: true, ...(pattern ? { pattern } : {}), ...(tested?.azure ?? {}) },
                                      onWait);
         if (got.failed.length) { setFailed(() => got.failed); setStep(2); return; }
         readServer = got.id; setServerRead(got.id);
       }
-      const unread = readServer ? [] : whole.filter((d) => !read[d]);
+      const unread = whole.filter((d) => !read[d]);
       const ids = new Set([...(readServer ? [readServer] : []), ...Object.values(read)]);
       if (unread.length) {
         // Databases typed by hand are read by name.

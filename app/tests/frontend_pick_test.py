@@ -34,3 +34,10 @@ def test_the_server_row_is_all_part_or_none_by_what_the_whole_server_covers():
     out = subprocess.run(["node", "--experimental-strip-types", "--input-type=module", "-e", script, json.dumps(cases)],
                          capture_output=True, text=True, check=True)
     assert json.loads(out.stdout) == [tick for *_, tick in CASES]
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node is needed to run the picker's functions")
+def test_the_pickers_helpers_pass_their_node_tests():
+    tests = pathlib.Path(__file__).resolve().parent / "js" / "pick_state.test.mjs"
+    result = subprocess.run(["node", "--test", str(tests)], capture_output=True, text=True, timeout=120)
+    assert result.returncode == 0, result.stdout[-4000:] + result.stderr[-2000:]

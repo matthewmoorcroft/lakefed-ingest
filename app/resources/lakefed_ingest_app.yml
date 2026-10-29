@@ -8,6 +8,8 @@
 #     (app/README.md, Security model);
 #   - cluster copies job: CAN_MANAGE_RUN, to start it when an app job's own cluster changes. It runs as the
 #     deployer and makes the copies of the ingestion job (each gives the app CAN_MANAGE on it);
+#   - the discovery warehouse below: CAN_USE through an app resource, to run discovery's catalog queries through the
+#     Unity Catalog connections (remote_query; app/src/warehouse.py says why the app can't open them itself);
 #   - Lakebase: granted by the lakefed_ingest_app_grants job below (run once after the first deploy,
 #     as the instance manager / tables' owner): CAN_USE on the instance, a Postgres role, and
 #     SELECT / INSERT / UPDATE on the lakefed_ingest tables. The app has no `database` resource:
@@ -38,6 +40,8 @@ resources:
             value_from: cluster-copies-job
           - name: DELETE_JOB_ID
             value_from: delete-job
+          - name: WAREHOUSE_ID
+            value_from: discovery-warehouse
       resources:
         - name: ingest-job
           description: The lakefed_ingest ingestion job.
@@ -69,6 +73,27 @@ resources:
           job:
             id: ${var.delete_job_id}
             permission: CAN_MANAGE_RUN
+        - name: discovery-warehouse
+          description: The serverless SQL warehouse discovery runs on.
+          sql_warehouse:
+            id: ${resources.sql_warehouses.lakefed_ingest_discovery.id}
+            permission: CAN_USE
+
+  # Discovery's warehouse: serverless, the smallest size, stopping after a few idle minutes. It runs only catalog
+  # queries (database names, tables, columns, keys), never table data, and only while someone chooses tables.
+  sql_warehouses:
+    lakefed_ingest_discovery:
+      name: "lakefed_ingest discovery"
+      warehouse_type: PRO
+      enable_serverless_compute: true
+      cluster_size: ${var.discovery_warehouse_size}
+      min_num_clusters: 1
+      max_num_clusters: ${var.discovery_warehouse_max_clusters}
+      auto_stop_mins: ${var.discovery_warehouse_auto_stop_mins}
+      tags:
+        custom_tags:
+          - key: project
+            value: lakefed_ingest
 
   jobs:
     lakefed_ingest_app_grants:

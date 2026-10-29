@@ -1400,6 +1400,20 @@ def discovery_listing_sql() -> str:
             f"order by src_database limit %s offset %s")
 
 
+# A discovery row the app writes itself, for a listing or a read it ran through the SQL warehouse (the discovery job
+# writes its own): one per (discovery, database).
+DISCOVERY_ROW_COLUMNS = ("discovery_id", "src_type", "src_connection", "src_database", "status", "error", "tables",
+                         "requested_by", "listing")
+
+
+def insert_discovery_rows_sql(count: int) -> str:
+    """Insert ``count`` discovery rows (DISCOVERY_ROW_COLUMNS, listing as JSON text), finished now. A row already there
+    is kept, so asking again after a statement ended writes nothing twice."""
+    one_row = "(" + ", ".join(["%s"] * (len(DISCOVERY_ROW_COLUMNS) - 1)) + ", %s::jsonb, now())"
+    return (f"insert into {SCHEMA}.discovery ({', '.join(DISCOVERY_ROW_COLUMNS)}, finished_at) "
+            f"values {', '.join([one_row] * count)} on conflict (discovery_id, src_database) do nothing")
+
+
 def discovered_tables_sql() -> str:
     """Discovered tables of one discovery, with the source connection and any existing control row
     for the same source table (``registered_id``). Param: discovery_id."""

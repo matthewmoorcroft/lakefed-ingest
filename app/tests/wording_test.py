@@ -82,9 +82,9 @@ def test_discover_says_when_the_login_cant_open_master_and_takes_typed_databases
     assert "function TypedDatabases" in discover and "Databases typed by hand are read by name" in discover
 
 
-def test_discover_lists_by_a_name_filter_and_says_which_databases_it_couldnt_read():
+def test_discover_lists_every_database_then_filters_and_says_which_databases_it_couldnt_read():
     discover = (FRONTEND / "pages" / "Discover.tsx").read_text()
-    assert "Databases matching" in discover and "pattern" in discover
+    assert "Databases matching" not in discover and "Lists every database on the server" in discover
     assert "function Unread" in discover and "couldn't be read" in discover
     assert "databasesOfCsv" not in discover and "CSV file" not in discover
     assert "Discover is the first choice" in discover and "the fallback" in discover

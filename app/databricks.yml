@@ -49,6 +49,17 @@ variables:
       (looked up by name, like ingest_job_id).
     lookup:
       job: lakefed_ingest_delete_job
+  discovery_warehouse_size:
+    description: Size of the serverless SQL warehouse discovery runs on (the connection test, the database list and the
+      tables of the chosen databases). Catalog queries only, so the smallest size; more clusters, not a bigger size, if
+      many statements queue.
+    default: 2X-Small
+  discovery_warehouse_max_clusters:
+    description: The most clusters the discovery warehouse scales out to when its statements queue.
+    default: 2
+  discovery_warehouse_auto_stop_mins:
+    description: Idle minutes before the discovery warehouse stops. It is used only while someone chooses tables.
+    default: 5
 
 targets:
   dev:

@@ -44,6 +44,8 @@ import rediscovery
 import rollup
 import run_poller
 import schedules as sch
+import source_catalog
+import warehouse
 
 
 @asynccontextmanager
@@ -2762,6 +2764,47 @@ def _connection_unseen(name: str, listing_error: Optional[str]) -> str:
             f"{name}, Permissions, Grant, USE CONNECTION to the app; then Refresh the list.")
 
 
+# The database a server's databases are listed from.
+SERVER_DATABASE = "master"
+
+
+def _require_connection(name: str) -> None:
+    """Refuse a connection the app can't see, naming the grant it lacks."""
+    listed = connections()
+    if name not in {c["name"] for c in listed["connections"]}:
+        raise HTTPException(404, _connection_unseen(name, listed.get("error")))
+
+
+def _listing_answer(discovery_id: str, connection: str, user: Optional[str], answer: dict) -> dict:
+    """Where a listing through the warehouse stands, for the page; once it has ended, its databases saved (status
+    listed) or, when it failed, why, on a row for master as the discovery job records it. A statement still going
+    answers with its id and the warehouse's state, so the page can say it is starting and ask again."""
+    base = {"discovery_id": discovery_id, "via": "warehouse"}
+    state = answer["state"]
+    if state not in warehouse.ENDED:
+        return {**base, "statement_id": answer["statement_id"], "state": state, "warehouse": warehouse.warehouse_state()}
+    listing = json.dumps({"via": "warehouse"})
+    if state != "SUCCEEDED":
+        error = answer.get("error") or f"the listing ended {state}"
+        db.execute(q.insert_discovery_rows_sql(1),
+                   (discovery_id, "sqlserver", connection, SERVER_DATABASE, "failed", error, None, user, listing))
+        return {**base, "state": "FAILED", "error": error}
+    names = sorted({str(r["name"]) for r in answer["rows"] or []}, key=lambda n: (n.lower(), n))
+    for at in range(0, len(names), q.CONTROL_BATCH):
+        chunk = names[at:at + q.CONTROL_BATCH]
+        db.execute(q.insert_discovery_rows_sql(len(chunk)),
+                   tuple(v for name in chunk
+                         for v in (discovery_id, "sqlserver", connection, name, "listed", None, None, user, listing)))
+    return {**base, "state": "SUCCEEDED", "databases": len(names)}
+
+
+@app.get("/api/discoveries/{discovery_id}/warehouse/{statement_id}")
+def warehouse_listing(discovery_id: str, statement_id: str, connection: str, request: Request):
+    """A listing through the warehouse, asked again until it ends (_listing_answer)."""
+    _require_connection(connection)
+    return _listing_answer(discovery_id, connection, _user(request), warehouse.read(statement_id))
+
+
 @app.post("/api/discoveries/source")
 def start_source_discovery(body: SourceDiscoverRequest, request: Request):
     names = list(dict.fromkeys(d.strip() for d in body.databases if d.strip()))
@@ -2769,9 +2812,13 @@ def start_source_discovery(body: SourceDiscoverRequest, request: Request):
         raise HTTPException(422, "choose the whole server or at least one database")
     if bool(body.azure_credential) != bool(body.azure_resource_id):
         raise HTTPException(422, "listing through Azure takes both a service credential and the server's resource id")
-    listed = connections()
-    if body.src_connection not in {c["name"] for c in listed["connections"]}:
-        raise HTTPException(404, _connection_unseen(body.src_connection, listed.get("error")))
+    _require_connection(body.src_connection)
+    if body.kind == "list" and warehouse.configured() and not body.azure_credential:
+        # Test connection is the listing: one statement on the warehouse, every database (the filter comes after).
+        did = uuid.uuid4().hex[:12]
+        statement, parameters = warehouse.remote_query_statement(body.src_connection, SERVER_DATABASE,
+                                                                 source_catalog.databases_sql(""))
+        return _listing_answer(did, body.src_connection, _user(request), warehouse.start(statement, parameters))
     job_id = _require(jobs.DISCOVER_JOB_ID, "discovery")
     _refuse_run_of(job_id, request)
     did = uuid.uuid4().hex[:12]

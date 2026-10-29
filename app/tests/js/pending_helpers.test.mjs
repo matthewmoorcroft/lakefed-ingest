@@ -2,7 +2,7 @@
 // strips the types in pending.ts as it loads it). frontend_pending_test.py runs this file from pytest.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { changeInProgress, connectionNextBlock, deleteNotice, discoveryWait, waitingSince, isUnconfirmed, requestWriteNotice, runButton, runTimeoutNotice, rediscoveryBusy, rediscoveryButton, rediscoveryNotice, saveNotice, setupRunBlocks, setupRunNotice, syncFailureLines }
+import { changeInProgress, connectionNextBlock, deleteNotice, discoveryWait, warehouseRunState, waitingSince, isUnconfirmed, requestWriteNotice, runButton, runTimeoutNotice, rediscoveryBusy, rediscoveryButton, rediscoveryNotice, saveNotice, setupRunBlocks, setupRunNotice, syncFailureLines }
   from "../../src/frontend/src/pending.ts";
 
 const IDLE = { phase: "idle", timed_out: false, run_url: null, blocked: null, refused: null };
@@ -400,4 +400,18 @@ test("Next on the connection step says it needs a passed test, and what the test
                "Next needs a passed connection test. Testing now: Waiting for compute: 2 min 44 s so far, since 20:42. "
                + "The discovery job's compute is starting (its cluster stops after an hour unused), which can take a few minutes");
   assert.equal(connectionNextBlock(true, null), undefined);
+});
+
+test("a statement on the SQL warehouse says whether the warehouse is starting or busy, then what it reads", () => {
+  assert.equal(warehouseRunState({ state: "PENDING", warehouse: "STARTING" }), "WAREHOUSE_STARTING");
+  assert.equal(warehouseRunState({ state: "PENDING", warehouse: "STOPPED" }), "WAREHOUSE_STARTING");
+  assert.equal(warehouseRunState({ state: "PENDING", warehouse: "RUNNING" }), "WAREHOUSE_QUEUED");
+  assert.equal(warehouseRunState({ state: "RUNNING", warehouse: "RUNNING" }), "RUNNING");
+  assert.equal(discoveryWait({ state: "WAREHOUSE_STARTING", since: ASKED }, ASKED, "Reading the server's databases", LATER),
+               "The SQL warehouse is starting: 2 min 44 s so far, since 20:42. It usually takes a few seconds");
+  assert.equal(discoveryWait({ state: "WAREHOUSE_QUEUED", since: ASKED }, ASKED, "Reading the server's databases", LATER),
+               "Waiting for the SQL warehouse: 2 min 44 s so far, since 20:42. Other statements are ahead of this one");
+  assert.equal(connectionNextBlock(false, discoveryWait({ state: "WAREHOUSE_STARTING", since: ASKED }, ASKED, "Reading", LATER)),
+               "Next needs a passed connection test. Testing now: The SQL warehouse is starting: 2 min 44 s so far, since 20:42. "
+               + "It usually takes a few seconds");
 });
