@@ -82,7 +82,8 @@ def test_a_run_holding_a_groups_lock_refuses_the_delete_and_the_deletion_is_list
     sid = _job(pg, "Hourly", ["g1"], deleted=True)
     _row(pg, "g1", "a")
     pg.execute(q.set_schedule_flag_sql(), (["delete_drop_targets"], True, sid))
-    run = psycopg.connect(pg.info.dsn, autocommit=True)                 # the ingestion run's session lock
+    # The ingestion run's session lock, on a connection of its own, built from the address (a dsn has no password).
+    run = psycopg.connect(psycopg.conninfo.make_conninfo(URI, dbname=pg.info.dbname), autocommit=True)
     try:
         run.execute(state_store.try_lock_collection_sql(), (state_store.collection_lock_key("g1"),))
         with pytest.raises(delete_job.RunGoing):

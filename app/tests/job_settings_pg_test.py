@@ -15,6 +15,7 @@ pytest.importorskip("httpx")
 from fastapi.testclient import TestClient  # noqa: E402
 
 import main  # noqa: E402
+import run_poller  # noqa: E402
 
 URI = os.environ.get("LAKEFED_APP_TEST_PG")
 pytestmark = pytest.mark.skipif(not URI, reason="LAKEFED_APP_TEST_PG not set")
@@ -56,6 +57,8 @@ def client(monkeypatch):
         monkeypatch.setattr(main.db, "connect", lambda: psycopg.connect(target, autocommit=True))
         monkeypatch.setattr(main.jobs, "ingest_variants", lambda: {"default": "555"})
         monkeypatch.setattr(main.jobs, "user_job_permission", lambda job_id, user: "CAN_MANAGE")
+        # This database has the run poller's table, so a job page reads its runs from it, not from the Jobs API.
+        monkeypatch.setattr(run_poller, "table_ready", lambda: True)
         c = TestClient(main.app, headers={"X-Forwarded-Email": "op@example.com"})
         c.target, c.sid = target, sid
         yield c

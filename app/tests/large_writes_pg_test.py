@@ -121,20 +121,24 @@ def test_a_task_whose_heartbeat_stopped_reads_failed_or_written(client):
 # ---- uploads and selections ----------------------------------------------------------------------------------------
 
 def test_an_upload_is_kept_once_and_its_top_level_and_pages_come_from_lakebase(client):
-    text = _csv(30, 40) + _csv(2, 5, server="sql_b", head=False).replace("eng_", "eng_00b") + "sql_a,,gen,orphan,id,id\n"
+    text = _csv(30, 40) + "sql_a,,gen,orphan,id,id\n"
     start = time.perf_counter()
-    up = client.post("/api/uploads", json={"csv": text, "file_name": "tables.csv"}).json()
+    up = client.post("/api/uploads", json={"csv": text, "connection": "sql_a", "file_name": "tables.csv"}).json()
     took = time.perf_counter() - start
-    assert (up["lines"], up["tables"], up["invalid"]) == (1211, 1210, 1)
-    assert up["invalid_lines"][0]["line"] == 1212 and "src_database is required" in up["invalid_lines"][0]["errors"]
+    assert (up["lines"], up["tables"], up["invalid"]) == (1201, 1200, 1)
+    assert up["invalid_lines"][0]["line"] == 1202 and "src_database is required" in up["invalid_lines"][0]["errors"]
     top = client.get(f"/api/sources/upload/{up['upload_id']}", params={"limit": 10}).json()
-    assert top["totals"] == {"servers": 2, "databases": 32, "tables": 1210}
-    assert [(s["server"], s["databases"], s["tables"], s["unset"]) for s in top["servers"]] == [
-        ("sql_a", 30, 1200, 1200), ("sql_b", 2, 10, 10)]
+    assert top["totals"] == {"servers": 1, "databases": 30, "tables": 1200}
+    assert [(s["server"], s["databases"], s["tables"], s["unset"]) for s in top["servers"]] == [("sql_a", 30, 1200, 1200)]
     assert len(top["databases"]) == 10 and top["databases"][0]["src_database"] == "eng_000"
-    assert top["invalid_lines"][0]["line"] == 1212
+    assert top["invalid_lines"][0]["line"] == 1202
     filtered = client.get(f"/api/sources/upload/{up['upload_id']}", params={"filter": "ENG_01"}).json()
-    assert filtered["matched"] == {"databases": 10, "tables": 400} and filtered["totals"]["tables"] == 1210
+    assert filtered["matched"] == {"databases": 10, "tables": 400} and filtered["totals"]["tables"] == 1200
+    # A file reads through the one connection chosen with it: a line naming another is refused, and nothing is kept.
+    other = client.post("/api/uploads", json={"csv": _csv(1, 2) + _csv(1, 1, server="sql_b", head=False),
+                                              "connection": "sql_a"})
+    assert other.status_code == 422 and "names sql_b, not sql_a" in other.text
+    assert client.sql("select count(*) from lakefed_ingest.table_upload") == [(1,)]
     page = client.get(f"/api/sources/upload/{up['upload_id']}/tables",
                       params={"server": "sql_a", "database": "eng_003", "search": "t001", "limit": 4}).json()
     assert page["total"] == 10 and [t["src_table"] for t in page["tables"]] == ["t0010", "t0011", "t0012", "t0013"]
@@ -143,31 +147,29 @@ def test_an_upload_is_kept_once_and_its_top_level_and_pages_come_from_lakebase(c
 
 
 def test_create_and_add_tables_by_reference_to_an_upload_keep_what_was_chosen(client):
-    text = _csv(20, 30) + _csv(2, 3, server="sql_b", head=False).replace("eng_", "eng_00b")
-    up = client.post("/api/uploads", json={"csv": text}).json()["upload_id"]
+    up = client.post("/api/uploads", json={"csv": _csv(20, 30), "connection": "sql_a"}).json()["upload_id"]
     source = {"upload_id": up, "whole_server": True, "filter": "eng_00"}
     preview = client.post("/api/ingestion-jobs", json={"name": "Ref", "settings": SETTINGS, "source": source}).json()
-    assert preview["created"] is False and preview["summary"]["tables"] == 10 * 30 + 2 * 3
+    assert preview["created"] is False and preview["summary"]["tables"] == 10 * 30
     assert client.sql("select count(*) from lakefed_ingest.control") == [(0,)]
     r = _create(client, "ref-1", name="Ref", source=source)
     assert r.status_code == 200 and r.json()["created"] is True
     job_id = r.json()["id"]
-    assert client.sql("select count(*) from lakefed_ingest.control") == [(306,)]
+    assert client.sql("select count(*) from lakefed_ingest.control") == [(300,)]
     # Some tables of one more database, by name, then a whole database, as Add tables sends them.
     add = client.post(f"/api/ingestion-jobs/{job_id}/tables", json={"dry_run": False, "source": {
         "upload_id": up, "tables": [{"server": "sql_a", "database": "eng_015", "tables": ["gen.t0001", "GEN.T0002"]}],
         "databases": [{"server": "sql_a", "database": "eng_016"}]}})
     assert add.status_code == 200 and add.json()["applied"] is True and add.json()["summary"]["tables"] == 32
-    assert client.sql("select count(*) from lakefed_ingest.control") == [(338,)]
+    assert client.sql("select count(*) from lakefed_ingest.control") == [(332,)]
     kept = client.get(f"/api/ingestion-jobs/{job_id}/selection").json()
     assert [(k["scope"], k["server"], k["src_database"], k["tables"], k["filter"], k["source_kind"]) for k in kept] == [
-        ("server", "sql_a", None, None, "eng_00", "upload"), ("server", "sql_b", None, None, "eng_00", "upload"),
-        ("database", "sql_a", "eng_016", None, None, "upload"),
+        ("server", "sql_a", None, None, "eng_00", "upload"), ("database", "sql_a", "eng_016", None, None, "upload"),
         ("tables", "sql_a", "eng_015", ["gen.t0001", "GEN.T0002"], None, "upload")]
 
 
 def test_a_large_selection_runs_as_a_task(client):
-    up = client.post("/api/uploads", json={"csv": _csv(10, 80)}).json()["upload_id"]
+    up = client.post("/api/uploads", json={"csv": _csv(10, 80), "connection": "sql_a"}).json()["upload_id"]
     r = _create(client, "ref-big", source={"upload_id": up, "whole_server": True})
     assert r.status_code == 202
     task = client.get(f"/api/tasks/{r.json()['task']['id']}").json()
