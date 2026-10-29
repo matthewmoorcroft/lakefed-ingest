@@ -62,9 +62,10 @@ def _fixture(conn):
                  "now() - interval '3 days', 'completed', 20, 20, 0, 0, %s)",
                  (json.dumps({"batch_rows": 500, "batch_rows_unknown": 0}),))
     conn.execute("insert into lakefed_ingest.ingest_event (run_id, task_collection, control_id, src_database, "
-                 "src_schema, src_table, action, status, started_at, finished_at, rows_merged) "
+                 "src_schema, src_table, action, status, started_at, finished_at, rows_merged, pool) "
                  "select 1, 'c1', id, src_database, src_schema, src_table, 'seed', 'ok', now() - interval '3 days', "
-                 "now() - interval '3 days', case when src_database = 'db1' then 100 end "
+                 "now() - interval '3 days', case when src_database = 'db1' then 100 end, "
+                 "case when src_database = 'db2' then 'batch9' end "
                  "from lakefed_ingest.control where src_table <> 't10' or src_database = 'db1'")
     # A run going now: started 5 minutes ago; db1 t1..t6 unchanged (stamped at planning), t7 loaded with 7
     # rows, t8 in flight; db2 t9 failed.
@@ -99,7 +100,8 @@ def test_the_rows_written_in_a_window_count_its_table_loads_and_say_which_had_no
     day, = rows(pg, q.rows_written_since_sql(), (["c1"], 24))
     assert (day["rows_written"], day["uncounted"]) == (7, 0)       # the running run's t7; the failed t9 has no rows
     four_days, = rows(pg, q.rows_written_since_sql(), (["c1"], 96))
-    assert (four_days["rows_written"], four_days["uncounted"]) == (1007, 9)    # db2's first load was batched
+    # db2's first load was batched: its 9 loads are counted by the run's batch total, not uncounted.
+    assert (four_days["rows_written"], four_days["uncounted"]) == (1007, 0)
     assert [r["run_id"] for r in rows(pg, q.run_batch_rows_sql(), (96,))] == [1]
     assert rows(pg, q.rows_written_since_sql(), (["other"], 96))[0]["rows_written"] == 0
 
@@ -166,8 +168,8 @@ def test_a_runs_databases_and_rows(pg):
     by_db = {d["src_database"]: d for d in rows(pg, q.run_databases_sql(), (2,))}
     assert (by_db["db1"]["loaded"], by_db["db1"]["in_flight"], by_db["db1"]["rows_written"]) == (1, 1, 7)
     assert by_db["db2"]["failed"] == 1
-    per_run = {r["run_id"]: r for r in rows(pg, q.run_rows_sql(), ([1, 2],))}
-    assert (per_run[1]["rows_written"], per_run[1]["uncounted"]) == (1000, 9)
+    per_run = {r["run_id"]: r for r in rows(pg, q.run_work_sql(), ([1, 2],))}
+    assert (per_run[1]["rows_written"], per_run[1]["uncounted"]) == (1000, 0)
     assert {r["run_id"] for r in rows(pg, q.run_batch_rows_sql(), (24 * 7,))} == {1}
 
 

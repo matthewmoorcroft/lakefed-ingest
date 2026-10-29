@@ -178,23 +178,20 @@ left join lateral (
 order by r.started_at desc"""
 
 
-def group_runs_sql() -> str:
-    """The runs of some ingestion groups that started in a window, oldest first (the group runs the app
-    places into job runs). Params: groups, window start, window end."""
-    return (f"select run_id, task_collection, status, started_at, finished_at, total, ok, failed, skipped, "
-            f"reseeded, job_run_id, cluster_id, parallelism, detail "
-            f"from {SCHEMA}.ingest_run where task_collection = any(%s) and started_at >= %s and started_at < %s "
-            f"order by started_at")
+# Loads that recorded no row count and that no batched append's total covers: a batch's members record none, since
+# the batch's commit reports one total for them all (on the run's detail, batch_rows), and their pool is batch<size>.
+UNCOUNTED_OUTSIDE_BATCHES = ("count(*) filter (where e.status = 'ok' and e.rows_merged is null "
+                             "and coalesce(e.pool, '') not like 'batch%%')")
 
 
 def run_work_sql() -> str:
     """Per group run: its work span (first table start to last table finish), tables loaded and failed,
-    and rows written (uncounted: loads with no count). Param: array of run ids."""
+    and rows written (uncounted: loads with no count outside a batched append). Param: array of run ids."""
     return (f"select e.run_id, min(e.started_at) as work_started_at, max(e.finished_at) as work_finished_at, "
             f"count(*) filter (where e.status = 'ok') as loaded, "
             f"count(*) filter (where e.status = 'failed') as failed_tables, "
             f"sum(e.rows_merged) as rows_written, "
-            f"count(*) filter (where e.status = 'ok' and e.rows_merged is null) as uncounted "
+            f"{UNCOUNTED_OUTSIDE_BATCHES} as uncounted "
             f"from {SCHEMA}.ingest_event e where e.run_id = any(%s) group by e.run_id")
 
 
@@ -352,19 +349,6 @@ left join {SCHEMA}.checkpoint cp on cp.control_id = t.id
 {DATABASE_CHECK_JOIN}
 group by 1
 order by 1"""
-
-
-def server_health(row: dict) -> str:
-    """A server's one-word health from its enabled tables by state: "healthy" only when every table is
-    current; otherwise the worst state any table is in (failing, then late, then first load), and
-    "unknown" when the counts don't add up."""
-    count = lambda k: int(row.get(k) or 0)
-    if not count("tables"):
-        return "no tables"
-    for state, label in (("state_failing", "failing"), ("state_late", "late"), ("state_first_load", "first load")):
-        if count(state):
-            return label
-    return "healthy" if count("state_current") == count("tables") else "unknown"
 
 
 def collection_databases_sql() -> str:
@@ -599,21 +583,11 @@ def database_tables_count_sql() -> str:
             f"where (t.src_schema || '.' || t.src_table) ilike %s")
 
 
-def run_rows_sql() -> str:
-    """Per run: rows its table loads wrote, how many loads recorded no count, and its detail (which
-    holds a batched append's total). Param: array of run ids."""
-    return (f"select r.run_id, r.detail, "
-            f"(select sum(e.rows_merged) from {SCHEMA}.ingest_event e where e.run_id = r.run_id) as rows_written, "
-            f"(select count(*) from {SCHEMA}.ingest_event e where e.run_id = r.run_id and e.status = 'ok' "
-            f"and e.rows_merged is null) as uncounted "
-            f"from {SCHEMA}.ingest_run r where r.run_id = any(%s)")
-
-
 def rows_written_since_sql() -> str:
-    """The rows these groups' table loads wrote in the last N hours, and how many loads recorded no count (batched
-    appends record theirs on the run: run_batch_rows_sql). Params: groups, hours."""
+    """The rows these groups' table loads wrote in the last N hours, and how many loads recorded no count outside a
+    batched append (batched appends record theirs on the run: run_batch_rows_sql). Params: groups, hours."""
     return (f"select coalesce(sum(e.rows_merged), 0) as rows_written, "
-            f"count(*) filter (where e.status = 'ok' and e.rows_merged is null) as uncounted "
+            f"{UNCOUNTED_OUTSIDE_BATCHES} as uncounted "
             f"from {SCHEMA}.ingest_event e where e.task_collection = any(%s) "
             f"and e.finished_at > now() - make_interval(hours => %s)")
 
@@ -1846,11 +1820,3 @@ left join last l on l.task_collection = c.task_collection
 left join agg a on a.task_collection = c.task_collection
 left join sla s on s.task_collection = c.task_collection
 order by c.task_collection"""
-
-
-def timeline_runs_sql() -> str:
-    """Group runs overlapping a window. Params: window end, window start."""
-    return (f"select run_id, task_collection, status, started_at, finished_at, job_run_id, ok, failed, skipped "
-            f"from {SCHEMA}.ingest_run "
-            f"where started_at < %s and coalesce(finished_at, now()) > %s and {not_a_check()} "
-            f"order by task_collection, started_at")

@@ -436,9 +436,47 @@ def job_runs(cadence: int, tz: str, members: List[dict], runs: List[dict], start
             slots.setdefault(slot, []).append(
                 {"task_collection": group, "offset_minutes": offset, "fire_at": fire, "state": state,
                  "run": in_slot[0] if in_slot else None, "extra": in_slot[1:]})
+    outside = _outside_job_runs(members, by_group, slots, start, end, offset_of)
+    slots.update(outside)
     return [{"slot": slot, "members": sorted(entries, key=lambda e: (e["offset_minutes"], e["task_collection"])),
-             "checks": sorted(slot_checks.get(slot, []), key=lambda c: (_when(c["started_at"]), c["task_collection"]))}
+             "checks": sorted(slot_checks.get(slot, []), key=lambda c: (_when(c["started_at"]), c["task_collection"])),
+             "outside": slot in outside}
             for slot, entries in sorted(slots.items(), reverse=True)]
+
+
+# Group runs started outside every trigger within this long of each other are one job run: a Run now starts each
+# member's wrapper job at once, and their clusters come up a few minutes apart.
+OUTSIDE_SPAN = timedelta(minutes=STARTING_MINUTES)
+
+
+def _outside_job_runs(members: List[dict], by_group: Dict[str, List[dict]], slots: Dict[datetime, List[dict]],
+                      start: datetime, end: datetime, offset_of) -> Dict[datetime, List[dict]]:
+    """The members' group runs that started in [start, end) while they belonged to the schedule but fall in no
+    trigger's job run: a Run now before the job's first trigger, a run started from a group's page or the Jobs page,
+    or by the ingestion job's own schedule. Each becomes part of a job run of its own, slotted at its first run's
+    start, so the job's runs list every run it made. Runs starting within OUTSIDE_SPAN of that first one join it."""
+    placed = {id(r) for entries in slots.values() for e in entries for r in ([e["run"]] if e["run"] else []) + e["extra"]}
+    found = []
+    for m in members:
+        added, removed = _when(m.get("added_at")), _when(m.get("removed_at"))
+        for r in by_group.get(m["task_collection"], []):
+            started = _when(r["started_at"])
+            if (id(r) not in placed and r.get("status") != "skipped" and start <= started < end
+                    and (added is None or started >= added) and (removed is None or started < removed)):
+                found.append((started, m, r))
+    out: Dict[datetime, List[dict]] = {}
+    slot = None
+    for started, m, r in sorted(found, key=lambda f: (f[0], f[1]["task_collection"])):
+        if slot is None or started - slot > OUTSIDE_SPAN or slot in slots:
+            slot = started
+        entries = out.setdefault(slot, [])
+        same = next((e for e in entries if e["task_collection"] == m["task_collection"]), None)
+        if same:
+            same["extra"].append(r)
+        else:
+            entries.append({"task_collection": m["task_collection"], "offset_minutes": offset_of(m), "fire_at": started,
+                            "state": "run", "run": r, "extra": []})
+    return out
 
 
 # ---- wrapper job settings and drift -------------------------------------------------------------

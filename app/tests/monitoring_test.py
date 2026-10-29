@@ -7,7 +7,7 @@ import pytest
 import queries as q
 
 MONITORING_SQL = (q.servers_sql(), q.collection_databases_sql(), q.collection_database_rows_sql(),
-                  q.run_databases_sql(), q.run_rows_sql(), q.run_batch_rows_sql(), q.collection_batch_runs_sql(),
+                  q.run_databases_sql(), q.run_batch_rows_sql(), q.collection_batch_runs_sql(),
                   q.connection_databases_sql(), q.in_flight_sql(), q.in_flight_count_sql(), q.run_events_sql(),
                   q.group_runs_sql(), q.job_run_databases_sql(), q.run_failures_sql())
 
@@ -176,7 +176,8 @@ def api(monkeypatch):
                                                 failed_this_run=0)],
         q.collection_batch_runs_sql(): [dict(run_id=7, detail=json.dumps({"batch_rows": 400, "batch_rows_unknown": 0}),
                                              databases=["db2"], keys=[q.server_database_key("s1", "db2")])],
-        q.run_work_sql(): [dict(run_id=9, rows_written=12, uncounted=1), dict(run_id=8, rows_written=None, uncounted=3)],
+        # Run 8's three loads were members of its batched append, so none of them counts as uncounted.
+        q.run_work_sql(): [dict(run_id=9, rows_written=12, uncounted=1), dict(run_id=8, rows_written=None, uncounted=0)],
         q.recent_errors_sql(): [dict(finished_at="2026-10-23T07:40:00+00:00", task_collection="c1", src_database="db1",
                                      src_schema="dbo", src_table="t", error="connection reset")],
         q.failed_tables_sql(): [dict(finished_at="2026-10-23T07:40:00+00:00", task_collection="c1", control_id=1, src_database="db1",
@@ -230,6 +231,21 @@ def test_runs_report_rows_written_with_batches_and_say_when_partial(api):
     runs = {r["run_id"]: r for r in api.get("/api/runs").json()}
     assert runs[9]["rows_written"] == 12 and runs[9]["rows_partial"] is True
     assert runs[8]["rows_written"] == 50 and runs[8]["rows_partial"] is False
+
+
+def test_a_run_with_a_batch_and_an_uncounted_full_reload_is_partial(monkeypatch):
+    import main
+    work = {q.run_work_sql(): [dict(run_id=1, rows_written=None, uncounted=1)]}
+    monkeypatch.setattr(main.db, "query", lambda sql, params=(): work.get(sql, []))
+    run = dict(run_id=1, status="ok", ended_without_finishing=False,
+               detail=json.dumps({"batch_rows": 50, "batch_rows_unknown": 0}))
+    done = main._with_rows_written([run])[0]
+    assert done["rows_written"] == 50 and done["rows_partial"] is True
+
+
+def test_loads_counted_by_a_batch_are_not_uncounted():
+    for sql in (q.run_work_sql(), q.rows_written_since_sql()):
+        assert "coalesce(e.pool, '') not like 'batch%%'" in sql
 
 
 def test_error_groups_endpoint(api):

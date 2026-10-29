@@ -279,6 +279,28 @@ def test_a_run_two_minutes_late_belongs_to_its_trigger_and_a_second_one_is_extra
     assert by_slot[13]["state"] == "no run" and [j["slot"].hour for j in found] == [14, 13]
 
 
+def test_a_run_now_before_the_first_trigger_is_a_job_run_of_its_own():
+    members = _members(("a", 0), ("b", 30), added=datetime(2026, 10, 26, 13, 10, tzinfo=UTC))
+    runs = [_run("a", datetime(2026, 10, 26, 13, 12, tzinfo=UTC), run_id=1),
+            _run("b", datetime(2026, 10, 26, 13, 14, tzinfo=UTC), run_id=2)]
+    found = sch.job_runs(60, "UTC", members, runs, datetime(2026, 10, 26, 13, tzinfo=UTC),
+                         datetime(2026, 10, 26, 15, tzinfo=UTC), now=datetime(2026, 10, 26, 13, 40, tzinfo=UTC))
+    outside = [j for j in found if j["outside"]]
+    assert [j["slot"] for j in outside] == [datetime(2026, 10, 26, 13, 12, tzinfo=UTC)]
+    assert [(m["task_collection"], m["state"], m["run"]["run_id"]) for m in outside[0]["members"]] == [("a", "run", 1), ("b", "run", 2)]
+    assert all(not j["outside"] for j in found if j["slot"] != outside[0]["slot"])
+
+
+def test_runs_by_hand_far_apart_are_separate_job_runs_and_a_skipped_one_is_left_out():
+    members = _members(("a", 0), added=datetime(2026, 10, 26, 13, 1, tzinfo=UTC))
+    runs = [_run("a", datetime(2026, 10, 26, 13, 5, tzinfo=UTC), run_id=1),
+            _run("a", datetime(2026, 10, 26, 13, 40, tzinfo=UTC), run_id=2),
+            _run("a", datetime(2026, 10, 26, 13, 41, tzinfo=UTC), run_id=3, status="skipped")]
+    found = sch.job_runs(60, "UTC", members, runs, datetime(2026, 10, 26, 13, tzinfo=UTC),
+                         datetime(2026, 10, 26, 14, tzinfo=UTC), now=datetime(2026, 10, 26, 13, 59, tzinfo=UTC))
+    assert [(j["slot"].minute, j["members"][0]["run"]["run_id"]) for j in found if j["outside"]] == [(40, 2), (5, 1)]
+
+
 def test_a_trigger_missed_while_the_previous_run_was_going_is_skipped():
     runs = [_run("a", datetime(2026, 10, 26, 13, 0, tzinfo=UTC), minutes=75, run_id=1)]
     found = sch.job_runs(60, "UTC", _members(("a", 0)), runs, datetime(2026, 10, 26, 14, tzinfo=UTC),

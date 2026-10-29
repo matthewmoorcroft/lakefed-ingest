@@ -1242,13 +1242,25 @@ def add_job_tables(job_id: int, body: JobTablesRequest, request: Request):
     return {"summary": summary, "applied": True}
 
 
+def _instant(value: str, name: str) -> datetime:
+    """A request's date and time, with its UTC offset (as the app's own links give it), or 400 saying what is wrong
+    with it rather than a server error."""
+    try:
+        at = datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        raise HTTPException(400, f"{name} must be a date and time such as 2026-10-29T13:00:00+00:00, not {value!r}")
+    if at.tzinfo is None:
+        raise HTTPException(400, f"{name} must say its UTC offset, such as 2026-10-29T13:00:00+00:00")
+    return at
+
+
 @app.get("/api/ingestion-jobs/{job_id}/runs")
 def ingestion_job_runs(job_id: int, before: Optional[str] = None, limit: int = 25):
     """A job's job runs, newest first, `limit` slots before `before` (now when not given); `next_before` is
     the oldest slot shown, for the next page. Placed by the job's current schedule."""
     job = _schedule(job_id)
     now = datetime.now(timezone.utc)
-    end = datetime.fromisoformat(before) if before else now + timedelta(seconds=1)
+    end = _instant(before, "before") if before else now + timedelta(seconds=1)
     limit = max(1, min(int(limit), 100))
     runs = _job_runs_of(job, end - timedelta(minutes=int(job["cadence_minutes"]) * limit), end, now)
     return {"job_runs": [{k: v for k, v in r.items() if k != "placed"} for r in runs[:limit]],
@@ -1262,7 +1274,7 @@ def ingestion_job_run(job_id: int, slot: str):
     how many job runs before it also had failed tables."""
     job = _schedule(job_id)
     now = datetime.now(timezone.utc)
-    at = datetime.fromisoformat(slot)
+    at = _instant(slot, "the job run's time")
     cadence = int(job["cadence_minutes"])
     runs = _job_runs_of(job, at - timedelta(minutes=cadence * ij.RECENT_JOB_RUNS), at + timedelta(seconds=1), now)
     found = next((r for r in runs if r["slot"] == at.isoformat()), None)
@@ -1292,7 +1304,7 @@ def job_runs_across(job: Optional[str] = None, outcome: Optional[str] = None, be
     the page is full or JOB_RUNS_HISTORY is reached. job=none lists the group runs of the groups in no job
     instead, with today's run columns."""
     now = datetime.now(timezone.utc)
-    end = datetime.fromisoformat(before) if before else now + timedelta(seconds=1)
+    end = _instant(before, "before") if before else now + timedelta(seconds=1)
     limit = max(1, min(int(limit), 100))
     schedules, members = _schedules()
     if job == "none":
@@ -1398,7 +1410,9 @@ def _with_rows_written(out: List[dict]) -> List[dict]:
             r.update({k: w.get(k) for k in ("work_started_at", "work_finished_at", "loaded")})
             batched, batched_unknown = q.batch_rows(r.get("detail"))
             r["rows_written"] = int(w.get("rows_written") or 0) + batched
-            r["rows_partial"] = bool(batched_unknown) if batched else bool(w.get("uncounted"))
+            # Partial when a batch had members without a count, or a load outside the batches had none (a full
+            # reload, say): either leaves part of the total unknown.
+            r["rows_partial"] = bool(batched_unknown) or bool(w.get("uncounted"))
             q.with_outcome(r, progress.get(r["run_id"]))
             r["speed_tables_per_min"] = None if r["ended_without_finishing"] else q.work_speed(r)
     return out

@@ -125,6 +125,7 @@ def summarize(job: dict, job_run: dict, running_by_run: dict, group_tables: Dict
         "run_ids": [r["run_id"] for r in runs if r.get("run_id") is not None],
         "checks": [check_summary(c) for c in job_run.get("checks") or []],     # never counted as group runs
         "progress": progress,
+        "outside": bool(job_run.get("outside")),     # started outside every trigger: Run now, a group page, the Jobs UI
     }
     if running:
         live = [q.live_speed(running_by_run[r["run_id"]], now) for r in ran

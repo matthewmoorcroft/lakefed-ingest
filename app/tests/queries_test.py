@@ -293,20 +293,6 @@ def test_reseed_flips_clear_status_and_any_pending_append():
         assert "pending_position = null" in sql and "pending_run_id = null" in sql
 
 
-def test_a_server_is_healthy_only_when_every_enabled_table_is_current():
-    def health(**counts):
-        return q.server_health({"tables": 0, "state_current": 0, "state_late": 0, "state_first_load": 0,
-                                "state_failing": 0, **counts})
-    assert health(tables=10, state_current=10) == "healthy"
-    assert health(tables=10, state_current=9) != "healthy"
-    assert health(tables=10, state_current=9, state_failing=1) == "failing"
-    assert health(tables=10, state_late=10) == "late"
-    assert health(tables=10, state_first_load=10) == "first load"
-    assert health(tables=10, state_current=5, state_late=2, state_first_load=3) == "late"
-    assert health(tables=0) == "no tables"
-    assert health(tables=None, state_current=None) == "no tables"
-
-
 def test_tables_page_after_a_cursor_with_an_exact_database():
     sql, params = q.tables_sql("c1", None, "all", 100, database="db1", after=["c1", "db1", "dbo", "t5", 42])
     assert "coalesce(t.src_database, '') = %s" in sql and params == ("c1", "db1", "c1", "db1", "dbo", "t5", 42, 100)
@@ -354,7 +340,7 @@ def test_the_database_source_copies_agree_for_every_source_type_and_port():
 
 
 def test_lists_of_group_runs_leave_out_the_check_jobs_own_records():
-    for sql in (q.runs_sql(None)[0], q.runs_sql("c1")[0], q.group_runs_before_sql(), q.timeline_runs_sql(),
+    for sql in (q.runs_sql(None)[0], q.runs_sql("c1")[0], q.group_runs_before_sql(),
                 q.last_runs_sql(), q.running_progress_sql(), q.collection_run_stats_sql()):
         assert q.not_a_check() in sql or q.not_a_check("x") in sql
     assert q.not_a_check() not in q.group_runs_sql()      # job runs place the checks themselves

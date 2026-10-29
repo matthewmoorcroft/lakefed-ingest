@@ -531,3 +531,12 @@ def test_a_save_without_options_keeps_the_jobs_start_time(api):
     sid = api.post("/api/schedules", json=dict(daily, options={"start_minute": 150})).json()["id"]
     assert api.post(f"/api/schedules/{sid}", json=daily).status_code == 200
     assert sch.options_of(api.store.schedules[sid])["start_minute"] == 150
+
+
+def test_a_malformed_or_zoneless_date_in_a_request_is_a_bad_request_not_a_server_error(api):
+    sid = api.post("/api/schedules", json=BODY).json()["id"]
+    for path in (f"/api/ingestion-jobs/{sid}/runs?before=yesterday", "/api/job-runs?before=2026-13-40",
+                 f"/api/ingestion-jobs/{sid}/runs/not-a-time", "/api/job-runs?before=2026-10-29T13:00:00"):
+        r = api.get(path)
+        assert r.status_code == 400, (path, r.status_code)
+        assert "UTC offset" in r.text or "date and time" in r.text
