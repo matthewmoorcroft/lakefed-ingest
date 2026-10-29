@@ -304,9 +304,11 @@ key changed (see `checkpoint`).
 
 Written by the `lakefed_ingest_discover` job, which reads source catalog metadata only, and reviewed
 in the operations app's Bulk import page.
-- **`discovery`:** one row per (discovery, database), with the connection used (`src_host`,
-  `src_port`, `secret_key`), `status` (`running` | `ok` | `failed`), `error`, and the number of
-  tables found.
+- **`discovery`:** one row per (discovery, database), with the source read: a Unity Catalog connection
+  (`src_connection`, read through `remote_query` with no secret) or a host (`src_host`, `src_port`,
+  `secret_key`); `status` (`running` | `ok` | `failed`, or `listed` for a discovery that only lists the server's
+  databases, as Test connection does), `error`, and the number of tables found. A connection that fails is recorded
+  on the server's `master` row.
 - **`discovered_table`:** one row per table, with size and row counts, whether Change Tracking is
   enabled, and the recommended settings: `select_list` (unsupported column types listed in
   `excluded_columns`), `primary_key`, `load_type` (`ct` if CT and a PK; `cursor` on a rowversion

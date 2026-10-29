@@ -57,6 +57,14 @@ PK_SQL = (
     "WHERE i.is_primary_key = 1 AND t.is_ms_shipped = 0"
 )
 
+# The server's user databases that are online, for Test connection and for discovering a whole server. Read through
+# master, which every login can see; system databases (ids 1 to 4) are left out.
+DATABASES_SQL = (
+    "SELECT name FROM sys.databases WHERE database_id > 4 AND state_desc = 'ONLINE' AND HAS_DBACCESS(name) = 1 "
+    "ORDER BY name"
+)
+SERVER_DATABASE = "master"
+
 UNSUPPORTED_TYPES = {"geography", "geometry", "hierarchyid", "sql_variant"}
 PARTITION_TYPES = {"tinyint", "smallint", "int", "bigint", "decimal", "numeric",
                    "date", "datetime", "datetime2", "smalldatetime"}
@@ -142,33 +150,70 @@ def assemble(tables, columns, pks) -> List[dict]:
 CONNECT_RETRIES, CONNECT_RETRY_BASE_S, CONNECT_RETRY_MAX_S = 3, 30.0, 120.0
 
 
-def discover_database(cfg: dict, slots=None, sleep=None, rand=None) -> List[dict]:
-    """Discover every user table of one source database (three catalog queries), retrying a query
-    that fails with a transient error (``CONNECT_RETRIES``)."""
+def cfg_for(spec: dict, database: str) -> dict:
+    """The row a discovery reads one database with: through the spec's Unity Catalog connection (remote_query, no
+    secret), or by Spark JDBC with its host, port and secret, as ingestion reads it."""
+    base = {"id": 0, "src_type": spec.get("src_type") or "sqlserver", "src_database": database}
+    if spec.get("src_connection"):
+        return {**base, "src_connection": spec["src_connection"], "use_remote_query": True}
+    return {**base, "src_host": spec["src_host"], "src_port": spec.get("src_port"),
+            "secret_key": secret_key_for(spec, database)}
+
+
+def spec_errors(spec: dict) -> List[str]:
+    """What a discovery spec lacks: a UC connection, or a host with a secret; and the databases to read, unless it
+    only lists them (kind 'list')."""
+    errors = []
+    if not spec.get("src_connection") and not spec.get("src_host"):
+        errors.append("spec needs src_connection (a UC connection) or src_host")
+    if spec.get("src_host") and not spec.get("src_connection") and not (spec.get("secret_key") or spec.get("secret_key_template")):
+        errors.append("spec needs secret_key or secret_key_template with src_host")
+    if spec.get("kind") != "list" and not spec.get("databases"):
+        errors.append("spec needs databases: a list, or \"*\" for every database on the server")
+    return errors
+
+
+def _query(cfg: dict, sql: str, slots=None, sleep=None, rand=None) -> List[dict]:
+    """One catalog query's rows, retrying a transient error (``CONNECT_RETRIES``)."""
     import random
     import time
     import ct_engine
     import table_retry
-    if sa.get_adapter(cfg.get("src_type")).src_type != sa.SQLSERVER:
-        raise ValueError(f"discovery is not implemented yet for src_type '{cfg.get('src_type')}'")
     sleep, rand = sleep or time.sleep, rand or random.random
     spark = ct_engine._spark()
-    rows = []
-    for sql in (TABLES_SQL, COLUMNS_SQL, PK_SQL):
-        for attempt in range(CONNECT_RETRIES + 1):
-            try:
-                with ct_engine._unit(slots):
-                    rows.append([r.asDict() for r in ct_engine._read(spark, cfg, sql).collect()])
-                break
-            except Exception as e:
-                if attempt == CONNECT_RETRIES or table_retry.classify(e) != table_retry.TRANSIENT:
-                    raise
-                sleep(table_retry.backoff_delay(attempt, CONNECT_RETRY_BASE_S, CONNECT_RETRY_MAX_S, rand))
-    return assemble(*rows)
+    for attempt in range(CONNECT_RETRIES + 1):
+        try:
+            with ct_engine._unit(slots):
+                return [r.asDict() for r in ct_engine._read(spark, cfg, sql).collect()]
+        except Exception as e:
+            if attempt == CONNECT_RETRIES or table_retry.classify(e) != table_retry.TRANSIENT:
+                raise
+            sleep(table_retry.backoff_delay(attempt, CONNECT_RETRY_BASE_S, CONNECT_RETRY_MAX_S, rand))
+    raise AssertionError("unreachable")
+
+
+def _sqlserver_only(cfg: dict) -> None:
+    if sa.get_adapter(cfg.get("src_type")).src_type != sa.SQLSERVER:
+        raise ValueError(f"discovery is not implemented yet for src_type '{cfg.get('src_type')}'")
+
+
+def list_databases(spec: dict, query=None) -> List[str]:
+    """The server's user databases, read through master: what Test connection shows, and what discovering a
+    whole server ("databases": "*") reads."""
+    cfg = cfg_for(spec, SERVER_DATABASE)
+    _sqlserver_only(cfg)
+    return [str(r["name"]) for r in (query or _query)(cfg, DATABASES_SQL)]
+
+
+def discover_database(cfg: dict, slots=None, sleep=None, rand=None) -> List[dict]:
+    """Discover every user table of one source database (three catalog queries), retrying a query
+    that fails with a transient error (``CONNECT_RETRIES``)."""
+    _sqlserver_only(cfg)
+    return assemble(*(_query(cfg, sql, slots, sleep, rand) for sql in (TABLES_SQL, COLUMNS_SQL, PK_SQL)))
 
 
 def secret_key_for(spec: dict, database: str) -> str:
     """The secret key for a database: ``secret_key_template`` with {database} filled in, else
     ``secret_key``."""
     tpl = spec.get("secret_key_template")
-    return tpl.replace("{database}", database) if tpl else spec["secret_key"]
+    return tpl.replace("{database}", database) if tpl else spec.get("secret_key")

@@ -597,6 +597,7 @@ SCHEMA_FINGERPRINTS = {
     4: "f105421638e334fbf50e4f7ee40469d129a03b4e22e7074f751b3dbad21b6d73",
     # 5 was the start-time branch's own number before it met 3 and 4; never reused.
     6: "8bdb0c74e5aaeeefafe658951e872a64494746e1eb60e1750a0db86df3851232",
+    7: "853692ef91037d70967740372efac90d2c505ae3a290bc1a6637adb906b5f895",
 }
 
 

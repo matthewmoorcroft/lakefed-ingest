@@ -129,3 +129,37 @@ def test_nullable_rowversion_is_not_a_cursor_candidate():
     rec = d.recommend({"ct_enabled": 0}, cols, ["id"])
     assert rec["load_type"] == "full" and rec["cursor_column"] is None
     assert "is_nullable" in d.COLUMNS_SQL
+
+
+def test_a_discovery_through_a_uc_connection_reads_with_no_secret():
+    cfg = d.cfg_for({"src_connection": "sql_a"}, "eng_001")
+    assert cfg == {"id": 0, "src_type": "sqlserver", "src_database": "eng_001", "src_connection": "sql_a",
+                   "use_remote_query": True}
+    jdbc = d.cfg_for({"src_host": "h1", "src_port": 1433, "secret_key_template": "creds-{database}"}, "eng_001")
+    assert (jdbc["src_host"], jdbc["secret_key"]) == ("h1", "creds-eng_001") and "use_remote_query" not in jdbc
+
+
+@pytest.mark.parametrize("spec,error", [
+    ({"databases": ["a"]}, "src_connection (a UC connection) or src_host"),
+    ({"src_host": "h1", "databases": ["a"]}, "secret_key"),
+    ({"src_connection": "sql_a"}, "databases"),
+])
+def test_a_spec_says_what_it_lacks(spec, error):
+    assert any(error in e for e in d.spec_errors(spec))
+
+
+def test_listing_only_needs_a_connection_and_no_databases():
+    assert d.spec_errors({"src_connection": "sql_a", "kind": "list"}) == []
+    assert d.spec_errors({"src_connection": "sql_a", "databases": "*"}) == []
+
+
+def test_a_servers_databases_are_read_through_master():
+    seen = []
+    names = d.list_databases({"src_connection": "sql_a"}, query=lambda cfg, sql: seen.append((cfg, sql)) or
+                             [{"name": "eng_001"}, {"name": "eng_002"}])
+    assert names == ["eng_001", "eng_002"]
+    cfg, sql = seen[0]
+    assert cfg["src_database"] == "master" and cfg["use_remote_query"] and sql == d.DATABASES_SQL
+    assert "database_id > 4" in sql and "ONLINE" in sql
+    with pytest.raises(ValueError):
+        d.list_databases({"src_connection": "ora", "src_type": "oracle"}, query=lambda cfg, sql: [])

@@ -415,6 +415,9 @@ create table if not exists lakefed_ingest.discovery (
     finished_at   timestamptz,
     constraint discovery_pk primary key (discovery_id, src_database)
 );
+-- A discovery through a Unity Catalog connection (remote_query) names it instead of a host and secret. A discovery
+-- of the 'list' kind only lists the server's databases (status 'listed', no tables), as Test connection does.
+alter table lakefed_ingest.discovery add column if not exists src_connection text;
 
 create table if not exists lakefed_ingest.discovered_table (
     discovery_id          text        not null,
