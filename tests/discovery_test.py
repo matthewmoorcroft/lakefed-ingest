@@ -1,4 +1,6 @@
 """Table discovery: recommendations per table, assembly of the catalog queries, helpers."""
+import re
+
 import pytest
 
 import discovery as d
@@ -184,3 +186,67 @@ def test_a_filter_that_isnt_a_plain_name_pattern_is_refused(pattern):
 @pytest.mark.parametrize("pattern", ["", "lfc_eng_%", "eng_0[0-4]%", "sales-2024.%"])
 def test_name_patterns_as_like_reads_them_are_taken(pattern):
     assert d.pattern_errors(pattern) == []
+
+
+# The two lab connections, as found on 29 Oct: one whose login is a user contained in each database (it opens
+# every lab database but not master), and one whose login is a server login with ##MS_DefinitionReader## (master
+# lists all 201 databases, though HAS_DBACCESS there is 0 for every one of them).
+LAB = ([f"lfc_eng_{i:03d}" for i in range(1, 101)] + ["lfc_test"] + [f"lfc_test_{i:03d}" for i in range(1, 51)]
+       + [f"lfc_heavy_{i:03d}" for i in range(1, 51)])
+CANT_OPEN_MASTER = ("[FAILED_JDBC.CONNECTION] Failed JDBC on the operation: Failed to connect to the database. "
+                    "SQLSTATE: HV000")
+
+
+def _server_login(cfg, sql):
+    """master as the server login sees it: every database by name, whatever HAS_DBACCESS would say."""
+    assert cfg["src_database"] == "master" and "HAS_DBACCESS" not in sql
+    like = re.search(r"name LIKE N'([^']*)'", sql)
+    pattern = re.compile("^" + "".join(".*" if c == "%" else "." if c == "_" else re.escape(c)
+                                       for c in (like.group(1) if like else "%")) + "$")
+    return [{"name": n} for n in LAB if pattern.match(n)]
+
+
+def _contained_user(cfg, sql):
+    if cfg["src_database"] == "master":
+        raise RuntimeError(CANT_OPEN_MASTER)
+    return []
+
+
+def test_a_contained_user_cant_list_and_its_typed_databases_are_read_by_name_never_through_master():
+    spec = {"src_connection": "lfc_sqlserver_test", "kind": "list"}
+    with pytest.raises(RuntimeError, match="FAILED_JDBC.CONNECTION"):
+        d.list_databases(spec, query=_contained_user)       # the notebook records it on the master row
+    typed = {"src_connection": "lfc_sqlserver_test", "databases": ["lfc_eng_001", "lfc_eng_002"]}
+    assert not d.needs_listing(typed) and d.spec_errors(typed) == []
+    assert [d.cfg_for(typed, db)["src_database"] for db in typed["databases"]] == ["lfc_eng_001", "lfc_eng_002"]
+
+
+def test_a_server_login_lists_all_201_databases_by_name_and_the_filter_narrows_them_to_the_lab():
+    spec = {"src_connection": "lfc_sqlserver_discover", "kind": "list"}
+    assert d.needs_listing(spec) and len(d.list_databases(spec, query=_server_login)) == 201
+    lab = d.list_databases(dict(spec, pattern="lfc_eng_%"), query=_server_login)
+    assert lab == [f"lfc_eng_{i:03d}" for i in range(1, 101)]
+
+
+def test_a_whole_server_discovery_lists_with_the_same_filter():
+    spec = {"src_connection": "lfc_sqlserver_discover", "databases": "*", "pattern": "lfc_eng_%"}
+    assert d.needs_listing(spec) and d.spec_errors(spec) == []
+    assert len(d.list_databases(spec, query=_server_login)) == 100
+
+
+def test_a_database_the_login_can_name_but_not_open_fails_on_its_own(monkeypatch):
+    # discover_tables.ipynb reads each database in its own try (one()), recording a failure on that database's row
+    # and going on: so the reading of a database raises, and the others are read as usual.
+    def catalog(cfg, sql, *args):
+        if cfg["src_database"] == "lfc_heavy_001":
+            raise RuntimeError('Cannot open database "lfc_heavy_001" requested by the login. The login failed.')
+        return []
+    monkeypatch.setattr(d, "_query", catalog)
+    spec = {"src_connection": "lfc_sqlserver_discover", "databases": ["lfc_eng_001", "lfc_heavy_001", "lfc_eng_002"]}
+    read, failed = {}, {}
+    for db in spec["databases"]:
+        try:
+            read[db] = d.discover_database(d.cfg_for(spec, db))
+        except RuntimeError as e:
+            failed[db] = str(e)
+    assert sorted(read) == ["lfc_eng_001", "lfc_eng_002"] and list(failed) == ["lfc_heavy_001"]

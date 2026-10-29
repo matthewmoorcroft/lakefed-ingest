@@ -92,3 +92,15 @@ def test_discover_lists_by_a_name_filter_and_says_which_databases_it_couldnt_rea
 def test_the_target_schema_field_says_a_new_schema_is_made_by_the_first_run():
     form = (FRONTEND / "pages" / "jobForm.tsx").read_text()
     assert "A new schema is made by the first run" in form and "CREATE SCHEMA on the catalog" in form
+
+
+def test_discover_offers_typed_or_csv_databases_on_the_lab_logins_real_errors():
+    import re
+    discover = (FRONTEND / "pages" / "Discover.tsx").read_text()
+    source = re.search(r"const cantList = .*?/(.+)/i\.test", discover).group(1)
+    cant_list = re.compile(source, re.I)
+    # lfc_sqlserver_test's login, a user contained in each database, opening master (29 Oct):
+    assert cant_list.search("[FAILED_JDBC.CONNECTION] Failed JDBC on the operation: Failed to connect to the database. "
+                            "SQLSTATE: HV000")
+    assert cant_list.search("Login failed for user 'lfc_ingest'.")
+    assert not cant_list.search("the discovery run ended CANCELED")

@@ -215,6 +215,13 @@ def _sqlserver_only(cfg: dict) -> None:
         raise ValueError(f"discovery is not implemented yet for src_type '{cfg.get('src_type')}'")
 
 
+def needs_listing(spec: dict) -> bool:
+    """Whether a discovery lists the server's databases through master: Test connection (kind 'list') and a
+    whole server ("databases": "*") do; databases named by hand or from a file are read by name, never through
+    master, so a login that can't open master (a user contained in each database) can still discover them."""
+    return spec.get("kind") == "list" or spec.get("databases") == "*"
+
+
 def list_databases(spec: dict, query=None) -> List[str]:
     """The server's user databases, read through master and matching spec's "pattern" if it has one: what Test
     connection shows, and what discovering a whole server ("databases": "*") reads."""
