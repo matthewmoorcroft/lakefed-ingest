@@ -6,7 +6,8 @@ stay behind, as groups in no job. This job runs as the deployer (the state datab
 - **Which groups:** the deleted job's members that no other live job holds (a group is in one job, but a removed
   member could have joined another job since).
 - **What goes, in one transaction under each group's run lock:** the groups' control rows and what is keyed by them
-  (checkpoint, reseed_queue) or by the group (database_check, check_work). A run of any of the groups refuses the
+  (checkpoint, reseed_queue) or by the group (database_check, check_work, and the monitoring rollups
+  rollup_database and rollup_group). A run of any of the groups refuses the
   lot: nothing is deleted while one is loading.
 - **What it was made from:** the job's job_selection rows (the servers, databases and tables it was chosen from, for
   a later re-discovery), in the same transaction, so a deleted job never takes new tables. Skipped on a state
@@ -24,7 +25,7 @@ from __future__ import annotations
 from typing import Dict, List, Optional
 
 from ct_engine import sink_fqn
-from state_store import collection_lock_key
+from state_store import ROLLUP_DATABASE_TABLE, ROLLUP_GROUP_TABLE, collection_lock_key, delete_rollups_sql
 
 SCHEMA = "lakefed_ingest"
 
@@ -71,6 +72,8 @@ DELETES = (
                    f"(select id from {SCHEMA}.control where task_collection = any(%s))"),
     ("database_check", f"delete from {SCHEMA}.database_check where task_collection = any(%s)"),
     ("check_work", f"delete from {SCHEMA}.check_work where task_collection = any(%s)"),
+    ("rollup_database", delete_rollups_sql(ROLLUP_DATABASE_TABLE)),
+    ("rollup_group", delete_rollups_sql(ROLLUP_GROUP_TABLE)),
     ("control", f"delete from {SCHEMA}.control where task_collection = any(%s)"),
 )
 

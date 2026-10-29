@@ -22,9 +22,10 @@ class FixedClock(datetime):
 
 
 def state(group, tables, current=0, late=0, failing=0):
+    """A database's rollup row: its loaded tables, and whether it is late."""
     return dict(server="srv1", src_connection=None, src_host="h", task_collection=group, src_database=f"{group}_db",
-                tables=tables, state_current=current, state_late=late, state_first_load=0, state_failing=failing,
-                no_sla_tables=0)
+                tables=tables, state_loaded=current + late, late_database=late > 0, state_first_load=0,
+                state_failing=failing, no_sla_tables=0)
 
 
 def group_run(run_id, group, started, status="completed", failed=0):
@@ -51,9 +52,11 @@ RUNS = [group_run(9, "c1", datetime(2026, 10, 26, 13, 0, 20, tzinfo=UTC), status
 @pytest.fixture
 def client(monkeypatch):
     answers = {
-        q.schedules_sql(): SCHEDULES, q.database_states_sql(): [state("c1", 10, current=8, failing=2),
-                                                               state("c2", 5, current=5), state("c3", 4, late=4),
-                                                               state("c4", 3, current=3)],
+        q.schedules_sql(): SCHEDULES,
+        q.rollup_states_sql(): [state("c1", 10, current=8, failing=2), state("c2", 5, current=5),
+                                state("c3", 4, late=4), state("c4", 3, current=3)],
+        q.rollup_group_names_sql(): [dict(task_collection=g) for g in ("c1", "c2", "c3", "c4")],
+        q.control_group_names_sql(): [dict(task_collection=g) for g in ("c1", "c2", "c3", "c4")],
         q.running_progress_sql(): [], q.last_runs_sql(): [],
         q.collection_run_stats_sql(): [dict(task_collection="c1", p50_s=300, p95_s=400),
                                        dict(task_collection="c2", p50_s=300, p95_s=400)],
@@ -185,6 +188,10 @@ def test_one_database_lists_its_tables_with_the_group_and_its_job(client, monkey
             return [dict(id=1, src_schema="dbo", src_table="t1", state="failing")]
         if sql == q.database_tables_count_sql():
             return [dict(tables=1)]
+        if sql == q.database_counts_sql():
+            found = params[1] == "srv1"
+            return [dict(control_rows=int(found), tables=10 if found else 0, no_sla_tables=0, state_current=8,
+                         state_late=0, state_first_load=0, state_failing=2)]
         return real(sql, params)
     monkeypatch.setattr(main.db, "query", query)
     body = client.get("/api/collections/c1/databases/srv1/c1_db?search=t1").json()
@@ -239,7 +246,7 @@ def test_the_groups_in_no_job_have_a_page_of_their_own(client):
     # A read-only app with no jobs still lets you click through: the "Not in any job" row lists its groups and tables.
     body = client.get("/api/ingestion-jobs/not-in-job").json()
     assert [g["task_collection"] for g in body["groups_detail"]] == ["c4"]
-    assert (body["groups_detail"][0]["enabled_tables"], body["groups_detail"][0]["state_current"]) == (3, 3)
+    assert (body["groups_detail"][0]["enabled_tables"], body["groups_detail"][0]["state_loaded"]) == (3, 3)
     assert (body["enabled_tables"], body["name"]) == (3, "Not in any job")
 
 

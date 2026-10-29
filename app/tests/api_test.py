@@ -356,7 +356,7 @@ def test_the_overviews_job_reads_refresh_as_often_as_the_running_runs(monkeypatc
     clock[0] += 20
     client.get("/api/overview")
     assert reads.count(q.running_progress_sql()) == reads.count(q.schedules_sql()) == 2
-    assert reads.count(q.database_states_sql()) == 1
+    assert reads.count(q.rollup_states_sql()) == 1
 
 
 def test_the_overview_says_when_its_table_states_were_read(monkeypatch):

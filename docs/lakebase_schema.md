@@ -409,6 +409,24 @@ Written by the operations app's run poller (`app/src/run_poller.py`), which list
 - Added by the schema version that created it. Its statements are `create table if not exists` and `create index if not exists` only,
   so the upgrade takes no lock on an existing table.
 
+## `rollup_database` and `rollup_group`: monitoring rollups
+
+The operations app's pages read these instead of scanning `control` and `checkpoint` on every refresh.
+
+- `rollup_database` has one row per database and grain (`task_collection`, `src_database`, `server`,
+  `src_connection`, `src_host`, `instance_label`; blanks are `''`). It holds the enabled tables (`tables`), tables
+  without a freshness target, tables failing, waiting for a first load and loaded (current or late), the oldest and
+  newest success, `earliest_due_at` (the earliest moment a loaded table with a freshness target goes late, from its
+  last success or its creation), and `control_rows` (the control rows in the grain, enabled or not; 0 once none).
+  The app's "late" is `earliest_due_at < now()`, so it is live without a scan. Index: `(task_collection,
+  earliest_due_at)`.
+- `rollup_group` has one row per ingestion group: its totals over its databases, and how many databases it has
+  (with an enabled table) and servers.
+- The rewrite (`state_store.rollup_database_rewrite_sql`, `rollup_group_rewrite_sql`; the app copies the text and a
+  test keeps them equal) recounts the named databases from their own rows, then the groups. Nothing is kept by
+  deltas, so a missed write only delays the counts until the next write of that database. A group with no rollup
+  row yet is counted from its control rows by the app until a write or a check gives it one.
+
 ## `schema_version` — schema versions applied
 
 One row per version (`state_store.SCHEMA_VERSION`) applied: `version`, `applied_at`, `applied_by`.

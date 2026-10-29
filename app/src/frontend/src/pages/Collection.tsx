@@ -27,7 +27,7 @@ export default function CollectionPage() {
   const data = useQuery({
     queryKey: ["collection", name],
     queryFn: () => api.get<CollectionData>(`/collections/${encodeURIComponent(name)}/databases`),
-    refetchInterval: (q) => ((q.state.data as CollectionData | undefined)?.running ? 15_000 : 60_000),
+    refetchInterval: 15_000,
   });
   const dbs = data.data?.databases ?? [];
   const run = data.data?.running ?? null;

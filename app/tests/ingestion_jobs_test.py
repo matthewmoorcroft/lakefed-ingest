@@ -17,8 +17,10 @@ MEMBERS = [dict(schedule_id=1, task_collection="c1", offset_minutes=0, added_at=
 
 
 def state(group, tables, current=0, late=0, failing=0, server="srv1", database=None):
+    """A database's rollup row: its loaded tables, and whether it is late."""
     return dict(server=server, task_collection=group, src_database=database or f"{group}_db", tables=tables,
-                state_current=current, state_late=late, state_first_load=0, state_failing=failing, no_sla_tables=0)
+                state_loaded=current + late, late_database=late > 0, state_first_load=0, state_failing=failing,
+                no_sla_tables=0)
 
 
 STATES = [state("c1", 10, current=8, failing=2), state("c2", 5, current=5), state("c3", 4, late=4),
@@ -58,7 +60,7 @@ def test_jobs_come_failing_first_with_their_status_and_last_job_run():
     assert (last["slot"], last["outcome"]["label"], last["failed_tables"]) == ("2026-10-26T13:00:00+00:00",
                                                                                "Succeeded with failures", 2)
     assert last["took_s"] == 2390 and last["loaded"] == 2 + 0 and last["ran"] == 2
-    assert (nightly["status"]["label"], nightly["status"]["detail"]) == ("Late: 4 tables", ["paused"])
+    assert (nightly["status"]["label"], nightly["status"]["detail"]) == ("Late: 1 database", ["paused"])
 
 
 def test_a_running_job_run_counts_every_tables_of_the_job_and_its_waiting_groups():
@@ -124,10 +126,12 @@ def test_a_group_run_running_longer_than_the_window_still_shows_as_running():
 
 def test_a_paused_job_with_failing_tables_shows_failing_and_says_it_is_paused():
     paused_since = datetime(2026, 10, 26, 9, 2, tzinfo=UTC)
-    got = ij.status(dict(state_failing=3, state_late=9, paused=True, updated_at=paused_since), None, None, "Timed out", [])
+    got = ij.status(dict(state_failing=3, late_databases=9, paused=True, updated_at=paused_since), None, None,
+                    "Timed out", [])
     assert (got["label"], got["detail"], got["paused_since"], got["cause"]) == ("Failing: 3 tables", ["paused"], paused_since, "Timed out")
-    late = ij.status(dict(state_failing=0, state_late=9, paused=True, updated_at=paused_since), None, None, None, [])
-    assert (late["label"], late["detail"]) == ("Late: 9 tables", ["paused"])
+    late = ij.status(dict(state_failing=0, late_databases=9, paused=True, updated_at=paused_since), None, None, None,
+                     [])
+    assert (late["label"], late["detail"]) == ("Late: 9 databases", ["paused"])
 
 
 def test_a_window_starting_mid_slot_never_cuts_a_job_run_short():

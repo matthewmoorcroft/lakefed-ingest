@@ -141,7 +141,7 @@ class _Store:
     def __init__(self, configs, checkpoints, held=()):
         self.configs, self.checkpoints, self.held = configs, checkpoints, set(held)
         self.runs, self.finished, self.advanced, self.stamped, self.unlocked = [], {}, [], {}, []
-        self.closed, self.work_ids = [], []
+        self.closed, self.work_ids, self.rolled = [], [], {}
         self.alive = True
 
     def mixed_sinks(self):
@@ -173,6 +173,9 @@ class _Store:
     def stamp_databases(self, collection, stamps, run_id):
         self.stamped[collection] = [s[1] for s in stamps]
 
+    def rewrite_rollups(self, collection, src_databases):
+        self.rolled.setdefault(collection, set()).update(src_databases)
+
     def finish_run(self, run_id, **kw):
         self.finished[run_id] = kw
 
@@ -182,6 +185,15 @@ class _Store:
 
     def is_alive(self):
         return self.alive
+
+
+def test_the_check_recomputes_the_rollups_of_the_databases_it_stamped():
+    configs = [_cfg(1, "quiet", "a", "c1"), _cfg(2, "quiet", "b", "c1"),
+               _cfg(3, "new", "a", "c2"), _cfg(4, "old", "a", "c2")]
+    store = _Store(configs, _recorded(configs, {1: _cp(10), 2: _cp(10), 4: _cp(10)}))
+    ic.run_check(store, store, ["c1", "c2"], _detector({"quiet": 10, "old": 10}),
+                 existing_sinks_of=_sinks, job_run_id="77", cluster_id="serverless", parallelism=4)
+    assert store.rolled == {"c1": {"quiet"}, "c2": {"old"}}
 
 
 def test_the_check_stamps_the_quiet_databases_and_lists_each_collections_work():

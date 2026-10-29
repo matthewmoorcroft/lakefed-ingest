@@ -225,8 +225,8 @@ def status(job: dict, running: Optional[dict], last: Optional[dict], top_cause: 
            warnings: List[str]) -> dict:
     """A job's Status cell: its running state and its issues together. Running (with failing tables, the
     progress, expected end and top cause), else failing (paused or not), late while paused, late, paused,
-    ended without finishing, or current. A paused job whose tables are only late shows late, not failing."""
-    failing, late = q._count(job, "state_failing"), q._count(job, "state_late")
+    ended without finishing, or current. A paused job whose databases are only late shows late, not failing."""
+    failing, late = q._count(job, "state_failing"), q._count(job, "late_databases")
     if running:
         p = running["progress"]
         checked = p["unchanged"] + p["loaded"]
@@ -240,9 +240,10 @@ def status(job: dict, running: Optional[dict], last: Optional[dict], top_cause: 
         return {"label": f"Failing: {failing:,} {'table' if failing == 1 else 'tables'}", "tone": "bad", **paused,
                 "cause": top_cause}
     if job.get("paused") and late:
-        return {"label": f"Late: {late:,} {'table' if late == 1 else 'tables'}", "tone": "warn", **paused, "cause": None}
+        return {"label": f"Late: {late:,} {'database' if late == 1 else 'databases'}", "tone": "warn", **paused,
+                "cause": None}
     if late:
-        return {"label": f"Late: {late:,} {'table' if late == 1 else 'tables'}", "tone": "warn",
+        return {"label": f"Late: {late:,} {'database' if late == 1 else 'databases'}", "tone": "warn",
                 "detail": warnings[:1], "cause": None}
     if job.get("paused"):
         return {"label": "Paused", "tone": "neutral", "detail": [], "cause": None}
@@ -333,18 +334,19 @@ def jobs_view(schedules: List[dict], members: List[dict], states: List[dict], ru
         rows.append(row)
         running_job_runs += [x for x in summaries if x["outcome"]["label"] == "Running"]
     rows.sort(key=lambda j: (-1 if j["running_job_run"] and j["state_failing"] else 0 if j["state_failing"] else
-                             1 if j["state_late"] else 2, str(j["name"]).lower()))
+                             1 if j["late_databases"] else 2, str(j["name"]).lower()))
     attention = [j for j in rows if j["state_failing"]
                  or (j["last_job_run"] and j["last_job_run"]["outcome"]["label"] == "Ended without finishing")]
     attention.sort(key=lambda j: (-q._count(j, "state_failing"), str(j["name"]).lower()))
     running_job_runs.sort(key=lambda r: r.get("started_at") or r["slot"])
-    totals = {**{k: sum(q._count(g, k) for g in groups.values()) for k in ("enabled_tables", "no_sla_tables") + rollup.STATES},
+    totals = {**{k: sum(q._count(g, k) for g in groups.values())
+                 for k in ("enabled_tables", "no_sla_tables", "late_databases") + rollup.STATES},
               "groups": len(groups), "databases": len({(s["server"], s["src_database"]) for s in states
                                                         if q._count(s, "tables")}),
               "servers": len({s["server"] for s in states if q._count(s, "tables")}),
               "jobs": len(rows), "running_jobs": sum(1 for j in rows if j["running_job_run"]),
               "failing_jobs": sum(1 for j in rows if j["state_failing"]),
-              "late_jobs": sum(1 for j in rows if j["state_late"])}
+              "late_jobs": sum(1 for j in rows if j["late_databases"])}
     unscheduled = set((not_in_job or {}).get("groups") or [])
     running_not_in_job = [dict(r, outcome=q.run_outcome({"status": "running"}, r)) for r in running
                           if r["task_collection"] in unscheduled]

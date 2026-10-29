@@ -27,7 +27,7 @@ export default function Database() {
   const found = useQuery({
     queryKey: ["database", name, server, database, search, offset],
     queryFn: () => api.get<Row>(`${path}${qs({ search, offset })}`),
-    refetchInterval: (q) => ((q.state.data as Row | undefined)?.running ? 15_000 : 60_000),
+    refetchInterval: 15_000,
   });
   const d = found.data;
   const running = !!d?.running;

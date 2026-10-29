@@ -4,8 +4,9 @@ import rollup
 
 def state(server, group, database, tables=0, current=0, late=0, first=0, failing=0, no_sla=0, connection=None,
           host=None, newest=None, oldest=None):
-    return dict(server=server, task_collection=group, src_database=database, tables=tables, state_current=current,
-                state_late=late, state_first_load=first, state_failing=failing, no_sla_tables=no_sla,
+    """A database's rollup row: its loaded tables (current and late), and whether it is late (a late table)."""
+    return dict(server=server, task_collection=group, src_database=database, tables=tables, state_loaded=current + late,
+                late_database=late > 0, state_first_load=first, state_failing=failing, no_sla_tables=no_sla,
                 src_connection=connection, src_host=host, newest_success_at=newest, oldest_success_at=oldest)
 
 
@@ -18,7 +19,7 @@ STATES = [state("srvX", "c1", "Sales", tables=3, current=3, newest="2026-10-26T1
 def test_two_servers_same_named_databases_are_two_and_disabled_only_ones_none():
     g = rollup.groups(STATES)["c1"]
     assert (g["databases"], g["servers"], g["server"]) == (2, 2, "srvX")
-    assert (g["enabled_tables"], g["state_current"], g["state_late"]) == (5, 4, 1)
+    assert (g["enabled_tables"], g["state_loaded"], g["late_databases"]) == (5, 5, 1)
     assert g["newest_success_at"] == "2026-10-26T11:00"
 
 
@@ -62,7 +63,7 @@ def test_a_group_in_two_jobs_adds_to_both_and_one_in_no_job_is_not_in_any_job():
     by_name = {j["name"]: j for j in jobs}
     assert (by_name["East hourly"]["enabled_tables"], by_name["East hourly"]["databases"]) == (5, 2)
     assert (by_name["Nightly"]["enabled_tables"], by_name["Nightly"]["databases"], by_name["Nightly"]["servers"]) == (10, 3, 3)
-    assert by_name["Nightly"]["groups"] == ["c1", "c3"] and by_name["Nightly"]["state_late"] == 1
+    assert by_name["Nightly"]["groups"] == ["c1", "c3"] and by_name["Nightly"]["late_databases"] == 1
     assert not_in_job["groups"] == ["c2"] and (not_in_job["enabled_tables"], not_in_job["state_failing"]) == (4, 2)
     assert rollup.jobs(STATES, SCHEDULES, MEMBERS + [dict(schedule_id=1, task_collection="c2", offset_minutes=30,
                                                           removed_at=None)])[1] is None
@@ -144,3 +145,18 @@ def test_a_connection_claims_rows_at_its_own_port_and_a_stale_host_on_a_connecti
     assert [d["src_database"] for d in rollup.connection_databases(states, "on_default", "db.example", None, "SQLSERVER")] == ["A"]
     conn = {i["server"]: i for i in rollup.sources(states, [], [], SCHEDULES, MEMBERS)["instances"]}["conn_a"]
     assert [v["kind"] for v in conn["read_via"]] == ["uc"]
+
+
+def test_a_late_database_counts_once_however_many_grains_it_has():
+    rows = [state("srvY", "c1", "Sales", tables=2, current=1, late=1),
+            state("srvY", "c1", "Sales", tables=1, late=1, connection="other")]
+    g = rollup.groups(rows)["c1"]
+    assert (g["late_databases"], g["state_loaded"]) == (1, 3)
+    assert [s["late_databases"] for s in rollup.servers(rows)] == [1]
+
+
+def test_a_scanned_database_is_loaded_with_its_late_tables_and_is_late_when_one_is():
+    row = rollup.from_scan(dict(server="s", task_collection="c", src_database="d", tables=4, state_current=2,
+                                state_late=2, state_first_load=0, state_failing=0))
+    assert (row["state_loaded"], row["late_database"]) == (4, True)
+    assert "state_current" not in row and "state_late" not in row
