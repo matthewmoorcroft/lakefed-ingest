@@ -50,14 +50,14 @@ def test_a_whole_server_of_100000_tables_fits_one_job():
 def test_more_lines_than_a_job_takes_at_once_are_refused(monkeypatch):
     monkeypatch.setattr(nj, "MAX_LINES", 10)
     plan = nj.plan("Big job", _server(1, 11), {"sink_catalog": "main", "sink_schema": "s"}, 4, set())
-    assert plan["errors"] == ["11 lines: at most 10 in one import"]
+    assert plan["errors"] == ["more than 10 lines: at most 10 in one import"]
 
 
 def test_import_csv_keeps_its_own_cap_of_5000_lines():
     import config_import as ci
     read = ci.plan_import(_server(1, 5001), "g", {"src_type": "sqlserver", "load_type": "ct", "use_remote_query": True,
                                                   "sink_catalog": "c", "sink_schema": "s", "sink_table": "{table}"}, [])
-    assert read["errors"] == ["5,001 lines: at most 5,000 in one import"]
+    assert read["errors"] == ["more than 5,000 lines: at most 5,000 in one import"]
 
 
 def test_the_same_database_always_joins_the_same_group():

@@ -10,6 +10,11 @@ import new_job as nj
 TABLES_PER_GROUP = 12_500
 # Databases are read this many at a time, each page starting after the key of the last one read.
 DATABASE_PAGE = 500
+# A transaction of a big job writes its databases up to about this many tables together. A database is never split
+# across transactions, so one bigger than this has a transaction of its own.
+TABLES_PER_TRANSACTION = 5_000
+# The check reads the tables of this many databases in one statement.
+DATABASES_PER_READ = 100
 
 
 def groups_for_tables(tables: int) -> int:
@@ -36,11 +41,14 @@ def database_pages(page: Callable[[Tuple[str, str, str]], List[dict]]) -> Iterat
 
 
 class Unit:
-    """One database a selection takes: all its tables (every is True) or only the named ones (schema.table, lower case)."""
-    __slots__ = ("server", "database", "every", "tables")
+    """One database a selection takes: all its tables (every is True) or only the named ones (schema.table, lower case).
+    exact is True when the server and database are the names the source listing returned, so a read can match them
+    as stored; a name the user typed may differ in case and is matched without regard to case."""
+    __slots__ = ("server", "database", "every", "tables", "exact")
 
-    def __init__(self, server: str, database: str, every: bool, tables: Optional[frozenset] = None):
-        self.server, self.database, self.every, self.tables = server, database, every, tables
+    def __init__(self, server: str, database: str, every: bool, tables: Optional[frozenset] = None,
+                 exact: bool = False):
+        self.server, self.database, self.every, self.tables, self.exact = server, database, every, tables, exact
 
     def keeps(self, row: dict) -> bool:
         """Whether a table row of this database is one the selection takes."""
@@ -56,7 +64,7 @@ def selection_units(selection, server_database_keys: Iterator[Tuple[str, str]]) 
     seen = set()
     for server, database in server_database_keys:
         seen.add((server.lower(), database.lower()))
-        yield Unit(server, database, True)
+        yield Unit(server, database, True, exact=True)
     filter_ = str(selection.filter or "").lower()
     covered = lambda database: bool(selection.whole_server) and filter_ in database.lower()
     for named in selection.databases:
@@ -74,6 +82,43 @@ def selection_units(selection, server_database_keys: Iterator[Tuple[str, str]]) 
             continue
         seen.add((server, database_lower))
         yield Unit(server, database, False, frozenset(names))
+
+
+def read_key(server: str, database: str) -> str:
+    """A database as database_rows_chunk_sql matches it: its lower-case server and name, joined by the unit
+    separator."""
+    return f"{str(server).lower()}\x1f{str(database).lower()}"
+
+
+def read_batches(units: List[Unit]) -> Iterator[List[Unit]]:
+    """The units in order, DATABASES_PER_READ at a time, so one statement reads a batch's tables."""
+    for at in range(0, len(units), DATABASES_PER_READ):
+        yield units[at:at + DATABASES_PER_READ]
+
+
+def rows_by_unit(units: List[Unit], rows: List[dict]) -> List[Tuple[Unit, List[dict]]]:
+    """Each unit with the table rows of its database that it takes, out of the rows of all the units' databases (read
+    together, in one statement)."""
+    by_key: Dict[str, List[dict]] = {}
+    for row in rows:
+        by_key.setdefault(read_key(row["server"], row["src_database"]), []).append(row)
+    return [(unit, [row for row in by_key.get(read_key(unit.server, unit.database), []) if unit.keeps(row)])
+            for unit in units]
+
+
+def transactions_of(counted: List[Tuple[Unit, int]]) -> Iterator[List[Unit]]:
+    """The databases, in order, packed into transactions: each (unit, tables) is added to the transaction being filled
+    until adding it would take that past TABLES_PER_TRANSACTION, and then the next transaction starts."""
+    chunk: List[Unit] = []
+    tables = 0
+    for unit, count in counted:
+        if chunk and tables + count > TABLES_PER_TRANSACTION:
+            yield chunk
+            chunk, tables = [], 0
+        chunk.append(unit)
+        tables += count
+    if chunk:
+        yield chunk
 
 
 def plan_database(job_name: str, given: dict, rows: List[dict], columns: List[str], groups: Dict[str, int],

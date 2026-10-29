@@ -49,6 +49,14 @@ class RecordingConnection:
     def total_rows(self) -> int:
         return sum(self.rows.values())
 
+    def reads(self) -> int:
+        """Statements that read (a select, or a lock taken by a select), as the Counter's kinds name them."""
+        return sum(count for kind, count in self.statements.items() if kind.startswith("select"))
+
+    def round_trips(self) -> int:
+        """Round trips a real connection makes: each statement, and the BEGIN and COMMIT of each transaction."""
+        return self.total_statements() + 2 * self.transactions
+
     @contextmanager
     def cursor(self) -> Iterator["RecordingCursor"]:
         yield RecordingCursor(self)

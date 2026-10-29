@@ -79,12 +79,12 @@ def test_wall_time_is_one_worker_at_most_and_the_sum_of_work_at_one_worker(small
     one_worker = run.wall_s(slow, 1)
     assert one_worker == slow.seconds(run.ledger[sim.MASTER].calls, 0) + sum(
         run.ledger[name].seconds(slow) for name in run.order)
-    assert run.wall_s(slow, steps.DESIGN_WORKERS) <= run.wall_s(slow, steps.NOTEBOOK_WORKERS) <= one_worker
+    assert run.wall_s(slow, steps.NOTEBOOK_WORKERS) <= run.wall_s(slow, steps.PREVIOUS_WORKERS) <= one_worker
 
 
 def test_wall_time_rises_with_latency(small_catalog):
     run = steps.discover(small_catalog)
-    assert run.wall_s(sim.Latency(0.25), steps.DESIGN_WORKERS) < run.wall_s(sim.Latency(1.0), steps.DESIGN_WORKERS)
+    assert run.wall_s(sim.Latency(0.25), steps.NOTEBOOK_WORKERS) < run.wall_s(sim.Latency(1.0), steps.NOTEBOOK_WORKERS)
 
 
 def test_pool_makespan_takes_tasks_in_order_on_the_freest_worker():
@@ -101,11 +101,13 @@ def test_like_matches_the_patterns_the_harness_uses():
     assert sim.like_matches("%", "ops_00001")
 
 
-def test_the_discover_writes_are_one_insert_per_table_and_a_start_and_finish_per_database(small_catalog):
+def test_the_discover_writes_are_a_thousand_tables_to_a_statement_and_a_transaction_per_database(small_catalog):
     run, connection = steps.discover_writes(small_catalog)
-    assert connection.statements["insert lakefed_ingest.discovered_table"] == run.tables
+    per_database = math.ceil(small_catalog.tables_per_database / steps.TABLE_BATCH)
+    assert connection.statements["insert lakefed_ingest.discovered_table"] == run.discovered * per_database
     assert connection.rows["insert lakefed_ingest.discovered_table"] == run.tables
     assert connection.statements["delete lakefed_ingest.discovered_table"] == run.discovered
+    assert connection.transactions == run.discovered
     databases = run.discovered + len(run.refused)
     assert connection.statements["insert lakefed_ingest.discovery"] == databases
     assert connection.statements["update lakefed_ingest.discovery"] == databases
@@ -117,6 +119,13 @@ def test_the_writer_columns_are_the_notebook_columns():
     source = "".join("".join(cell["source"]) for cell in notebook["cells"] if cell["cell_type"] == "code")
     notebook_cols = re.findall(r'"(\w+)"', re.search(r"TABLE_COLS = \[(.*?)\]", source, re.S).group(1))
     assert notebook_cols == steps.TABLE_COLS
+
+
+def test_the_notebook_writes_its_batch_size():
+    with open(os.path.join(paths.ROOT, "src", "lakefed_ingest", "discover_tables.ipynb"), encoding="utf-8") as handle:
+        notebook = json.load(handle)
+    source = "".join("".join(cell["source"]) for cell in notebook["cells"] if cell["cell_type"] == "code")
+    assert int(re.search(r"^TABLE_BATCH = (\d+)", source, re.M).group(1)) == steps.TABLE_BATCH
 
 
 def test_the_recording_connection_counts_executemany_per_row_and_multi_row_values_by_group():
@@ -140,6 +149,29 @@ def test_create_by_reference_plans_every_discovered_table_and_writes_it_in_thous
     assert run.connection.statements["insert lakefed_ingest.schedule"] == 1
 
 
+def test_create_by_database_checks_every_database_then_writes_each_in_its_own_transaction(small_catalog):
+    run = apps.create_by_database(small_catalog)
+    databases = small_catalog.databases - len(small_catalog.unopenable_names())
+    assert run.errors == []
+    assert run.databases == databases and run.tables == steps.discover(small_catalog).tables
+    assert run.connection.transactions == databases + 2      # plus the job's own, and the task's result
+    assert run.connection.statements["insert lakefed_ingest.control"] == databases
+    assert run.connection.statements["insert lakefed_ingest.schedule_member"] == databases
+    assert run.connection.statements["update lakefed_ingest.app_task"] == databases + 2
+
+
+def test_create_by_chunk_writes_the_same_tables_in_packed_transactions_and_fewer_statements(small_catalog):
+    before = apps.create_by_database(small_catalog)
+    after = apps.create_by_chunk(small_catalog)
+    assert after.errors == [] and after.databases == before.databases and after.tables == before.tables
+    assert after.groups == before.groups
+    assert after.connection.transactions < before.connection.transactions
+    assert after.connection.reads() < before.connection.reads()
+    assert after.connection.total_statements() < before.connection.total_statements()
+    assert after.connection.round_trips() < before.connection.round_trips()
+    assert after.connection.statements["insert lakefed_ingest.schedule_member"] <= after.connection.transactions
+
+
 def test_an_upload_writes_its_header_and_each_line_a_thousand_to_a_statement(small_catalog):
     run = apps.upload_by_reference(small_catalog)
     assert run.errors == []
@@ -150,7 +182,7 @@ def test_an_upload_writes_its_header_and_each_line_a_thousand_to_a_statement(sma
 
 def test_the_line_caps_refuse_the_file_past_them():
     errors, _ = apps.create_refusal(nj.MAX_LINES + 1)
-    assert errors == [f"{nj.MAX_LINES + 1:,} lines: at most {nj.MAX_LINES:,} in one import"]
+    assert errors == [f"more than {nj.MAX_LINES:,} lines: at most {nj.MAX_LINES:,} in one import"]
     errors, _ = apps.upload_refusal(nj.MAX_LINES + 1)
     assert errors == [f"more than {nj.MAX_LINES:,} lines: at most {nj.MAX_LINES:,} in one file"]
 
@@ -173,8 +205,8 @@ def test_no_connection_is_made_while_the_steps_run():
 @pytest.mark.skipif(not SCALE, reason="LAKEFED_SCALE=1 runs the 100,000-table size")
 def test_create_and_upload_at_a_hundred_thousand_tables_are_planned_in_full():
     catalog = sc.ServerCatalog(databases=417)
-    run = apps.create_by_reference(catalog)
-    assert run.errors == [] and run.tables == steps.discover(catalog).tables
+    run = apps.create_by_database(catalog)
+    assert run.errors == [] and run.tables == (417 - len(catalog.unopenable_names())) * 240
     upload = apps.upload_by_reference(catalog)
     assert upload.lines == run.tables and upload.errors == []
 

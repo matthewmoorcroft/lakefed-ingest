@@ -9,15 +9,16 @@ from collections import Counter
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional
 
+import discovery
 import paths  # noqa: F401  (sys.path)
 import lakebase_fake
 import server_catalog
 import simulation as sim
 
-# discover_tables.ipynb runs at most 8 databases at once (ThreadPoolExecutor(max_workers=min(8, databases))), each one's
-# three catalog queries in turn. The design's cap is 32 queries at a time under the server's limit.
-NOTEBOOK_WORKERS = 8
-DESIGN_WORKERS = 32
+# discover_tables.ipynb ran 8 databases at once before the discovery fix (min(8, databases)), and runs
+# discovery.DEFAULT_WORKERS now (32, the design's cap). Both are kept, so one run shows the before and the after.
+PREVIOUS_WORKERS = 8
+NOTEBOOK_WORKERS = discovery.DEFAULT_WORKERS
 
 FoundCallback = Callable[[str, List[dict]], None]
 RefusalCallback = Callable[[str, str], None]
@@ -101,14 +102,19 @@ START_SQL = ("insert into lakefed_ingest.discovery (discovery_id, src_type, src_
 FINISH_SQL = ("update lakefed_ingest.discovery set status = %s, tables = %s, error = %s, finished_at = now() "
               "where discovery_id = %s and src_database = %s")
 DELETE_SQL = "delete from lakefed_ingest.discovered_table where discovery_id = %s and src_database = %s"
-INSERT_SQL = (f"insert into lakefed_ingest.discovered_table ({', '.join(TABLE_COLS)}) "
-              f"values ({', '.join(['%s'] * len(TABLE_COLS))})")
+TABLE_BATCH = 1000   # rows to an insert statement (discover_tables.ipynb's TABLE_BATCH)
+
+
+def insert_sql(rows: int) -> str:
+    """The insert of ``rows`` discovered tables in one statement, as discover_tables.ipynb writes them."""
+    one_row = f"({', '.join(['%s'] * len(TABLE_COLS))})"
+    return f"insert into lakefed_ingest.discovered_table ({', '.join(TABLE_COLS)}) values {', '.join([one_row] * rows)}"
 
 
 class DiscoveryWriter:
-    """The Lakebase writes discover_tables.ipynb makes for each database: start it, replace its tables, finish it. The
-    notebook starts a database before it reads it; the writer makes the same statements after each database is read,
-    and the counts come out the same."""
+    """The Lakebase writes discover_tables.ipynb makes for each database: start it, replace its tables in one transaction
+    (TABLE_BATCH rows to a statement), finish it. The notebook starts a database before it reads it; the writer makes the
+    same statements after each database is read, and the counts come out the same."""
 
     def __init__(self, connection: lakebase_fake.RecordingConnection, discovery_id: str = DISCOVERY_ID,
                  spec: Optional[dict] = None):
@@ -129,9 +135,11 @@ class DiscoveryWriter:
         self.start(database)
         rows = [tuple({**t, "discovery_id": self.discovery_id, "src_database": database}.get(c) for c in TABLE_COLS)
                 for t in found_rows]
-        with self.connection.cursor() as cursor:
+        with self.connection.transaction() as cursor:
             cursor.execute(DELETE_SQL, (self.discovery_id, database))
-            cursor.executemany(INSERT_SQL, rows)
+            for at in range(0, len(rows), TABLE_BATCH):
+                chunk = rows[at:at + TABLE_BATCH]
+                cursor.execute(insert_sql(len(chunk)), tuple(v for row in chunk for v in row))
         self.finish(database, "ok", tables=len(rows))
 
     def refused(self, database: str, message: str) -> None:

@@ -10,7 +10,7 @@ import io
 import json
 from collections import Counter
 from itertools import product
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import queries as q
 
@@ -162,6 +162,19 @@ def _source_errors(row: dict, settings: dict) -> List[str]:
     return errors
 
 
+def _lines_within(rows, max_lines: int) -> Optional[List[dict]]:
+    """The file's non-blank lines, read one at a time. None as soon as there are more than max_lines, so an oversize
+    file is refused without reading the rest of it."""
+    lines: List[dict] = []
+    for row in rows:
+        if not any(not _blank(v) for v in row.values()):
+            continue
+        if len(lines) == max_lines:
+            return None
+        lines.append(dict(row))
+    return lines
+
+
 def plan_import(text: str, group: str, given: dict, group_rows: List[dict], max_lines: int = MAX_LINES) -> dict:
     """What importing this CSV into the group would write: {"errors": the file's own problems, "lines": one per
     line, with its file line number, the control row it makes, its status (valid, invalid or registered, for a
@@ -172,9 +185,10 @@ def plan_import(text: str, group: str, given: dict, group_rows: List[dict], max_
     errors = _header_errors(header) if header else ["the file is empty"]
     if errors:
         return {"errors": errors, "lines": [], "settings": {}}
-    lines = [dict(r) for r in reader if any(not _blank(v) for v in r.values())]
-    if len(lines) > max_lines:
-        return {"errors": [f"{len(lines):,} lines: at most {max_lines:,} in one import"], "lines": [], "settings": {}}
+    lines = _lines_within(reader, max_lines)
+    if lines is None:
+        return {"errors": [f"more than {max_lines:,} lines: at most {max_lines:,} in one import"], "lines": [],
+                "settings": {}}
     settings, errors = effective_settings(given, group_rows)
     if errors:
         return {"errors": errors, "lines": [], "settings": settings}

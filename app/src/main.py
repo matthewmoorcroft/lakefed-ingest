@@ -16,12 +16,13 @@ import logging
 import os
 import re
 from contextlib import asynccontextmanager, contextmanager
+from dataclasses import dataclass
 import threading
 import time
 import uuid
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
-from typing import Iterable, List, Optional
+from typing import Iterable, List, Optional, Tuple
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response
@@ -144,14 +145,25 @@ def _lock_collections(cur, collections):
             raise HTTPException(409, f"ingestion group '{c}' is running; try again after the run finishes")
 
 
+def _lock_collections_together(cur, collections):
+    """_lock_collections for many collections in one statement: each one's lock, or a 409 for the first a run holds."""
+    collections = sorted({c for c in collections if c})
+    if not collections:
+        return
+    cur.execute(q.collection_locks_sql(), ([q.collection_lock_key(c) for c in collections],))
+    got = {key: taken for key, taken in cur.fetchall()}
+    for c in collections:
+        if not got.get(q.collection_lock_key(c)):
+            raise HTTPException(409, f"ingestion group '{c}' is running; try again after the run finishes")
+
+
 def _refuse_mixed_sinks(cur, rows):
     """After writing control rows, in the same transaction: refuse when a sink they write would be
     claimed by a dedicated row and by other rows (the next run would stop every table on it)."""
-    sinks = sorted({".".join(str(r.get(k)).lower() for k in ("sink_catalog", "sink_schema", "sink_table"))
-                    for r in rows})
+    sinks = sorted({tuple(str(r.get(k)).lower() for k in ("sink_catalog", "sink_schema", "sink_table")) for r in rows})
     if not sinks:
         return
-    cur.execute(q.mixed_sinks_for_sql(), (sinks,))
+    cur.execute(q.mixed_sinks_for_sql(), tuple([sink[at] for sink in sinks] for at in range(3)))
     mixed = [r[0] for r in cur.fetchall()]
     if mixed:
         raise HTTPException(409, f"sink {mixed[0]} would be claimed by a dedicated row and by other rows; "
@@ -179,13 +191,13 @@ def _log(cur, user, action, control_id, collection, field=None, old=None, new=No
                                      as_text(new), reseed, batch))
 
 
-def _log_lines(cur, lines):
-    """Many change log lines, each the values _log takes after cur, written q.CONTROL_BATCH to a statement."""
+def _log_lines(cur, lines, per_statement=q.CONTROL_BATCH):
+    """Many change log lines, each the values _log takes after cur, per_statement to a statement."""
     as_text = lambda v: None if v is None else str(v)
     lines = [(user or None, action, control_id, collection, field, as_text(old), as_text(new), reseed, batch)
              for user, action, control_id, collection, field, old, new, reseed, batch in lines]
-    for at in range(0, len(lines), q.CONTROL_BATCH):
-        chunk = lines[at:at + q.CONTROL_BATCH]
+    for at in range(0, len(lines), per_statement):
+        chunk = lines[at:at + per_statement]
         cur.execute(q.log_changes_sql(len(chunk)), tuple(v for line in chunk for v in line))
 
 
@@ -194,10 +206,12 @@ def _taken_target(row: dict) -> str:
             + (f" for {row['client_id']}" if row.get("client_id") else ""))
 
 
-def _insert_controls(cur, rows, user, batch, skip_taken=False, progress=None) -> List[tuple]:
-    """Insert new control rows q.CONTROL_BATCH to a statement, each with its "import" change log line, inside the
-    caller's transaction. A row whose target another table writes refuses the lot (409), or with skip_taken is left
-    out. Returns (row, id) for each row written; progress(n) is told how many rows are done after each statement."""
+def _insert_controls(cur, rows, user, batch, skip_taken=False, progress=None,
+                     log_per_statement=q.CONTROL_BATCH) -> List[tuple]:
+    """Insert new control rows q.CONTROL_BATCH to a statement, then their "import" change log lines, log_per_statement
+    to a statement, inside the caller's transaction. A row whose target another table writes refuses the lot (409), or
+    with skip_taken is left out. Returns (row, id) for each row written; progress(n) is told how many rows are done
+    after each statement."""
     written = []
     for at in range(0, len(rows), q.CONTROL_BATCH):
         chunk = rows[at:at + q.CONTROL_BATCH]
@@ -211,12 +225,11 @@ def _insert_controls(cur, rows, user, batch, skip_taken=False, progress=None) ->
                 now.append((row, control_id))
             elif not skip_taken:
                 raise HTTPException(409, _taken_target(row))
-        if now:
-            _log_lines(cur, [(user, "import", control_id, row["task_collection"], None, None, None, None, batch)
-                             for row, control_id in now])
         written += now
         if progress:
             progress(at + len(chunk))
+    _log_lines(cur, [(user, "import", control_id, row["task_collection"], None, None, None, None, batch)
+                     for row, control_id in written], log_per_statement)
     _rewrite_rollups(cur, [(row["task_collection"], row.get("src_database")) for row, _ in written])
     return written
 
@@ -677,7 +690,8 @@ class Selection(BaseModel):
 
 
 def _selection_params(selection: Selection) -> tuple:
-    """(kind, the parameter the source's queries take, source id, the parameters of selected_rows_sql after it)."""
+    """(kind, the parameter the source's queries take, source id, the parameters the selection queries take after
+    it)."""
     kind, param, source_id = selection.source()
     if kind == "upload" and not db.query(q.upload_sql(), (param,)):
         raise HTTPException(404, f"upload {param} not found")
@@ -695,6 +709,30 @@ def _selection_parts(selection: Selection, whole_servers: List[str]) -> list:
             + [("tables", t.server, t.database, list(t.tables), None) for t in selection.tables if not covered(t.database)])
 
 
+SELECTED_PAGE = 1000   # the tables a selection is read from Lakebase by, one keyset page at a time
+
+
+def _selected_rows(kind: str, param, selection: Selection) -> List[dict]:
+    """The tables a selection takes, read a page at a time in key order. The read stops, with a refusal, when the rows
+    passed BACKGROUND_ROWS: the count before it said fewer, so the selection grew while it was read, and the request
+    is sent again to be written in the background. The request holds at most BACKGROUND_ROWS rows, whatever the source
+    has."""
+    database_keys = [q.selection_key(d.server, d.database) for d in selection.databases]
+    table_keys = [q.selection_key(t.server, t.database, name) for t in selection.tables for name in t.tables]
+    rows, after = [], ("", "", -1, "", "")
+    while True:
+        page = db.query(q.selected_rows_page_sql(kind), (param, selection.whole_server, selection.filter, database_keys,
+                                                         table_keys, *after, SELECTED_PAGE))
+        if len(rows) + len(page) > BACKGROUND_ROWS:
+            raise HTTPException(422, {"errors": [f"the selection grew past {BACKGROUND_ROWS:,} tables while it was "
+                                                 "read: send it again, and it is written in the background"]})
+        rows += page
+        if len(page) < SELECTED_PAGE:
+            return rows
+        last = page[-1]
+        after = (last["server"], last["k_database"], last["line"], last["k_schema"], last["k_table"])
+
+
 def _selected(selection: Selection) -> dict:
     """What a selection takes, read back from Lakebase: {"text": the CSV a plan reads, "lines": each of its lines'
     line number in the uploaded file (or None), "parts": the job_selection rows to keep with the job, "kind",
@@ -707,9 +745,7 @@ def _selected(selection: Selection) -> dict:
         columns = list(upload[0]["columns"])
     else:
         columns = list(nj.DISCOVERY_COLUMNS)
-    database_keys = [q.selection_key(d.server, d.database) for d in selection.databases]
-    table_keys = [q.selection_key(t.server, t.database, name) for t in selection.tables for name in t.tables]
-    rows = db.query(q.selected_rows_sql(kind), (param, selection.whole_server, selection.filter, database_keys, table_keys))
+    rows = _selected_rows(kind, param, selection)
     if not rows:
         raise HTTPException(422, {"errors": ["the selection takes no tables"]})
     whole = ([s["server"] for s in db.query(q.source_servers_sql(kind), (param, selection.filter))]
@@ -2018,7 +2054,7 @@ def add_job_tables(job_id: int, body: JobTablesRequest, request: Request):
         return made
     if body.source is not None:
         kind, param, source_id, rest = _selection_params(body.source)
-        counted = db.query(q.selected_rows_sql(kind, count=True), (param, *rest))
+        counted = db.query(q.selected_count_sql(kind), (param, *rest))
         if counted and counted[0]["n"] > BACKGROUND_ROWS:
             return _add_by_database(job_id, body, request, kind, param, source_id, rest, int(counted[0]["n"]))
     job = _load_schedule(job_id)[0]
@@ -3091,6 +3127,72 @@ def _unit_rows(kind: str, param, unit) -> List[dict]:
     return [r for r in db.query(q.database_rows_sql(kind), (param, unit.server, unit.database)) if unit.keeps(r)]
 
 
+@dataclass(slots=True, kw_only=True)
+class ChunkJob:
+    """The job a by-database write puts its databases into: its schedule, who asked and the batch their log lines carry,
+    the schedule's cadence and time zone (for the create lines' text), each group's offset, and the task whose
+    progress each transaction records."""
+    sid: int
+    name: str
+    user: str
+    batch: str
+    cadence_minutes: int
+    timezone: str
+    offsets: dict
+    task_id: int
+
+
+def _write_chunk(cur, plans: List[dict], job: ChunkJob, state: dict) -> None:
+    """The writes of one transaction, for the databases of a chunk (their plans), in the caller's transaction: each
+    group's run lock once, the control rows the chunk's databases do not have yet (a resumed write skips the rows a
+    committed transaction wrote) with their change log lines in one statement, the mixed and split checks once, the
+    members its groups are missing (a schedule_create line for each one added), and the task's progress."""
+    groups = sorted({group for plan in plans for group in plan["groups"]})
+    _lock_collections_together(cur, groups)
+    lines = [(line, line["row"]) for plan in plans for line in plan["lines"]]
+    names = {str(row.get("src_database") or "") for _, row in lines}
+    databases = sorted(names | {name.lower() for name in names})
+    have = set()
+    if groups and databases:
+        cur.execute(q.job_database_sinks_chunk_sql(), (groups, databases))
+        have = {tuple(found) for found in cur.fetchall()}
+    todo = [row for line, row in lines
+            if (str(row.get("src_database") or "").lower(), line["sink"], str(row.get("client_id") or ""),
+                row["task_collection"]) not in have]
+    if todo:
+        _insert_controls(cur, todo, job.user, job.batch, log_per_statement=by_database.TABLES_PER_TRANSACTION)
+        _refuse_mixed_sinks(cur, todo)
+        _refuse_split_databases(cur, todo)
+    if groups:
+        cur.execute(q.insert_members_if_absent_sql(),
+                    (job.sid, groups, [job.offsets.get(group, 0) for group in groups]))
+        created = sorted(found[0] for found in cur.fetchall())
+        _log_lines(cur, [(job.user, "schedule_create", None, group, "schedule", None,
+                          f"{job.name} ({sch.describe(job.cadence_minutes, job.offsets.get(group, 0), job.timezone)})",
+                          None, job.batch) for group in created])
+    state["databases_written"] += len(plans)
+    state["tables_written"] += sum(len(plan["lines"]) for plan in plans)
+    cur.execute(q.task_progress_json_sql(), (json.dumps(state), state["tables_written"], job.task_id))
+
+
+def _rows_of_units(kind, param, units: List) -> List[Tuple[object, List[dict]]]:
+    """Each unit with the table rows it takes, read for all of the units in one or two statements. The databases a
+    source listing returned for an upload are read by their exact names (an index range each); the rest, which a
+    user named in any case, are read without regard to case."""
+    if not units:
+        return []
+    rows = []
+    exact = [unit for unit in units if kind == "upload" and unit.exact]
+    if exact:
+        rows += db.query(q.database_rows_exact_sql(),
+                         ([unit.server for unit in exact], [unit.database for unit in exact], param))
+    named = [unit for unit in units if not (kind == "upload" and unit.exact)]
+    if named:
+        keys = [by_database.read_key(unit.server, unit.database) for unit in named]
+        rows += db.query(q.database_rows_chunk_sql(kind), (param, keys))
+    return by_database.rows_by_unit(units, rows)
+
+
 def _create_by_database(body: NewJobRequest, request: Request, selection: Selection, kind, param, source_id, rest):
     """A big job, by reference to more tables than BACKGROUND_ROWS: its groups are sized by tables (by_database), and it
     is written in a background task, one database at a time, each database's rows in its own transaction. First every
@@ -3137,29 +3239,30 @@ def _create_by_database(body: NewJobRequest, request: Request, selection: Select
     def units():
         return _units_of(kind, param, selection)
 
-    def rows_of(unit):
-        return _unit_rows(kind, param, unit)
-
     def plan_of(rows, own):
         plan = by_database.plan_database(name, body.settings, rows, columns, groups_of, taken, own)
         return plan
 
     def check(task_id, own):
-        """Every database planned, nothing written: the file's and the settings' problems, and the groups in use."""
-        errors_found = []
-        for unit in units():
-            rows = rows_of(unit)
-            if not rows:
-                continue
-            plan = plan_of(rows, own)
-            if plan["errors"]:
-                raise HTTPException(422, {"errors": plan["errors"][:20]})
-            for line in plan["lines"]:
-                if line["status"] == "invalid":
-                    errors_found.append(f"{unit.database} {line['table']}: {'; '.join(line['errors'])}")
+        """Every database planned, nothing written: the file's and the settings' problems, and the groups in use.
+        Returns each database that has tables with its table count, in order, for the write to pack into
+        transactions."""
+        errors_found, counted = [], []
+        for read_batch in by_database.read_batches(list(units())):
+            for unit, rows in _rows_of_units(kind, param, read_batch):
+                if not rows:
+                    continue
+                plan = plan_of(rows, own)
+                if plan["errors"]:
+                    raise HTTPException(422, {"errors": plan["errors"][:20]})
+                for line in plan["lines"]:
+                    if line["status"] == "invalid":
+                        errors_found.append(f"{unit.database} {line['table']}: {'; '.join(line['errors'])}")
+                counted.append((unit, len(rows)))
         if errors_found:
             raise HTTPException(422, {"errors": errors_found[:20] + (
                 [f"{len(errors_found)} lines cannot be taken"] if len(errors_found) > 20 else [])})
+        return counted
 
     def write(progress, task_id):
         task = db.query(q.task_sql(), (task_id,))[0]
@@ -3167,7 +3270,7 @@ def _create_by_database(body: NewJobRequest, request: Request, selection: Select
         own = set(_job_groups(sid)) if sid else set()
         state = {"stage": "checking", "databases_total": databases_total, "databases_written": 0, "tables_written": 0}
         db.execute(q.task_progress_json_sql(), (json.dumps(state), 0, task_id))
-        check(task_id, own)
+        counted = check(task_id, own)
         state["stage"] = "writing"
         if sid is None:
             try:
@@ -3182,29 +3285,13 @@ def _create_by_database(body: NewJobRequest, request: Request, selection: Select
                     cur.execute(q.task_job_sql(), (sid, task_id))
             except psycopg.errors.UniqueViolation:
                 raise HTTPException(409, f"an ingestion job named '{name}' already exists")
-        for unit in units():
-            rows = rows_of(unit)
-            if not rows:
-                continue
-            plan = plan_of(rows, own)
-            groups = sorted(plan["groups"])
-            with _write() as cur:
-                _lock_collections(cur, groups)
-                have = {(r["sink"], r["client_id"]) for r in db.fetch(cur, q.job_database_sinks_sql(), (groups, unit.database))}
-                todo = [line for line in plan["lines"] if (line["sink"], str(line["row"].get("client_id") or "")) not in have]
-                rows_todo = [line["row"] for line in todo]
-                if rows_todo:
-                    _insert_controls(cur, rows_todo, user, batch)
-                    _refuse_mixed_sinks(cur, rows_todo)
-                    _refuse_split_databases(cur, rows_todo)
-                for group in groups:
-                    cur.execute(q.insert_member_if_absent_sql(), (sid, group, offs.get(group, 0)))
-                    if cur.fetchone():
-                        _log(cur, user, "schedule_create", None, group, "schedule", None,
-                             f"{name} ({sch.describe(run.cadence_minutes, offs.get(group, 0), timezone_)})", None, batch)
-                state["databases_written"] += 1
-                state["tables_written"] += len(plan["lines"])
-                cur.execute(q.task_progress_json_sql(), (json.dumps(state), state["tables_written"], task_id))
+        job = ChunkJob(sid=sid, name=name, user=user, batch=batch, cadence_minutes=run.cadence_minutes,
+                       timezone=timezone_, offsets=offs, task_id=task_id)
+        for chunk in by_database.transactions_of(counted):
+            plans = [plan_of(rows, own) for _, rows in _rows_of_units(kind, param, chunk) if rows]
+            if plans:
+                with _write() as cur:
+                    _write_chunk(cur, plans, job, state)
         result = {"id": sid, "summary": summary, "settings": settings, "created": True}
         with _write() as cur:
             _task_written(cur, task_id, result, sid, state["tables_written"])
@@ -3335,7 +3422,7 @@ def create_ingestion_job(body: NewJobRequest, request: Request):
     than BACKGROUND_ROWS tables is written database by database in a background task (_create_by_database)."""
     if body.source is not None:
         kind, param, source_id, rest = _selection_params(body.source)
-        counted = db.query(q.selected_rows_sql(kind, count=True), (param, *rest))
+        counted = db.query(q.selected_count_sql(kind), (param, *rest))
         if counted and counted[0]["n"] > BACKGROUND_ROWS:
             return _create_by_database(body, request, body.source, kind, param, source_id, rest)
     user = _user(request)

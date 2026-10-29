@@ -134,8 +134,9 @@ secret). See `README.md`, `docs/deploy.md`, `docs/monitoring.md`, `docs/lakebase
   Run history (ingest_run, ingest_event) and control_change stay. With `drop_targets`, after the commit, it drops
   (`DROP TABLE IF EXISTS`) only the target tables no other group's rows write, never a schema.
 - `lakefed_ingest_discover` → `discover_tables.ipynb`: table discovery for bulk onboarding (params
-  `discovery_id`, `spec` JSON); writes `discovery` / `discovered_table`. Runs on the bundle's
-  single-node all-purpose cluster `lakefed_ingest utility` (`resources.clusters.lakefed_ingest_utility`,
+  `discovery_id`, `spec` JSON, `discover_workers` (databases read at once, default 32, capped by
+  `max_queries_per_source`)); writes `discovery` / `discovered_table` in one transaction per database. Runs on the
+  bundle's single-node all-purpose cluster `lakefed_ingest utility` (`resources.clusters.lakefed_ingest_utility`,
   auto-terminates after 60 min) so repeated runs skip cluster start; transient connection errors
   (paused sources) retry with backoff (`discovery.CONNECT_RETRIES`).
 - Setup and the app's grant job run on serverless (job `environments`); ingestion on job clusters. The check job
