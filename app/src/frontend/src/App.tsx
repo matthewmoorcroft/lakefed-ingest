@@ -29,13 +29,14 @@ export const useSettings = () => useContext(SettingsContext);
 
 const NAV = [
   ["Monitor", [["/overview", "Overview"], ["/ingestion-jobs", "Ingestion jobs"], ["/runs", "Runs"], ["/sources", "Sources"], ["/timeline", "Timeline"]]],
-  ["Manage", [["/tables", "Tables"], ["/schedules-and-jobs", "Schedules and jobs"], ["/add", "Add table"],
-              ["/bulk", "Bulk import"], ["/import", "Import CSV"], ["/changes", "Changes"]]],
+  // Add table, Bulk import and Import CSV are Add tables inside New ingestion job and Edit; their pages stay for
+  // groups in no job, reached from a group's page and from Sources.
+  ["Manage", [["/tables", "Tables"], ["/schedules-and-jobs", "Schedules and jobs"], ["/changes", "Changes"]]],
 ] as const;
 
 // Pages under an ingestion job keep Ingestion jobs selected, as the workspace keeps a job's section selected on its pages.
 // A group run (/runs/<id>) is under its job too, as its crumbs say; the Runs list itself stays under Runs.
-const UNDER = { "/ingestion-jobs": ["/ingestion-jobs", "/collections", "/runs/"] } as Record<string, string[]>;
+const UNDER = { "/ingestion-jobs": ["/ingestion-jobs", "/collections", "/runs/", "/add", "/bulk", "/import"] } as Record<string, string[]>;
 
 export default function App() {
   const config = useQuery({ queryKey: ["config"], queryFn: () => api.get<Config>("/config") });

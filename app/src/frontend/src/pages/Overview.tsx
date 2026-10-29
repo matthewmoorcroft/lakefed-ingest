@@ -238,7 +238,7 @@ export default function OverviewPage() {
           in <strong>{fmtInt(jobs)}</strong> {plural(jobs, "ingestion job")}.</> : "No enabled tables yet.")}
         right={<Stamp at={d?.read_at} every={30} error={ov.error} />} />
       <ErrorBox error={ov.error} />
-      {d && !enabled && <Notice tone="info">No tables are set up yet. Add them with <Link to="/bulk">Bulk import</Link> or <Link to="/add">Add table</Link>.</Notice>}
+      {d && !enabled && <Notice tone="info">No tables are set up yet. <Link to="/ingestion-jobs/new">New ingestion job</Link> makes a job with its tables.</Notice>}
       {/* Only once freshness targets are in use: until then no table can be late, and there is nothing to warn about. */}
       {Number(t.no_sla_tables) > 0 && Number(t.no_sla_tables) < enabled && (
         <Notice tone="warn">{fmtInt(t.no_sla_tables)} enabled {plural(t.no_sla_tables, "table")} {Number(t.no_sla_tables) === 1 ? "has" : "have"} no
