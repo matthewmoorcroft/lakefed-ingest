@@ -1739,6 +1739,12 @@ class SourceDiscoverRequest(BaseModel):
     whole_server: bool = False
     # A database name filter for listing the server, as SQL Server's LIKE reads it (discovery.pattern_errors).
     pattern: str = Field(default="", max_length=128, pattern=r"^[A-Za-z0-9_%\-\[\]\.$#@]*$")
+    # For an Azure SQL server whose login can't open master: a Unity Catalog service credential with Reader on the
+    # server, and the server's resource id. The discovery job then lists the databases through Azure
+    # (discovery.azure_databases); the app never calls Azure. Both or neither.
+    azure_credential: str = Field(default="", max_length=255, pattern=r"^[A-Za-z0-9_\-]*$")
+    azure_resource_id: str = Field(default="", max_length=512, pattern=r"^(/subscriptions/[0-9A-Za-z-]+/resourceGroups/"
+                                   r"[-\w.()]+/providers/Microsoft\.Sql/(servers|managedInstances)/[a-z0-9][a-z0-9-]*)?$")
 
 
 def _connection_unseen(name: str, listing_error: Optional[str]) -> str:
@@ -1757,6 +1763,8 @@ def start_source_discovery(body: SourceDiscoverRequest, request: Request):
     names = list(dict.fromkeys(d.strip() for d in body.databases if d.strip()))
     if body.kind == "tables" and not body.whole_server and not names:
         raise HTTPException(422, "choose the whole server or at least one database")
+    if bool(body.azure_credential) != bool(body.azure_resource_id):
+        raise HTTPException(422, "listing through Azure takes both a service credential and the server's resource id")
     listed = connections()
     if body.src_connection not in {c["name"] for c in listed["connections"]}:
         raise HTTPException(404, _connection_unseen(body.src_connection, listed.get("error")))
@@ -1765,7 +1773,9 @@ def start_source_discovery(body: SourceDiscoverRequest, request: Request):
     did = uuid.uuid4().hex[:12]
     spec = {"src_type": "sqlserver", "src_connection": body.src_connection, "kind": body.kind,
             "databases": "*" if body.kind == "tables" and body.whole_server else names, "requested_by": _user(request),
-            **({"pattern": body.pattern} if body.pattern else {})}
+            **({"pattern": body.pattern} if body.pattern else {}),
+            **({"azure_credential": body.azure_credential, "azure_resource_id": body.azure_resource_id}
+               if body.azure_credential else {})}
     if body.kind == "list":
         spec.pop("databases")
     rid = jobs.run_now(job_id, {"discovery_id": did, "spec": json.dumps(spec)})

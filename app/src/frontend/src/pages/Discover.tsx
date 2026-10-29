@@ -101,6 +101,12 @@ function Step1({ chosen, setChosen, tested, setTested }: { chosen: string; setCh
   const [search, setSearch] = useState("");
   const [testing, setTesting] = useState(false);
   const [pattern, setPattern] = useState("");
+  // For an Azure SQL server: a service credential with Reader on it and its resource id, so the discovery job lists
+  // the databases through Azure instead of master. Both or neither.
+  const [azureCredential, setAzureCredential] = useState("");
+  const [azureResource, setAzureResource] = useState("");
+  const azure: Row = azureCredential.trim() && azureResource.trim()
+    ? { azure_credential: azureCredential.trim(), azure_resource_id: azureResource.trim() } : {};
   const [error, setError] = useState<unknown>(null);
   const qc = useQueryClient();
   const list = useQuery({ queryKey: ["connections"], queryFn: () => api.get<Row>("/connections") });
@@ -115,10 +121,10 @@ function Step1({ chosen, setChosen, tested, setTested }: { chosen: string; setCh
   const test = async () => {
     setTesting(true); setError(null); setTested(null);
     try {
-      const id = await discover(chosen, { kind: "list", ...(pattern.trim() ? { pattern: pattern.trim() } : {}) });
+      const id = await discover(chosen, { kind: "list", ...(pattern.trim() ? { pattern: pattern.trim() } : {}), ...azure });
       const rows = await api.get<Row[]>(`/discoveries/${id}/databases`);
       setTested({ discovery_id: id, databases: rows.filter((r) => r.status === "listed").map((r) => r.src_database),
-                  pattern: pattern.trim() });
+                  pattern: pattern.trim(), azure });
     } catch (e) { setError(e); } finally { setTesting(false); }
   };
   return (
@@ -160,7 +166,25 @@ function Step1({ chosen, setChosen, tested, setTested }: { chosen: string; setCh
             {cantList(error) && <p>The server's databases are listed from its master database, and this connection's login can't open
               it, so they can't be listed here. The databases themselves may still be readable through the connection: type them below
               or take them from a CSV file. Or give the login access to
-              master (a user there with VIEW ANY DATABASE) and test again.</p>}</Notice>}
+              master (a user there with VIEW ANY DATABASE) and test again. On Azure SQL, Azure can list them instead: see
+              Azure SQL below.</p>}</Notice>}
+          <details className="advanced">
+            <summary><b>Azure SQL</b> <span className="muted">list the databases through Azure instead of master
+              {azure.azure_credential ? <>: on, with {azure.azure_credential}</> : ", for a login that can't open master"}</span></summary>
+            <p className="muted">The discovery job asks Azure for the server's databases with a Unity Catalog service credential
+              (Catalog Explorer, External data, Credentials) whose managed identity has Reader on the server, then reads each
+              database through the connection. Whoever runs the discovery job needs ACCESS on the credential. Azure SQL Database
+              and Managed Instance only.</p>
+            <div className="toolbar">
+              <label className="inline">Service credential<input className="search" placeholder="e.g. sql_reader" value={azureCredential}
+                onChange={(e) => { setAzureCredential(e.target.value); setTested(null); }} /></label>
+              <label className="inline">Server resource id<input className="search" size={60}
+                placeholder="/subscriptions/…/resourceGroups/…/providers/Microsoft.Sql/servers/…" value={azureResource}
+                onChange={(e) => { setAzureResource(e.target.value); setTested(null); }} /></label>
+            </div>
+            {Boolean(azureCredential.trim()) !== Boolean(azureResource.trim()) &&
+              <span className="muted">Both are needed; with one, the databases are listed through master.</span>}
+          </details>
           {error != null && cantList(error) && <TypedDatabases onUse={(names) => { setError(null); setTested({ discovery_id: null, databases: names, typed: true }); }} />}
         </div>
       )}
@@ -280,10 +304,11 @@ export function DiscoverDialog({ onClose }: { onClose: (lines: string | null) =>
       const unread = whole.filter((d) => !tables[d]);
       const read: Row[] = [];
       if (unread.length) {
-        // A whole server is listed from master (with the same name filter); databases typed by hand are read by name.
+        // A whole server is listed again as it was tested (master or Azure, with the same name filter); databases typed by
+        // hand are read by name.
         const all = unread.length === databases.length && !tested?.typed;
-        const got = await readTables(connection, all ? { whole_server: true, ...(tested?.pattern ? { pattern: tested.pattern } : {}) }
-          : { databases: unread });
+        const got = await readTables(connection, all ? { whole_server: true, ...(tested?.pattern ? { pattern: tested.pattern } : {}),
+          ...(tested?.azure ?? {}) } : { databases: unread });
         read.push(...got.tables);
         if (got.failed.length) {
           // Keep what was read, and say which databases weren't, before anything is added.

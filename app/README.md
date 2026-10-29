@@ -152,6 +152,12 @@ The app runs as its own service principal (created with the app):
   holds `USE CONNECTION` on; the connections aren't the bundle's, so they are named, not created. A connection
   the job can't grant on is reported in its output and the others are still granted; Discover's screen names
   the grant for any connection it can't see.
+- **Azure SQL listing (optional):** for a login that can't open master, Discover's Test connection can have the
+  discovery job list an Azure SQL server's (or Managed Instance's) databases through Azure Resource Manager instead.
+  It takes a Unity Catalog service credential (Catalog Explorer, External data, Credentials) on an access connector
+  whose managed identity has Reader on the server, `ACCESS` on that credential for whoever runs the discovery job,
+  and the server's resource id, both typed under Azure SQL on the Test connection step. The app never calls Azure;
+  each listed database is then read through the connection, and one the login can't open fails on its own.
 - **Who can act:** every action on an existing ingestion job follows the signed-in user's own Databricks
   permission on the job its runs execute as (the check job on a check schedule, else the ingestion job), as the
   Jobs UI does:

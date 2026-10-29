@@ -89,6 +89,12 @@ def test_discover_lists_by_a_name_filter_and_says_which_databases_it_couldnt_rea
     assert "function databasesOfCsv" in discover and "take them from a CSV file" in discover
 
 
+def test_discover_can_list_an_azure_sql_server_through_azure_and_reads_the_whole_server_the_same_way():
+    discover = (FRONTEND / "pages" / "Discover.tsx").read_text()
+    assert "Service credential" in discover and "Server resource id" in discover and "Reader on the server" in discover
+    assert "azure_credential" in discover and "azure_resource_id" in discover and "...(tested?.azure ?? {})" in discover
+
+
 def test_the_target_schema_field_says_a_new_schema_is_made_by_the_first_run():
     form = (FRONTEND / "pages" / "jobForm.tsx").read_text()
     assert "A new schema is made by the first run" in form and "CREATE SCHEMA on the catalog" in form
