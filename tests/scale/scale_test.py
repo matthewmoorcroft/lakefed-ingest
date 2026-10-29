@@ -101,11 +101,13 @@ def test_like_matches_the_patterns_the_harness_uses():
     assert sim.like_matches("%", "ops_00001")
 
 
-def test_the_discover_writes_are_one_insert_per_table_and_a_start_and_finish_per_database(small_catalog):
+def test_the_discover_writes_are_a_thousand_tables_to_a_statement_and_a_transaction_per_database(small_catalog):
     run, connection = steps.discover_writes(small_catalog)
-    assert connection.statements["insert lakefed_ingest.discovered_table"] == run.tables
+    per_database = math.ceil(small_catalog.tables_per_database / steps.TABLE_BATCH)
+    assert connection.statements["insert lakefed_ingest.discovered_table"] == run.discovered * per_database
     assert connection.rows["insert lakefed_ingest.discovered_table"] == run.tables
     assert connection.statements["delete lakefed_ingest.discovered_table"] == run.discovered
+    assert connection.transactions == run.discovered
     databases = run.discovered + len(run.refused)
     assert connection.statements["insert lakefed_ingest.discovery"] == databases
     assert connection.statements["update lakefed_ingest.discovery"] == databases
@@ -117,6 +119,13 @@ def test_the_writer_columns_are_the_notebook_columns():
     source = "".join("".join(cell["source"]) for cell in notebook["cells"] if cell["cell_type"] == "code")
     notebook_cols = re.findall(r'"(\w+)"', re.search(r"TABLE_COLS = \[(.*?)\]", source, re.S).group(1))
     assert notebook_cols == steps.TABLE_COLS
+
+
+def test_the_notebook_writes_its_batch_size():
+    with open(os.path.join(paths.ROOT, "src", "lakefed_ingest", "discover_tables.ipynb"), encoding="utf-8") as handle:
+        notebook = json.load(handle)
+    source = "".join("".join(cell["source"]) for cell in notebook["cells"] if cell["cell_type"] == "code")
+    assert int(re.search(r"^TABLE_BATCH = (\d+)", source, re.M).group(1)) == steps.TABLE_BATCH
 
 
 def test_the_recording_connection_counts_executemany_per_row_and_multi_row_values_by_group():
