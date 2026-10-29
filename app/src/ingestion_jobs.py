@@ -258,6 +258,11 @@ DELETE_STARTING_S = 300
 
 
 def delete_state(job: dict, tables_left: bool, run: Optional[dict], now: datetime) -> dict:
+    """See _delete_state; adds whether the job's Delete drops its target tables, so Run again starts it the same way."""
+    return {**_delete_state(job, tables_left, run, now), "drop_targets": bool(sch.options_of(job).get("delete_drop_targets"))}
+
+
+def _delete_state(job: dict, tables_left: bool, run: Optional[dict], now: datetime) -> dict:
     """Where a deleted job's Delete stands. ``deleting`` while its delete job runs (or is starting), ``failed`` with
     the reason when the start or the run failed, ``gone`` once the delete job succeeded and no tables are left: only
     then does the job leave the Ingestion jobs list. ``run_again`` says whether the Delete can be run again (only
