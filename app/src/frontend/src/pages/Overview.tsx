@@ -176,7 +176,7 @@ function Freshness({ totals }: { totals: Row }) {
 /** The next scheduled triggers across every job, soonest first; paused jobs have none. */
 function NextScheduled({ triggers, paused }: { triggers: Row[]; paused: number }) {
   return (
-    <Section title="Next scheduled" actions={<Link to="/schedules">Schedules</Link>}>
+    <Section title="Next scheduled" actions={<Link to="/schedules-and-jobs">Schedules and jobs</Link>}>
       {!triggers.length && <p className="muted">No trigger is scheduled{paused ? `: ${fmtInt(paused)} ${paused === 1 ? "job is" : "jobs are"} paused` : ""}.</p>}
       {triggers.map((t) => (
         <div key={t.id} className="attention-row">

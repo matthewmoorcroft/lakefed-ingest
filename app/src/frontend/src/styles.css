@@ -305,6 +305,7 @@ details.advanced .compute h4 { margin: var(--db-space-3) 0 var(--db-space-2); }
 .menu-items > button.danger-text { color: var(--bad); }
 .menu-items > button .sub { display: block; color: var(--muted); font-size: var(--db-font-size-sm); white-space: normal; }
 .menu-items.wide, .menu-items:has(.sub) { min-width: 320px; }
+.page-sub { font-size: var(--db-font-size-lg, 16px); margin: var(--db-space-4) 0 var(--db-space-2); }
 .empty-drop { border: 1px dashed var(--border); border-radius: var(--db-shape-container-small); padding: var(--db-space-4); text-align: center; color: var(--muted); margin: 0; }
 .menu-note { padding: 6px 12px; overflow-wrap: anywhere; }
 .menu-note + .menu-note { border-top: 1px solid var(--border); }

@@ -7,11 +7,10 @@ import Overview from "./pages/Overview";
 import Runs from "./pages/Runs";
 import RunDetail from "./pages/RunDetail";
 import Tables from "./pages/Tables";
-import Jobs from "./pages/Jobs";
 import AddTable from "./pages/AddTable";
 import BulkImport from "./pages/BulkImport";
 import Changes from "./pages/Changes";
-import Schedules from "./pages/Schedules";
+import SchedulesAndJobs from "./pages/SchedulesAndJobs";
 import Timeline from "./pages/Timeline";
 import Collection from "./pages/Collection";
 import IngestionJobs from "./pages/IngestionJobs";
@@ -30,7 +29,7 @@ export const useSettings = () => useContext(SettingsContext);
 
 const NAV = [
   ["Monitor", [["/overview", "Overview"], ["/ingestion-jobs", "Ingestion jobs"], ["/runs", "Runs"], ["/sources", "Sources"], ["/timeline", "Timeline"]]],
-  ["Manage", [["/tables", "Tables"], ["/schedules", "Schedules"], ["/jobs", "Databricks jobs"], ["/add", "Add table"],
+  ["Manage", [["/tables", "Tables"], ["/schedules-and-jobs", "Schedules and jobs"], ["/add", "Add table"],
               ["/bulk", "Bulk import"], ["/import", "Import CSV"], ["/changes", "Changes"]]],
 ] as const;
 
@@ -77,8 +76,10 @@ export default function App() {
             <Route path="/runs" element={<Runs />} />
             <Route path="/runs/:id" element={<RunDetail />} />
             <Route path="/tables" element={<Tables />} />
-            <Route path="/jobs" element={<Jobs />} />
-            <Route path="/schedules" element={<Schedules />} />
+            <Route path="/schedules-and-jobs" element={<SchedulesAndJobs />} />
+            {/* The two pages it replaces, for old links and bookmarks. */}
+            <Route path="/jobs" element={<Navigate to="/schedules-and-jobs" replace />} />
+            <Route path="/schedules" element={<Navigate to="/schedules-and-jobs" replace />} />
             <Route path="/timeline" element={<Timeline />} />
             <Route path="/collections/:name" element={<Collection />} />
             <Route path="/collections/:name/databases/:server/:database" element={<Database />} />

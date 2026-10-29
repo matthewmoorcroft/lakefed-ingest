@@ -18,7 +18,10 @@ function cronWords(cron: string): string {
   return `Cron: ${cron}`;
 }
 
-export default function Jobs() {
+/** The Databricks jobs the app runs ingestion jobs with. Embedded under Schedules and jobs, runs name the ingestion job
+ * they ran for, not the group, and the job's own schedule and Run now by group are left out: each ingestion job's page
+ * runs it. */
+export default function Jobs({ embedded }: { embedded?: boolean }) {
   const qc = useQueryClient();
   const job = useQuery({ queryKey: ["ingest-job"], queryFn: () => api.get<IngestJob>("/jobs/ingest"), refetchInterval: 15_000 });
   const collections = useQuery({ queryKey: ["collections"], queryFn: () => api.get<string[]>("/collections") });
@@ -37,15 +40,22 @@ export default function Jobs() {
   const { config } = useSettings();
   const linkCol = { cellRenderer: (p: any) => p.value ? <OutLink href={p.value}>View run</OutLink> : null };
   const stateCols = { state: { cellRenderer: (p: any) => <Badge value={p.value} /> }, result: { cellRenderer: (p: any) => <Badge value={p.value} /> }, url: linkCol };
+  const byJob = (rows: Row[]) => embedded ? rows.map(({ task_collection, schedule, ...r }) => ({ ingestion_job: schedule ?? "started by hand", ...r })) : rows;
+  const active = byJob(job.data?.active ?? []), recent = byJob(job.data?.recent ?? []);
   const coll = collection || collections.data?.[0] || "";
   const par = parallelism === "" ? Number(j?.parameters?.parallelism || 32) : parallelism;
   return (
     <>
-      <PageHead title="Databricks jobs" lead="The Databricks job that ingests one ingestion group a run, and the schema setup job."
-        right={<Stamp at={readAt(job)} every={15} error={job.error} />} />
+      {!embedded && <PageHead title="Databricks jobs" lead="The Databricks job that ingests one ingestion group a run, and the schema setup job."
+        right={<Stamp at={readAt(job)} every={15} error={job.error} />} />}
       <ErrorBox error={job.error || post.error} />
       {message && <Notice tone="ok">{message}</Notice>}
-      {j && (
+      {j && embedded && (
+        <Section title={j.name} actions={<a href={j.url} target="_blank" rel="noreferrer">Open in Jobs</a>}>
+          <p className="muted small">The Databricks job every ingestion job runs. Its own schedule stays paused: the schedules above start it.</p>
+        </Section>
+      )}
+      {j && !embedded && (
         <Section title={j.name} actions={<a href={j.url} target="_blank" rel="noreferrer">Open in Jobs</a>}>
           <div className="metrics">
             <Metric label="Schedule" value={j.schedule ? <Tip focusable text={`Cron syntax: ${j.schedule}${j.timezone ? ` (${j.timezone})` : ""}`}>
@@ -72,9 +82,9 @@ export default function Jobs() {
         </Section>
       )}
       <Section title={`Active runs (${job.data?.active.length ?? "…"})`}>
-        {job.data?.active.length ? (
-          <Grid rows={job.data.active} fitRows
-            columns={[...autoColumns(job.data.active, stateCols), {
+        {active.length ? (
+          <Grid rows={active} fitRows
+            columns={[...autoColumns(active, stateCols), {
               headerName: "", field: "run_id", width: 150, sortable: false, filter: false,
               cellRenderer: (p: any) => (
                 <ConfirmButton label="Cancel" danger confirmLabel="Cancel run" title={`Cancel run ${p.value}?`}
@@ -86,8 +96,8 @@ export default function Jobs() {
       </Section>
       <Section title="Recent runs">
         {/* Result alone, as the Runs list shows a finished run's outcome; no per-column filters on a short list. */}
-        <Grid rows={job.data?.recent ?? (job.error ? [] : undefined)} fillReserve={150} filters={false}
-          columns={autoColumns(job.data?.recent ?? [], stateCols, ["state"])} />
+        <Grid rows={job.data ? recent : job.error ? [] : undefined} fillReserve={150} filters={false}
+          columns={autoColumns(recent, stateCols, ["state"])} />
       </Section>
       <Section title="Schema setup">
         {config && <p>State database: Lakebase instance <span className="mono">{config.lakebase_instance}</span>, database{" "}
