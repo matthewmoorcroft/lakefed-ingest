@@ -1067,6 +1067,24 @@ def _truthy(v) -> bool:
     return v if isinstance(v, bool) else str(v or "").strip().lower() in ("true", "1", "yes", "y")
 
 
+TRUE_WORDS, FALSE_WORDS = ("true", "1", "yes", "y", "on"), ("false", "0", "no", "n", "off")
+
+
+def parse_bool(v) -> bool:
+    """A yes or no setting as given: a boolean, or one of the words for one ("false" is false). Anything else raises
+    ValueError, so a mistyped value is refused rather than read as true."""
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, int) and v in (0, 1):
+        return bool(v)
+    word = str(v).strip().lower() if v is not None else ""
+    if word in TRUE_WORDS:
+        return True
+    if word in FALSE_WORDS:
+        return False
+    raise ValueError(f"{v!r} is not true or false")
+
+
 def _json_object(v):
     """A JSON object given as text or a dict -> the dict; None when blank; raises ValueError otherwise."""
     if v is None or (isinstance(v, str) and not v.strip()):

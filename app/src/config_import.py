@@ -27,6 +27,7 @@ REQUIRED_SETTINGS = ("src_type", "load_type", "sink_catalog", "sink_schema", "si
 DEFAULTS = {"use_remote_query": False, "write_mode": "merge", "fan_in": False, "freshness_sla_minutes": None,
             "jdbc_options": None}
 SINK_SETTINGS = ("sink_catalog", "sink_schema", "sink_table")
+BOOLEAN_SETTINGS = ("use_remote_query", "fan_in")
 PLACEHOLDERS = ("{database}", "{schema}", "{table}")
 
 
@@ -103,10 +104,15 @@ def effective_settings(given: dict, group_rows: List[dict]):
     """(settings, errors): each setting as given for this import, else the group's shared value, else its default.
     A required setting nobody gave, or one the group's rows differ on, is an error naming it."""
     shared = group_settings(group_rows)
-    settings, errors = {}, []
+    settings, errors = {}, [f"unknown setting {name}" for name in given if name not in SETTINGS]
     for name in SETTINGS:
         if name in given and not (_blank(given[name]) and name in REQUIRED_SETTINGS):
             settings[name] = given[name]
+            if name in BOOLEAN_SETTINGS and given[name] is not None:
+                try:
+                    settings[name] = q.parse_bool(given[name])
+                except ValueError as e:
+                    errors.append(f"{name}: {e}")
         elif "mixed" in shared[name]:
             errors.append(f"{name} differs across the group's rows ({', '.join(shared[name]['mixed'])}): "
                           "set it for this import")

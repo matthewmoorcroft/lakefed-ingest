@@ -1,6 +1,13 @@
 """Run now and Delete follow Databricks' own job permissions (jobs.highest_permission, jobs.action_refusal): the
-signed-in user's highest level on the job, directly or through a group, with workspace admins as managers."""
-import jobs
+signed-in user's highest level on the job, directly or through a group, with workspace admins as managers.
+
+Skipped when the app's libraries aren't installed (jobs.py imports the Lakebase client, psycopg and the Databricks
+SDK), as the other app tests are, so the repo's base `pytest` runs."""
+import pytest
+
+pytest.importorskip("psycopg")
+pytest.importorskip("databricks.sdk")
+import jobs  # noqa: E402
 
 ACL = [
     {"user_name": "owner@example.com", "all_permissions": [{"permission_level": "IS_OWNER"}]},

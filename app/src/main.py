@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from contextlib import contextmanager
 import threading
 import time
@@ -40,6 +41,55 @@ import schedules as sch
 
 app = FastAPI(title="lakefed_ingest operations", docs_url="/api/docs", openapi_url="/api/openapi.json")
 STATIC = Path(__file__).parent / "static"
+
+# The routes that take a CSV of tables, and the most a request to one may carry: 5,000 lines (config_import.MAX_LINES)
+# of long select lists fit well within it, and a larger upload is refused before it is read, not after.
+MAX_UPLOAD_BYTES = int(os.environ.get("MAX_UPLOAD_BYTES", str(16 * 1024 * 1024)))
+UPLOAD_ROUTES = re.compile(r"^/api/(import|ingestion-jobs|ingestion-jobs/\d+/(tables|databases))/?$")
+
+
+class UploadLimit:
+    """Refuse (413) a request to an upload route whose body is over MAX_UPLOAD_BYTES: by its Content-Length when it
+    gives one, else by counting the body as it arrives. Past the limit the rest is never read: the route sees an
+    empty end of body, and its answer is replaced with the refusal (FastAPI would turn a raised error into a 400)."""
+
+    def __init__(self, inner, limit: int):
+        self.inner, self.limit = inner, limit
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http" or scope["method"] != "POST" or not UPLOAD_ROUTES.match(scope["path"]):
+            return await self.inner(scope, receive, send)
+        length = dict(scope.get("headers") or []).get(b"content-length")
+        if length is not None and length.isdigit() and int(length) > self.limit:
+            return await self._refuse(send)
+        state = {"seen": 0, "over": False, "refused": False}
+
+        async def counted():
+            if state["over"]:
+                return {"type": "http.request", "body": b"", "more_body": False}
+            message = await receive()
+            state["seen"] += len(message.get("body", b""))
+            if state["seen"] > self.limit:
+                state["over"] = True
+                return {"type": "http.request", "body": b"", "more_body": False}
+            return message
+
+        async def answered(message):
+            if not state["over"]:
+                return await send(message)
+            if not state["refused"]:
+                state["refused"] = True
+                await self._refuse(send)
+        await self.inner(scope, counted, answered)
+
+    async def _refuse(self, send):
+        body = json.dumps({"detail": f"the upload is over {self.limit // (1024 * 1024)} MB: split the file"}).encode()
+        await send({"type": "http.response.start", "status": 413,
+                    "headers": [(b"content-type", b"application/json"), (b"content-length", str(len(body)).encode())]})
+        await send({"type": "http.response.body", "body": body})
+
+
+app.add_middleware(UploadLimit, limit=MAX_UPLOAD_BYTES)
 
 
 @app.exception_handler(Exception)
@@ -1674,6 +1724,13 @@ class ImportRequest(BaseModel):
     csv: str
     dry_run: bool = True
 
+    @field_validator("task_collection")
+    @classmethod
+    def _named(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("name the ingestion group: a blank name would put the tables in no group")
+        return v.strip()
+
 
 @app.post("/api/import")
 def import_csv(body: ImportRequest, request: Request):
@@ -1720,7 +1777,9 @@ def import_csv(body: ImportRequest, request: Request):
                     _log(cur, _user(request), "import", res[0], group, batch=batch)
                 else:
                     line["errors"] = ["sink already used by another control row"]
-            _refuse_mixed_sinks(cur, [line["row"] for line in plan["lines"] if line["status"] == "imported"])
+            imported = [line["row"] for line in plan["lines"] if line["status"] == "imported"]
+            _refuse_mixed_sinks(cur, imported)
+            _refuse_split_databases(cur, imported)
             _touch(cur, _user(request), groups=[group])
     return {"task_collection": group, "settings": plan["settings"], "counts": counted(plan["lines"]),
             "lines": [{k: v for k, v in line.items() if k != "row"} for line in plan["lines"]]}

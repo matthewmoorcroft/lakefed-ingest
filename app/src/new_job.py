@@ -22,10 +22,31 @@ DEFAULTS = {"src_type": "sqlserver", "load_type": "ct", "fan_in": False, "write_
             "lowercase": True, "client_id": "{database}", "identity": {}, "freshness_sla_minutes": None}
 
 
+BOOLEAN_SETTINGS = ("fan_in", "lowercase")
+
+
+def given_errors(given: dict) -> List[str]:
+    """What is wrong with the settings as given: a name the job has no setting for (a typo would otherwise be
+    ignored), or a yes or no setting that is neither."""
+    errors = [f"unknown setting {name}" for name in (given or {}) if name not in DEFAULTS]
+    for name in BOOLEAN_SETTINGS:
+        if (given or {}).get(name) is not None:
+            try:
+                q.parse_bool(given[name])
+            except ValueError as e:
+                errors.append(f"{name}: {e}")
+    return errors
+
+
 def settings_of(given: dict) -> dict:
     """The job's settings as given, each blank or missing one at its default."""
     out = dict(DEFAULTS)
     out.update({k: v for k, v in (given or {}).items() if k in DEFAULTS and v is not None})
+    for name in BOOLEAN_SETTINGS:
+        try:
+            out[name] = q.parse_bool(out[name])
+        except ValueError:
+            out[name] = DEFAULTS[name]      # given_errors reports it, and nothing is written while it does
     out["identity"] = {str(k).strip(): str(v).strip() for k, v in (out.get("identity") or {}).items() if str(k).strip()}
     return out
 
@@ -75,7 +96,7 @@ def plan(job_name: str, text: str, given: dict, groups_per_server: int = DEFAULT
     groups); have holds the (target, client_id) pairs a job already writes."""
     settings = settings_of(given)
     group_of = group_of or (lambda server, database: group_name(job_name, server, database, groups_per_server))
-    out = {"errors": setting_errors(settings), "lines": [], "groups": [], "settings": settings}
+    out = {"errors": given_errors(given) + setting_errors(settings), "lines": [], "groups": [], "settings": settings}
     if not str(job_name or "").strip():
         out["errors"].insert(0, "name the job")
     if not 1 <= int(groups_per_server or 0) <= MAX_GROUPS_PER_SERVER:

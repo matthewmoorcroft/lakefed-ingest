@@ -111,3 +111,40 @@ def test_apply_reads_the_groups_rows_only_after_taking_its_lock(client):
     lock = next(i for i, sql in enumerate(order) if "pg_try_advisory_xact_lock" in sql)
     read = next(i for i, sql in enumerate(order) if sql == q.collection_control_rows_sql())
     assert lock < read
+
+
+def test_a_blank_group_name_is_refused(client):
+    r = _import(client, group="   ", dry_run=False)
+    assert r.status_code == 422 and "name the ingestion group" in r.text
+    assert client.db.of("insert into lakefed_ingest.control (") == []
+
+
+def test_an_import_that_would_split_a_database_across_two_groups_is_refused(client):
+    client.db.split = {q.database_key(dict(src_connection="sql_a", use_remote_query=True, src_database="Sales",
+                                           task_collection="g9"))}
+    r = _import(client, dry_run=False)
+    assert r.status_code == 409 and "Sales" in r.json()["detail"] and "move all of its tables together" in r.text
+
+
+def test_a_mistyped_setting_is_refused_and_false_reads_as_false(client):
+    r = _import(client, settings=dict(SETTINGS, sink_shema="x"))
+    assert r.status_code == 422 and "unknown setting sink_shema" in r.text
+    r = _import(client, settings=dict(SETTINGS, use_remote_query="maybe"))
+    assert r.status_code == 422 and "use_remote_query: 'maybe' is not true or false" in r.text
+    host_csv = ("src_host,secret_key,src_database,src_schema,src_table,select_list,primary_key\n"
+                "sql.example.net,k,Sales,dbo,orders,id,id\n")
+    lines = _import(client, csv_text=host_csv, settings=dict(SETTINGS, use_remote_query="false")).json()["lines"]
+    assert lines[0]["status"] == "valid" and lines[0]["errors"] == []
+
+
+def test_an_upload_over_the_limit_is_refused_before_it_is_read(client):
+    limited = TestClient(main.UploadLimit(main.app, limit=1000), headers={"X-Forwarded-Email": "op@example.com"})
+    big = CSV + "sql_a,Sales,dbo,t,\"id\",id\n" * 100
+    for path in ("/api/import", "/api/ingestion-jobs", "/api/ingestion-jobs/3/tables"):
+        r = limited.post(path, json={"task_collection": "g9", "settings": SETTINGS, "csv": big, "name": "j"})
+        assert r.status_code == 413 and "split the file" in r.text, path
+    # A body sent without a length is counted as it arrives.
+    r = limited.post("/api/import", content=iter([b'{"csv": "' + b"x" * 600, b"x" * 600 + b'"}']),
+                     headers={"Content-Type": "application/json"})
+    assert r.status_code == 413
+    assert limited.post("/api/import", json={"task_collection": "g9", "settings": SETTINGS, "csv": CSV}).status_code == 200

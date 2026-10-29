@@ -28,6 +28,15 @@ def test_each_line_becomes_a_row_with_the_jobs_settings_and_a_group_per_server()
     assert all(g.startswith("engagement_extraction_sql_a_c0") for g in plan["groups"])
 
 
+def test_a_mistyped_setting_is_refused_and_the_words_for_yes_and_no_are_read():
+    assert nj.plan("Job", CSV, {**FAN_IN, "sink_shema": "x"}, 4)["errors"] == ["unknown setting sink_shema"]
+    assert nj.plan("Job", CSV, {**FAN_IN, "fan_in": "sometimes"}, 4)["errors"] == ["fan_in: 'sometimes' is not true or false"]
+    off = nj.plan("Job", CSV, {**FAN_IN, "fan_in": "false", "sink_table": "{database}_{table}"}, 4)
+    assert off["errors"] == [] and off["settings"]["fan_in"] is False
+    assert all(line["row"]["client_id"] is None for line in off["lines"])
+    assert nj.plan("Job", CSV, {**FAN_IN, "lowercase": "no"}, 4)["settings"]["lowercase"] is False
+
+
 def test_the_same_database_always_joins_the_same_group():
     first = nj.plan("Job", CSV, FAN_IN, 4)["lines"][0]["group"]
     assert first == nj.group_name("Job", "sql_a", "eng_001", 4) == nj.plan("Job", CSV, FAN_IN, 4)["lines"][0]["group"]

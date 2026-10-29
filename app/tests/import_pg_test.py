@@ -39,7 +39,14 @@ def client(monkeypatch):
         with psycopg.connect(target, autocommit=True) as conn:
             for statement in state_store.split_sql_statements((REPO / "src/lakefed_ingest/lakebase_schema.sql").read_text()):
                 conn.execute(statement)
+            # Every group belongs to an ingestion job, so the group imported into is one job's.
+            sid = conn.execute("insert into lakefed_ingest.schedule (name, cadence_minutes, timezone, parameters) "
+                               "values ('Units', 60, 'UTC', '{}'::jsonb) returning id").fetchone()[0]
+            conn.execute("insert into lakefed_ingest.schedule_member (schedule_id, task_collection, offset_minutes) "
+                         "values (%s, 'units', 0)", (sid,))
         monkeypatch.setattr(main.db, "connect", lambda: psycopg.connect(target, autocommit=True))
+        monkeypatch.setattr(main.jobs, "ingest_variants", lambda: {"default": "555"})
+        monkeypatch.setattr(main.jobs, "user_job_permission", lambda job_id, user: "CAN_MANAGE")
         c = TestClient(main.app, headers={"X-Forwarded-Email": "op@example.com"})
         c.target = target
         yield c
