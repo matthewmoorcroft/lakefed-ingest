@@ -219,14 +219,33 @@ OVERVIEW_LIST = 5
 OVERVIEW_JOBS_PAGE = 25
 
 
+def _rows_written_24h() -> dict:
+    """The rows every group wrote in the last 24 hours ({rows, partial}: partial when some loads recorded no count),
+    their table loads' and their batched appends' together; shared like _states."""
+    def compute():
+        groups = sorted({s["task_collection"] for s in _states()})
+        if not groups:
+            return {"rows": 0, "partial": False}
+        loads = next(iter(db.query(q.rows_written_since_sql(), (groups, 24))), {})
+        batched = [q.batch_rows(r["detail"]) for r in db.query(q.run_batch_rows_sql(), (24,))]
+        return {"rows": int(loads.get("rows_written") or 0) + sum(rows for rows, _ in batched),
+                "partial": bool(loads.get("uncounted")) or any(unknown for _, unknown in batched)}
+    return _shared("rows_written_24h", compute, ttl=STATES_CACHE_S)
+
+
 @app.get("/api/overview")
 def overview(offset: int = 0):
-    """The ingestion jobs (a page of OVERVIEW_JOBS_PAGE, failing first) with their Status, "Not in any job",
-    the running job runs and the jobs needing attention (OVERVIEW_LIST of each, with their totals), and the
-    totals over every enabled table, from the shared reads (_jobs_view)."""
+    """The status summary: the running job runs and the jobs needing attention (OVERVIEW_LIST of each, with their
+    totals), the totals over every enabled table with the rows written in 24 hours, and the next scheduled triggers,
+    from the shared reads (_jobs_view). The ingestion jobs (a page of OVERVIEW_JOBS_PAGE, failing first) and "Not in
+    any job" come too, for the totals' links."""
     view = _jobs_view()
     offset = max(0, int(offset))
-    return {"jobs": view["jobs"][offset:offset + OVERVIEW_JOBS_PAGE], "jobs_total": len(view["jobs"]),
+    upcoming = sorted((j for j in view["jobs"] if j.get("next_start")), key=lambda j: j["next_start"])
+    return {"next_triggers": [{k: j.get(k) for k in ("id", "name", "next_start", "description")}
+                              for j in upcoming[:OVERVIEW_LIST]],
+            "paused_jobs": sum(1 for j in view["jobs"] if j.get("paused")), "rows_24h": _rows_written_24h(),
+            "jobs": view["jobs"][offset:offset + OVERVIEW_JOBS_PAGE], "jobs_total": len(view["jobs"]),
             "offset": offset, "limit": OVERVIEW_JOBS_PAGE, "not_in_job": view["not_in_job"],
             "running_job_runs": view["running_job_runs"][:OVERVIEW_LIST], "running_total": len(view["running_job_runs"]),
             "running_not_in_job": view["running_not_in_job"],
@@ -1966,39 +1985,52 @@ def check_schedule(sid: int):
     return sch.check(s, active, jobs.schedule_client(), target, _owner())
 
 
+def _timeline_run(job_run: dict, now: datetime) -> dict:
+    """One job run as a bar on the Timeline: from its first group run's start to its last one's finish (to now while
+    running; a trigger that did not run has no span), its outcome, and each group with its group run, for the hover."""
+    members = job_run["placed"]["members"]
+    runs = [m["run"] for m in members if m.get("run")]
+    finishes = [q._when(r["finished_at"]) for r in runs if r.get("finished_at")]
+    running = job_run["outcome"]["label"] == "Running"
+    ended = now if running else (max(finishes) if finishes and job_run["started_at"] else None)
+    return {**{k: job_run.get(k) for k in ("slot", "started_at", "outcome", "ran", "members", "failed_tables", "took_s")},
+            "ended_at": ended.isoformat() if ended else None,
+            "groups": [{"group": m["task_collection"], "status": (m.get("run") or {}).get("status"),
+                        "run_id": (m.get("run") or {}).get("run_id")} for m in members]}
+
+
 @app.get("/api/timeline")
 def timeline(hours: int = 24):
-    """Runs per collection in the last `hours`, planned triggers of scheduled collections, and skipped
-    triggers (from the wrapper jobs' runs)."""
+    """The last `hours` as the Jobs UI's run timeline, one lane per ingestion job: its job runs (each with its span,
+    outcome and groups), its planned triggers (the current schedule, since it or the group last changed) and the
+    triggers Databricks skipped because the previous run was still going (from the wrapper jobs' runs). The group runs
+    of groups in no job make one more lane."""
     hours = max(1, min(int(hours), 168))
     end = datetime.now(timezone.utc)
     start = end - timedelta(hours=hours)
-    runs = db.query(q.timeline_runs_sql(), (end, start))
-    scheds = db.query(q.schedules_sql())
-    members = db.query(q.schedule_members_sql(), ([r["id"] for r in scheds],)) if scheds else []
-    by_id = {r["id"]: r for r in scheds}
-    rows = {}
-    for r in runs:
-        rows.setdefault(r["task_collection"], {"task_collection": r["task_collection"], "runs": [], "planned": [],
-                                               "skipped": [], "schedules": []})["runs"].append(r)
+    schedules, members = _schedules()
+    active = _active(members)
     client = None
-    for m in members:
-        if m["removed_at"] is not None:
-            continue
-        s = by_id[m["schedule_id"]]
-        row = rows.setdefault(m["task_collection"], {"task_collection": m["task_collection"], "runs": [],
-                                                     "planned": [], "skipped": [], "schedules": []})
-        row["schedules"].append(f"{s['name']} ({sch.describe(int(s['cadence_minutes']), int(m['offset_minutes']), s['timezone'])})")
-        if not s["paused"]:
-            # The current schedule's triggers, from when the collection joined or the schedule last changed.
-            since = max([start] + [datetime.fromisoformat(v) for v in (m.get("added_at"), s.get("updated_at")) if v])
-            row["planned"] += [t.isoformat() for t in
-                               sch.fire_times(int(s["cadence_minutes"]), int(m["offset_minutes"]), s["timezone"], since, end)]
-        if m.get("job_id"):
-            client = client or jobs.schedule_client()
-            row["skipped"] += [jobs.ts(t) for t in (_skipped_starts(m["job_id"], start, end, client) or [])]
-    return {"start": start.isoformat(), "end": end.isoformat(),
-            "collections": [rows[k] for k in sorted(rows)]}
+    lanes = []
+    for s in sorted(schedules, key=lambda s: str(s["name"]).lower()):
+        planned, skipped = set(), []
+        for m in (m for m in active if m["schedule_id"] == s["id"]):
+            if not s["paused"]:
+                since = max([start] + [q._when(v) for v in (m.get("added_at"), s.get("updated_at")) if v])
+                planned |= {t.isoformat() for t in sch.fire_times(int(s["cadence_minutes"]), int(m["offset_minutes"]),
+                                                                   s["timezone"], since, end)}
+            if m.get("job_id"):
+                client = client or jobs.schedule_client()
+                skipped += [jobs.ts(t) for t in (_skipped_starts(m["job_id"], start, end, client) or [])]
+        lanes.append({"job_id": s["id"], "name": s["name"], "paused": bool(s["paused"]),
+                      "description": sch.describe(int(s["cadence_minutes"]), sch.start_minute(s), s["timezone"] or "UTC"),
+                      "runs": [_timeline_run(jr, end) for jr in _job_runs_of(s, start, end, end)],
+                      "planned": sorted(planned), "skipped": sorted(skipped)})
+    unscheduled = sorted({st["task_collection"] for st in _states()} - {m["task_collection"] for m in active})
+    group_runs = [{k: r.get(k) for k in ("run_id", "task_collection", "status", "started_at", "finished_at")}
+                  for r in _group_runs(unscheduled, start, end)] if unscheduled else []
+    return {"start": start.isoformat(), "end": end.isoformat(), "jobs": lanes,
+            "not_in_job": {"groups": unscheduled, "group_runs": group_runs} if group_runs else None}
 
 
 # ---- UC connections (bulk import) ----------------------------------------------------------------

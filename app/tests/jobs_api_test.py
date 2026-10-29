@@ -230,6 +230,9 @@ def test_a_jobs_last_job_run_is_its_last_real_one_however_long_ago_and_never_a_m
 def test_a_jobs_page_gives_its_next_trigger_or_none_while_paused(client):
     assert client.get("/api/ingestion-jobs/1").json()["next_start"] == "2026-10-26T14:30:00+00:00"
     assert client.get("/api/ingestion-jobs/2").json()["next_start"] is None
+    overview = client.get("/api/overview").json()
+    assert [(t["id"], t["next_start"]) for t in overview["next_triggers"]] == [(1, "2026-10-26T14:30:00+00:00")]
+    assert overview["paused_jobs"] == 1
 
 
 def test_the_groups_in_no_job_have_a_page_of_their_own(client):
@@ -276,3 +279,14 @@ def test_a_jobs_target_tables_come_with_their_sources_and_a_catalog_explorer_lin
     assert sources["items"] == [{"id": 7, "database": "db_1"}]
     assert seen[q.job_target_sources_sql()] == (["c1", "c2"], ["c1", "c2"], "bronze", "sales", "orders", 25, 0)
     assert client.get("/api/ingestion-jobs/1/targets/sources", params={"target": "orders"}).status_code == 400
+
+
+def test_the_timeline_draws_each_jobs_runs_in_its_own_lane_with_their_groups(client, monkeypatch):
+    monkeypatch.setattr(main.jobs, "schedule_client", lambda: None)
+    monkeypatch.setattr(main, "_skipped_starts", lambda job_id, since, now, client=None: [])
+    body = client.get("/api/timeline?hours=168").json()
+    lanes = {lane["name"]: lane for lane in body["jobs"]}
+    ran = [r for lane in lanes.values() for r in lane["runs"] if r["started_at"]]
+    assert ran and all(r["ended_at"] and r["groups"] and {"group", "status", "run_id"} <= set(r["groups"][0]) for r in ran)
+    # A trigger that did not run has no span; a running job run with no group run started yet ends now.
+    assert all(r["ended_at"] is None for lane in lanes.values() for r in lane["runs"] if r["outcome"]["label"] == "Not run")

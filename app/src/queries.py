@@ -609,6 +609,15 @@ def run_rows_sql() -> str:
             f"from {SCHEMA}.ingest_run r where r.run_id = any(%s)")
 
 
+def rows_written_since_sql() -> str:
+    """The rows these groups' table loads wrote in the last N hours, and how many loads recorded no count (batched
+    appends record theirs on the run: run_batch_rows_sql). Params: groups, hours."""
+    return (f"select coalesce(sum(e.rows_merged), 0) as rows_written, "
+            f"count(*) filter (where e.status = 'ok' and e.rows_merged is null) as uncounted "
+            f"from {SCHEMA}.ingest_event e where e.task_collection = any(%s) "
+            f"and e.finished_at > now() - make_interval(hours => %s)")
+
+
 def run_batch_rows_sql() -> str:
     """Runs with a detail that started in the last N hours, for their batched appends' row totals.
     Param: hours."""

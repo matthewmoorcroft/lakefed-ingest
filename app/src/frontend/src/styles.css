@@ -79,6 +79,9 @@ p.small, .alert, .empty { max-width: 140ch; }
 .card-actions { display: flex; gap: var(--db-space-2); align-items: center; flex-wrap: wrap; }
 .metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: var(--db-space-3); margin-bottom: var(--db-space-4); }
 .metric { background: var(--card); border: 1px solid var(--border); border-radius: var(--db-shape-container-small); padding: var(--db-space-3) var(--db-space-4); min-width: 0; }
+/* A totals tile that opens its list, as the workspace home's tiles do: the whole tile is the link. */
+.metric-link { color: inherit; text-decoration: none; }
+.metric-link:hover { border-color: var(--db-color-action-default-border-hover, var(--accent)); }
 .metric-label { color: var(--muted); font-size: var(--db-font-size-sm); }
 .metric-value { font-size: var(--db-font-size-xl); line-height: var(--db-line-height-xl); font-weight: var(--db-font-weight-semibold);
   margin-top: 2px; font-variant-numeric: tabular-nums; }
@@ -229,6 +232,13 @@ label.changed input, label.changed select { border-color: var(--accent); }
 .legend i { display: inline-block; width: 14px; height: 10px; border-radius: 2px; margin-left: 8px; }
 .legend i.tick { width: 1px; height: 12px; background: var(--db-border-strong); }
 .legend .skipmark { color: var(--bad); margin-left: 8px; }
+.legend i.hollow { width: 10px; height: 10px; border-radius: 50%; border: 1.5px solid var(--muted); background: transparent; }
+/* The Timeline's job names and job runs open their pages, as the Jobs UI's timeline bars do. */
+.timeline .lane-link { fill: var(--accent); cursor: pointer; font-weight: var(--db-font-weight-semibold); }
+.timeline .lane-link:hover { text-decoration: underline; }
+.timeline .run-bar { cursor: pointer; opacity: 0.9; }
+.timeline .run-bar:hover { opacity: 1; stroke: var(--text); stroke-width: 1; }
+.timeline .hollow-mark { fill: var(--db-surface-base); stroke: var(--muted); stroke-width: 1.5; cursor: pointer; }
 .split { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--db-space-4); }
 @media (max-width: 1100px) { .run-row, .split { grid-template-columns: minmax(0, 1fr); } }
 

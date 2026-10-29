@@ -192,16 +192,17 @@ def test_check_reports_drift_without_changing_anything(api):
     assert api.jobs.jobs[jid]["max_concurrent_runs"] == 4
 
 
-def test_timeline_has_planned_triggers_for_scheduled_collections(api, monkeypatch):
+def test_the_timeline_has_one_lane_per_job_with_its_planned_triggers(api, monkeypatch):
     api.post("/api/schedules", json=BODY)
-    t = api.get("/api/timeline?hours=2").json()
-    rows = {r["task_collection"]: r for r in t["collections"]}
-    assert set(rows) == {"c1", "c2"} and len(rows["c1"]["planned"]) <= 1      # only since the schedule began
-    api.store.members[1]["added_at"] = "2020-01-01T00:00:00+00:00"
+    lanes = api.get("/api/timeline?hours=2").json()["jobs"]
+    assert [(lane["name"], lane["paused"]) for lane in lanes] == [("Prod 15", False)]
+    assert len(lanes[0]["planned"]) <= 2 and lanes[0]["runs"] == []      # only since the schedule began; none ran yet
+    api.store.members[1]["added_at"] = api.store.members[2]["added_at"] = "2020-01-01T00:00:00+00:00"
     api.store.schedules[1]["updated_at"] = "2020-01-01T00:00:00+00:00"
-    rows = {r["task_collection"]: r for r in api.get("/api/timeline?hours=2").json()["collections"]}
-    assert 7 <= len(rows["c1"]["planned"]) <= 9
-    assert rows["c2"]["schedules"] == ["Prod 15 (Every 15 minutes, starting at 7 minutes past the hour (UTC))"]
+    main._shared_reads.clear()      # the schedules are a shared read
+    lane, = api.get("/api/timeline?hours=2").json()["jobs"]
+    assert 14 <= len(lane["planned"]) <= 18     # both groups' triggers, staggered 7 minutes apart, in one lane
+    assert lane["description"].startswith("Every 15 minutes")
 
 
 def test_sync_takes_the_schedule_lock_and_a_failed_delete_is_retried(api):

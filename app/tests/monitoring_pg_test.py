@@ -95,6 +95,15 @@ def rows(conn, sql, params=()):
     return [dict(zip(cols, r)) for r in cur.fetchall()]
 
 
+def test_the_rows_written_in_a_window_count_its_table_loads_and_say_which_had_no_count(pg):
+    day, = rows(pg, q.rows_written_since_sql(), (["c1"], 24))
+    assert (day["rows_written"], day["uncounted"]) == (7, 0)       # the running run's t7; the failed t9 has no rows
+    four_days, = rows(pg, q.rows_written_since_sql(), (["c1"], 96))
+    assert (four_days["rows_written"], four_days["uncounted"]) == (1007, 9)    # db2's first load was batched
+    assert [r["run_id"] for r in rows(pg, q.run_batch_rows_sql(), (96,))] == [1]
+    assert rows(pg, q.rows_written_since_sql(), (["other"], 96))[0]["rows_written"] == 0
+
+
 def test_every_enabled_table_is_in_exactly_one_state(pg):
     c = rows(pg, q.collections_overview_sql())[0]
     states = (c["state_current"], c["state_late"], c["state_first_load"], c["state_failing"])

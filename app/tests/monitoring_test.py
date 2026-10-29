@@ -169,6 +169,7 @@ def api(monkeypatch):
         q.last_runs_sql(): [dict(task_collection="c1", run_id=9, status="running")],
         q.running_progress_sql(): [dict(run_id=9, task_collection="c1", enabled_tables=10, tables_checked=4)],
         q.run_batch_rows_sql(): [dict(run_id=8, task_collection="c1", detail=json.dumps({"batch_rows": 50}))],
+        q.rows_written_since_sql(): [dict(rows_written=700, uncounted=2)],
         q.collection_databases_sql(): [dict(server="s1", src_database="db1", tables=5), dict(server="s1", src_database="db2", tables=5)],
         q.collection_database_rows_sql(): [dict(server="s1", src_database="db1", rows_first_loads=1000, first_loads=5,
                                                 first_loads_uncounted=0, rows_changes_24h=3, in_flight=1,
@@ -212,6 +213,9 @@ def test_overview_sums_the_shared_reads_into_jobs_and_groups_in_no_job(api):
     assert (data["not_in_job"]["enabled_tables"], data["not_in_job"]["databases"]) == (10, 2)
     assert [r["run_id"] for r in data["running_not_in_job"]] == [9]
     assert data["totals"]["enabled_tables"] == 10 and data["totals"]["servers"] == 1
+    # 24 hours of rows: the table loads' and the batched appends' together, partial since two loads had no count.
+    assert data["rows_24h"] == {"rows": 750, "partial": True}
+    assert data["next_triggers"] == [] and data["paused_jobs"] == 0     # no job yet
 
 
 def test_collection_databases_merge_rows_and_place_a_batch_on_its_one_database(api):

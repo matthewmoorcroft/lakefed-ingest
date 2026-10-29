@@ -1,9 +1,10 @@
-import { useState } from "react";
+import { type ReactNode } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { Link } from "react-router-dom";
 import { api, qs, type Row } from "../api";
+import { pausedNotRun } from "./IngestionJob";
 import {
-  ErrorBox, FillBox, JobStatus, Name, Notice, PageHead, Pager, ProgressBar, RunStatus, Section, Stamp, StateBar, StateKey,
+  ErrorBox, FillBox, JobStatus, Name, Notice, PageHead, Pager, ProgressBar, RunStatus, Section, Stamp, StateBar,
   fmtClock, fmtDuration, fmtInt, fmtShort, fmtSlot, fmtSpeed, fmtTime, jobRunName, jobRunPath, plural, progressFrom, progressText
 } from "../components";
 
@@ -11,6 +12,7 @@ interface Overview {
   jobs: Row[]; jobs_total: number; offset: number; limit: number; not_in_job: Row | null;
   running_job_runs: Row[]; running_total: number; running_not_in_job: Row[];
   attention: Row[]; attention_total: number; totals: Row; read_at: string; cache_s: number;
+  next_triggers: Row[]; paused_jobs: number; rows_24h: { rows: number; partial: boolean };
 }
 
 const jobPath = (id: unknown) => `/ingestion-jobs/${encodeURIComponent(String(id))}`;
@@ -154,25 +156,86 @@ export function NeedsAttention({ jobs, total }: { jobs: Row[]; total: number }) 
   );
 }
 
+/** Every enabled table by state, each state linking to the tables in it, as the Jobs UI's run summary counts. */
+function Freshness({ totals }: { totals: Row }) {
+  const states: [string, string, string, string][] = [
+    ["state_current", "seg-current", "Current", "/tables"], ["state_late", "seg-late", "Late", "/tables?status=sla_breached"],
+    ["state_first_load", "seg-first", "Waiting for a first load", "/tables?status=seeding"],
+    ["state_failing", "seg-failing", "Failing", "/tables?status=failing"]];
+  return (
+    <Section title="Freshness" note="Every enabled table of every job, by its state now.">
+      <StateBar row={totals} />
+      <div className="key" style={{ marginTop: 8 }}>
+        {states.map(([key, cls, label, to]) => (
+          <span key={key}><i className={cls} /><Link to={to}>{label}</Link> <b>{fmtInt(totals[key])}</b></span>
+        ))}
+      </div>
+    </Section>
+  );
+}
+
+/** The next scheduled triggers across every job, soonest first; paused jobs have none. */
+function NextScheduled({ triggers, paused }: { triggers: Row[]; paused: number }) {
+  return (
+    <Section title="Next scheduled" actions={<Link to="/schedules">Schedules</Link>}>
+      {!triggers.length && <p className="muted">No trigger is scheduled{paused ? `: ${fmtInt(paused)} ${paused === 1 ? "job is" : "jobs are"} paused` : ""}.</p>}
+      {triggers.map((t) => (
+        <div key={t.id} className="attention-row">
+          <div className="title"><Link to={jobPath(t.id)}>{t.name}</Link> <span className="muted">{fmtTime(t.next_start)}</span></div>
+          <div className="kv"><span>{t.description}</span></div>
+        </div>
+      ))}
+      {triggers.length > 0 && paused > 0 && <p className="muted small">{fmtInt(paused)} paused {plural(paused, "job")} not shown.</p>}
+    </Section>
+  );
+}
+
+/** The latest finished job runs across every job, newest first, each opening its job run; triggers a paused job
+ * skipped are left out, as the Runs list leaves them out of Finished. */
+function RecentRuns() {
+  const runs = useQuery({ queryKey: ["overview-recent-runs"], queryFn: () => api.get<Row>(`/job-runs${qs({ limit: 8 })}`),
+                          refetchInterval: 60_000 });
+  const finished = (runs.data?.job_runs ?? []).filter((r: Row) => r.outcome?.label !== "Running" && !pausedNotRun(r)).slice(0, 6);
+  return (
+    <Section title="Recent runs" actions={<Link to="/runs">All runs</Link>}>
+      <ErrorBox error={runs.error} />
+      {runs.data && !finished.length && <p className="muted">No job run has finished yet.</p>}
+      {finished.map((r: Row) => (
+        <div key={`${r.job_id}-${r.slot}`} className="attention-row">
+          <div className="title"><Link to={jobRunPath(r.job_id, r.slot)}><RunStatus status={null} outcome={r.outcome} /></Link>{" "}
+            <Link to={jobPath(r.job_id)}>{r.job_name}</Link></div>
+          <div className="kv"><span>{fmtSlot(r.slot)}</span>{r.took_s != null && <span>took {fmtDuration(r.took_s)}</span>}
+            {Number(r.failed_tables) > 0 && <span>{fmtInt(r.failed_tables)} {plural(r.failed_tables, "table")} failed</span>}</div>
+        </div>
+      ))}
+    </Section>
+  );
+}
+
+/** A status summary, as the Databricks home and Jobs pages open: totals, what runs now, what needs a look, how fresh
+ * the tables are, what runs next and what ran last, each item linking to its job or run. The jobs themselves are
+ * listed on Ingestion jobs. */
 export default function OverviewPage() {
-  const [offset, setOffset] = useState(0);
-  const ov = useQuery({ queryKey: ["overview", offset], queryFn: () => api.get<Overview>(`/overview${qs({ offset })}`),
-                        refetchInterval: 30_000 });
+  const ov = useQuery({ queryKey: ["overview"], queryFn: () => api.get<Overview>("/overview"), refetchInterval: 30_000 });
   const d = ov.data;
   const t = d?.totals ?? {};
   const enabled = Number(t.enabled_tables || 0);
   const pct = enabled ? ((100 * Number(t.state_current || 0)) / enabled).toFixed(1) : "0.0";
   const jobs = Number(t.jobs || 0);
   const unscheduled = d?.not_in_job?.groups?.length ?? 0;
-  const idle = !!d && !d.running_total && !d.running_not_in_job.length;
-  const calm = !!d && !d.attention_total;
+  const tiles: [string, string, ReactNode, ReactNode][] = d ? [
+    ["Ingestion jobs", "/ingestion-jobs", <>{fmtInt(jobs)}<small>{plural(jobs, "job")}</small></>,
+      <>{fmtInt(t.running_jobs)} running · {fmtInt(d.paused_jobs)} paused{unscheduled ? ` · ${fmtInt(unscheduled)} ${plural(unscheduled, "group")} in no job` : ""}</>],
+    ["Databases", "/sources", <>{fmtInt(t.databases)}<small>{plural(t.databases, "database")}</small></>,
+      <>on {fmtInt(t.servers)} {plural(t.servers, "server")}</>],
+    ["Tables", "/tables", <>{fmtInt(enabled)}<small>enabled</small></>, <>{pct}% current</>],
+    ["Rows written, 24 hours", "/runs", <>{d.rows_24h.partial ? "at least " : ""}{fmtShort(d.rows_24h.rows)}<small>rows</small></>,
+      <>by every job's runs</>]] : [];
   return (
     <>
       <PageHead title="Overview"
         lead={d && (enabled ? <>{pct}% of <strong>{fmtInt(enabled)}</strong> enabled {plural(enabled, "table")} {enabled === 1 ? "is" : "are"} current,
-          in <strong>{fmtInt(t.groups)}</strong> {plural(t.groups, "ingestion group")} and <strong>{fmtInt(t.databases)}</strong>{" "}
-          {plural(t.databases, "database")} on <strong>{fmtInt(t.servers)}</strong> {plural(t.servers, "server")}
-          {unscheduled > 0 && <>; {fmtInt(unscheduled)} {plural(unscheduled, "group")} in no job</>}.</> : "No enabled tables yet.")}
+          in <strong>{fmtInt(jobs)}</strong> {plural(jobs, "ingestion job")}.</> : "No enabled tables yet.")}
         right={<Stamp at={d?.read_at} every={30} error={ov.error} />} />
       <ErrorBox error={ov.error} />
       {d && !enabled && <Notice tone="info">No tables are set up yet. Add them with <Link to="/bulk">Bulk import</Link> or <Link to="/add">Add table</Link>.</Notice>}
@@ -183,33 +246,24 @@ export default function OverviewPage() {
           tables, Bulk edit, then Freshness target.</Notice>
       )}
       {/* Until the first read, the tiles show a dash, never zeros that look like real counts. */}
-      {!d && <div className="metrics">{["Ingestion jobs", "Running now", "Failing", "Late data"].map((label) => (
-        <div key={label} className="metric"><div className="metric-label">{label}</div><div className="metric-value muted">–</div></div>))}</div>}
-      {d && <div className="metrics">
-        <div className="metric"><div className="metric-label">Ingestion jobs</div>
-          <div className="metric-value">{fmtInt(jobs)}<small>{plural(jobs, "job")}</small></div>
-          <div className="metric-sub">{unscheduled ? `and ${fmtInt(unscheduled)} ${plural(unscheduled, "group")} in no job` : "every group is in one"}</div></div>
-        <div className="metric run"><div className="metric-label">Running now</div>
-          <div className="metric-value">{fmtInt(d?.running_total)}<small>{plural(d?.running_total, "job run")}</small></div>
-          <div className="metric-sub">in {fmtInt(t.running_jobs)} of {fmtInt(t.jobs)} {plural(t.jobs, "job")}
-            {d?.running_not_in_job.length ? `, and ${fmtInt(d.running_not_in_job.length)} group runs in no job` : ""}</div></div>
-        <div className={`metric ${Number(t.failing_jobs) ? "bad" : ""}`}><div className="metric-label">Failing</div>
-          <div className="metric-value">{fmtInt(t.failing_jobs)}<small>{plural(t.failing_jobs, "job")}</small></div>
-          <div className="metric-sub">{fmtInt(t.state_failing)} {plural(t.state_failing, "table")} failing now</div></div>
-        <div className={`metric ${Number(t.late_jobs) ? "warn" : ""}`}><div className="metric-label">Late data</div>
-          <div className="metric-value">{fmtInt(t.late_jobs)}<small>{plural(t.late_jobs, "job")}</small></div>
-          <div className="metric-sub">{fmtInt(t.state_late)} {plural(t.state_late, "table")} past their freshness target</div></div>
+      <div className="metrics">
+        {d ? tiles.map(([label, to, value, sub]) => (
+          <Link key={label} to={to} className="metric metric-link"><div className="metric-label">{label}</div>
+            <div className="metric-value">{value}</div><div className="metric-sub">{sub}</div></Link>
+        )) : ["Ingestion jobs", "Databases", "Tables", "Rows written, 24 hours"].map((label) => (
+          <div key={label} className="metric"><div className="metric-label">{label}</div><div className="metric-value muted">–</div></div>))}
+      </div>
+      {d && <RunningNow runs={d.running_job_runs} total={d.running_total} notInJob={d.running_not_in_job} />}
+      {d && <div className="split">
+        <div>
+          <NeedsAttention jobs={d.attention} total={d.attention_total} />
+          <Freshness totals={t} />
+        </div>
+        <div>
+          <NextScheduled triggers={d.next_triggers} paused={d.paused_jobs} />
+          <RecentRuns />
+        </div>
       </div>}
-      <Section title="Ingestion jobs" note="Each job is a schedule and its ingestion groups. Failing first, then late, then by name."
-        actions={<StateKey />}>
-        {d && <JobsTable jobs={d.jobs} notInJob={offset + d.limit >= d.jobs_total ? d.not_in_job : null} total={d.jobs_total}
-          offset={offset} limit={d.limit} onPage={setOffset} link />}
-      </Section>
-      {/* As the workspace home folds an empty section into a line: a quiet line, not a card, when nothing runs or needs a look. */}
-      {(idle || calm) && <p className="muted small">{idle && <>Nothing running (<Link to="/runs">all runs</Link>)</>}
-        {idle && calm && " · "}{calm && "No job needs attention"}</p>}
-      {d && !idle && <RunningNow runs={d.running_job_runs} total={d.running_total} notInJob={d.running_not_in_job} />}
-      {d && !calm && <NeedsAttention jobs={d.attention} total={d.attention_total} />}
     </>
   );
 }

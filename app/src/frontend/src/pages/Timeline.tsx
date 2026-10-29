@@ -1,18 +1,33 @@
 import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
+import { useNavigate } from "react-router-dom";
 import { api, qs, type Row } from "../api";
-import { PageHead, Stamp, readAt, ErrorBox, Notice, fmtTime, useWidth, plural } from "../components";
+import { PageHead, Stamp, readAt, ErrorBox, Notice, fmtDuration, fmtTime, jobRunName, jobRunPath, plural, statusName, useWidth } from "../components";
 
-// Runs per collection over a window: planned triggers (ticks), runs (bars by outcome) and triggers
-// Databricks skipped because the previous run was still going (red markers).
+// One lane per ingestion job, as the Jobs UI's run timeline: each job run a bar from its first group run's start to
+// its last one's finish, coloured by its outcome, opening the job run; its groups on hover. Planned triggers are
+// ticks, and triggers Databricks skipped (the previous run still going) red markers. Groups in no job get one lane.
 
-interface Timeline { start: string; end: string; collections: { task_collection: string; runs: Row[]; planned: string[]; skipped: string[]; schedules: string[] }[] }
+interface Lane { job_id: number; name: string; description: string; paused: boolean; runs: Row[]; planned: string[]; skipped: string[] }
+interface Timeline { start: string; end: string; jobs: Lane[]; not_in_job: { groups: string[]; group_runs: Row[] } | null }
 
-const LABEL_W = 230, MIN_CHART_W = 600, ROW_H = 26, AXIS_H = 26;
-const COLOR: Record<string, string> = { completed: "var(--s-current)", failed: "var(--s-failing)", running: "var(--s-flight)", skipped: "var(--s-late)" };
+const LABEL_W = 260, MIN_CHART_W = 600, ROW_H = 40, AXIS_H = 26;
+const TONE: Record<string, string> = { ok: "var(--s-current)", warn: "var(--s-late)", bad: "var(--s-failing)", run: "var(--s-flight)" };
+const GROUP_RUN: Record<string, string> = { completed: TONE.ok, failed: TONE.bad, running: TONE.run, skipped: TONE.warn };
+
+const groupsText = (run: Row) => (run.groups ?? []).map((g: Row) => `${g.group}: ${g.status ? statusName(g.status) : "did not run"}`).join("\n");
+
+function runTitle(lane: Lane, run: Row) {
+  const span = run.started_at ? `${fmtTime(run.started_at)} – ${run.outcome.label === "Running" ? "running" : fmtTime(run.ended_at)}` : "did not run";
+  return [jobRunName(lane.name, run.slot), `${run.outcome.label}${run.outcome.note ? ` (${run.outcome.note})` : ""}`, span,
+    run.took_s != null ? `took ${fmtDuration(run.took_s)}` : "",
+    Number(run.failed_tables) > 0 ? `${run.failed_tables} ${plural(run.failed_tables, "table")} failed` : "",
+    `${run.ran} of ${run.members} ${plural(run.members, "group")} ran`, groupsText(run), "Click to open the job run"].filter(Boolean).join("\n");
+}
 
 export default function TimelinePage() {
   const [hours, setHours] = useState(24);
+  const navigate = useNavigate();
   // The chart is drawn at the card's own width, so it uses the whole screen without scaling its text.
   const [box, boxWidth] = useWidth<HTMLDivElement>();
   const CHART_W = Math.max(MIN_CHART_W, boxWidth - LABEL_W - 26);
@@ -20,19 +35,24 @@ export default function TimelinePage() {
   const d = t.data;
   const t0 = d ? new Date(d.start).getTime() : 0, t1 = d ? new Date(d.end).getTime() : 1;
   const x = (iso: string | number) => LABEL_W + ((new Date(iso).getTime() - t0) / (t1 - t0)) * CHART_W;
-  const rows = d?.collections ?? [];
-  const height = AXIS_H + rows.length * ROW_H + 8;
+  const lanes = d?.jobs ?? [];
+  const rows = lanes.length + (d?.not_in_job ? 1 : 0);
+  const height = AXIS_H + rows * ROW_H + 8;
   const step = hours <= 6 ? 1 : hours <= 24 ? 2 : 6;
   const ticks: number[] = [];
   if (d) {
     const first = new Date(t0); first.setMinutes(0, 0, 0);
     for (let ms = first.getTime() + 3600_000; ms < t1; ms += step * 3600_000) ticks.push(ms);
   }
-  const stats = rows.reduce((a, r) => ({ runs: a.runs + r.runs.length, failed: a.failed + r.runs.filter((x) => x.status === "failed").length,
-    skipped: a.skipped + r.skipped.length }), { runs: 0, failed: 0, skipped: 0 });
+  const runs = lanes.flatMap((l) => l.runs);
+  const failed = runs.filter((r) => r.outcome.tone === "bad").length;
+  const skipped = lanes.reduce((n, l) => n + l.skipped.length, 0);
+  const band = (i: number) => <rect x={0} y={AXIS_H + i * ROW_H} width={LABEL_W + CHART_W + 10} height={ROW_H}
+    style={{ fill: i % 2 ? "var(--db-surface-subtle)" : "var(--db-surface-base)" }} />;
   return (
     <>
-      <PageHead title="Timeline" lead="Every group run and trigger in the window, by ingestion group." right={<Stamp at={readAt(t)} every={60} error={t.error} />} />
+      <PageHead title="Timeline" lead="The job runs of every ingestion job in the window, one lane per job. Click a job run to open it."
+        right={<Stamp at={readAt(t)} every={60} error={t.error} />} />
       <div className="toolbar">
         <label>Window
           <select value={hours} onChange={(e) => setHours(Number(e.target.value))}>
@@ -40,18 +60,19 @@ export default function TimelinePage() {
           </select>
         </label>
         <span className="legend">
-          <i style={{ background: COLOR.completed }} /> completed <i style={{ background: COLOR.failed }} /> failed
-          <i style={{ background: COLOR.running }} /> running <i style={{ background: COLOR.skipped }} /> skipped (ingestion group already running)
-          <i className="tick" /> planned trigger (current schedule, since its last change) <b className="skipmark">▼</b> trigger skipped by Databricks
+          <i style={{ background: TONE.ok }} /> Succeeded <i style={{ background: TONE.warn }} /> Succeeded with failures
+          <i style={{ background: TONE.bad }} /> Failed <i style={{ background: TONE.run }} /> Running
+          <i className="hollow" /> Not run <i className="tick" /> planned trigger <b className="skipmark">▼</b> trigger skipped by Databricks
         </span>
       </div>
       <ErrorBox error={t.error} />
-      {d && <p className="muted small">{stats.runs} {plural(stats.runs, "run")}, {stats.failed} failed, {stats.skipped} skipped {plural(stats.skipped, "trigger")}, {fmtTime(d.start)} – {fmtTime(d.end)}.
-        Hover a bar for details.</p>}
-      {d && rows.length === 0 && <Notice>No runs or schedules in this window.</Notice>}
-      {d && rows.length > 0 && (
+      {d && <p className="muted small">{runs.length} {plural(runs.length, "job run")}, {failed} failed, {skipped} skipped {plural(skipped, "trigger")},
+        {" "}{fmtTime(d.start)} – {fmtTime(d.end)}. Hover a job run for its groups.</p>}
+      {d && rows === 0 && <Notice>No ingestion jobs yet.</Notice>}
+      {d && rows > 0 && (
         <div className="card timeline" ref={box}>
-          <svg viewBox={`0 0 ${LABEL_W + CHART_W + 10} ${height}`} width={LABEL_W + CHART_W + 10} height={height} role="img" aria-label="Runs per ingestion group over time">
+          <svg viewBox={`0 0 ${LABEL_W + CHART_W + 10} ${height}`} width={LABEL_W + CHART_W + 10} height={height} role="img"
+            aria-label="Job runs per ingestion job over time">
             {ticks.map((ms) => (
               <g key={ms}>
                 <line x1={x(ms)} x2={x(ms)} y1={AXIS_H - 4} y2={height} style={{ stroke: "var(--border)" }} />
@@ -60,33 +81,60 @@ export default function TimelinePage() {
                 </text>
               </g>
             ))}
-            {rows.map((r, i) => {
+            {lanes.map((lane, i) => {
               const y = AXIS_H + i * ROW_H;
               return (
-                <g key={r.task_collection}>
-                  <rect x={0} y={y} width={LABEL_W + CHART_W + 10} height={ROW_H} style={{ fill: i % 2 ? "var(--db-surface-subtle)" : "var(--db-surface-base)" }} />
-                  <text x={6} y={y + 17} fontSize={12} style={{ fill: "var(--text)" }}>
-                    {r.task_collection.length > 30 ? r.task_collection.slice(0, 29) + "…" : r.task_collection}
-                    <title>{r.task_collection}{r.schedules.length ? `\n${r.schedules.join("\n")}` : "\nnot scheduled"}</title>
+                <g key={lane.job_id}>
+                  {band(i)}
+                  <text x={6} y={y + 17} fontSize={12.5} className="lane-link" onClick={() => navigate(`/ingestion-jobs/${lane.job_id}`)}>
+                    {lane.name.length > 34 ? lane.name.slice(0, 33) + "…" : lane.name}<title>{`${lane.name}\nOpen the job and its past runs`}</title>
                   </text>
-                  {r.planned.map((p) => <line key={p} x1={x(p)} x2={x(p)} y1={y + 3} y2={y + ROW_H - 3} strokeWidth={1} style={{ stroke: "var(--db-border-strong, #9aa5b1)" }} />)}
-                  {r.runs.map((run) => {
-                    const sx = Math.max(LABEL_W, x(run.started_at)), ex = x(run.finished_at ?? d.end);
+                  <text x={6} y={y + 32} fontSize={11} style={{ fill: "var(--muted)" }}>
+                    {(lane.paused ? "Paused · " : "") + (lane.description.length > 40 ? lane.description.slice(0, 39) + "…" : lane.description)}
+                  </text>
+                  {lane.planned.map((p) => <line key={p} x1={x(p)} x2={x(p)} y1={y + 6} y2={y + ROW_H - 6} strokeWidth={1}
+                    style={{ stroke: "var(--db-border-strong, #9aa5b1)" }} />)}
+                  {lane.runs.map((run) => {
+                    const open = () => navigate(jobRunPath(lane.job_id, run.slot));
+                    if (!run.started_at && run.outcome.label !== "Running") {
+                      return <circle key={run.slot} cx={Math.max(LABEL_W + 4, x(run.slot))} cy={y + ROW_H / 2} r={4} className="hollow-mark"
+                        onClick={open}><title>{runTitle(lane, run)}</title></circle>;
+                    }
+                    const sx = Math.max(LABEL_W, x(run.started_at ?? run.slot)), ex = x(run.ended_at ?? d.end);
                     return (
-                      <rect key={run.run_id} x={sx} y={y + 6} width={Math.max(2, ex - sx)} height={ROW_H - 12} rx={2}
-                        opacity={0.85} style={{ fill: COLOR[run.status] ?? "var(--muted)" }}>
-                        <title>{`run ${run.run_id}: ${run.status}\n${fmtTime(run.started_at)} – ${run.finished_at ? fmtTime(run.finished_at) : "running"}`
-                          + `\n${Math.round(((run.finished_at ? new Date(run.finished_at).getTime() : t1) - new Date(run.started_at).getTime()) / 6000) / 10} min`
-                          + (run.ok !== null && run.ok !== undefined ? `\nok ${run.ok}, failed ${run.failed}, unchanged ${run.skipped}` : "")}</title>
+                      <rect key={run.slot} x={sx} y={y + 10} width={Math.max(3, ex - sx)} height={ROW_H - 20} rx={2} className="run-bar"
+                        style={{ fill: TONE[run.outcome.tone] ?? "var(--muted)" }} onClick={open}>
+                        <title>{runTitle(lane, run)}</title>
                       </rect>
                     );
                   })}
-                  {r.skipped.map((s) => (
-                    <text key={s} x={x(s)} y={y + 10} fontSize={11} textAnchor="middle" style={{ fill: "var(--bad)" }}>▼<title>{`trigger skipped at ${fmtTime(s)}: previous run still going`}</title></text>
+                  {lane.skipped.map((s) => (
+                    <text key={s} x={x(s)} y={y + 10} fontSize={11} textAnchor="middle" style={{ fill: "var(--bad)" }}>▼
+                      <title>{`trigger skipped at ${fmtTime(s)}: the previous run was still going`}</title></text>
                   ))}
                 </g>
               );
             })}
+            {d.not_in_job && (() => {
+              const i = lanes.length, y = AXIS_H + i * ROW_H;
+              return (
+                <g key="not-in-job">
+                  {band(i)}
+                  <text x={6} y={y + 17} fontSize={12.5} style={{ fill: "var(--text)" }}>Not in any job</text>
+                  <text x={6} y={y + 32} fontSize={11} style={{ fill: "var(--muted)" }}>
+                    {d.not_in_job.groups.length} {plural(d.not_in_job.groups.length, "group")}, group runs</text>
+                  {d.not_in_job.group_runs.map((r) => {
+                    const sx = Math.max(LABEL_W, x(r.started_at)), ex = x(r.finished_at ?? d.end);
+                    return (
+                      <rect key={r.run_id} x={sx} y={y + 10} width={Math.max(3, ex - sx)} height={ROW_H - 20} rx={2} className="run-bar"
+                        style={{ fill: GROUP_RUN[r.status] ?? "var(--muted)" }} onClick={() => navigate(`/runs/${r.run_id}`)}>
+                        <title>{`${r.task_collection}, group run ${r.run_id}: ${statusName(r.status)}\n${fmtTime(r.started_at)} – ${r.finished_at ? fmtTime(r.finished_at) : "running"}\nClick to open the group run`}</title>
+                      </rect>
+                    );
+                  })}
+                </g>
+              );
+            })()}
           </svg>
         </div>
       )}
