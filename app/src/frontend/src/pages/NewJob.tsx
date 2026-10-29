@@ -143,8 +143,8 @@ export default function NewJob() {
   );
 }
 
-/** Import a CSV: a file of where each table is, and how its tables load. */
-function ImportCsvDialog({ csv, loadType, onClose }: { csv: string; loadType: string;
+/** Import a CSV: a file of where each table is, and how its tables load. New and Edit both use it. */
+export function ImportCsvDialog({ csv, loadType, onClose }: { csv: string; loadType: string;
                          onClose: (next: { csv: string; loadType: string } | null) => void }) {
   const [text, setText] = useState(csv);
   const [load, setLoad] = useState(loadType);

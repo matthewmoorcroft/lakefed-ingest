@@ -1025,6 +1025,64 @@ def add_job_databases(job_id: int, body: JobDatabasesRequest, request: Request):
     return {"summary": summary}
 
 
+class JobTablesRequest(BaseModel):
+    csv: str
+    load_type: str = "ct"
+    groups_per_server: int = nj.DEFAULT_GROUPS_PER_SERVER
+    dry_run: bool = True
+
+
+@app.post("/api/ingestion-jobs/{job_id}/tables")
+def add_job_tables(job_id: int, body: JobTablesRequest, request: Request):
+    """Preview (dry_run, the default) or add a CSV of tables to a job, as Add tables does in the Edit view: each line
+    says where a table is, and the table takes the job's settings (new_job.plan_for_job). A database the job has keeps
+    its group, a new one joins its server's groups, a new server gets new groups. Applying is one transaction under
+    the job's lock and its groups' run locks; tables the job already writes are left; then new groups are synced."""
+    job = _load_schedule(job_id)[0]
+    taken = {r["task_collection"] for r in db.query(q.collections_sql())}
+
+    def planned(rows):
+        plan = nj.plan_for_job(job["name"], body.csv, body.load_type, rows, body.groups_per_server, taken)
+        if plan["errors"]:
+            raise HTTPException(422, {"errors": plan["errors"]})
+        return plan
+
+    groups = _job_groups(job_id)
+    if body.dry_run:
+        plan = planned(db.query(q.groups_control_rows_sql(), (groups,)) if groups else [])
+        return {"summary": nj.summary(plan), "applied": False}
+    _refuse_job(job, request, "change")
+    user, batch = _user(request), uuid.uuid4().hex[:12]
+    with db.transaction() as cur:
+        groups = _lock_job(cur, job_id)
+        plan = planned(db.fetch(cur, q.groups_control_rows_sql(for_update=True), (groups,)) if groups else [])
+        summary = nj.summary(plan)
+        if summary["invalid"]:
+            return {"summary": summary, "applied": False}
+        _lock_collections(cur, plan["groups"])
+        rows = [line["row"] for line in plan["lines"] if line["status"] == "valid"]
+        for row in rows:
+            cur.execute(q.insert_control_if_absent_sql(), q.control_params(row))
+            res = cur.fetchone()
+            if not res:
+                raise HTTPException(409, f"another table already writes {row['sink_catalog']}.{row['sink_schema']}."
+                                         f"{row['sink_table']}" + (f" for {row['client_id']}" if row.get("client_id") else ""))
+            _log(cur, user, "import", res[0], row["task_collection"], batch=batch)
+        _refuse_mixed_sinks(cur, rows)
+        _refuse_split_databases(cur, rows)
+        if plan["new_groups"]:
+            _, members = _load_schedule(job_id, cur)
+            active = [m for m in members if m["removed_at"] is None]
+            offs = sch.offsets([m["task_collection"] for m in active] + plan["new_groups"],
+                               int(job["cadence_minutes"]), bool(job.get("stagger")), sch.start_minute(job))
+            for g in plan["new_groups"]:
+                cur.execute(q.insert_member_sql(), (job_id, g, offs[g]))
+        _touch(cur, user, [job_id])
+    if plan["new_groups"]:
+        _sync(job_id, user)
+    return {"summary": summary, "applied": True}
+
+
 @app.get("/api/ingestion-jobs/{job_id}/runs")
 def ingestion_job_runs(job_id: int, before: Optional[str] = None, limit: int = 25):
     """A job's job runs, newest first, `limit` slots before `before` (now when not given); `next_before` is

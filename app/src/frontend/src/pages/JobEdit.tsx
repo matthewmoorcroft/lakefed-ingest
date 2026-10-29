@@ -2,9 +2,10 @@ import { Fragment, useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate, useParams } from "react-router-dom";
 import { api, qs, type Row } from "../api";
-import { Crumbs, ConfirmButton, ErrorBox, Notice, PageHead, Pager, Section, StateBar, fmtInt, plural, useConfirm } from "../components";
+import { Crumbs, ConfirmButton, ErrorBox, Menu, Notice, PageHead, Pager, Section, StateBar, fmtInt, plural, useConfirm } from "../components";
 import { usePermissions } from "../permissions";
 import { CADENCES, IdentityFields, ParameterFields, RunFields, WritesFields, paramsSummary } from "./jobForm";
+import { ImportCsvDialog } from "./NewJob";
 
 // Edit an ingestion job: what it ingests (a tree from its servers), how it writes, its identity columns, when it
 // runs and its advanced configuration. A change in the tree applies once its dialog is confirmed, as Catalog Explorer
@@ -245,6 +246,42 @@ function AddDatabases({ jobId, servers }: { jobId: string; servers: string[] }) 
   );
 }
 
+/** Add tables from a CSV of where each one is: checked first, then added after a confirm, with the job's settings. */
+function useAddTables(jobId: string) {
+  const qc = useQueryClient();
+  const confirm = useConfirm();
+  const [open, setOpen] = useState(false);
+  const [found, setFound] = useState<Row | null>(null);
+  const add = useMutation({
+    mutationFn: async ({ csv, loadType }: { csv: string; loadType: string }) => {
+      const body = { csv, load_type: loadType };
+      const preview = (await api.post<Row>(`/ingestion-jobs/${jobId}/tables`, { ...body, dry_run: true })).summary;
+      setFound(preview);
+      if (preview.invalid.length || !preview.tables) return null;
+      const servers = (preview.servers as Row[]).map((s) => `${fmtInt(s.tables)} on ${s.server}`).join(", ");
+      const ok = await confirm.ask({ title: `Add ${fmtInt(preview.tables)} ${plural(preview.tables, "table")} to this job?`, action: "Add tables",
+        body: <><p>{servers}. Each takes the job's settings: how it writes, its target names and identity columns.</p>
+          {Number(preview.in_job) > 0 && <p>{fmtInt(preview.in_job)} more {plural(preview.in_job, "line")} the job already has {Number(preview.in_job) === 1 ? "is" : "are"} left as {Number(preview.in_job) === 1 ? "it is" : "they are"}.</p>}
+          {preview.new_groups.length > 0 && <p>A new server gets {fmtInt(preview.new_groups.length)} new {plural(preview.new_groups.length, "group")}.</p>}
+          <p>Their first loads run at the job's next run.</p></> });
+      return ok ? api.post<Row>(`/ingestion-jobs/${jobId}/tables`, { ...body, dry_run: false }) : null;
+    },
+    onSuccess: (r) => { if (r) { setFound(r.summary); qc.invalidateQueries({ queryKey: ["job-tree", jobId] });
+      qc.invalidateQueries({ queryKey: ["job-settings", jobId] }); qc.invalidateQueries({ queryKey: ["schedules"] }); } },
+  });
+  const dialog = <>
+    {open && <ImportCsvDialog csv="" loadType="ct" onClose={(next) => { setOpen(false); if (next) add.mutate(next); }} />}
+    {confirm.dialog}
+  </>;
+  const result = <>
+    <ErrorBox error={add.error} />
+    {found && found.invalid.length > 0 && <Notice tone="bad">Nothing was added: {fmtInt(found.invalid.length)} {plural(found.invalid.length, "line")} can't be
+      added.<ul>{found.invalid.slice(0, 20).map((l: Row) => <li key={l.line}>line {l.line}, {l.table}: {l.errors.join("; ")}</li>)}</ul></Notice>}
+    {add.data && <Notice tone="ok">Added {fmtInt(add.data.summary.tables)} {plural(add.data.summary.tables, "table")}.</Notice>}
+  </>;
+  return { open: () => setOpen(true), dialog, result };
+}
+
 export default function JobEdit() {
   const { id = "" } = useParams();
   const navigate = useNavigate();
@@ -263,6 +300,7 @@ export default function JobEdit() {
   const [name, setName] = useState("");
   const [params, setParams] = useState<Record<string, string>>({});
   const [addOpen, setAddOpen] = useState(false);
+  const addTables = useAddTables(id);
   // The settings form as it loaded, so "unsaved" means the user changed something, not that a default differs.
   const [loaded, setLoaded] = useState("");
   const locked: Locked = usePermissions().data?.jobs[id]?.change ?? null;
@@ -411,8 +449,13 @@ export default function JobEdit() {
       </Section>}
 
       <Section title="What it ingests" note="Open a server to see its databases, and a database to see its tables. A table's load type is the same in every database: change it and it changes in all of them."
-        actions={<button className="ghost" disabled={!!locked} title={locked ?? undefined} onClick={() => setAddOpen(!addOpen)}>{addOpen ? "Close" : "Add databases"}</button>}>
+        actions={locked ? <button className="ghost" disabled title={locked}>Add tables ▾</button> : <Menu label="Add tables ▾" buttonClass="ghost" title="Add tables">
+          <button onClick={addTables.open}>Import a CSV of tables<span className="sub">one line per table: where it is; the job says how to ingest it</span></button>
+          <button onClick={() => setAddOpen(true)}>Import a CSV of databases<span className="sub">each database gets every table of the job, or pick them by hand</span></button>
+        </Menu>}>
         <p className="impact">Changes here apply as soon as you confirm them; Save does not cover them.</p>
+        {addTables.dialog}{addTables.result}
+        {addOpen && <div className="toolbar"><b>Add databases</b><button className="ghost" onClick={() => setAddOpen(false)}>Close</button></div>}
         {addOpen && <AddDatabases jobId={id} servers={(servers.data?.items ?? []).map((x: Row) => x.server)} />}
         <Tree jobId={id} locked={locked} />
       </Section>

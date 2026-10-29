@@ -152,3 +152,94 @@ def test_settings_or_a_schedule_it_cannot_take_are_422(client):
     assert r.status_code == 422 and "set the target catalog" in r.json()["detail"]["errors"]
     r = _create(client, run={"cadence_minutes": 7})
     assert r.status_code == 422 and any("cadence" in e for e in r.json()["detail"]["errors"])
+
+
+# ---- adding a CSV of tables to an existing job --------------------------------------------------
+
+def _job_rows():
+    """The job made from CSV above, as its control rows read back."""
+    rows = [dict(line["row"], id=i + 1, task_enabled=True) for i, line in enumerate(nj.plan("Engagement extraction", CSV, FAN_IN, 4)["lines"])]
+    return rows
+
+
+def test_tables_added_to_a_job_take_its_settings_and_its_groups():
+    more = ("src_connection,src_database,src_schema,src_table,select_list,primary_key\n"
+            "sql_a,eng_002,gen,t0003,\"id, x\",id\n"            # a database the job has: its group
+            "sql_a,eng_009,gen,t0001,\"id, amount\",id\n"       # a new database on the job's server: one of its groups
+            "sql_b,ops_01,gen,t0001,\"id, amount\",id\n"        # a new server: new groups
+            "sql_a,eng_001,gen,t0001,\"id, amount\",id\n")      # a table the job already writes: left as it is
+    rows = _job_rows()
+    plan = nj.plan_for_job("Engagement extraction", more, "ct", rows, 4)
+    assert plan["errors"] == []
+    by_table = {line["table"]: line for line in plan["lines"]}
+    assert by_table["eng_002.gen.t0003"]["group"] == next(r["task_collection"] for r in rows if r["src_database"] == "eng_002")
+    assert by_table["eng_009.gen.t0001"]["group"] in {r["task_collection"] for r in rows}
+    assert by_table["ops_01.gen.t0001"]["group"].startswith("engagement_extraction_sql_b_c0")
+    assert by_table["eng_001.gen.t0001"]["status"] == "in_job"
+    assert plan["new_groups"] == [by_table["ops_01.gen.t0001"]["group"]]
+    new = by_table["eng_009.gen.t0001"]["row"]
+    assert (new["sink_schema"], new["sink_table"], new["client_id"], json.loads(new["client_attrs"])) == (
+        "engagements", "t0001", "eng_009", {"engagement": "eng_009"})
+    summary = nj.summary(plan)
+    assert (summary["tables"], summary["in_job"]) == (3, 1)
+
+
+def test_a_job_whose_tables_differ_on_a_setting_must_set_it_first():
+    rows = _job_rows()
+    rows[0]["sink_schema"] = "elsewhere"
+    plan = nj.plan_for_job("Engagement extraction", CSV, "ct", rows, 4)
+    assert plan["lines"] == [] and "target schema" in plan["errors"][0].replace("sink", "target").replace("_", " ")
+
+
+@pytest.fixture
+def job_client(monkeypatch):
+    pytest.importorskip("fastapi")
+    pytest.importorskip("httpx")
+    from fastapi.testclient import TestClient
+    import main
+    import queries as q
+    from api_test import FakeCursor, FakeDB
+
+    rows = _job_rows()
+    schedule = dict(id=7, name="Engagement extraction", cadence_minutes=60, timezone="UTC", stagger=True, paused=True,
+                    options=None, job_variant="default", parameters={}, notify_emails=None)
+    members = [dict(id=i, schedule_id=7, task_collection=g, offset_minutes=0, job_id=None, removed_at=None, delete_pending=False)
+               for i, g in enumerate(sorted({r["task_collection"] for r in rows}))]
+
+    def answer(sql, params=()):
+        if sql == q.schedule_sql():
+            return [dict(schedule)]
+        if sql == q.schedule_members_sql():
+            return [dict(m) for m in members]
+        if sql.startswith(q.groups_control_rows_sql().split(" for update")[0][:60]):
+            return [dict(r) for r in rows]
+        if sql == q.collections_sql():
+            return [{"task_collection": m["task_collection"]} for m in members]
+        return []
+
+    fake = FakeDB()
+    monkeypatch.setattr(main.db, "query", answer)
+    monkeypatch.setattr(main.db, "fetch", lambda cur, sql, params=(): answer(sql, params))
+    monkeypatch.setattr(main.db, "transaction", contextlib.contextmanager(lambda: (yield FakeCursor(fake))))
+    monkeypatch.setattr(main, "_refuse_job", lambda job, request, action: None)
+    synced = []
+    monkeypatch.setattr(main, "_sync", lambda sid, user: synced.append(sid) or [])
+    c = TestClient(main.app, headers={"X-Forwarded-Email": "op@example.com"})
+    c.db, c.synced, c.q = fake, synced, q
+    return c
+
+
+MORE = ("src_connection,src_database,src_schema,src_table,select_list,primary_key\n"
+        "sql_a,eng_009,gen,t0001,\"id, amount\",id\n"
+        "sql_b,ops_01,gen,t0001,\"id, amount\",id\n")
+
+
+def test_adding_tables_previews_then_writes_them_and_the_new_groups(job_client):
+    body = job_client.post("/api/ingestion-jobs/7/tables", json={"csv": MORE}).json()
+    assert body["applied"] is False and body["summary"]["tables"] == 2 and job_client.db.statements == []
+    body = job_client.post("/api/ingestion-jobs/7/tables", json={"csv": MORE, "dry_run": False}).json()
+    assert body["applied"] is True
+    inserted = [dict(zip(job_client.q.CONTROL_INSERT_COLUMNS, p)) for p in job_client.db.of("insert into lakefed_ingest.control (")]
+    assert [r["src_database"] for r in inserted] == ["eng_009", "ops_01"]
+    members = job_client.db.of("insert into lakefed_ingest.schedule_member")
+    assert [m[1] for m in members] == body["summary"]["new_groups"] and job_client.synced == [7]
