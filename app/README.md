@@ -115,6 +115,12 @@ until the poller records a run going, and **Cancel run** reads **Cancelling…**
 Both read the `databricks_run` table the poller keeps, with no timer on the page. After 15 minutes without a start, or
 10 minutes without a cancel being confirmed, the page says Databricks has not confirmed it and keeps Run now off.
 
+**The other actions wait the same way.** Run setup job shows **Setup job running** while Databricks lists its run going, then
+**succeeded**, or **failed** with Databricks' message; it stays off until the run has ended (a run still listed after 30
+minutes is not confirmed). Add databases, Add tables and Create show done only once their tables are written and the
+job's Databricks jobs are synced; a wrapper job that did not sync is named. Edit's Save shows saved only once the
+wrapper jobs are synced and any cluster copies run has ended; a copies run that failed says the cluster was not applied.
+
 ## Re-discovery
 
 A job made from a discovery can add new databases and tables by itself. On its Edit page, under When it runs,
@@ -138,6 +144,10 @@ Other rules: a paused job is skipped; a run that meets a group already running i
 made from an uploaded CSV has nothing to read again. Each run claims its job in SQL first, so two app instances
 don't run the same job twice. The scheduler runs only while the app runs: a day missed while it was down runs on
 the first tick after the hour.
+
+**Run it now** on the job page starts the same run (it is refused while one is going). While it runs the page reads
+pending from the discovery run in the poller, then **adding tables**, then done with what was found and added, or failed
+with the reason. Run it now stays off until the run has ended; a discovery run past its wait is not confirmed, not done.
 
 A whole-server part reads its servers again from `discovery.listing` (how the discovery listed databases: the LIKE
 pattern, the Azure resource and the host secret template, never a secret). A discovery made before schema version
