@@ -1229,6 +1229,21 @@ def discovery_databases_sql() -> str:
             f"from {SCHEMA}.discovery where discovery_id = %s order by src_database")
 
 
+def discovery_totals_sql() -> str:
+    """How many databases a discovery has, and how many of them match a filter (in their name). Params: filter,
+    discovery_id."""
+    return (f"select count(*) as total, count(*) filter (where position(lower(%s) in lower(src_database)) > 0) as matched "
+            f"from {SCHEMA}.discovery where discovery_id = %s")
+
+
+def discovery_listing_sql() -> str:
+    """One page of a discovery's databases matching a filter (in their name), by name, with each one's status and
+    error: the page the Discover step lists, so it never holds all of them. Params: discovery_id, filter, limit, offset."""
+    return (f"select src_database, status, error from {SCHEMA}.discovery "
+            f"where discovery_id = %s and position(lower(%s) in lower(src_database)) > 0 "
+            f"order by src_database limit %s offset %s")
+
+
 def discovered_tables_sql() -> str:
     """Discovered tables of one discovery, with the source connection and any existing control row
     for the same source table (``registered_id``). Param: discovery_id."""
@@ -1361,7 +1376,7 @@ def log_changes_sql(n: int) -> str:
 # ---- background writes (app_task) -----------------------------------------------------------------
 
 APP_TASK_FIELDS = ("id", "kind", "request_id", "job_id", "status", "done", "total", "result", "error", "created_by",
-                   "created_at", "heartbeat_at", "finished_at")
+                   "created_at", "heartbeat_at", "finished_at", "progress")
 
 
 def insert_task_sql() -> str:
@@ -1410,15 +1425,42 @@ def task_written_sql() -> str:
 
 
 def stale_tasks_sql() -> str:
-    """End the running tasks whose heartbeat stopped (the app restarted while writing): one with a result had
-    committed its tables and only missed what follows (failed_note is kept as its error), the rest were rolled back
-    with the app (failed, with rolled_back as the error). Params: rolled_back, failed_note, seconds, id (or null),
-    job_id (or null)."""
+    """End the running tasks whose heartbeat stopped (the app restarted while writing). One with a result had committed
+    its tables and only missed what follows (unsynced is kept as its error). One with progress but no result is a
+    by-database write: the databases it committed are kept, and the error says to send the request again to finish it.
+    The rest were rolled back with the app (rolled_back). Params: unsynced, rolled_back, partial, seconds, id (or
+    null), job_id (or null)."""
     return (f"update {SCHEMA}.app_task set status = case when result is null then 'failed' else 'succeeded' end, "
-            f"error = case when result is null then %s else %s end, finished_at = now() "
+            f"error = case when result is not null then %s when progress is null then %s else %s end, finished_at = now() "
             f"where status = 'running' and heartbeat_at < now() - make_interval(secs => %s) "
             f"and (id = %s or job_id = %s)")
 
+
+def task_progress_json_sql() -> str:
+    """A by-database write's progress, durable: written in each database's own transaction, so what the progress says
+    is what is committed. Params: progress (JSON text), done (tables written), id."""
+    return (f"update {SCHEMA}.app_task set progress = %s::jsonb, done = %s, heartbeat_at = now() "
+            f"where id = %s and status = 'running'")
+
+
+def task_job_sql() -> str:
+    """Records the job a write made, in the transaction that made it (so a restart finds the job, not a second one).
+    Params: job_id, id."""
+    return f"update {SCHEMA}.app_task set job_id = %s, heartbeat_at = now() where id = %s"
+
+
+def resume_task_sql() -> str:
+    """Restarts a by-database write that stopped before its result (failed with progress): the same request id again
+    finishes it, not a second job. Returns the task's id when it was restarted. Param: id."""
+    return (f"update {SCHEMA}.app_task set status = 'running', error = null, finished_at = null, "
+            f"heartbeat_at = now() where id = %s and status = 'failed' and result is null and progress is not null "
+            f"returning id")
+
+
+def running_task_sql() -> str:
+    """Whether a job has a write running (its heartbeat fresh): a Delete waits for it. Params: job_id, seconds."""
+    return (f"select id from {SCHEMA}.app_task where job_id = %s and status = 'running' "
+            f"and heartbeat_at > now() - make_interval(secs => %s) limit 1")
 
 EDITABLE_REVIEW_FIELDS = ("include", "load_type", "primary_key", "cursor_column", "load_partitioned",
                           "partition_col", "partition_size_mb", "sink_catalog", "sink_schema", "sink_table",
@@ -1919,6 +1961,20 @@ def delete_schedule_sql() -> str:
     return f"update {SCHEMA}.schedule set deleted_at = now(), updated_at = now() where id = %s and deleted_at is null"
 
 
+def insert_member_if_absent_sql() -> str:
+    """insert_member_sql for a group a job already has a member for (a resumed write): skipped, not refused. It returns
+    the new member's id, or nothing when it was skipped. Params: schedule_id, task_collection, offset_minutes."""
+    return (f"insert into {SCHEMA}.schedule_member (schedule_id, task_collection, offset_minutes) "
+            f"values (%s, %s, %s) on conflict do nothing returning id")
+
+
+def job_database_sinks_sql() -> str:
+    """The sinks (and client ids) the control rows of one database already write in the given groups: what a
+    by-database write checks before it writes the database again. Params: groups (list), database (lower case compared)."""
+    return (f"select lower(sink_catalog || '.' || sink_schema || '.' || sink_table) as sink, coalesce(client_id, '') as client_id "
+            f"from {SCHEMA}.control where task_collection = any(%s) and lower(src_database) = lower(%s)")
+
+
 def insert_member_sql() -> str:
     return (f"insert into {SCHEMA}.schedule_member (schedule_id, task_collection, offset_minutes) "
             f"values (%s, %s, %s) returning id")
@@ -2153,6 +2209,31 @@ def selected_rows_sql(kind: str, count: bool = False) -> str:
     return (f"select r.server, r.src_database, r.src_schema, r.src_table, r.line, r.fields "
             f"from ({source_rows_sql(kind)}) r where {_SELECTED} "
             f"order by r.server, lower(r.src_database), r.line, lower(r.src_schema), lower(r.src_table)")
+
+
+def source_databases_after_sql(kind: str) -> str:
+    """The next page of a source's databases matching the filter, in key order (server, lower-case name, name), after the
+    key of the last one read: keyset paging, so each page starts where the last ended without an offset. Each row
+    carries its server, database and tables. Params: the source's, filter, after server, after lower-case name, after
+    name, limit (use ('', '', '') for the first page)."""
+    return (f"select r.server, r.src_database, count(*) as tables from ({source_rows_sql(kind)}) r "
+            f"where {_MATCHES} and (r.server, lower(r.src_database), r.src_database) > (%s, %s, %s) "
+            f"group by r.server, r.src_database order by r.server, lower(r.src_database), r.src_database limit %s")
+
+
+def database_rows_sql(kind: str) -> str:
+    """Every table of one database of a source, in the order a plan reads them, with the fields its CSV line takes.
+    Params: the source's, server, database (both compared lower case)."""
+    return (f"select r.server, r.src_database, r.src_schema, r.src_table, r.line, r.fields from ({source_rows_sql(kind)}) r "
+            f"where lower(r.server) = lower(%s) and lower(r.src_database) = lower(%s) "
+            f"order by lower(r.src_schema), lower(r.src_table)")
+
+
+def selected_servers_sql(kind: str) -> str:
+    """A selection's servers: each one's databases and tables it takes, in the order of the servers. Params: the same as
+    selected_rows_sql (the source's, whole_server, filter, database keys, table keys)."""
+    return (f"select r.server, count(distinct lower(r.src_database)) as databases, count(*) as tables "
+            f"from ({source_rows_sql(kind)}) r where {_SELECTED} group by r.server order by r.server")
 
 
 def insert_job_selection_sql(n: int) -> str:

@@ -34,6 +34,7 @@ import ingestion_jobs as ij
 import job_settings as js
 import job_settings_sql as jss
 import jobs
+import by_database
 import lakebase as db
 import new_job as nj
 import queries as q
@@ -354,6 +355,8 @@ TASK_ROLLED_BACK = ("the app restarted while writing these tables; its transacti
                     "of them was written: send it again")
 TASK_UNSYNCED = ("the tables were written, but the app restarted before the job's Databricks jobs were synced: "
                  "open the job and save it once to sync them")
+TASK_PARTIAL = ("the app restarted while writing the job's databases: the ones written so far are kept, with their "
+                "tables; send the same request again to finish the job")
 
 
 def _start_background(work) -> None:
@@ -373,7 +376,7 @@ def _error_text(e: BaseException) -> str:
 
 def _task(task_id: int) -> dict:
     """A task as GET /api/tasks/{id} shows it, a stale one first ended (TASK_STALE_S)."""
-    db.execute(q.stale_tasks_sql(), (TASK_ROLLED_BACK, TASK_UNSYNCED, TASK_STALE_S, int(task_id), None))
+    db.execute(q.stale_tasks_sql(), (TASK_UNSYNCED, TASK_ROLLED_BACK, TASK_PARTIAL, TASK_STALE_S, int(task_id), None))
     rows = db.query(q.task_sql(), (int(task_id),))
     if not rows:
         raise HTTPException(404, f"task {task_id} not found")
@@ -458,7 +461,7 @@ def task(task_id: int):
 @app.get("/api/ingestion-jobs/{job_id}/tasks")
 def job_tasks(job_id: int):
     """A job's background writes of the last day, newest first, so its page shows one still running."""
-    db.execute(q.stale_tasks_sql(), (TASK_ROLLED_BACK, TASK_UNSYNCED, TASK_STALE_S, None, int(job_id)))
+    db.execute(q.stale_tasks_sql(), (TASK_UNSYNCED, TASK_ROLLED_BACK, TASK_PARTIAL, TASK_STALE_S, None, int(job_id)))
     return db.query(q.job_tasks_sql(), (int(job_id),))
 
 
@@ -577,6 +580,25 @@ class Selection(BaseModel):
             return "upload", self.upload_id, self.upload_id
         ids = list(dict.fromkeys(([self.discovery_id] if self.discovery_id else []) + self.discovery_ids))
         return "discovery", ids, ",".join(ids)
+
+
+def _selection_params(selection: Selection) -> tuple:
+    """(kind, the parameter the source's queries take, source id, the parameters of selected_rows_sql after it)."""
+    kind, param, source_id = selection.source()
+    if kind == "upload" and not db.query(q.upload_sql(), (param,)):
+        raise HTTPException(404, f"upload {param} not found")
+    database_keys = [q.selection_key(d.server, d.database) for d in selection.databases]
+    table_keys = [q.selection_key(t.server, t.database, name) for t in selection.tables for name in t.tables]
+    return kind, param, source_id, (selection.whole_server, selection.filter, database_keys, table_keys)
+
+
+def _selection_parts(selection: Selection, whole_servers: List[str]) -> list:
+    """What a selection was made from, part by part (job_selection): the whole servers (with the filter), the whole
+    databases and the tables it names, leaving out those a whole server covers."""
+    covered = lambda database: bool(selection.whole_server) and selection.filter.lower() in database.lower()
+    return ([("server", server, None, None, selection.filter or None) for server in whole_servers]
+            + [("database", d.server, d.database, None, None) for d in selection.databases if not covered(d.database)]
+            + [("tables", t.server, t.database, list(t.tables), None) for t in selection.tables if not covered(t.database)])
 
 
 def _selected(selection: Selection) -> dict:
@@ -1793,6 +1815,11 @@ def add_job_tables(job_id: int, body: JobTablesRequest, request: Request):
     tables come as CSV lines (csv) or by reference to an upload or discovery (source), which is kept with the job."""
     if (made := _made_already(body)) is not None:
         return made
+    if body.source is not None:
+        kind, param, source_id, rest = _selection_params(body.source)
+        counted = db.query(q.selected_rows_sql(kind, count=True), (param, *rest))
+        if counted and counted[0]["n"] > BACKGROUND_ROWS:
+            return _add_by_database(job_id, body, request, kind, param, source_id, rest, int(counted[0]["n"]))
     job = _load_schedule(job_id)[0]
     taken = {r["task_collection"] for r in db.query(q.collections_sql())}
     text, selected = body.text()
@@ -2357,6 +2384,18 @@ def discovery_databases(discovery_id: str):
     return db.query(q.discovery_databases_sql(), (discovery_id,))
 
 
+@app.get("/api/discoveries/{discovery_id}/listing")
+def discovery_listing(discovery_id: str, filter: str = "", offset: int = 0, limit: int = 100):
+    """One page of a discovery's databases matching the filter, by name (100 at a time), with the discovery's totals:
+    total (its databases), matched (those the filter keeps). The Discover step pages through it rather than holding
+    every database in the browser."""
+    limit, offset = max(1, min(int(limit), 500)), max(0, int(offset))
+    totals = db.query(q.discovery_totals_sql(), (filter, discovery_id))[0]
+    return {"discovery_id": discovery_id, "filter": filter, "offset": offset, "limit": limit,
+            "total": totals["total"], "matched": totals["matched"],
+            "databases": db.query(q.discovery_listing_sql(), (discovery_id, filter, limit, offset))}
+
+
 class Shared(BaseModel):
     sink_catalog: str = "main"
     sink_schema: str = "bronze_{database}"
@@ -2788,13 +2827,277 @@ class NewJobRequest(_TablesFrom):
     request_id: Optional[str] = Field(None, max_length=80)
 
 
+def _source_columns(kind: str, param) -> List[str]:
+    """The CSV columns a source's rows are written as (what a plan reads): an upload's header, a discovery's columns."""
+    if kind == "upload":
+        return list(db.query(q.upload_sql(), (param,))[0]["columns"])
+    return list(nj.DISCOVERY_COLUMNS)
+
+
+def _units_of(kind: str, param, selection: "Selection"):
+    """The databases a selection takes, one at a time: a whole server's databases (matching its filter) are read a page
+    at a time from Lakebase, then the named ones (by_database.selection_units)."""
+    keys = ()
+    if selection.whole_server:
+        pages = by_database.database_pages(lambda after: db.query(
+            q.source_databases_after_sql(kind), (param, selection.filter, *after, by_database.DATABASE_PAGE)))
+        keys = ((d["server"], d["src_database"]) for d in pages)
+    return by_database.selection_units(selection, keys)
+
+
+def _unit_rows(kind: str, param, unit) -> List[dict]:
+    """One database's table rows from the source, the ones the unit takes."""
+    return [r for r in db.query(q.database_rows_sql(kind), (param, unit.server, unit.database)) if unit.keeps(r)]
+
+
+def _create_by_database(body: NewJobRequest, request: Request, selection: Selection, kind, param, source_id, rest):
+    """A big job, by reference to more tables than BACKGROUND_ROWS: its groups are sized by tables (by_database), and it
+    is written in a background task, one database at a time, each database's rows in its own transaction. First every
+    database is checked (read and planned, nothing written); then the job is made (its schedule and what it was chosen
+    from, in one transaction), and each database is written with its group's run lock, its group's member, and the
+    task's progress, all committed together. The job's Databricks jobs are synced once, at the end. A restart leaves
+    the databases written so far, and the same request id finishes the job: a database a job already has is skipped,
+    so it is never written twice (the task's progress is what the page shows)."""
+    import psycopg
+    name = body.name.strip()
+    run = body.run.model_copy()
+    run.stagger = run.stagger and run.job_variant != sch.CHECK_VARIANT
+    user = _user(request)
+    settings = nj.settings_of(body.settings)
+    errors = nj.given_errors(body.settings) + nj.setting_errors(settings)
+    if not name:
+        errors.insert(0, "name the job")
+    servers = db.query(q.selected_servers_sql(kind), (param, *rest))
+    if not servers:
+        errors.append("the selection takes no tables")
+    groups_of = by_database.groups_by_server(servers)
+    all_groups = [g for s in servers for g in nj.group_names(name, s["server"], groups_of[s["server"]])]
+    timezone_ = sch.timezone_for(run.cadence_minutes, run.timezone)
+    if not errors:
+        errors += sch.validate({**run.model_dump(), "name": name, "members": all_groups, "timezone": timezone_},
+                               all_groups, jobs.schedule_variants())
+    if errors:
+        raise HTTPException(422, {"errors": errors})
+    summary = by_database.summary_of(name, servers)
+    if body.dry_run:
+        return {"summary": summary, "settings": settings, "created": False}
+    if not run.paused:     # anyone may set up a job, but one that runs needs the right to run what it starts
+        _refuse(_permission_refusals({"job_variant": run.job_variant}, user)["run"])
+    options = {k: v for k, v in (run.options or {}).items() if k not in MANAGED_OPTIONS}
+    _refuse_unknown_node_types(sch.own_cluster({"options": options}))
+    offs = sch.offsets(all_groups, run.cadence_minutes, run.stagger,
+                       sch.start_minute({"options": options, "cadence_minutes": run.cadence_minutes}))
+    taken = {r["task_collection"] for r in db.query(q.collections_sql())}
+    columns = _source_columns(kind, param)
+    selection_parts = _selection_parts(selection, [s["server"] for s in servers] if selection.whole_server else [])
+    batch = uuid.uuid4().hex[:12]
+    databases_total = sum(s["databases"] for s in servers)
+
+    def units():
+        return _units_of(kind, param, selection)
+
+    def rows_of(unit):
+        return _unit_rows(kind, param, unit)
+
+    def plan_of(rows, own):
+        plan = by_database.plan_database(name, body.settings, rows, columns, groups_of, taken, own)
+        return plan
+
+    def check(task_id, own):
+        """Every database planned, nothing written: the file's and the settings' problems, and the groups in use."""
+        errors_found = []
+        for unit in units():
+            rows = rows_of(unit)
+            if not rows:
+                continue
+            plan = plan_of(rows, own)
+            if plan["errors"]:
+                raise HTTPException(422, {"errors": plan["errors"][:20]})
+            for line in plan["lines"]:
+                if line["status"] == "invalid":
+                    errors_found.append(f"{unit.database} {line['table']}: {'; '.join(line['errors'])}")
+        if errors_found:
+            raise HTTPException(422, {"errors": errors_found[:20] + (
+                [f"{len(errors_found)} lines cannot be taken"] if len(errors_found) > 20 else [])})
+
+    def write(progress, task_id):
+        task = db.query(q.task_sql(), (task_id,))[0]
+        sid = task["job_id"]
+        own = set(_job_groups(sid)) if sid else set()
+        state = {"stage": "checking", "databases_total": databases_total, "databases_written": 0, "tables_written": 0}
+        db.execute(q.task_progress_json_sql(), (json.dumps(state), 0, task_id))
+        check(task_id, own)
+        state["stage"] = "writing"
+        if sid is None:
+            try:
+                with _write() as cur:
+                    cur.execute(q.insert_schedule_sql(), (name, run.cadence_minutes, timezone_, json.dumps(run.parameters),
+                                                          run.job_variant or "default", run.stagger, run.paused,
+                                                          run.notify_emails or None, json.dumps(options) if options else None,
+                                                          user or None))
+                    sid = cur.fetchone()[0]
+                    _keep_selection(cur, sid, {"parts": selection_parts, "kind": kind, "source_id": source_id}, user)
+                    _touch(cur, user, [sid])
+                    cur.execute(q.task_job_sql(), (sid, task_id))
+            except psycopg.errors.UniqueViolation:
+                raise HTTPException(409, f"an ingestion job named '{name}' already exists")
+        for unit in units():
+            rows = rows_of(unit)
+            if not rows:
+                continue
+            plan = plan_of(rows, own)
+            groups = sorted(plan["groups"])
+            with _write() as cur:
+                _lock_collections(cur, groups)
+                have = {(r["sink"], r["client_id"]) for r in db.fetch(cur, q.job_database_sinks_sql(), (groups, unit.database))}
+                todo = [line for line in plan["lines"] if (line["sink"], str(line["row"].get("client_id") or "")) not in have]
+                rows_todo = [line["row"] for line in todo]
+                if rows_todo:
+                    _insert_controls(cur, rows_todo, user, batch)
+                    _refuse_mixed_sinks(cur, rows_todo)
+                    _refuse_split_databases(cur, rows_todo)
+                for group in groups:
+                    cur.execute(q.insert_member_if_absent_sql(), (sid, group, offs.get(group, 0)))
+                    if cur.fetchone():
+                        _log(cur, user, "schedule_create", None, group, "schedule", None,
+                             f"{name} ({sch.describe(run.cadence_minutes, offs.get(group, 0), timezone_)})", None, batch)
+                state["databases_written"] += 1
+                state["tables_written"] += len(plan["lines"])
+                cur.execute(q.task_progress_json_sql(), (json.dumps(state), state["tables_written"], task_id))
+        result = {"id": sid, "summary": summary, "settings": settings, "created": True}
+        with _write() as cur:
+            _task_written(cur, task_id, result, sid, state["tables_written"])
+        return result
+
+    def after(result):
+        sid = result["id"]
+        synced = _sync(sid, user)
+        cluster = _apply_cluster(sid) if sch.own_cluster({"options": options}) else None
+        return {**result, "sync": synced, "cluster_error": cluster}
+
+    made = db.query(q.insert_task_sql(), ("create", body.request_id or uuid.uuid4().hex, None,
+                                          summary["tables"], None, user or None))[0]
+    if made["made"] or db.query(q.resume_task_sql(), (made["id"],)):
+        _start_background(lambda: _run_task(made["id"], write, after))
+    return JSONResponse(status_code=202, content={"task": _task(made["id"]), "created": False, "applied": False})
+
+
+def _add_by_database(job_id: int, body: "JobTablesRequest", request: Request, kind, param, source_id, rest, total: int):
+    """Add tables to a job by reference when the source has more than BACKGROUND_ROWS of them: written one database at a
+    time in a background task, like _create_by_database, each database's rows in its own transaction under the job's
+    schedule lock and its groups' run locks, with its groups' members and the task's progress committed with them. The
+    job's settings, groups and tables (new_job.job_inputs, read once when the request arrives) place each database; a
+    table the job already writes is left. Every database is checked first (nothing written), and the job's Databricks
+    jobs are synced once at the end. The same request id after a stop finishes the job, skipping the rows already in."""
+    job = _load_schedule(job_id)[0]
+    selection = body.source
+    groups = _job_groups(job_id)
+    _refuse_job_tables(job, groups, request)
+    inputs = nj.job_inputs(job["name"], db.query(q.groups_control_rows_sql(), (groups,)) if groups else [],
+                           body.groups_per_server)
+    if inputs["errors"]:
+        raise HTTPException(422, {"errors": inputs["errors"]})
+    taken = {r["task_collection"] for r in db.query(q.collections_sql())}
+    columns = _source_columns(kind, param)
+    user, batch = _user(request), uuid.uuid4().hex[:12]
+    given = {**inputs["given"], "load_type": body.load_type}
+    servers = db.query(q.selected_servers_sql(kind), (param, *rest))
+    databases_total = sum(s["databases"] for s in servers)
+    parts = _selection_parts(selection, [s["server"] for s in servers] if selection.whole_server else [])
+
+    def plan_of(rows):
+        return by_database.plan_database(job["name"], given, rows, columns, {}, taken, set(groups),
+                                         group_of=inputs["group_of"], have=inputs["have"])
+
+    def check():
+        """Every database planned, nothing written: the lines that cannot be taken, and the groups the job would add."""
+        invalid, tables, in_job, new_groups = [], 0, 0, set()
+        for unit in _units_of(kind, param, selection):
+            rows = _unit_rows(kind, param, unit)
+            if not rows:
+                continue
+            plan = plan_of(rows)
+            if plan["errors"]:
+                raise HTTPException(422, {"errors": plan["errors"][:20]})
+            for line in plan["lines"]:
+                if line["status"] == "invalid":
+                    invalid.append(f"{unit.database} {line['table']}: {'; '.join(line['errors'])}")
+                elif line["status"] == "in_job":
+                    in_job += 1
+                else:
+                    tables += 1
+            new_groups |= set(plan["groups"]) - set(groups)
+        if invalid:
+            raise HTTPException(422, {"errors": invalid[:20] + (
+                [f"{len(invalid)} lines cannot be taken"] if len(invalid) > 20 else [])})
+        return {"tables": tables, "in_job": in_job, "new_groups": sorted(new_groups)}
+
+    def write(progress, task_id):
+        state = {"stage": "checking", "databases_total": databases_total, "databases_written": 0, "tables_written": 0}
+        db.execute(q.task_progress_json_sql(), (json.dumps(state), 0, task_id))
+        found = check()
+        active = [m for m in _load_schedule(job_id)[1] if m["removed_at"] is None]
+        offs = sch.offsets([m["task_collection"] for m in active] + found["new_groups"], int(job["cadence_minutes"]),
+                           bool(job.get("stagger")), sch.start_minute(job))
+        state["stage"] = "writing"
+        for unit in _units_of(kind, param, selection):
+            rows = _unit_rows(kind, param, unit)
+            if not rows:
+                continue
+            plan = plan_of(rows)
+            with _write() as cur:
+                _lock_job(cur, job_id)
+                plan_groups = sorted(plan["groups"])
+                _lock_collections(cur, plan_groups)
+                have_sinks = {(r["sink"], r["client_id"])
+                              for r in db.fetch(cur, q.job_database_sinks_sql(), (plan_groups, unit.database))}
+                todo = [line["row"] for line in plan["lines"]
+                        if line["status"] == "valid" and (line["sink"], str(line["row"].get("client_id") or "")) not in have_sinks]
+                if todo:
+                    _insert_controls(cur, todo, user, batch)
+                    _refuse_mixed_sinks(cur, todo)
+                    _refuse_split_databases(cur, todo)
+                for group in plan_groups:
+                    cur.execute(q.insert_member_if_absent_sql(), (job_id, group, offs.get(group, 0)))
+                state["databases_written"] += 1
+                state["tables_written"] += len(todo)
+                cur.execute(q.task_progress_json_sql(), (json.dumps(state), state["tables_written"], task_id))
+        result = {"summary": {**found, "tables": state["tables_written"], "by_database": True, "checked": True},
+                  "applied": True, "databases": state["databases_written"]}
+        with _write() as cur:
+            _keep_selection(cur, job_id, {"parts": parts, "kind": kind, "source_id": source_id}, user)
+            _touch(cur, user, [job_id])
+            _task_written(cur, task_id, result, job_id, state["tables_written"])
+        return {**result, "new_groups": found["new_groups"]}
+
+    def after(result):
+        if result.pop("new_groups"):
+            _sync(job_id, user)
+        return result
+
+    if body.dry_run:
+        return {"summary": {"tables": total, "by_database": True, "checked": False, "new_groups": []},
+                "applied": False}
+    made = db.query(q.insert_task_sql(), ("tables", body.request_id or uuid.uuid4().hex, job_id, total, None,
+                                          user or None))[0]
+    if made["made"] or db.query(q.resume_task_sql(), (made["id"],)):
+        _start_background(lambda: _run_task(made["id"], write, after))
+    return JSONResponse(status_code=202, content={"task": _task(made["id"]), "created": False, "applied": False})
+
+
 @app.post("/api/ingestion-jobs")
 def create_ingestion_job(body: NewJobRequest, request: Request):
     """Preview (dry_run, the default) or create an ingestion job in one go, as New ingestion job does: its tables from
     a CSV of where each one is (new_job.plan), written with the job's settings into groups per server, and the job
     (a schedule with those groups). Creating is one transaction: the schedule, every table (all or nothing: a target
     another table writes refuses the lot), the groups' members; then its Databricks jobs are synced. The tables come
-    as CSV lines (csv) or by reference to an upload or discovery (source), which is kept with the job."""
+    as CSV lines (csv) or by reference to an upload or discovery (source), which is kept with the job. A source of more
+    than BACKGROUND_ROWS tables is written database by database in a background task (_create_by_database)."""
+    if body.source is not None:
+        kind, param, source_id, rest = _selection_params(body.source)
+        counted = db.query(q.selected_rows_sql(kind, count=True), (param, *rest))
+        if counted and counted[0]["n"] > BACKGROUND_ROWS:
+            return _create_by_database(body, request, body.source, kind, param, source_id, rest)
     if (made := _made_already(body)) is not None:
         return made
     import psycopg
@@ -3020,9 +3323,12 @@ def _delete_plan(sid: int) -> dict:
 
 def _delete_blocker(job: dict, active: List[dict], groups: List[str]):
     """Why the job can't be deleted right now: a run of it, or of a group it deletes, is going (Lakebase sees a run
-    once its cluster is up, the Jobs API from its start), or its delete job is still running."""
+    once its cluster is up, the Jobs API from its start), a background write to it is still running (its heartbeat is
+    fresh), or its delete job is still running."""
     if any(r["task_collection"] in {m["task_collection"] for m in active} | set(groups) for r in _running()):
         return "a run of this job is going: wait for it to end, or stop it, then delete the job"
+    if db.query(q.running_task_sql(), (int(job["id"]), TASK_STALE_S)):
+        return "a write to this job is still running (adding or creating tables): wait for it to finish, then delete the job"
     going = _active_wrapper_runs(active)
     if going:
         return {"message": f"a run of this job is going, started {going[0].get('started') or 'just now'}: wait for it "

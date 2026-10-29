@@ -546,6 +546,8 @@ create table if not exists lakefed_ingest.app_task (
 );
 create unique index if not exists app_task_request_uq on lakefed_ingest.app_task (request_id);
 create index if not exists app_task_job_idx on lakefed_ingest.app_task (job_id, created_at);
+-- A by-database write's progress (stage, databases written of how many, tables written), committed with each database.
+alter table lakefed_ingest.app_task add column if not exists progress jsonb;
 
 -- A CSV of tables uploaded to the operations app for New ingestion job or Add tables: the file is posted once and
 -- kept here, one row per line, so the pages show its servers and databases from Lakebase and page its tables, and

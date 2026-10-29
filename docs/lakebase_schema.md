@@ -352,11 +352,20 @@ at once, and a thread in the app writes the tables in one transaction, 1,000 to 
 - `status` (`running`, `succeeded` or `failed`), `done` of `total` tables, `result` (what the request would have
   answered), `error`;
 - `created_at`, `heartbeat_at` (moved every 2 seconds while the thread runs), `finished_at`.
+- `progress` (schema version 12, `jsonb`): a by-database write's stage (`checking` or `writing`), databases of how
+  many, and tables written so far. Each database's transaction commits its progress with its rows.
 
 The write's last statement, in its own transaction, sets `result`, so the result commits with the tables or not at
 all. A running task whose heartbeat stopped for 2 minutes (the app restarted) is ended when it is next read: with
 no `result` it failed and its transaction was rolled back with the app, so nothing of it was written and it can be
 sent again; with a `result` its tables were written and only the sync of the job's Databricks jobs was missed.
+
+A by-database write (a source of more than 5,000 tables, by reference) commits one database per transaction, so a
+restart leaves the databases before the one it was writing committed, with `progress` set and no `result`. That task
+shows as failed with its progress ("writing database 1,240 of 22,000"), and the same request id again resumes it
+(`queries.resume_task_sql`): a database whose sinks the job already has is skipped, so none is written twice. A job
+created this way and left half-written stays as it is until finished (same request id) or deleted (Delete refuses
+while a write to the job is running).
 
 ## `table_upload` and `table_upload_line`: CSV files of tables
 

@@ -79,7 +79,7 @@ def test_the_backend_names_the_databricks_job():
 def test_discover_says_when_the_login_cant_open_master_and_takes_typed_databases():
     discover = (FRONTEND / "pages" / "Discover.tsx").read_text()
     assert "this connection's login can't open" in discover and "VIEW ANY DATABASE" in discover
-    assert "function TypedDatabases" in discover and "!tested?.typed" in discover   # typed names are read by name
+    assert "function TypedDatabases" in discover and "Databases typed by hand are read by name" in discover
 
 
 def test_discover_lists_by_a_name_filter_and_says_which_databases_it_couldnt_read():

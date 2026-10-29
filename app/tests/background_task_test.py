@@ -216,7 +216,7 @@ def test_reading_a_task_first_ends_it_when_its_heartbeat_stopped(client):
     client.tasks.executed.clear()
     client.get(f"/api/tasks/{task['id']}")
     stale = [p for sql, p in client.tasks.executed if sql == q.stale_tasks_sql()]
-    assert stale == [(main.TASK_ROLLED_BACK, main.TASK_UNSYNCED, main.TASK_STALE_S, task["id"], None)]
+    assert stale == [(main.TASK_UNSYNCED, main.TASK_ROLLED_BACK, main.TASK_PARTIAL, main.TASK_STALE_S, task["id"], None)]
     assert client.get("/api/tasks/999").status_code == 404
 
 
@@ -224,6 +224,9 @@ def test_the_stale_rule_tells_a_rolled_back_write_from_one_that_committed():
     sql = q.stale_tasks_sql()
     assert "status = 'running' and heartbeat_at < now() - make_interval(secs => %s)" in sql
     assert "case when result is null then 'failed' else 'succeeded' end" in sql
+    # A write that committed some databases and stopped says so: its progress is kept and the same request finishes it.
+    assert "when progress is null then %s else %s end" in sql
+    assert "status = 'failed' and result is null and progress is not null" in q.resume_task_sql()
     # A late finish can't undo a stale task's verdict, nor a stale read undo a finish.
     assert q.finish_task_sql().endswith("where id = %s and status = 'running'")
     assert q.insert_task_sql().count("%s") == 6 and "on conflict (request_id)" in q.insert_task_sql()
@@ -281,7 +284,7 @@ def test_the_job_page_reads_its_tasks_after_ending_stale_ones(job_client):
     job_client.tasks.executed.clear()
     assert job_client.get("/api/ingestion-jobs/7/tasks").status_code == 200
     assert [p for sql, p in job_client.tasks.executed if sql == q.stale_tasks_sql()] == [
-        (main.TASK_ROLLED_BACK, main.TASK_UNSYNCED, main.TASK_STALE_S, None, 7)]
+        (main.TASK_UNSYNCED, main.TASK_ROLLED_BACK, main.TASK_PARTIAL, main.TASK_STALE_S, None, 7)]
 
 
 # ---- uploads and selections (their SQL runs against Postgres in large_writes_pg_test.py) -------------------------

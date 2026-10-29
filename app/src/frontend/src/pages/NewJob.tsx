@@ -7,7 +7,7 @@ import { CADENCES, IdentityFields, ParameterFields, RunFields, WritesFields, par
 import { DiscoverDialog } from "./Discover";
 import { ClusterFields, clusterSummary, ownCluster } from "./JobEdit";
 import { SourcePick, nothingPicked, pickedAny, pickedText, type Picked } from "./SourcePick";
-import { TaskProgress, finished, newRequestId } from "./tasks";
+import { TaskProgress, finished, newRequestId, resumableWrite } from "./tasks";
 
 // New ingestion job: the Edit view, empty, with Create in place of Save. Its tables are added in What it ingests
 // (Add tables: a CSV uploaded once, or a discovery), the rest is set as in Edit, and nothing is written until Create,
@@ -80,14 +80,16 @@ export default function NewJob() {
     queryKey: ["new-job-preview", settled], enabled: !!chosen && !!name.trim(), retry: false,
     queryFn: () => api.post<Row>("/ingestion-jobs", previewBody),
   });
+  // The body is the variables, so a Create that stopped part way is finished by sending the same body again.
   const create = useMutation({
-    mutationFn: async () => finished(await api.post<Row>("/ingestion-jobs", body(false)), setTask),
+    mutationFn: async (sent: Row) => { setTask(null); return finished(await api.post<Row>("/ingestion-jobs", sent), setTask); },
     onSuccess: (r) => {
       qc.invalidateQueries({ queryKey: ["ingestion-jobs"] }); qc.invalidateQueries({ queryKey: ["schedules"] });
       if (r.created) navigate(`/ingestion-jobs/${r.id}`);
     },
-    // A Create that failed is a new request when it is sent again.
-    onError: () => setRequestId(newRequestId()),
+    // A Create that failed is a new request when it is sent again, unless it stopped part way: its databases are kept
+    // and the same request finishes it.
+    onError: (error) => { if (!resumableWrite(error)) setRequestId(newRequestId()); },
   });
   const summary: Row | undefined = preview.data?.summary;
   const blocked = !name.trim() ? "Name the job first" : !chosen ? "Add its tables first"
@@ -108,10 +110,12 @@ export default function NewJob() {
         right={<span className="card-actions">
           <button onClick={cancel}>Cancel</button>
           <button className="primary" disabled={!!blocked || create.isPending} title={blocked ?? undefined}
-            onClick={() => create.mutate()}>{create.isPending ? "Creating…" : "Create"}</button></span>} />
+            onClick={() => create.mutate(body(false))}>{create.isPending ? "Creating…" : "Create"}</button></span>} />
       {confirm.dialog}
       {create.isPending && <TaskProgress task={task} />}
-      <ErrorBox error={create.error} />
+      {!create.isPending && resumableWrite(create.error)
+        ? <TaskProgress task={task} onResume={() => create.mutate(create.variables as Row)} />
+        : <ErrorBox error={create.error} />}
       {create.data && !create.data.created && <Notice tone="warn">Not created: fix the invalid lines below first.</Notice>}
 
       <Section title="Name">

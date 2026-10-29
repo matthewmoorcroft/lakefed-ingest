@@ -624,6 +624,16 @@ def test_delete_is_refused_while_a_run_of_the_job_is_going(api, monkeypatch):
     assert api.store.schedules[sid]["deleted_at"] is None and api.delete_runs == {} and len(api.jobs.jobs) == 2
 
 
+def test_delete_is_refused_while_a_background_write_to_the_job_is_running(api, monkeypatch):
+    sid = api.post("/api/schedules", json=BODY).json()["id"]
+    answer = main.db.query
+    monkeypatch.setattr(main.db, "query",
+                        lambda sql, params=(): [{"id": 9}] if sql == q.running_task_sql() else answer(sql, params))
+    r = api.post(f"/api/schedules/{sid}/delete")
+    assert r.status_code == 409 and "a write to this job is still running" in r.json()["detail"]
+    assert api.store.schedules[sid]["deleted_at"] is None
+
+
 def test_delete_needs_the_delete_job_when_the_groups_have_tables(api, monkeypatch):
     sid = api.post("/api/schedules", json=BODY).json()["id"]
     monkeypatch.setattr(main.jobs, "DELETE_JOB_ID", None)

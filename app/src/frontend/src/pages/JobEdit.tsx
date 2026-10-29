@@ -6,7 +6,7 @@ import { Crumbs, ConfirmButton, ErrorBox, Menu, Notice, PageHead, Pager, Section
 import { usePermissions } from "../permissions";
 import { CADENCES, IdentityFields, ParameterFields, RunFields, WritesFields, paramsSummary } from "./jobForm";
 import { ImportCsvDialog } from "./NewJob";
-import { TaskProgress, finished, newRequestId } from "./tasks";
+import { TaskProgress, finished, newRequestId, resumableWrite } from "./tasks";
 import { DiscoverDialog } from "./Discover";
 
 // Edit an ingestion job: what it ingests (a tree from its servers), how it writes, its identity columns, when it
@@ -261,10 +261,17 @@ function useAddTables(jobId: string) {
   const [discovering, setDiscovering] = useState(false);
   const [found, setFound] = useState<Row | null>(null);
   const [task, setTask] = useState<Row | null>(null);
+  // The body of the write sent last: a write that stopped part way is finished by sending it again, as it was.
+  const [sent, setSent] = useState<Row | null>(null);
+  const write = async (body: Row) => {
+    setSent(body);
+    return finished(await api.post<Row>(`/ingestion-jobs/${jobId}/tables`, { ...body, dry_run: false }), setTask);
+  };
   const add = useMutation({
-    mutationFn: async ({ source, loadType }: { source: Row; loadType: string }) => {
-      const body = { source, load_type: loadType, request_id: newRequestId() };
+    mutationFn: async (request: { source: Row; loadType: string } | { resume: Row }) => {
       setTask(null);
+      if ("resume" in request) return write(request.resume);
+      const body = { source: request.source, load_type: request.loadType, request_id: newRequestId() };
       const preview = (await api.post<Row>(`/ingestion-jobs/${jobId}/tables`, { ...body, dry_run: true })).summary;
       setFound(preview);
       if (preview.invalid.length || !preview.tables) return null;
@@ -274,7 +281,7 @@ function useAddTables(jobId: string) {
           {Number(preview.in_job) > 0 && <p>{fmtInt(preview.in_job)} more {plural(preview.in_job, "line")} the job already has {Number(preview.in_job) === 1 ? "is" : "are"} left as {Number(preview.in_job) === 1 ? "it is" : "they are"}.</p>}
           {preview.new_groups.length > 0 && <p>A new server gets {fmtInt(preview.new_groups.length)} new {plural(preview.new_groups.length, "group")}.</p>}
           <p>Their first loads run at the job's next run.</p></> });
-      return ok ? finished(await api.post<Row>(`/ingestion-jobs/${jobId}/tables`, { ...body, dry_run: false }), setTask) : null;
+      return ok ? write(body) : null;
     },
     onSuccess: (r) => { if (r) { setFound(r.summary); qc.invalidateQueries({ queryKey: ["job-tree", jobId] });
       qc.invalidateQueries({ queryKey: ["job-settings", jobId] }); qc.invalidateQueries({ queryKey: ["schedules"] }); } },
@@ -286,7 +293,9 @@ function useAddTables(jobId: string) {
   </>;
   const result = <>
     {add.isPending && <TaskProgress task={task} />}
-    <ErrorBox error={add.error} />
+    {!add.isPending && resumableWrite(add.error)
+      ? <TaskProgress task={task} onResume={() => add.mutate({ resume: sent as Row })} />
+      : <ErrorBox error={add.error} />}
     {found && found.invalid.length > 0 && <Notice tone="bad">Nothing was added: {fmtInt(found.invalid.length)} {plural(found.invalid.length, "line")} can't be
       added.<ul>{found.invalid.slice(0, 20).map((l: Row) => <li key={l.line}>line {l.line}, {l.table}: {l.errors.join("; ")}</li>)}</ul></Notice>}
     {add.data && <Notice tone="ok">Added {fmtInt(add.data.summary.tables)} {plural(add.data.summary.tables, "table")}.</Notice>}

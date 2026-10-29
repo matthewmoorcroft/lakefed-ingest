@@ -137,7 +137,8 @@ def split_sql_statements(ddl: str) -> List[str]:
 #   9 = app_task, table_upload, table_upload_line, job_selection (the operations app's background writes and uploads)
 #   10 = databricks_run: the Databricks runs the operations app tracks (its poller writes them)
 #   11 = discovery.listing (how a discovery listed its databases, for a later re-discovery)
-SCHEMA_VERSION = 11
+#   12 = app_task.progress (a by-database write's progress)
+SCHEMA_VERSION = 12
 # Advisory lock that serializes migrations (the setup job and ingestion runs of any collection): two
 # int keys, so it can't collide with a collection's one-key lock whatever the collection is named,
 # and a class of its own (not SOURCE_LOCK_CLASS).
