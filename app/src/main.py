@@ -2339,6 +2339,18 @@ def discovery_databases(discovery_id: str):
     return db.query(q.discovery_databases_sql(), (discovery_id,))
 
 
+@app.get("/api/discoveries/{discovery_id}/listing")
+def discovery_listing(discovery_id: str, filter: str = "", offset: int = 0, limit: int = 100):
+    """One page of a discovery's databases matching the filter, by name (100 at a time), with the discovery's totals:
+    total (its databases), matched (those the filter keeps). The Discover step pages through it rather than holding
+    every database in the browser."""
+    limit, offset = max(1, min(int(limit), 500)), max(0, int(offset))
+    totals = db.query(q.discovery_totals_sql(), (filter, discovery_id))[0]
+    return {"discovery_id": discovery_id, "filter": filter, "offset": offset, "limit": limit,
+            "total": totals["total"], "matched": totals["matched"],
+            "databases": db.query(q.discovery_listing_sql(), (discovery_id, filter, limit, offset))}
+
+
 class Shared(BaseModel):
     sink_catalog: str = "main"
     sink_schema: str = "bronze_{database}"

@@ -1229,6 +1229,21 @@ def discovery_databases_sql() -> str:
             f"from {SCHEMA}.discovery where discovery_id = %s order by src_database")
 
 
+def discovery_totals_sql() -> str:
+    """How many databases a discovery has, and how many of them match a filter (in their name). Params: filter,
+    discovery_id."""
+    return (f"select count(*) as total, count(*) filter (where position(lower(%s) in lower(src_database)) > 0) as matched "
+            f"from {SCHEMA}.discovery where discovery_id = %s")
+
+
+def discovery_listing_sql() -> str:
+    """One page of a discovery's databases matching a filter (in their name), by name, with each one's status and
+    error: the page the Discover step lists, so it never holds all of them. Params: discovery_id, filter, limit, offset."""
+    return (f"select src_database, status, error from {SCHEMA}.discovery "
+            f"where discovery_id = %s and position(lower(%s) in lower(src_database)) > 0 "
+            f"order by src_database limit %s offset %s")
+
+
 def discovered_tables_sql() -> str:
     """Discovered tables of one discovery, with the source connection and any existing control row
     for the same source table (``registered_id``). Param: discovery_id."""
