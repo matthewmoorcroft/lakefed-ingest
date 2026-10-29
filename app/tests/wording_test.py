@@ -80,3 +80,10 @@ def test_discover_says_when_the_login_cant_open_master_and_takes_typed_databases
     discover = (FRONTEND / "pages" / "Discover.tsx").read_text()
     assert "this connection's login can't open" in discover and "VIEW ANY DATABASE" in discover
     assert "function TypedDatabases" in discover and "!tested?.typed" in discover   # typed names are read by name
+
+
+def test_discover_lists_by_a_name_filter_and_says_which_databases_it_couldnt_read():
+    discover = (FRONTEND / "pages" / "Discover.tsx").read_text()
+    assert "Databases matching" in discover and "pattern" in discover
+    assert "function Unread" in discover and "couldn't be read" in discover
+    assert "function databasesOfCsv" in discover and "take them from a CSV file" in discover

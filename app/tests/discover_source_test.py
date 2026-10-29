@@ -69,3 +69,12 @@ def test_a_connection_the_app_cant_see_names_the_grant_it_needs(client, monkeypa
     r = client.post("/api/discoveries/source", json={"src_connection": "sql_a", "kind": "list"})
     assert r.status_code == 404 and "can't list connections (PERMISSION_DENIED: no access)" in r.text
     assert client.started == []
+
+
+def test_a_name_filter_goes_with_the_listing_and_the_whole_server(client):
+    client.post("/api/discoveries/source", json={"src_connection": "sql_a", "kind": "list", "pattern": "lfc_eng_%"})
+    assert _spec(client)[1]["pattern"] == "lfc_eng_%"
+    client.post("/api/discoveries/source", json={"src_connection": "sql_a", "whole_server": True, "pattern": "lfc_eng_%"})
+    assert _spec(client)[1]["databases"] == "*" and _spec(client)[1]["pattern"] == "lfc_eng_%"
+    r = client.post("/api/discoveries/source", json={"src_connection": "sql_a", "kind": "list", "pattern": "x' or 1=1"})
+    assert r.status_code == 422 and len(client.started) == 2

@@ -30,6 +30,24 @@ async function discover(connection: string, request: Row): Promise<string> {
   }
 }
 
+/** Read the tables of some databases: those found, and each database that couldn't be read with the first line of
+ *  why. A database the login can name but not open fails on its own; the others are still read. */
+async function readTables(connection: string, request: Row): Promise<{ tables: Row[]; failed: [string, string][] }> {
+  const id = await discover(connection, request);
+  const [tables, rows] = await Promise.all([api.get<Row[]>(`/discoveries/${id}/tables`), api.get<Row[]>(`/discoveries/${id}/databases`)]);
+  return { tables, failed: rows.filter((r) => r.status === "failed").map((r) => [r.src_database, String(r.error ?? "").split("\n")[0]]) };
+}
+
+/** The databases that couldn't be read, and why: often that the login can see the name but not open the database. */
+function Unread({ failed }: { failed: [string, string][] }) {
+  if (!failed.length) return null;
+  return <Notice tone="warn">{fmtInt(failed.length)} {plural(failed.length, "database")} couldn't be read, so none of
+    {failed.length === 1 ? " its" : " their"} tables are added. The login can see {failed.length === 1 ? "its name" : "their names"} on the
+    server but may not open {failed.length === 1 ? "it" : "them"}: untick {failed.length === 1 ? "it" : "them"}, or give the login access and
+    read again.<ul>{failed.slice(0, 10).map(([d, why]) => <li key={d}><b>{d}</b>: {why}</li>)}</ul>
+    {failed.length > 10 && <span className="muted">and {fmtInt(failed.length - 10)} more.</span>}</Notice>;
+}
+
 const cell = (v: unknown) => { const s = v == null ? "" : String(v); return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s; };
 
 /** The lines Add tables takes, one per discovered table. */
@@ -48,15 +66,28 @@ function TriBox({ pick, label, onClick }: { pick: Pick; label: string; onClick: 
 /** A test that failed because the login can't open master, where SQL Server lists its databases. */
 const cantList = (error: unknown) => /FAILED_JDBC\.CONNECTION|Login failed|Cannot open database|HV000/i.test(String((error as Error)?.message ?? error));
 
-/** The databases typed by hand, one per line or separated by commas, for a login that can't list the server's. */
+/** The database names of a CSV file: its database column (as in a databases file), else its first column. */
+export function databasesOfCsv(text: string): string[] {
+  const lines = text.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+  if (!lines.length) return [];
+  const head = lines[0].split(",").map((h) => h.trim().replace(/^"|"$/g, "").toLowerCase());
+  const at = head.indexOf("database") >= 0 ? head.indexOf("database") : head.indexOf("src_database");
+  const column = at >= 0 ? at : 0;
+  const rows = at >= 0 || ["server", "name"].includes(head[0]) ? lines.slice(1) : lines;
+  return rows.map((l) => (l.split(",")[column] ?? "").trim().replace(/^"|"$/g, "")).filter(Boolean);
+}
+
+/** The databases typed by hand or taken from a CSV file, for a login that can't list the server's. */
 function TypedDatabases({ onUse }: { onUse: (names: string[]) => void }) {
   const [text, setText] = useState("");
   const names = [...new Set(text.split(/[\s,;]+/).map((n) => n.trim()).filter(Boolean))];
   return (
     <div className="form-grid">
-      <label className="wide">Its databases<textarea rows={4} value={text} placeholder={"lfc_eng_001\nlfc_eng_002"}
-        onChange={(e) => setText(e.target.value)} />
-        <span className="help">One per line, or separated by commas. Each is read on its own in the next step.</span></label>
+      <label className="wide">Its databases<input type="file" accept=".csv,text/csv,text/plain" onChange={async (e) => {
+          const file = e.target.files?.[0]; if (file) setText(databasesOfCsv(await file.text()).join("\n")); }} />
+        <textarea rows={4} value={text} placeholder={"lfc_eng_001\nlfc_eng_002"} onChange={(e) => setText(e.target.value)} />
+        <span className="help">Type them one per line or separated by commas, or choose a CSV file (its database column, as in a
+          databases file, or its first column). Each is read on its own in the next step.</span></label>
       <div className="toolbar"><button disabled={!names.length} onClick={() => onUse(names)}>
         Use {names.length ? `these ${fmtInt(names.length)} ${plural(names.length, "database")}` : "these databases"}</button></div>
     </div>
@@ -69,6 +100,7 @@ function Step1({ chosen, setChosen, tested, setTested }: { chosen: string; setCh
   const [how, setHow] = useState<"existing" | "create">("existing");
   const [search, setSearch] = useState("");
   const [testing, setTesting] = useState(false);
+  const [pattern, setPattern] = useState("");
   const [error, setError] = useState<unknown>(null);
   const qc = useQueryClient();
   const list = useQuery({ queryKey: ["connections"], queryFn: () => api.get<Row>("/connections") });
@@ -83,9 +115,10 @@ function Step1({ chosen, setChosen, tested, setTested }: { chosen: string; setCh
   const test = async () => {
     setTesting(true); setError(null); setTested(null);
     try {
-      const id = await discover(chosen, { kind: "list" });
+      const id = await discover(chosen, { kind: "list", ...(pattern.trim() ? { pattern: pattern.trim() } : {}) });
       const rows = await api.get<Row[]>(`/discoveries/${id}/databases`);
-      setTested({ discovery_id: id, databases: rows.filter((r) => r.status === "listed").map((r) => r.src_database) });
+      setTested({ discovery_id: id, databases: rows.filter((r) => r.status === "listed").map((r) => r.src_database),
+                  pattern: pattern.trim() });
     } catch (e) { setError(e); } finally { setTesting(false); }
   };
   return (
@@ -115,14 +148,18 @@ function Step1({ chosen, setChosen, tested, setTested }: { chosen: string; setCh
             </tbody>
           </table></div>
           <div className="toolbar">
+            <label className="inline">Databases matching<input className="search" placeholder="all, or e.g. lfc_eng_%" value={pattern}
+              onChange={(e) => { setPattern(e.target.value); setTested(null); }} /></label>
             <button disabled={!chosen || testing} onClick={test}>{testing ? "Testing…" : "Test connection"}</button>
             {testing && <span className="muted">Reading the server's databases: a few minutes when the discovery cluster starts cold.</span>}
+            {!testing && !tested && <span className="muted">% matches any characters and _ any one, as in SQL Server; blank lists every database.</span>}
             {tested && <span><Tag tone="ok">{tested.typed ? "Typed" : "Connected"}</Tag> <span className="muted">{tested.typed ? "uses" : "reads"}{" "}
               {fmtInt(tested.databases.length)} {plural(tested.databases.length, "database")} through {chosen}</span></span>}
           </div>
           {error != null && <Notice tone="bad">The connection failed its test: {String((error as Error).message ?? error)}
             {cantList(error) && <p>The server's databases are listed from its master database, and this connection's login can't open
-              it. The databases themselves may still be readable through the connection: type them below. Or give the login access to
+              it, so they can't be listed here. The databases themselves may still be readable through the connection: type them below
+              or take them from a CSV file. Or give the login access to
               master (a user there with VIEW ANY DATABASE) and test again.</p>}</Notice>}
           {error != null && cantList(error) && <TypedDatabases onUse={(names) => { setError(null); setTested({ discovery_id: null, databases: names, typed: true }); }} />}
         </div>
@@ -144,9 +181,10 @@ function Step1({ chosen, setChosen, tested, setTested }: { chosen: string; setCh
 
 type Picks = Record<string, Pick | string[]>;
 
-function Step2({ connection, databases, picks, setPicks, tables, setTables }: { connection: string; databases: string[];
-  picks: Picks; setPicks: (update: (p: Picks) => Picks) => void;
-  tables: Record<string, Row[]>; setTables: (update: (t: Record<string, Row[]>) => Record<string, Row[]>) => void }) {
+function Step2({ connection, databases, picks, setPicks, tables, setTables, failed, setFailed }: { connection: string;
+  databases: string[]; picks: Picks; setPicks: (update: (p: Picks) => Picks) => void;
+  tables: Record<string, Row[]>; setTables: (update: (t: Record<string, Row[]>) => Record<string, Row[]>) => void;
+  failed: [string, string][]; setFailed: (update: (f: [string, string][]) => [string, string][]) => void }) {
   const [filter, setFilter] = useState("");
   const [open, setOpen] = useState<string | null>(null);
   const [reading, setReading] = useState<string | null>(null);
@@ -168,9 +206,9 @@ function Step2({ connection, databases, picks, setPicks, tables, setTables }: { 
     if (tables[d]) return;
     setReading(d); setError(null);
     try {
-      const id = await discover(connection, { databases: [d] });
-      const found = await api.get<Row[]>(`/discoveries/${id}/tables`);
-      setTables((now) => ({ ...now, [d]: found }));
+      const read = await readTables(connection, { databases: [d] });
+      if (read.failed.length) setFailed((now) => [...now.filter(([name]) => name !== d), ...read.failed]);
+      else setTables((now) => ({ ...now, [d]: read.tables }));
     } catch (e) { setError(e); } finally { setReading(null); }
   };
   const toggleTable = (d: string, key: string) => setPicks((now) => {
@@ -216,6 +254,7 @@ function Step2({ connection, databases, picks, setPicks, tables, setTables }: { 
             {fmtInt(databases.length - shown.length)} more {plural(databases.length - shown.length, "database")} hidden by the filter</td></tr>}
         </tbody>
       </table></div>
+      <Unread failed={failed} />
       <ErrorBox error={error} />
     </>
   );
@@ -228,6 +267,7 @@ export function DiscoverDialog({ onClose }: { onClose: (lines: string | null) =>
   const [tested, setTested] = useState<Row | null>(null);
   const [picks, setPicks] = useState<Picks>({});
   const [tables, setTables] = useState<Record<string, Row[]>>({});
+  const [failed, setFailed] = useState<[string, string][]>([]);
   const [error, setError] = useState<unknown>(null);
   const databases: string[] = tested?.databases ?? [];
   const whole = databases.filter((d) => picks[d] === "all");
@@ -240,10 +280,18 @@ export function DiscoverDialog({ onClose }: { onClose: (lines: string | null) =>
       const unread = whole.filter((d) => !tables[d]);
       const read: Row[] = [];
       if (unread.length) {
-        // A whole server is listed from master; databases typed by hand are read by name instead.
+        // A whole server is listed from master (with the same name filter); databases typed by hand are read by name.
         const all = unread.length === databases.length && !tested?.typed;
-        const id = await discover(connection, all ? { whole_server: true } : { databases: unread });
-        read.push(...await api.get<Row[]>(`/discoveries/${id}/tables`));
+        const got = await readTables(connection, all ? { whole_server: true, ...(tested?.pattern ? { pattern: tested.pattern } : {}) }
+          : { databases: unread });
+        read.push(...got.tables);
+        if (got.failed.length) {
+          // Keep what was read, and say which databases weren't, before anything is added.
+          const byDatabase: Record<string, Row[]> = {};
+          for (const t of got.tables) (byDatabase[t.src_database] ??= []).push(t);
+          setTables((now) => ({ ...now, ...byDatabase })); setFailed(() => got.failed); setStep(2);
+          return;
+        }
       }
       const picked = [...whole.filter((d) => tables[d]).flatMap((d) => tables[d]), ...read,
         ...handPicked.flatMap(([d, keys]) => (tables[d] ?? []).filter((t) => keys.includes(`${t.src_schema}.${t.src_table}`)))];
@@ -262,7 +310,8 @@ export function DiscoverDialog({ onClose }: { onClose: (lines: string | null) =>
       }}>
       <div className="discover">
         {step === 1 && <Step1 chosen={connection} setChosen={setConnection} tested={tested} setTested={setTested} />}
-        {step >= 2 && <Step2 connection={connection} databases={databases} picks={picks} setPicks={setPicks} tables={tables} setTables={setTables} />}
+        {step >= 2 && <Step2 connection={connection} databases={databases} picks={picks} setPicks={setPicks} tables={tables} setTables={setTables}
+          failed={failed} setFailed={setFailed} />}
         {step === 3 && <p className="muted">Reading the tables of {fmtInt(whole.filter((d) => !tables[d]).length)} {plural(whole.length, "database")}:
           a few minutes when the discovery cluster starts cold. The tables are added to the job's page when it ends.</p>}
         {step === 2 && chosen > 0 && <p className="muted">{fmtInt(whole.length)} whole {plural(whole.length, "database")}

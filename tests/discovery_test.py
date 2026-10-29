@@ -159,7 +159,28 @@ def test_a_servers_databases_are_read_through_master():
                              [{"name": "eng_001"}, {"name": "eng_002"}])
     assert names == ["eng_001", "eng_002"]
     cfg, sql = seen[0]
-    assert cfg["src_database"] == "master" and cfg["use_remote_query"] and sql == d.DATABASES_SQL
+    assert cfg["src_database"] == "master" and cfg["use_remote_query"] and sql == d.databases_sql("")
     assert "database_id > 4" in sql and "ONLINE" in sql
     with pytest.raises(ValueError):
         d.list_databases({"src_connection": "ora", "src_type": "oracle"}, query=lambda cfg, sql: [])
+
+
+def test_databases_are_listed_by_name_not_by_access_through_master():
+    # A contained user in each database has no access through master, so HAS_DBACCESS would list none of them.
+    assert "HAS_DBACCESS" not in d.databases_sql("")
+    seen = []
+    d.list_databases({"src_connection": "sql_a", "pattern": "lfc_eng_%"}, query=lambda cfg, sql: seen.append(sql) or [])
+    assert seen == ["SELECT name FROM sys.databases WHERE database_id > 4 AND state_desc = 'ONLINE' "
+                    "AND name LIKE N'lfc_eng_%' ORDER BY name"]
+
+
+@pytest.mark.parametrize("pattern", ["x' OR 1=1 --", "a b", "a;drop", "x" * 129])
+def test_a_filter_that_isnt_a_plain_name_pattern_is_refused(pattern):
+    assert d.pattern_errors(pattern) and d.spec_errors({"src_connection": "sql_a", "kind": "list", "pattern": pattern})
+    with pytest.raises(ValueError):
+        d.databases_sql(pattern)
+
+
+@pytest.mark.parametrize("pattern", ["", "lfc_eng_%", "eng_0[0-4]%", "sales-2024.%"])
+def test_name_patterns_as_like_reads_them_are_taken(pattern):
+    assert d.pattern_errors(pattern) == []

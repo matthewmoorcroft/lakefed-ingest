@@ -1694,6 +1694,8 @@ class SourceDiscoverRequest(BaseModel):
     kind: str = Field(default="tables", pattern="^(list|tables)$")
     databases: List[str] = []
     whole_server: bool = False
+    # A database name filter for listing the server, as SQL Server's LIKE reads it (discovery.pattern_errors).
+    pattern: str = Field(default="", max_length=128, pattern=r"^[A-Za-z0-9_%\-\[\]\.$#@]*$")
 
 
 def _connection_unseen(name: str, listing_error: Optional[str]) -> str:
@@ -1719,7 +1721,8 @@ def start_source_discovery(body: SourceDiscoverRequest, request: Request):
     _refuse_run_of(job_id, request)
     did = uuid.uuid4().hex[:12]
     spec = {"src_type": "sqlserver", "src_connection": body.src_connection, "kind": body.kind,
-            "databases": "*" if body.kind == "tables" and body.whole_server else names, "requested_by": _user(request)}
+            "databases": "*" if body.kind == "tables" and body.whole_server else names, "requested_by": _user(request),
+            **({"pattern": body.pattern} if body.pattern else {})}
     if body.kind == "list":
         spec.pop("databases")
     rid = jobs.run_now(job_id, {"discovery_id": did, "spec": json.dumps(spec)})

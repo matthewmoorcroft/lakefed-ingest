@@ -23,6 +23,7 @@ Pure Python except ``discover_database`` (unit-tested in tests/discovery_test.py
 
 from __future__ import annotations
 
+import re
 from typing import Dict, List
 
 import load_strategies as ls
@@ -58,12 +59,28 @@ PK_SQL = (
 )
 
 # The server's user databases that are online, for Test connection and for discovering a whole server. Read through
-# master, which every login can see; system databases (ids 1 to 4) are left out.
-DATABASES_SQL = (
-    "SELECT name FROM sys.databases WHERE database_id > 4 AND state_desc = 'ONLINE' AND HAS_DBACCESS(name) = 1 "
-    "ORDER BY name"
-)
+# master; system databases (ids 1 to 4) are left out. Listed by name, not by HAS_DBACCESS: a login whose access to
+# each database is a contained user there (Azure SQL) has no access through master, though it opens them all. A
+# database the login can name but not open is listed, and fails when its tables are read.
+DATABASES_SQL = "SELECT name FROM sys.databases WHERE database_id > 4 AND state_desc = 'ONLINE'{name} ORDER BY name"
 SERVER_DATABASE = "master"
+# A name filter as SQL Server's LIKE reads it (% any run of characters, _ any one character, [ ] a set), as typed in
+# Test connection: letters, digits and those marks only, so it can go into the query as a literal.
+PATTERN = re.compile(r"^[A-Za-z0-9_%\-\[\]\.$#@]{1,128}$")
+
+
+def pattern_errors(pattern: str) -> List[str]:
+    """Why a database name filter can't be used, or nothing: a blank one lists every database."""
+    if not pattern or PATTERN.match(pattern):
+        return []
+    return [f"database filter {pattern!r}: use letters, digits and _ % - [ ] . $ # @ only (at most 128)"]
+
+
+def databases_sql(pattern: str = "") -> str:
+    """DATABASES_SQL with the name filter, if any (checked by pattern_errors first)."""
+    if pattern_errors(pattern):
+        raise ValueError(pattern_errors(pattern)[0])
+    return DATABASES_SQL.format(name=f" AND name LIKE N'{pattern}'" if pattern else "")
 
 UNSUPPORTED_TYPES = {"geography", "geometry", "hierarchyid", "sql_variant"}
 PARTITION_TYPES = {"tinyint", "smallint", "int", "bigint", "decimal", "numeric",
@@ -170,7 +187,7 @@ def spec_errors(spec: dict) -> List[str]:
         errors.append("spec needs secret_key or secret_key_template with src_host")
     if spec.get("kind") != "list" and not spec.get("databases"):
         errors.append("spec needs databases: a list, or \"*\" for every database on the server")
-    return errors
+    return errors + pattern_errors(spec.get("pattern") or "")
 
 
 def _query(cfg: dict, sql: str, slots=None, sleep=None, rand=None) -> List[dict]:
@@ -198,11 +215,11 @@ def _sqlserver_only(cfg: dict) -> None:
 
 
 def list_databases(spec: dict, query=None) -> List[str]:
-    """The server's user databases, read through master: what Test connection shows, and what discovering a
-    whole server ("databases": "*") reads."""
+    """The server's user databases, read through master and matching spec's "pattern" if it has one: what Test
+    connection shows, and what discovering a whole server ("databases": "*") reads."""
     cfg = cfg_for(spec, SERVER_DATABASE)
     _sqlserver_only(cfg)
-    return [str(r["name"]) for r in (query or _query)(cfg, DATABASES_SQL)]
+    return [str(r["name"]) for r in (query or _query)(cfg, databases_sql(spec.get("pattern") or ""))]
 
 
 def discover_database(cfg: dict, slots=None, sleep=None, rand=None) -> List[dict]:
