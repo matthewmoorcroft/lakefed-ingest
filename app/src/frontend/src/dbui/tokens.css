@@ -787,7 +787,7 @@
   --db-action-border-radius: var(--action-border-radius, 4px);
   --db-action-border-width: 1px;
 
-  /* Color — defaults to the neutral palette (the base, unmodified action). */
+  /* Color: defaults to the neutral palette (the base, unmodified action). */
   --db-action-surface: var(--db-surface-base);
   --db-action-text: var(--db-text-base);
   --db-action-border: var(--db-border-base);
