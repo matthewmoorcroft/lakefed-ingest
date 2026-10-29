@@ -492,8 +492,8 @@ export function Notice({ tone = "info", children }: { tone?: "info" | "ok" | "wa
 
 /** A dialog as the Databricks UI asks before a change: a title, what it does, then Cancel and the action at the right,
  * red when it destroys or disables something. Escape, a click outside and Cancel all cancel. */
-export function Modal({ title, action, danger, onClose, children }: { title: string; action: string; danger?: boolean;
-                        onClose: (confirmed: boolean) => void; children?: ReactNode }) {
+export function Modal({ title, action, danger, actionDisabled, onClose, children }: { title: string; action: string;
+                        danger?: boolean; actionDisabled?: string; onClose: (confirmed: boolean) => void; children?: ReactNode }) {
   const id = useId();
   const box = useRef<HTMLDivElement>(null);
   const cancel = useRef<HTMLButtonElement>(null);
@@ -525,7 +525,8 @@ export function Modal({ title, action, danger, onClose, children }: { title: str
         {children && <div className="modal-body">{children}</div>}
         <div className="modal-actions">
           <button ref={cancel} onClick={() => onClose(false)}>Cancel</button>
-          <button className={danger ? "danger" : "primary"} onClick={() => onClose(true)}>{action}</button>
+          <button className={danger ? "danger" : "primary"} disabled={!!actionDisabled} title={actionDisabled}
+            onClick={() => onClose(true)}>{action}</button>
         </div>
       </div>
     </div>, document.body);

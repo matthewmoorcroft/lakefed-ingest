@@ -4,13 +4,12 @@ import { useNavigate, useParams } from "react-router-dom";
 import { api, qs, type Row } from "../api";
 import { Crumbs, ConfirmButton, ErrorBox, Notice, PageHead, Pager, Section, StateBar, fmtInt, plural, useConfirm } from "../components";
 import { usePermissions } from "../permissions";
+import { CADENCES, IdentityFields, ParameterFields, RunFields, WritesFields, paramsSummary } from "./jobForm";
 
 // Edit an ingestion job: what it ingests (a tree from its servers), how it writes, its identity columns, when it
 // runs and its advanced configuration. A change in the tree applies once its dialog is confirmed, as Catalog Explorer
 // asks before a change to data; the rest is saved with Save.
 
-const TAGS = "{server} {database} {schema} {table}";
-const CADENCE_LABEL = (m: number) => (m < 60 ? `${m} minutes` : m === 60 ? "hour" : m === 1440 ? "day" : `${m / 60} hours`);
 const PAGE = 25;
 const LOAD_TYPES: Record<string, string> = { ct: "Change tracking", cursor: "Cursor column", full: "Full reload" };
 
@@ -33,12 +32,6 @@ function scheduleForm(schedule: Row) {
 
 const startMinute = (hhmm: string) => { const [h, m] = String(hhmm || "00:00").split(":").map(Number); return (h || 0) * 60 + (m || 0); };
 const value = (s?: Row) => (s && "value" in s ? s.value : undefined);
-const mixedText = (s?: Row) => (s?.mixed ? Object.entries(s.mixed).map(([v, n]) => `${v || "(none)"}: ${fmtInt(n)}`).join(", ") : "");
-
-function Mixed({ s }: { s?: Row }) {
-  return s?.mixed ? <span className="help">Differs between tables ({mixedText(s)}); a value here sets it for all.</span> : null;
-}
-
 function TableRows({ jobId, server, database, locked }: { jobId: string; server: string; database: string; locked: Locked }) {
   const [offset, setOffset] = useState(0);
   const qc = useQueryClient();
@@ -393,10 +386,7 @@ export default function JobEdit() {
     return () => { window.removeEventListener("beforeunload", unload); document.removeEventListener("click", click, true); };
   });
 
-  const cadences: number[] = options.data?.cadences ?? [5, 10, 15, 20, 30, 60, 120, 180, 240, 360, 720, 1440];
-  const paramNames: string[] = (options.data?.parameters ?? []).filter((k: string) => k !== "fail_on_table_errors");
-  const atSetTimes = Number(run.cadence_minutes) > 60;
-  const tablesFail = params.fail_on_table_errors === "true";
+  const cadences: number[] = options.data?.cadences ?? CADENCES;
   return (
     <>
       <PageHead crumb={<Crumbs steps={[["Ingestion jobs", "/ingestion-jobs"], [schedule?.name ?? "Ingestion job", `/ingestion-jobs/${id}`], ["Edit"]]} />}
@@ -425,110 +415,44 @@ export default function JobEdit() {
       </Section>
 
       {s && <Section title="How it writes" note="For every table of the job.">
-        <div className="form-grid">
-          <label>Fan-in<select value={w.fan_in === undefined || w.fan_in === null ? "" : String(w.fan_in)} onChange={(e) => setW({ ...w, fan_in: e.target.value === "true" })}>
-            {w.fan_in == null && <option value="">choose</option>}
-            <option value="true">Yes: shared tables</option><option value="false">No: own tables</option></select>
-            <span className="help">With fan-in, each database writes only its own rows of a shared table.</span><Mixed s={s.fan_in} /></label>
-          <label>Change-tracked tables<select value={w.write_mode_changes ?? ""} onChange={(e) => setW({ ...w, write_mode_changes: e.target.value })}>
-            {w.write_mode_changes == null && <option value="">none in this job</option>}
-            <option value="append">Append: change log</option><option value="merge">Merge: current state</option></select><Mixed s={s.write_mode_changes} /></label>
-          <label>Full-reload tables<select value={w.write_mode_full ?? ""} onChange={(e) => setW({ ...w, write_mode_full: e.target.value })}>
-            {w.write_mode_full == null && <option value="">none in this job</option>}
-            <option value="append">Append: a snapshot each run</option><option value="merge">Merge: replace the rows</option></select><Mixed s={s.write_mode_full} /></label>
-          <label>Freshness target (minutes)<input type="number" min={1} value={w.freshness_sla_minutes ?? ""} placeholder="none"
-            onChange={(e) => setW({ ...w, freshness_sla_minutes: e.target.value })} /><Mixed s={s.freshness_sla_minutes} /></label>
-        </div>
-        {writeModeMoves && <p className={targetsChanged ? "help" : "impact"}>A new write mode makes new target tables and loads every
-          table again{targetsChanged ? "." : ": change the target names below too."}</p>}
-        <div className="form-grid">
-          <label>Target catalog<input value={w.sink_catalog} onChange={(e) => setW({ ...w, sink_catalog: e.target.value })} /><Mixed s={s.sink_catalog} /></label>
-          <label>Target schema<input value={w.sink_schema} onChange={(e) => setW({ ...w, sink_schema: e.target.value })} /><Mixed s={s.sink_schema} /></label>
-          <label>Target table<input value={w.sink_table} onChange={(e) => setW({ ...w, sink_table: e.target.value })} /><Mixed s={s.sink_table} /></label>
-          <label className="checkbox"><input type="checkbox" checked={!!w.lowercase} onChange={(e) => setW({ ...w, lowercase: e.target.checked })} /> Lower-case names</label>
-        </div>
-        <p className="help"><span className="info" aria-hidden>ⓘ</span> Valid tags: <span className="mono">{TAGS}</span>, with any text between them.
-          With fan-in, {"{server}"} and {"{database}"} can't be used in target names: they would give every database its own table.</p>
-        {targetsChanged && <p className="impact">New target names make new tables and load their tables again. The old tables are left in place.</p>}
+        <WritesFields w={w} setW={setW} stored={s}
+          modeNote={writeModeMoves && <p className={targetsChanged ? "help" : "impact"}>A new write mode makes new target tables and loads every
+            table again{targetsChanged ? "." : ": change the target names below too."}</p>}
+          targetsNote={targetsChanged && <p className="impact">New target names make new tables and load their tables again. The old tables are left in place.</p>} />
       </Section>}
 
       {s && <Section title="Identity columns" note="Written on every row next to __client_id__, so the shared tables say whose rows they are.">
-        <table className="data identity">
-          <thead><tr><th>Column</th><th>Value</th><th></th></tr></thead>
-          <tbody>
-            {s.identity?.mixed && !Object.keys(differing).length && <tr><td colSpan={3}><Mixed s={s.identity} /></td></tr>}
-            <tr><td className="mono">__client_id__</td><td><input className="mono" value={w.client_id} disabled={w.fan_in === false}
-              onChange={(e) => setW({ ...w, client_id: e.target.value })} /> <span className="help">keeps each database's rows apart{w.fan_in === false ? " (fan-in only)" : ""}</span></td><td></td></tr>
-            {Object.entries(differing).map(([name, template]) => (
-              <tr key={`differs-${name}`}>
-                <td className="mono">{name}</td>
-                <td><input className="mono" value={template} placeholder="differs between tables" aria-label={`${name} value`}
-                  onChange={(e) => setDiffering({ ...differing, [name]: e.target.value })} />
-                  <span className="help">a value here sets it for all {fmtInt(settings.data?.tables)} {plural(settings.data?.tables, "table")}</span></td>
-                <td></td>
-              </tr>
-            ))}
-            {identity.map(([name, template], i) => (
-              <tr key={i}>
-                <td><input className="mono" value={name} placeholder="column name" aria-label="Identity column name" onChange={(e) => setIdentity(identity.map((x, j) => (j === i ? [e.target.value, x[1]] : x)))} /></td>
-                <td><input className="mono" value={template} placeholder="{database}" aria-label="Identity column value" onChange={(e) => setIdentity(identity.map((x, j) => (j === i ? [x[0], e.target.value] : x)))} /></td>
-                <td><button className="ghost" onClick={() => setIdentity(identity.filter((_, j) => j !== i))}>Remove</button></td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-        <div className="toolbar"><button className="ghost" onClick={() => setIdentity([...identity, ["", "{database}"]])}>Add a column</button></div>
-        <p className="help"><span className="info" aria-hidden>ⓘ</span> Valid tags: <span className="mono">{TAGS}</span>, for example{" "}
-          <span className="mono">{"{server}/{database}"}</span>. A column added later is empty for rows loaded before it.</p>
+        <IdentityFields w={w} setW={setW} identity={identity} setIdentity={setIdentity} differing={differing}
+          setDiffering={setDiffering} stored={s} tables={settings.data?.tables} />
       </Section>}
 
       {schedule && <Section title="When it runs">
-        <div className="form-grid">
-          <label>Every<select value={run.cadence_minutes} onChange={(e) => setRun({ ...run, cadence_minutes: Number(e.target.value) })}>
-            {cadences.map((c) => <option key={c} value={c}>{CADENCE_LABEL(c)}</option>)}</select>
-            <span className="help">{atSetTimes ? "Tied to the time of day, so it follows the time zone below."
-              : "In UTC: London is a whole hour off, so the runs fall on the same minutes there, and none is skipped on a clock-change night."}</span></label>
-          {atSetTimes && <label>{Number(run.cadence_minutes) === 1440 ? "Daily at" : "Starting from"}
-            <input type="time" value={run.start} onChange={(e) => setRun({ ...run, start: e.target.value })} />
-            <span className="help">{Number(run.cadence_minutes) === 1440 ? "The time of day it runs."
-              : `Then every ${CADENCE_LABEL(Number(run.cadence_minutes))}, round the clock.`}</span></label>}
-          {atSetTimes && <label>Time zone<input value={run.timezone} onChange={(e) => setRun({ ...run, timezone: e.target.value })} />
-            <span className="help">A run between 01:00 and 02:00 can be skipped or run an hour late on the night the clocks change.</span></label>}
-          <label className="checkbox wide"><input type="checkbox" checked={!!run.paused} onChange={(e) => setRun({ ...run, paused: e.target.checked })} /> Paused</label>
-          <label className="wide emails">Emails to<input value={run.notify_emails} placeholder="a@example.com, b@example.com" onChange={(e) => setRun({ ...run, notify_emails: e.target.value })} />
-            <span className="help">Sent when a run fails.</span></label>
-          <label className="checkbox wide"><input type="checkbox" checked={tablesFail}
-            onChange={(e) => setParams({ ...params, fail_on_table_errors: e.target.checked ? "true" : "" })} />
-            Also email when tables fail in a run <span className="help">(the run then ends as failed)</span></label>
-        </div>
+        <RunFields run={run} setRun={setRun} params={params} setParams={setParams} cadences={cadences} />
       </Section>}
 
-      {/* As a Databricks job's Compute: the job cluster first, editable; the rest of what its runs use under it. */}
-      {schedule && <Section title="Compute" note="What each run of this job runs on.">
+      {/* Compute and the tuning keys are one closed section, at the defaults the job was tested with, as on the board. */}
+      {schedule && <details className="card advanced">
+        <summary><b>Advanced configuration</b> <span className="muted">compute and tuning: {clusterSummary(clusterInfo.data, cluster)};
+          {" "}{paramsSummary(params) || "every key at its default"}</span></summary>
+        <h3>Compute</h3>
         <ClusterFields info={clusterInfo.data} error={clusterInfo.error} cluster={cluster} setCluster={setCluster} locked={locked} />
         <Compute jobId={id} />
-      </Section>}
-
-      {schedule && <details className="card advanced">
-        <summary><b>Advanced configuration</b> <span className="muted">{Object.entries(params).filter(([k, v]) => v && k !== "fail_on_table_errors")
-          .map(([k, v]) => `${k.replace(/_/g, " ")} ${v}`).join(" · ") || "every key at its default"}</span></summary>
-        <div className="form-grid">
-          {paramNames.map((k) => (
-            <label key={k}>{k.replace(/_/g, " ").replace(/^./, (c) => c.toUpperCase())}
-              {(options.data?.flags ?? []).includes(k)
-                ? <select value={params[k] ?? ""} onChange={(e) => setParams({ ...params, [k]: e.target.value })}>
-                    <option value="">default{options.data?.defaults?.[k] ? ` (${options.data.defaults[k]})` : ""}</option><option>true</option><option>false</option></select>
-                : <input value={params[k] ?? ""} placeholder={options.data?.defaults?.[k] ? `default (${options.data.defaults[k]})` : "default"}
-                    onChange={(e) => setParams({ ...params, [k]: e.target.value })} />}
-            </label>
-          ))}
-        </div>
+        <h3>Tuning</h3>
+        <ParameterFields params={params} setParams={setParams} options={options.data} />
       </details>}
     </>
   );
 }
 
 const CLUSTER_KEYS = ["driver_node_type_id", "node_type_id", "num_workers"];
+
+/** The cluster each run uses, in a few words for the closed Advanced configuration. */
+function clusterSummary(info: Row | undefined, cluster: Row | null) {
+  const c = cluster ?? info?.defaults;
+  if (!c) return "the Databricks job's cluster";
+  const at = info?.defaults && !ownCluster(c, info.defaults) ? ", the tested defaults" : "";
+  return `${c.driver_node_type_id} driver, ${c.node_type_id} workers, ${c.num_workers} ${Number(c.num_workers) === 1 ? "worker" : "workers"}${at}`;
+}
 
 /** The cluster to save as the job's own, or null when it is the Databricks job's (so the job runs that job itself). */
 function ownCluster(cluster: Row, defaults: Row): Row | null {
@@ -572,7 +496,6 @@ function ClusterFields({ info, error, cluster, setCluster, locked }: { info?: Ro
           <span className="help">0 to {info.max_workers}; 0 runs on the driver alone</span></label>
       </div>
       <div className="toolbar">
-        <button disabled={off} onClick={() => setCluster({ ...d })}>Use the defaults</button>
         <span className="muted">{info.applying ? <>Applying: the cluster copies job is making this job's copy (<a href={info.applying.url}
           target="_blank" rel="noreferrer">run {info.applying.run_id}</a>).</>
           : info.copy_job_id ? <>Runs its own copy of the Databricks job, <a href={info.copy_url} target="_blank" rel="noreferrer">job {info.copy_job_id}</a>.</>

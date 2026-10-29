@@ -303,6 +303,9 @@ details.advanced .compute h4 { margin: var(--db-space-3) 0 var(--db-space-2); }
 .menu-items > button { display: block; width: 100%; text-align: left; border: 0; border-radius: 0; background: transparent; padding: 6px 12px; }
 .menu-items > button:hover:not(:disabled) { background: var(--db-color-table-background-selected-default); }
 .menu-items > button.danger-text { color: var(--bad); }
+.menu-items > button .sub { display: block; color: var(--muted); font-size: var(--db-font-size-sm); white-space: normal; }
+.menu-items.wide, .menu-items:has(.sub) { min-width: 320px; }
+.empty-drop { border: 1px dashed var(--border); border-radius: var(--db-shape-container-small); padding: var(--db-space-4); text-align: center; color: var(--muted); margin: 0; }
 .menu-note { padding: 6px 12px; overflow-wrap: anywhere; }
 .menu-note + .menu-note { border-top: 1px solid var(--border); }
 button.avatar { width: 32px; height: 32px; padding: 0; border-radius: 50%; border: 0; background: var(--db-color-action-primary-background-default, #2272b4);

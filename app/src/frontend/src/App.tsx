@@ -18,6 +18,7 @@ import IngestionJobs from "./pages/IngestionJobs";
 import IngestionJob from "./pages/IngestionJob";
 import NotInJob from "./pages/NotInJob";
 import JobEdit from "./pages/JobEdit";
+import NewJob from "./pages/NewJob";
 import JobRun from "./pages/JobRun";
 import Sources from "./pages/Sources";
 import Database from "./pages/Database";
@@ -69,6 +70,7 @@ export default function App() {
             <Route path="/overview" element={<Overview />} />
             <Route path="/ingestion-jobs" element={<IngestionJobs />} />
             <Route path="/ingestion-jobs/not-in-job" element={<NotInJob />} />
+            <Route path="/ingestion-jobs/new" element={<NewJob />} />
             <Route path="/ingestion-jobs/:id" element={<IngestionJob />} />
             <Route path="/ingestion-jobs/:id/edit" element={<JobEdit />} />
             <Route path="/ingestion-jobs/:id/runs/:slot" element={<JobRun />} />

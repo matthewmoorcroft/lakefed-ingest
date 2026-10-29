@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { useSearchParams } from "react-router-dom";
+import { useNavigate, useSearchParams } from "react-router-dom";
 import { api, qs, type Row } from "../api";
 import { ErrorBox, PageHead, Section, Stamp, StateKey, fmtInt } from "../components";
 import { JobsTable, type JobSort } from "./Overview";
@@ -14,6 +14,7 @@ interface JobsPage { jobs: Row[]; total: number; offset: number; limit: number; 
 /** Every ingestion job, failing first, filtered and searched, in a table that fills the page. */
 export default function IngestionJobs() {
   const [params, setParams] = useSearchParams();
+  const navigate = useNavigate();
   const filter = params.get("filter") || "all";
   const [search, setSearch] = useState("");
   const [offset, setOffset] = useState(0);
@@ -28,7 +29,8 @@ export default function IngestionJobs() {
     <>
       <PageHead title="Ingestion jobs"
         lead="Each ingestion job is a schedule: a cadence and its ingestion groups. Failing first, then late, then by name."
-        right={<Stamp at={jobs.data?.read_at} every={30} error={jobs.error} />} />
+        right={<span className="card-actions"><Stamp at={jobs.data?.read_at} every={30} error={jobs.error} />
+          <button className="primary" onClick={() => navigate("/ingestion-jobs/new")}>New ingestion job</button></span>} />
       <ErrorBox error={jobs.error} />
       <div className="toolbar">
         <span className="chips">
