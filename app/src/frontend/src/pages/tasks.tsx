@@ -13,26 +13,53 @@ export const newRequestId = (): string =>
 const wait = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 /** The write's answer: at once when it was small, else its task's result once the task has ended (onTask sees it as it
- *  goes). A failed task throws its error, as the request would have. */
+ *  goes). A failed task throws its error, as the request would have, with the task attached for its progress. */
 export async function finished(answer: Row, onTask: (task: Row) => void): Promise<Row> {
   if (!answer.task) return answer;
   let task = answer.task;
   for (;;) {
     onTask(task);
     if (task.status === "succeeded") return task.result ?? {};
-    if (task.status === "failed") throw new Error(task.error || "the write failed");
+    if (task.status === "failed") throw Object.assign(new Error(task.error || "the write failed"), { task });
     await wait(2000);
     task = await api.get<Row>(`/tasks/${task.id}`);
   }
 }
 
+/** Whether a failed write stopped part way (its task has progress): the databases written before it are kept, and the
+ *  same request finishes it. */
+export const resumableWrite = (error: unknown): boolean => Boolean((error as { task?: Row } | null)?.task?.progress);
+
 const KINDS: Record<string, string> = { create: "Creating the job", tables: "Adding tables", databases: "Adding databases" };
 
-/** "Writing 52,000 of 100,200 tables", or what it ended with. */
-export function TaskProgress({ task }: { task: Row | null }) {
+/** "Writing 52,000 of 100,200 tables", or what it ended with. A by-database write (its task has progress) shows its
+ *  databases; onResume, for a failed one, offers to finish it with the same request. */
+export function TaskProgress({ task, onResume }: { task: Row | null; onResume?: () => void }) {
   if (!task) return null;
+  const progress: Row | null = task.progress ?? null;
+  if (task.status === "failed" && progress) {
+    const total = Number(progress.databases_total);
+    return (
+      <Notice tone="bad">Stopped with {fmtInt(progress.databases_written)} of {fmtInt(total)} {plural(total, "database")} written
+        {task.error ? `: ${task.error}` : ""}. Those databases are kept. Sending the same write again, with the same request id,
+        finishes it, and nothing is written twice.
+        {onResume && <div className="toolbar"><button onClick={onResume}>Finish the write</button></div>}</Notice>
+    );
+  }
   if (task.status === "failed") return <Notice tone="bad">Nothing was written: {task.error}</Notice>;
   if (task.status === "succeeded") return <Notice tone="ok">Written: {fmtInt(task.total)} {plural(task.total, "table")}.</Notice>;
+  if (progress) {
+    const total = Number(progress.databases_total);
+    return (
+      <Notice>
+        {KINDS[task.kind] ?? "Writing"}: {progress.stage === "checking" ? <>checking {fmtInt(total)} {plural(total, "database")}</>
+          : <>writing database <b>{fmtInt(Math.min(Number(progress.databases_written) + 1, total))}</b> of {fmtInt(total)}</>}
+        <progress className="task-progress" max={Number(task.total) || 1} value={Number(task.done) || 0} />
+        <span className="sub">One database at a time: each database is written or not, and a stopped write can be finished by sending it
+          again. Leaving this page doesn't stop it.</span>
+      </Notice>
+    );
+  }
   return (
     <Notice>
       {KINDS[task.kind] ?? "Writing"}: {Number(task.done) > 0 ? <>writing <b>{fmtInt(task.done)}</b> of {fmtInt(task.total)} tables</>

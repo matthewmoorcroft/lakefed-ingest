@@ -3,6 +3,7 @@ import { keepPreviousData, useQuery } from "@tanstack/react-query";
 import { api, qs, type Row } from "../api";
 import { ErrorBox, Notice, Pager, fmtInt, plural } from "../components";
 import { TriBox } from "./Discover";
+import { serverRowPick, underFilter } from "./pickState";
 
 // What to take from an upload or a discovery, chosen at its top level: its servers and databases, with their table
 // counts and load types, a database filter, and a database's tables in pages only when it is opened. The tables stay in
@@ -17,6 +18,7 @@ const DATABASES = 100;
 const TABLES = 50;
 const same = (a: Row, server: string, database: string) =>
   String(a.server).toLowerCase() === server.toLowerCase() && String(a.database).toLowerCase() === database.toLowerCase();
+export { underFilter };
 
 export function loadTypes(r: Row): string {
   const parts = [["ct", "change tracking"], ["cursor", "cursor"], ["full", "full reload"], ["unset", "the job's"]]
@@ -79,7 +81,7 @@ export function SourcePick({ kind, sourceId, picked, setPicked }: { kind: "uploa
   });
   const data = top.data;
   const servers: Row[] = data?.servers ?? [];
-  const isWhole = (d: Row) => (picked.whole_server && String(d.src_database).toLowerCase().includes(picked.filter.toLowerCase()))
+  const isWhole = (d: Row) => (picked.whole_server && underFilter(d.src_database, picked.filter))
     || picked.databases.some((p) => same(p, d.server, d.src_database));
   const tablesOf = (d: Row): string[] => picked.tables.find((p) => same(p, d.server, d.src_database))?.tables ?? [];
   const toggleDatabase = (d: Row) => setPicked((now) => {
@@ -88,14 +90,26 @@ export function SourcePick({ kind, sourceId, picked, setPicked }: { kind: "uploa
       : [...now.databases, { server: d.server, database: d.src_database }],
       tables: now.tables.filter((p) => !same(p, d.server, d.src_database)) };
   });
+  // Ticking every table of a database makes it a whole database, so it reads as one ("1 whole database", not "2 chosen").
   const toggleTable = (d: Row, table: string) => setPicked((now) => {
     const current = now.tables.find((p) => same(p, d.server, d.src_database))?.tables ?? [];
     const next = current.includes(table) ? current.filter((t: string) => t !== table) : [...current, table];
     const others = now.tables.filter((p) => !same(p, d.server, d.src_database));
+    if (next.length > 0 && next.length >= Number(d.tables)) {
+      const whole = now.databases.some((p) => same(p, d.server, d.src_database)) ? now.databases
+        : [...now.databases, { server: d.server, database: d.src_database }];
+      return { ...now, databases: whole, tables: others };
+    }
     return { ...now, tables: next.length ? [...others, { server: d.server, database: d.src_database, tables: next }] : others };
   });
-  const wholeServer = () => setPicked((now) => now.whole_server && now.filter === filter
-    ? { ...now, whole_server: false } : { ...now, whole_server: true, filter });
+  // Ticking the whole server takes over what it covers: the databases matching its filter lose their own picks, so the
+  // choice never names one twice. Turning it off keeps the rest.
+  const wholeServerTicked = serverRowPick({ on: picked.whole_server, filter: picked.filter }, filter,
+    picked.databases.length > 0 || picked.tables.length > 0) === "all";
+  const wholeServer = () => setPicked((now) => wholeServerTicked
+    ? { ...now, whole_server: false } : { ...now, whole_server: true, filter,
+      databases: now.databases.filter((p) => !underFilter(p.database, filter)),
+      tables: now.tables.filter((p) => !underFilter(p.database, filter)) });
   const key = (d: Row) => `${d.server}\u001f${d.src_database}`;
   return (
     <>
@@ -114,7 +128,8 @@ export function SourcePick({ kind, sourceId, picked, setPicked }: { kind: "uploa
         <tbody>
           {servers.map((s) => (
             <tr key={s.server}><td className="name">
-              <TriBox pick={picked.whole_server && picked.filter === filter ? "all" : picked.whole_server ? "part" : "none"}
+              <TriBox pick={serverRowPick({ on: picked.whole_server, filter: picked.filter }, filter,
+                picked.databases.length > 0 || picked.tables.length > 0)}
                 label={`The whole server ${s.server}`} onClick={wholeServer} />{" "}
               <b>{s.server}</b>, {filter ? <>every database matching "{filter}"</> : "the whole server"}</td>
               <td className="num">{fmtInt(s.databases)} · {fmtInt(s.tables)}</td><td className="muted">{loadTypes(s)}</td></tr>
@@ -123,7 +138,7 @@ export function SourcePick({ kind, sourceId, picked, setPicked }: { kind: "uploa
             <Fragment key={key(d)}>
               <tr className="l2"><td className="name" style={{ paddingLeft: 30 }}>
                 <TriBox pick={isWhole(d) ? "all" : tablesOf(d).length ? "part" : "none"} label={`The whole database ${d.src_database}`}
-                  onClick={() => !(picked.whole_server && String(d.src_database).toLowerCase().includes(picked.filter.toLowerCase())) && toggleDatabase(d)} />{" "}
+                  onClick={() => !(picked.whole_server && underFilter(d.src_database, picked.filter)) && toggleDatabase(d)} />{" "}
                 <button className="twisty" aria-expanded={open === key(d)} onClick={() => setOpen(open === key(d) ? null : key(d))}>
                   {open === key(d) ? "▾" : "▸"}</button>{d.src_database}
                 {servers.length > 1 && <span className="sub">{d.server}</span>}</td>

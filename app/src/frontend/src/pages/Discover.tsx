@@ -1,9 +1,10 @@
 import { Fragment, useState } from "react";
-import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { api, type Row } from "../api";
-import { ErrorBox, Modal, Notice, OutLink, Tag, fmtInt, plural } from "../components";
+import { keepPreviousData, useQuery, useQueryClient } from "@tanstack/react-query";
+import { api, qs, type Row } from "../api";
+import { ErrorBox, Modal, Notice, OutLink, Pager, Tag, fmtInt, plural } from "../components";
 import { useSettings } from "../App";
 import { DatabaseTables } from "./SourcePick";
+import { serverRowPick, underFilter, type Pick } from "./pickState";
 
 // Add tables, Discover on a source: as Lakeflow Connect's Connection and Source steps. Step 1 is the Unity Catalog
 // connection, tested before anything is discovered; step 2 picks the whole server, whole databases or single tables in
@@ -11,7 +12,7 @@ import { DatabaseTables } from "./SourcePick";
 // database's tables are shown a page at a time when it is opened, and what is picked is handed to New and Edit by
 // reference (the discoveries, and the whole server, whole databases or tables chosen), never as the tables themselves.
 
-export type Pick = "all" | "part" | "none";
+export type { Pick };
 const RUNNING = new Set(["PENDING", "QUEUED", "RUNNING", "TERMINATING", "BLOCKED", "WAITING_FOR_RETRY"]);
 const wait = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -197,26 +198,51 @@ function Step1({ chosen, setChosen, tested, setTested }: { chosen: string; setCh
 }
 
 type Picks = Record<string, Pick | string[]>;
+/** The whole server, as a flag: on, and the filter it was ticked under (it covers the databases whose names contain it). */
+type WholeServer = { on: boolean; filter: string };
+const DATABASES_PER_PAGE = 100;
+/** Whether a whole-server tick covers a database: the same rule as SourcePick's, so the two pages never disagree. */
+const coveredByServer = (server: WholeServer, database: string) => server.on && underFilter(database, server.filter);
 
-function Step2({ connection, databases, picks, setPicks, read, setRead, failed, setFailed }: { connection: string;
-  databases: string[]; picks: Picks; setPicks: (update: (p: Picks) => Picks) => void;
+function Step2({ connection, discoveryId, typedNames, picks, setPicks, wholeServer, setWholeServer, read, setRead, failed, setFailed }: {
+  connection: string; discoveryId: string | null; typedNames: string[]; picks: Picks;
+  setPicks: (update: (p: Picks) => Picks) => void; wholeServer: WholeServer; setWholeServer: (next: WholeServer) => void;
   read: Record<string, string>; setRead: (update: (t: Record<string, string>) => Record<string, string>) => void;
   failed: [string, string][]; setFailed: (update: (f: [string, string][]) => [string, string][]) => void }) {
   const [filter, setFilter] = useState("");
+  const [offset, setOffset] = useState(0);
   const [open, setOpen] = useState<string | null>(null);
   const [reading, setReading] = useState<string | null>(null);
   const [error, setError] = useState<unknown>(null);
-  const shown = databases.filter((d) => d.toLowerCase().includes(filter.toLowerCase()));
+  // A discovery's databases come a page at a time from Lakebase, filtered there; typed names are a short list kept here.
+  const listing = useQuery({
+    queryKey: ["discovery-listing", discoveryId, filter, offset], placeholderData: keepPreviousData, enabled: discoveryId != null,
+    queryFn: () => api.get<Row>(`/discoveries/${encodeURIComponent(String(discoveryId))}/listing${qs({ filter, offset, limit: DATABASES_PER_PAGE })}`),
+  });
+  const typedShown = typedNames.filter((d) => d.toLowerCase().includes(filter.toLowerCase()));
+  const shown: string[] = discoveryId != null ? (listing.data?.databases ?? []).map((d: Row) => d.src_database) : typedShown;
+  const total = discoveryId != null ? Number(listing.data?.total ?? 0) : typedNames.length;
+  const covered = (d: string) => coveredByServer(wholeServer, d);
   const pickIn = (all: Picks, d: string): Pick => {
     const p = all[d];
     if (Array.isArray(p)) return p.length === 0 ? "none" : "part";
     return p ?? "none";
   };
-  const pickOf = (d: string) => pickIn(picks, d);
-  const server: Pick = databases.length && databases.every((d) => pickOf(d) === "all") ? "all"
-    : databases.some((d) => pickOf(d) !== "none") ? "part" : "none";
+  const pickOf = (d: string): Pick => (covered(d) ? "all" : pickIn(picks, d));
+  const typedServer: Pick = typedNames.length && typedNames.every((d) => pickOf(d) === "all") ? "all"
+    : typedNames.some((d) => pickOf(d) !== "none") ? "part" : "none";
+  const anyChosen = Object.values(picks).some((p) => (Array.isArray(p) ? p.length > 0 : p === "all" || p === "part"));
+  const server: Pick = discoveryId == null ? typedServer : serverRowPick(wholeServer, filter, anyChosen);
   // Each change starts from the choices as they are then, so quick clicks never undo each other.
   const setAll = (names: string[], pick: Pick) => setPicks((now) => ({ ...now, ...Object.fromEntries(names.map((d) => [d, pick])) }));
+  // A whole-server tick takes over what it covers: the picks of the databases matching its filter go. A discovery keeps
+  // just the flag; typed names are each ticked, as before.
+  const tickServer = () => {
+    if (discoveryId == null) return setAll(typedNames, server === "all" ? "none" : "all");
+    const turningOff = server === "all";
+    setWholeServer({ on: !turningOff, filter });
+    if (!turningOff) setPicks((now) => Object.fromEntries(Object.entries(now).filter(([d]) => !underFilter(d, filter))));
+  };
   const openDatabase = async (d: string) => {
     if (open === d) return setOpen(null);
     setOpen(d);
@@ -236,19 +262,21 @@ function Step2({ connection, databases, picks, setPicks, read, setRead, failed, 
     <>
       <p className="muted">The connection passed its test. Tick the whole server, whole databases, or open a database for its tables.
         Reading a database's catalog takes a few minutes when the discovery cluster starts cold.</p>
-      <div className="toolbar"><input className="search" placeholder="Filter databases, e.g. eng_0" value={filter} onChange={(e) => setFilter(e.target.value)} />
-        <button className="ghost" onClick={() => setAll(shown, "all")}>Select all shown</button></div>
+      <div className="toolbar"><input className="search" placeholder="Filter databases, e.g. eng_0" value={filter}
+        onChange={(e) => { setFilter(e.target.value); setOffset(0); }} />
+        <button className="ghost" onClick={() => setAll(shown.filter((d) => !covered(d)), "all")}>Select all shown</button></div>
       <div className="table-wrap tree-pick"><table className="data tree">
         <thead><tr><th>Server › database › schema.table</th><th className="num">Tables</th><th>Load type</th></tr></thead>
         <tbody>
-          <tr><td className="name"><TriBox pick={server} label={`The whole server ${connection}`}
-            onClick={() => setAll(databases, server === "all" ? "none" : "all")} /> <b>{connection}, the whole server</b></td>
-            <td className="num">{fmtInt(databases.length)} {plural(databases.length, "database")}</td>
+          <tr><td className="name"><TriBox pick={server} label={`The whole server ${connection}`} onClick={tickServer} />{" "}
+            <b>{connection}</b>, {discoveryId != null && wholeServer.on && wholeServer.filter
+              ? <>every database matching "{wholeServer.filter}"</> : "the whole server"}</td>
+            <td className="num">{fmtInt(total)} {plural(total, "database")}</td>
             <td className="muted">{server === "part" ? "chosen in part" : ""}</td></tr>
           {shown.slice(0, 500).map((d) => (
             <Fragment key={d}>
               <tr className="l2"><td className="name" style={{ paddingLeft: 30 }}>
-                <TriBox pick={pickOf(d)} label={`The whole database ${d}`} onClick={() => setAll([d], pickOf(d) === "all" ? "none" : "all")} />{" "}
+                <TriBox pick={pickOf(d)} label={`The whole database ${d}`} onClick={() => !covered(d) && setAll([d], pickOf(d) === "all" ? "none" : "all")} />{" "}
                 <button className="twisty" aria-expanded={open === d} onClick={() => openDatabase(d)}>{open === d ? "▾" : "▸"}</button>{d}</td>
                 <td className="num">{reading === d ? "reading…" : ""}</td>
                 <td className="muted">{pickOf(d) === "part" ? `${fmtInt((picks[d] as string[]).length)} chosen` : ""}</td></tr>
@@ -256,14 +284,16 @@ function Step2({ connection, databases, picks, setPicks, read, setRead, failed, 
                 whole={pickOf(d) === "all"} chosen={Array.isArray(picks[d]) ? (picks[d] as string[]) : []} onToggle={(key) => toggleTable(d, key)} />}
             </Fragment>
           ))}
-          {shown.length > 500 && <tr className="l2"><td colSpan={3} className="muted" style={{ paddingLeft: 30 }}>
+          {discoveryId == null && shown.length > 500 && <tr className="l2"><td colSpan={3} className="muted" style={{ paddingLeft: 30 }}>
             and {fmtInt(shown.length - 500)} more: filter to find one, or tick the whole server</td></tr>}
-          {databases.length > shown.length && <tr className="l2"><td colSpan={3} className="muted" style={{ paddingLeft: 30 }}>
-            {fmtInt(databases.length - shown.length)} more {plural(databases.length - shown.length, "database")} hidden by the filter</td></tr>}
+          {discoveryId == null && typedNames.length > shown.length && <tr className="l2"><td colSpan={3} className="muted" style={{ paddingLeft: 30 }}>
+            {fmtInt(typedNames.length - shown.length)} more {plural(typedNames.length - shown.length, "database")} hidden by the filter</td></tr>}
         </tbody>
       </table></div>
+      {discoveryId != null && <Pager offset={offset} limit={DATABASES_PER_PAGE} total={Number(listing.data?.matched ?? 0)} noun="database"
+        onPage={setOffset} />}
       <Unread failed={failed} />
-      <ErrorBox error={error} />
+      <ErrorBox error={listing.error ?? error} />
     </>
   );
 }
@@ -277,26 +307,37 @@ export function DiscoverDialog({ onClose }: { onClose: (pick: DiscoveredPick | n
   const [connection, setConnection] = useState("");
   const [tested, setTested] = useState<Row | null>(null);
   const [picks, setPicks] = useState<Picks>({});
+  const [wholeServer, setWholeServer] = useState<WholeServer>({ on: false, filter: "" });
+  // The whole server's discovery, read once as tested (same pattern and Azure); its databases are never listed here.
+  const [serverRead, setServerRead] = useState<string | null>(null);
   const [read, setRead] = useState<Record<string, string>>({});
   const [failed, setFailed] = useState<[string, string][]>([]);
   const [error, setError] = useState<unknown>(null);
-  const databases: string[] = tested?.databases ?? [];
-  const whole = databases.filter((d) => picks[d] === "all");
-  const handPicked = Object.entries(picks).filter(([, p]) => Array.isArray(p) && p.length) as [string, string[]][];
-  const chosen = whole.length + handPicked.length;
-  // Databases chosen whole whose tables aren't read yet are discovered on Add; a whole server reads it all at once.
+  const discoveryId: string | null = tested?.discovery_id ?? null;
+  const typedNames: string[] = discoveryId == null ? (tested?.databases ?? []) : [];
+  const whole = Object.keys(picks).filter((d) => picks[d] === "all" && !coveredByServer(wholeServer, d));
+  const handPicked = Object.entries(picks).filter(([d, p]) => Array.isArray(p) && p.length > 0 && !coveredByServer(wholeServer, d)) as [string, string[]][];
+  const chosen = (wholeServer.on ? 1 : 0) + whole.length + handPicked.length;
+  const chosenWords = [wholeServer.on ? (wholeServer.filter ? `every database matching "${wholeServer.filter}"` : "the whole server") : "",
+    whole.length ? `${fmtInt(whole.length)} whole ${plural(whole.length, "database")}` : "",
+    handPicked.length ? `tables from ${fmtInt(handPicked.length)} more` : ""].filter(Boolean).join(", ");
+  // Databases chosen whole whose tables aren't read yet are discovered on Add. The whole server is read once, as tested;
+  // its filter is applied to the job's selection, not to the read. A whole server's read lists every database under the
+  // tested pattern, so the databases picked one by one are in it already.
   const finish = async () => {
     setStep(3); setError(null);
     try {
-      const unread = whole.filter((d) => !read[d]);
-      const ids = new Set(Object.values(read));
-      const all = whole.length === databases.length && !tested?.typed;
+      let readServer = serverRead;
+      if (wholeServer.on && !readServer) {
+        const got = await readTables(connection, { whole_server: true, ...(tested?.pattern ? { pattern: tested.pattern } : {}), ...(tested?.azure ?? {}) });
+        if (got.failed.length) { setFailed(() => got.failed); setStep(2); return; }
+        readServer = got.id; setServerRead(got.id);
+      }
+      const unread = readServer ? [] : whole.filter((d) => !read[d]);
+      const ids = new Set([...(readServer ? [readServer] : []), ...Object.values(read)]);
       if (unread.length) {
-        // A whole server is listed again as it was tested (master or Azure, with the same name filter); databases typed by
-        // hand are read by name.
-        const got = await readTables(connection, unread.length === databases.length && !tested?.typed
-          ? { whole_server: true, ...(tested?.pattern ? { pattern: tested.pattern } : {}), ...(tested?.azure ?? {}) }
-          : { databases: unread });
+        // Databases typed by hand are read by name.
+        const got = await readTables(connection, { databases: unread });
         ids.add(got.id);
         if (got.failed.length) {
           // Keep what was read, and say which databases weren't, before anything is added.
@@ -307,10 +348,9 @@ export function DiscoverDialog({ onClose }: { onClose: (pick: DiscoveredPick | n
         }
       }
       const tables = handPicked.map(([d, keys]) => ({ server: connection, database: d, tables: keys }));
-      const source = { discovery_ids: [...ids], whole_server: all, filter: "",
-                       databases: all ? [] : whole.map((d) => ({ server: connection, database: d })), tables };
-      const label = all ? `${connection}, the whole server` : `${fmtInt(whole.length)} whole ${plural(whole.length, "database")}`
-        + (tables.length ? ` and tables from ${fmtInt(tables.length)} more` : "") + ` on ${connection}`;
+      const source = { discovery_ids: [...ids], whole_server: wholeServer.on, filter: wholeServer.on ? wholeServer.filter : "",
+                       databases: whole.map((d) => ({ server: connection, database: d })), tables };
+      const label = wholeServer.on ? `${connection}, ${chosenWords}` : `${chosenWords} on ${connection}`;
       onClose({ source, label });
     } catch (e) { setError(e); setStep(2); }
   };
@@ -326,12 +366,11 @@ export function DiscoverDialog({ onClose }: { onClose: (pick: DiscoveredPick | n
       }}>
       <div className="discover">
         {step === 1 && <Step1 chosen={connection} setChosen={setConnection} tested={tested} setTested={setTested} />}
-        {step >= 2 && <Step2 connection={connection} databases={databases} picks={picks} setPicks={setPicks} read={read} setRead={setRead}
-          failed={failed} setFailed={setFailed} />}
-        {step === 3 && <p className="muted">Reading the tables of {fmtInt(whole.filter((d) => !read[d]).length)} {plural(whole.length, "database")}:
-          a few minutes when the discovery cluster starts cold. The tables are added to the job's page when it ends.</p>}
-        {step === 2 && chosen > 0 && <p className="muted">{fmtInt(whole.length)} whole {plural(whole.length, "database")}
-          {handPicked.length ? `, and tables from ${fmtInt(handPicked.length)} more` : ""} chosen.</p>}
+        {step >= 2 && <Step2 connection={connection} discoveryId={discoveryId} typedNames={typedNames} picks={picks} setPicks={setPicks}
+          wholeServer={wholeServer} setWholeServer={setWholeServer} read={read} setRead={setRead} failed={failed} setFailed={setFailed} />}
+        {step === 3 && <p className="muted">Reading the tables of what was chosen: a few minutes when the discovery cluster starts cold.
+          The tables are added to the job's page when it ends.</p>}
+        {step === 2 && chosen > 0 && <p className="muted">{chosenWords} chosen.</p>}
         <ErrorBox error={error} />
       </div>
     </Modal>
