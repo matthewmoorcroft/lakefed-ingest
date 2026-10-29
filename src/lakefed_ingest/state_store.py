@@ -1172,8 +1172,10 @@ class StateStore:
     def _migrate_once(self, ddl: str, force: bool, lock_timeout_s: int) -> Optional[dict]:
         """One migration attempt, in one transaction (see ``migrate``)."""
         with self._cursor() as cur, cur.connection.transaction():
-            cur.execute(f"set local lock_timeout = '{int(lock_timeout_s)}s'")
+            # Before lock_timeout is set: Postgres applies lock_timeout to this wait too, and a migrator queued
+            # behind another's attempt should wait for that attempt, not give up after lock_timeout_s.
             cur.execute("select pg_advisory_xact_lock(%s::int, %s::int)", SCHEMA_LOCK)
+            cur.execute(f"set local lock_timeout = '{int(lock_timeout_s)}s'")
             before = self._applied_version(cur)
             if before > SCHEMA_VERSION:
                 raise RuntimeError(f"the Lakebase schema is at version {before}, newer than this code's "

@@ -123,6 +123,14 @@ def test_check_launch_sets_every_run_parameter_and_compiles():
     assert set(launcher.RUN_PARAMETERS) | {"task_collection", "work_id"} == ingest_widgets
 
 
+def test_check_launch_ends_without_failing_when_the_schema_migration_waits_for_a_load():
+    code = "\n".join(_code_cells("check_launch.ipynb"))
+    migrate = code.index("store.migrate(")
+    handler = code.index("except ss.MigrationLockTimeout")
+    assert migrate < handler < code.index('"status": "migration_waiting"')
+    assert code.index("dbutils.notebook.exit", handler) > handler
+
+
 def test_no_work_starts_nothing():
     jobs, clock = _Jobs(), _Clock()
     summary = launcher.launch(jobs, 7, launcher.run_requests(_per_collection(c1=[])), sleep=clock.sleep, clock=clock)
