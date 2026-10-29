@@ -1778,17 +1778,28 @@ def collection_lock_key(collection: str) -> str:
     return "lakefed_ingest:" + str(collection)   # state_store.LOCK_NAMESPACE + collection
 
 
+def collection_locks_sql() -> str:
+    """collection_lock_sql for several collections in one statement: a row per lock key with whether this transaction
+    took it (False = a run of that collection is in progress). Param: list of lock keys (collection_lock_key)."""
+    return "select k, pg_try_advisory_xact_lock(hashtextextended(k, 0)) from unnest(%s::text[]) as k"
+
+
 def flip_to_seeding_sql() -> str:
     """Params: detail, control ids."""
     return f"update {SCHEMA}.checkpoint set {_RESEED_SET}, detail = %s where control_id = any(%s)"
 
 
 def mixed_sinks_for_sql() -> str:
-    """Sinks among the given (lower-cased catalog.schema.table) list claimed by a dedicated row and by
-    other rows. Param: list of sink names."""
-    return (f"select lower(sink_catalog || '.' || sink_schema || '.' || sink_table) as sink from {SCHEMA}.control "
-            f"where lower(sink_catalog || '.' || sink_schema || '.' || sink_table) = any(%s) group by 1 "
-            f"having count(*) filter (where client_id is null) > 0 and count(*) > 1")
+    """Sinks among the given ones that a dedicated row and other rows both claim. Each sink is looked up by its
+    lower-cased catalog, schema and table, which is the prefix of control_sink_client_uq, so the check costs one
+    index probe per sink rather than a scan of the control table. Params: the catalogs, the schemas and the tables
+    (three lists, lower case, one entry per sink, in the same order). Returns the sink as catalog.schema.table."""
+    return (f"select s.c || '.' || s.sc || '.' || s.t as sink "
+            f"from unnest(%s::text[], %s::text[], %s::text[]) as s(c, sc, t) "
+            f"cross join lateral (select count(*) as claims, count(*) filter (where r.client_id is null) as dedicated "
+            f"from {SCHEMA}.control r where lower(r.sink_catalog) = s.c and lower(r.sink_schema) = s.sc "
+            f"and lower(r.sink_table) = s.t) m "
+            f"where m.dedicated > 0 and m.claims > 1")
 
 
 def database_source(row: dict) -> str:
@@ -1966,6 +1977,27 @@ def insert_member_if_absent_sql() -> str:
     the new member's id, or nothing when it was skipped. Params: schedule_id, task_collection, offset_minutes."""
     return (f"insert into {SCHEMA}.schedule_member (schedule_id, task_collection, offset_minutes) "
             f"values (%s, %s, %s) on conflict do nothing returning id")
+
+
+def job_database_sinks_chunk_sql() -> str:
+    """job_database_sinks_sql for a chunk of databases at once: one row per (database, sink, client id, group) that
+    their control rows already write, so a resumed write skips the rows a committed transaction wrote. The databases
+    match exactly (control_database_idx), so pass each one both as the source names it and in lower case: the rows
+    an earlier transaction wrote carry one of those. Params: groups (list), databases (list)."""
+    return (f"select lower(src_database) as src, "
+            f"lower(sink_catalog || '.' || sink_schema || '.' || sink_table) as sink, "
+            f"coalesce(client_id, '') as client_id, task_collection from {SCHEMA}.control "
+            f"where task_collection = any(%s) and src_database = any(%s)")
+
+
+def insert_members_if_absent_sql() -> str:
+    """insert_member_if_absent_sql for several groups in one statement: a group the job already has a member for is
+    skipped. It returns the task collection of each member it added. Params: schedule_id, groups (list),
+    offsets (list)."""
+    return (f"insert into {SCHEMA}.schedule_member (schedule_id, task_collection, offset_minutes) "
+            f"select %s, g.task_collection, g.offset_minutes "
+            f"from unnest(%s::text[], %s::int[]) as g(task_collection, offset_minutes) "
+            f"on conflict do nothing returning task_collection")
 
 
 def job_database_sinks_sql() -> str:
@@ -2228,6 +2260,29 @@ def source_databases_after_sql(kind: str) -> str:
     return (f"select r.server, r.src_database, count(*) as tables from ({source_rows_sql(kind)}) r "
             f"where {_MATCHES} and (r.server, lower(r.src_database), r.src_database) > (%s, %s, %s) "
             f"group by r.server, r.src_database order by r.server, lower(r.src_database), r.src_database limit %s")
+
+
+def database_rows_chunk_sql(kind: str) -> str:
+    """database_rows_sql for several databases at once, ordered by database and then table. Params: the source's,
+    then keys: a list of lower case server + chr(31) + database, one per database. Matches case-insensitively, so it
+    reads the whole source; a page of the source listing takes database_rows_exact_sql instead."""
+    return (f"select r.server, r.src_database, r.src_schema, r.src_table, r.line, r.fields "
+            f"from ({source_rows_sql(kind)}) r "
+            f"where lower(r.server) || chr(31) || lower(r.src_database) = any(%s) "
+            f"order by lower(r.server), lower(r.src_database), lower(r.src_schema), lower(r.src_table)")
+
+
+def database_rows_exact_sql() -> str:
+    """The rows of several databases of an upload, each database matched exactly on the server and name the upload
+    stores (what the source listing returns for it), so each one is an index range on table_upload_line_database_idx
+    rather than a pass over the whole upload. Params: the servers (list), the databases (list), in the same order
+    (one server and one database per database), then the upload id."""
+    return (f"select t.server, t.src_database, t.src_schema, t.src_table, t.line, t.fields "
+            f"from unnest(%s::text[], %s::text[]) as k(server, src_database) "
+            f"cross join lateral (select server, src_database, src_schema, src_table, line, fields "
+            f"from {SCHEMA}.table_upload_line where upload_id = %s and status = 'ok' "
+            f"and server = k.server and src_database = k.src_database) t "
+            f"order by lower(t.server), lower(t.src_database), lower(t.src_schema), lower(t.src_table)")
 
 
 def database_rows_sql(kind: str) -> str:

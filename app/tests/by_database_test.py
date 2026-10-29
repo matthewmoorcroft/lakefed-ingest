@@ -2,6 +2,7 @@
 how its databases are paged and planned, the write's transactions and progress, resume by the same request id, and the
 check before any write. The source and Lakebase are fakes; the SQL itself runs against Postgres in large_writes_pg_test.py."""
 import contextlib
+import copy
 import json
 import time
 
@@ -68,6 +69,24 @@ def test_a_unit_keeps_only_the_tables_named_when_it_is_not_a_whole_database():
     (unit,) = list(bd.selection_units(selection, iter(())))
     rows = [{"src_schema": "gen", "src_table": "t1"}, {"src_schema": "gen", "src_table": "t2"}]
     assert not unit.every and [unit.keeps(r) for r in rows] == [True, False]
+
+
+def test_databases_are_packed_into_transactions_up_to_the_limit_and_a_database_is_never_split(monkeypatch):
+    monkeypatch.setattr(bd, "TABLES_PER_TRANSACTION", 10)
+    units = [bd.Unit("sql_a", f"d{i}", True) for i in range(5)]
+    chunks = [[unit.database for unit in chunk] for chunk in bd.transactions_of(list(zip(units, [4, 4, 4, 12, 1])))]
+    assert chunks == [["d0", "d1"], ["d2"], ["d3"], ["d4"]]     # d3 is bigger than the limit: a transaction of its own
+
+
+def test_the_check_reads_databases_in_batches_and_each_database_gets_only_its_own_rows():
+    units = [bd.Unit("sql_a", "Eng_1", True), bd.Unit("sql_a", "eng_2", False, frozenset({"gen.t2"}))]
+    rows = [{"server": "sql_a", "src_database": "eng_1", "src_schema": "gen", "src_table": "t1"},
+            {"server": "SQL_A", "src_database": "ENG_2", "src_schema": "gen", "src_table": "t1"},
+            {"server": "sql_a", "src_database": "eng_2", "src_schema": "gen", "src_table": "t2"}]
+    assert [(unit.database, [row["src_table"] for row in kept]) for unit, kept in bd.rows_by_unit(units, rows)] == [
+        ("Eng_1", ["t1"]), ("eng_2", ["t2"])]
+    many = [bd.Unit("s", f"d{i}", True) for i in range(bd.DATABASES_PER_READ * 2 + 1)]
+    assert [len(batch) for batch in bd.read_batches(many)] == [bd.DATABASES_PER_READ, bd.DATABASES_PER_READ, 1]
 
 
 def test_a_database_is_planned_into_the_group_the_whole_job_gives_it():
@@ -162,6 +181,20 @@ class ByDatabaseTasks(Tasks):
         return super().query(sql, params)
 
 
+def _rows_for_keys(source, keys):
+    """The rows of the databases a chunked read names (queries.database_rows_chunk_sql's keys)."""
+    wanted = set(keys)
+    return [row for (server, database) in source.databases for row in source.rows(server, database)
+            if bd.read_key(server, database) in wanted]
+
+
+def _rows_for_exact(source, servers, databases):
+    """The rows of the databases an exact read names (queries.database_rows_exact_sql's server and database lists)."""
+    wanted = set(zip(servers, databases))
+    return [row for (server, database) in source.databases for row in source.rows(server, database)
+            if (server, database) in wanted]
+
+
 class ByDatabaseCursor(FakeCursor):
     def __init__(self, fake, store, tasks):
         super().__init__(fake)
@@ -196,6 +229,18 @@ class ByDatabaseCursor(FakeCursor):
             if key not in s.members:
                 s.members.add(key)
                 self._rows = [(len(s.members),)]
+        elif sql == q.insert_members_if_absent_sql():
+            self.db.statements.append((sql, params))
+            sid, groups = params[0], params[1]
+            added = [group for group in groups if (sid, group) not in s.members]
+            s.members.update((sid, group) for group in added)
+            self._rows = [(group,) for group in added]
+        elif sql == q.job_database_sinks_chunk_sql():
+            self.db.statements.append((sql, params))
+            groups, databases = params
+            self._rows = [(row["src_database"].lower(), ".".join(row["sink_key"][:3]), row["sink_key"][3],
+                           row["task_collection"]) for row in s.controls
+                          if row["task_collection"] in groups and row["src_database"] in databases]
         elif sql == q.task_progress_json_sql():
             self.db.statements.append((sql, params))
             self.tasks.rows[params[2]].update(progress=json.loads(params[0]), done=params[1])
@@ -240,6 +285,10 @@ def big(monkeypatch):
             return source.keys_after(tuple(params[2:5]), params[1], params[5])
         if sql == q.database_rows_sql("upload"):
             return source.rows(params[1], params[2])
+        if sql == q.database_rows_chunk_sql("upload"):
+            return _rows_for_keys(source, params[1])
+        if sql == q.database_rows_exact_sql():
+            return _rows_for_exact(source, params[0], params[1])
         if sql == q.upload_sql():
             return [{"upload_id": "u1", "columns": COLUMNS}]
         if sql == q.collections_sql():
@@ -263,7 +312,12 @@ def big(monkeypatch):
     @contextlib.contextmanager
     def transaction():
         store.transactions += 1
-        yield ByDatabaseCursor(fake, store, tasks)
+        saved = copy.deepcopy((store.controls, store.sinks, store.members, store.schedules, tasks.rows))
+        try:
+            yield ByDatabaseCursor(fake, store, tasks)
+        except Exception:
+            store.controls, store.sinks, store.members, store.schedules, tasks.rows = saved
+            raise
 
     monkeypatch.setattr(main.db, "query", query)
     monkeypatch.setattr(main.db, "fetch", fetch)
@@ -286,7 +340,7 @@ def _create(client, request_id="big-1", dry_run=False):
                                                     "source": {"upload_id": "u1", "whole_server": True}})
 
 
-def test_a_big_create_is_a_task_that_writes_each_database_in_its_own_transaction(big):
+def test_a_big_create_is_a_task_that_writes_its_databases_in_transactions(big):
     r = _create(big)
     assert r.status_code == 202 and r.json()["task"]["total"] == 150 and big.store.schedules == []
     big.tasks.run()
@@ -295,8 +349,23 @@ def test_a_big_create_is_a_task_that_writes_each_database_in_its_own_transaction
     assert len(big.store.controls) == 150 and big.synced == [7]
     assert big.tasks.rows[1]["progress"] == {"stage": "writing", "databases_total": 30, "databases_written": 30,
                                              "tables_written": 150}
-    assert big.store.transactions == 1 + 30 + 1       # the job, each database, then the result
+    assert big.store.transactions == 1 + 1 + 1       # the job, the 150 tables in one transaction, then the result
     assert {g for _, g in big.store.members} == {row["task_collection"] for row in big.store.controls}
+
+
+def test_a_whole_server_upload_reads_each_database_by_its_exact_names(big, monkeypatch):
+    seen = []
+    read = main.db.query
+
+    def recording(sql, params=()):
+        seen.append(sql)
+        return read(sql, params)
+
+    monkeypatch.setattr(main.db, "query", recording)
+    _create(big)
+    big.tasks.run()
+    assert seen.count(q.database_rows_exact_sql()) == 2        # the check's batch, then the one transaction
+    assert q.database_rows_chunk_sql("upload") not in seen
 
 
 def test_a_dry_run_of_a_big_source_says_it_is_read_by_database_and_not_yet_checked(big):
@@ -306,14 +375,23 @@ def test_a_dry_run_of_a_big_source_says_it_is_read_by_database_and_not_yet_check
     assert summary["tables"] == 150 and big.tasks.rows == {} and big.store.transactions == 0
 
 
-def test_a_database_that_fails_keeps_the_ones_before_it_and_the_same_request_finishes_the_job(big):
+def test_a_transaction_holds_whole_databases_up_to_the_table_limit(big, monkeypatch):
+    monkeypatch.setattr(bd, "TABLES_PER_TRANSACTION", 50)
+    _create(big)
+    big.tasks.run()
+    assert big.get("/api/tasks/1").json()["status"] == "succeeded" and len(big.store.controls) == 150
+    assert big.store.transactions == 1 + 3 + 1       # the job, three transactions of ten databases, the result
+
+
+def test_a_database_that_fails_takes_its_transaction_and_the_same_request_finishes_the_job(big, monkeypatch):
+    monkeypatch.setattr(bd, "TABLES_PER_TRANSACTION", 50)     # ten to a transaction: eng_020 starts the third
     big.store.fail_on = "eng_020"
     _create(big)
     big.tasks.run()
     failed = big.get("/api/tasks/1").json()
     assert failed["status"] == "failed" and failed["error"] == "the source went away"
     assert failed["progress"] == {"stage": "writing", "databases_total": 30, "databases_written": 20, "tables_written": 100}
-    assert len(big.store.controls) == 100 and big.synced == []
+    assert len(big.store.controls) == 100 and big.synced == []    # the third transaction was rolled back
     big.store.fail_on = None
     before = big.store.control_statements
     again = _create(big)
@@ -322,7 +400,7 @@ def test_a_database_that_fails_keeps_the_ones_before_it_and_the_same_request_fin
     done = big.get("/api/tasks/1").json()
     assert done["status"] == "succeeded" and done["job_id"] == 7
     assert len(big.store.controls) == 150 and big.store.schedules == [7] and big.synced == [7]
-    assert big.store.control_statements - before == 10          # eng_020 to eng_029 only: earlier databases skipped
+    assert big.store.control_statements - before == 1           # eng_020 to eng_029 only, in one statement
 
 
 def test_the_same_request_id_after_success_answers_the_task_and_starts_nothing(big):
@@ -342,6 +420,10 @@ def test_a_line_that_cannot_be_taken_stops_the_job_before_anything_is_written(bi
     def query(sql, params=()):
         if sql == q.database_rows_sql("upload"):
             return source.rows(params[1], params[2])
+        if sql == q.database_rows_chunk_sql("upload"):
+            return _rows_for_keys(source, params[1])
+        if sql == q.database_rows_exact_sql():
+            return _rows_for_exact(source, params[0], params[1])
         if sql == q.source_databases_after_sql("upload"):
             return source.keys_after(tuple(params[2:5]), params[1], params[5])
         return original(sql, params)

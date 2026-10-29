@@ -66,10 +66,13 @@ class FakeCursor:
             cols = list(next(iter(CONTROL.values())).keys())
             self.description = [type("D", (), {"name": c})() for c in cols]
             self._rows = [tuple(r[c] for c in cols) for r in rows]
+        elif sql == q.collection_locks_sql():
+            self._rows = [(key, key not in self.db.running) for key in params[0]]
         elif "pg_try_advisory_xact_lock" in sql:
             self._rows = [(params[0] not in self.db.running,)]
         elif sql == q.mixed_sinks_for_sql():
-            self._rows = [(s,) for s in params[0] if s in self.db.mixed]
+            sinks = [f"{c}.{sc}.{t}" for c, sc, t in zip(*params)]
+            self._rows = [(s,) for s in sinks if s in self.db.mixed]
         elif sql == q.split_databases_sql():
             self._rows = [(k, k.split("\x1f")[1], ["c1", "c2"]) for k in params[0] if k in self.db.split]
         elif sql.startswith("insert into lakefed_ingest.control ("):
