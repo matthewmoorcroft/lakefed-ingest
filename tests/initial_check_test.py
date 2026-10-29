@@ -339,3 +339,12 @@ def test_a_failing_close_of_abandoned_runs_does_not_stop_the_check():
     store.close_abandoned_runs = broken_close
     summary = ic.run_check(store, store, ["c1"], _detector({"quiet": 10}), existing_sinks_of=_sinks)
     assert summary["per_collection"][0]["work"] == [] and store.finished[1]["status"] == "completed"
+
+
+def test_a_database_check_stamp_names_the_check_run_that_wrote_it():
+    configs = [_cfg(1, "quiet", "a", "c1")]
+    store = _Store(configs, _recorded(configs, {1: _cp(10)}))
+    stamped_by = []
+    store.stamp_databases = lambda collection, stamps, run_id: stamped_by.append(run_id)
+    ic.run_check(store, store, ["c1"], _detector({"quiet": 10}), existing_sinks_of=_sinks)
+    assert stamped_by == [1]        # the check's own ingest_run row, so database_check.run_id is filled in
