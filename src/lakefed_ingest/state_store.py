@@ -857,7 +857,8 @@ class RollupQueue:
 
     Worker threads call ``add`` as each database's work finishes. A batch is written when it is full or the last
     write is older than ``max_age_s``, so the pages follow a long run; ``flush`` writes what is left at the end.
-    A failed write keeps its databases queued, so the next write (or the run's end) tries them again."""
+    A failed write keeps its databases queued, so the next write (or the run's end) tries them again. The write
+    itself runs outside the lock, so the workers finishing meanwhile are not held up by it."""
 
     def __init__(self, store, task_collection: str, batch_size: int = ROLLUP_CHUNK, max_age_s: float = 5.0,
                  clock: Callable[[], float] = time.monotonic):
@@ -873,21 +874,39 @@ class RollupQueue:
     def add(self, src_databases) -> None:
         with self._lock:
             self._pending.update(str(name or "") for name in src_databases)
-            if self._pending and (len(self._pending) >= self._batch_size
-                                  or self._clock() - self._last_write >= self._max_age_s):
-                self._write_locked()
+            names = self._take_if_due_locked()
+        if names:
+            self._write(names)
 
     def flush(self) -> None:
         with self._lock:
-            self._write_locked()
+            names = self._take_locked()
+        if names:
+            self._write(names)
 
-    def _write_locked(self) -> None:
+    def _take_if_due_locked(self) -> List[str]:
+        if self._pending and (len(self._pending) >= self._batch_size
+                              or self._clock() - self._last_write >= self._max_age_s):
+            return self._take_locked()
+        return []
+
+    def _take_locked(self) -> List[str]:
+        """Empty the pending set and return its names. The clock restarts here, not after the write, so a slow
+        write doesn't make the next add write a batch of one."""
         if not self._pending:
-            return
+            return []
         names = sorted(self._pending)
-        self._store.rewrite_rollups(self._task_collection, names)
         self._pending.clear()
         self._last_write = self._clock()
+        return names
+
+    def _write(self, names: List[str]) -> None:
+        try:
+            self._store.rewrite_rollups(self._task_collection, names)
+        except BaseException:
+            with self._lock:
+                self._pending.update(names)
+            raise
 
 
 def enabled_collections_sql() -> str:

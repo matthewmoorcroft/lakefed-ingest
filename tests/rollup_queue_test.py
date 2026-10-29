@@ -67,6 +67,53 @@ def test_databases_added_from_many_threads_are_each_written_once():
     assert sorted(written) == sorted(names)
 
 
+def test_a_worker_that_adds_while_a_flush_is_writing_is_not_held_up_by_the_write():
+    store = _BlockingStore()
+    queue = ss.RollupQueue(store, "c1", batch_size=200, max_age_s=1e9, clock=_Clock())
+    queue.add(["a"])
+    flusher = threading.Thread(target=queue.flush, daemon=True)
+    adder = threading.Thread(target=queue.add, args=(["b"],), daemon=True)
+    try:
+        flusher.start()
+        assert store.entered.wait(5)
+        adder.start()
+        adder.join(5)
+        assert not adder.is_alive()
+    finally:
+        store.release.set()
+        flusher.join(5)
+    queue.flush()
+    assert store.writes == [("c1", ["a"]), ("c1", ["b"])]
+
+
+def test_names_added_while_a_failing_write_is_in_flight_are_written_with_the_failed_ones():
+    store = _BlockingStore(fail_times=1)
+    queue = ss.RollupQueue(store, "c1", batch_size=200, max_age_s=1e9, clock=_Clock())
+    queue.add(["a"])
+    failures = []
+
+    def flush_and_record_failure():
+        try:
+            queue.flush()
+        except RuntimeError:
+            failures.append(True)
+
+    flusher = threading.Thread(target=flush_and_record_failure, daemon=True)
+    adder = threading.Thread(target=queue.add, args=(["b"],), daemon=True)
+    try:
+        flusher.start()
+        assert store.entered.wait(5)
+        adder.start()
+        adder.join(5)
+        assert not adder.is_alive()
+    finally:
+        store.release.set()
+        flusher.join(5)
+    assert failures == [True] and store.writes == []
+    queue.flush()
+    assert store.writes == [("c1", ["a", "b"])]
+
+
 def test_rewrite_rollups_recomputes_databases_in_chunks_then_the_group_in_one_transaction():
     store, cursor = _recording_store()
     names = [f"db{i:03d}" for i in range(450)]
@@ -140,6 +187,22 @@ class _Store:
             self.fail_times -= 1
             raise RuntimeError("lakebase unreachable")
         self.writes.append((task_collection, list(src_databases)))
+
+
+class _BlockingStore(_Store):
+    """Like _Store, but its first write is in flight until ``release`` is set: ``entered`` is set once it has started."""
+
+    def __init__(self, fail_times=0):
+        super().__init__(fail_times)
+        self.entered, self.release = threading.Event(), threading.Event()
+        self.first_write = True
+
+    def rewrite_rollups(self, task_collection, src_databases):
+        if self.first_write:
+            self.first_write = False
+            self.entered.set()
+            self.release.wait(5)
+        super().rewrite_rollups(task_collection, src_databases)
 
 
 class _Connection:
