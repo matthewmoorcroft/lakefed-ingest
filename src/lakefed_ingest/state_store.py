@@ -132,7 +132,9 @@ def split_sql_statements(ddl: str) -> List[str]:
 #       the check job's 3 and 4, and a database migrated to that 5 must still get 3 and 4.
 #   7 = discovery.src_connection (discovery through a UC connection)
 #   8 = indexes for the app's run history reads (runs by time, recent failures, each table's latest first load)
-SCHEMA_VERSION = 9
+#   9 = the operations app's uploads and selections (table_upload, table_upload_line, job_selection)
+#   12 = app_task.progress (a by-database write's progress). 10 and 11 are not used on this branch.
+SCHEMA_VERSION = 12
 # Advisory lock that serializes migrations (the setup job and ingestion runs of any collection): two
 # int keys, so it can't collide with a collection's one-key lock whatever the collection is named,
 # and a class of its own (not SOURCE_LOCK_CLASS).
