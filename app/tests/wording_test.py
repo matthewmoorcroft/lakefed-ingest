@@ -86,7 +86,8 @@ def test_discover_lists_by_a_name_filter_and_says_which_databases_it_couldnt_rea
     discover = (FRONTEND / "pages" / "Discover.tsx").read_text()
     assert "Databases matching" in discover and "pattern" in discover
     assert "function Unread" in discover and "couldn't be read" in discover
-    assert "function databasesOfCsv" in discover and "take them from a CSV file" in discover
+    assert "databasesOfCsv" not in discover and "CSV file" not in discover
+    assert "Discover is the first choice" in discover and "the fallback" in discover
 
 
 def test_discover_can_list_an_azure_sql_server_through_azure_and_reads_the_whole_server_the_same_way():

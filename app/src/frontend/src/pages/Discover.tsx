@@ -60,28 +60,15 @@ export function TriBox({ pick, label, onClick }: { pick: Pick; label: string; on
 /** A test that failed because the login can't open master, where SQL Server lists its databases. */
 const cantList = (error: unknown) => /FAILED_JDBC\.CONNECTION|Login failed|Cannot open database|HV000/i.test(String((error as Error)?.message ?? error));
 
-/** The database names of a CSV file: its database column (as in a databases file), else its first column. */
-export function databasesOfCsv(text: string): string[] {
-  const lines = text.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
-  if (!lines.length) return [];
-  const head = lines[0].split(",").map((h) => h.trim().replace(/^"|"$/g, "").toLowerCase());
-  const at = head.indexOf("database") >= 0 ? head.indexOf("database") : head.indexOf("src_database");
-  const column = at >= 0 ? at : 0;
-  const rows = at >= 0 || ["server", "name"].includes(head[0]) ? lines.slice(1) : lines;
-  return rows.map((l) => (l.split(",")[column] ?? "").trim().replace(/^"|"$/g, "")).filter(Boolean);
-}
-
-/** The databases typed by hand or taken from a CSV file, for a login that can't list the server's. */
+/** The databases typed by hand, for a login that can't list the server's. */
 function TypedDatabases({ onUse }: { onUse: (names: string[]) => void }) {
   const [text, setText] = useState("");
   const names = [...new Set(text.split(/[\s,;]+/).map((n) => n.trim()).filter(Boolean))];
   return (
     <div className="form-grid">
-      <label className="wide">Its databases<input type="file" accept=".csv,text/csv,text/plain" onChange={async (e) => {
-          const file = e.target.files?.[0]; if (file) setText(databasesOfCsv(await file.text()).join("\n")); }} />
-        <textarea rows={4} value={text} placeholder={"lfc_eng_001\nlfc_eng_002"} onChange={(e) => setText(e.target.value)} />
-        <span className="help">Type them one per line or separated by commas, or choose a CSV file (its database column, as in a
-          databases file, or its first column). Each is read on its own in the next step.</span></label>
+      <label className="wide">Its databases<textarea rows={4} value={text} placeholder={"lfc_eng_001\nlfc_eng_002"}
+          onChange={(e) => setText(e.target.value)} />
+        <span className="help">Type them one per line or separated by commas. Each is read on its own in the next step.</span></label>
       <div className="toolbar"><button disabled={!names.length} onClick={() => onUse(names)}>
         Use {names.length ? `these ${fmtInt(names.length)} ${plural(names.length, "database")}` : "these databases"}</button></div>
     </div>
@@ -158,8 +145,8 @@ function Step1({ chosen, setChosen, tested, setTested }: { chosen: string; setCh
           </div>
           {error != null && <Notice tone="bad">The connection failed its test: {String((error as Error).message ?? error)}
             {cantList(error) && <p>The server's databases are listed from its master database, and this connection's login can't open
-              it, so they can't be listed here. The databases themselves may still be readable through the connection: type them below
-              or take them from a CSV file. Or give the login access to
+              it, so they can't be listed here. The databases themselves may still be readable through the connection: type them below.
+              Or give the login access to
               master (a user there with VIEW ANY DATABASE) and test again. On Azure SQL, Azure can list them instead: see
               Azure SQL below.</p>}</Notice>}
           <details className="advanced">
@@ -365,6 +352,8 @@ export function DiscoverDialog({ onClose }: { onClose: (pick: DiscoveredPick | n
         finish();
       }}>
       <div className="discover">
+        {step === 1 && <p className="muted">Discover is the first choice: it reads the tables through the connection. A CSV upload
+          is the fallback, for a list Discover can't find.</p>}
         {step === 1 && <Step1 chosen={connection} setChosen={setConnection} tested={tested} setTested={setTested} />}
         {step >= 2 && <Step2 connection={connection} discoveryId={discoveryId} typedNames={typedNames} picks={picks} setPicks={setPicks}
           wholeServer={wholeServer} setWholeServer={setWholeServer} read={read} setRead={setRead} failed={failed} setFailed={setFailed} />}

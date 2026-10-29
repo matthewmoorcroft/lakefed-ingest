@@ -181,27 +181,21 @@ export function Tree({ jobId, locked, readOnly }: { jobId: string; locked: Locke
 }
 
 function AddDatabases({ jobId, servers }: { jobId: string; servers: string[] }) {
-  const [how, setHow] = useState<"csv" | "hand">("csv");
-  const [csv, setCsv] = useState("");
-  const [columns, setColumns] = useState({ server: "server", database: "database", enabled: "" });
   const [server, setServer] = useState(servers[0] ?? "");
   const [names, setNames] = useState("");
-  const [fullList, setFullList] = useState(false);
   const [perServer, setPerServer] = useState(4);
   const [preview, setPreview] = useState<Row | null>(null);
   const [checked, setChecked] = useState<Row | null>(null);
   const qc = useQueryClient();
   const body = (dry_run: boolean): Row => ({
-    ...(how === "csv"
-      ? { csv, columns: Object.fromEntries(Object.entries(columns).filter(([, v]) => v.trim())) }
-      : { databases: names.split(/[\n,]+/).map((n) => n.trim()).filter(Boolean).map((database) => ({ server, database })) }),
-    full_list: how === "csv" && fullList, groups_per_server: perServer, dry_run });
+    databases: names.split(/[\n,]+/).map((n) => n.trim()).filter(Boolean).map((database) => ({ server, database })),
+    full_list: false, groups_per_server: perServer, dry_run });
   // The confirm applies exactly the request that was checked; any change to the inputs clears the check.
   const check = useMutation({
     mutationFn: () => { const b = body(false); return api.post<Row>(`/ingestion-jobs/${jobId}/databases`, { ...b, dry_run: true }).then((r) => ({ r, b })); },
     onSuccess: ({ r, b }) => { setPreview(r.summary); setChecked({ ...b, request_id: newRequestId() }); setTask(null); },
   });
-  useEffect(() => { setPreview(null); setChecked(null); }, [how, csv, JSON.stringify(columns), server, names, fullList, perServer]);
+  useEffect(() => { setPreview(null); setChecked(null); }, [server, names, perServer]);
   const [task, setTask] = useState<Row | null>(null);
   // One request id per checked request: applying it again (a retry after a timeout) finds the same task.
   const apply = useMutation({
@@ -211,34 +205,18 @@ function AddDatabases({ jobId, servers }: { jobId: string; servers: string[] }) 
   const note = requestWriteNotice("Adding databases", { pending: apply.isPending && !task, error: apply.error });
   return (
     <div className="add-databases">
-      <div className="toolbar">
-        <label className="checkbox"><input type="radio" checked={how === "csv"} onChange={() => { setHow("csv"); setPreview(null); }} /> By a databases file</label>
-        <label className="checkbox"><input type="radio" checked={how === "hand"} onChange={() => { setHow("hand"); setPreview(null); }} /> By hand</label>
+      <div className="form-grid">
+        <label>Server (a UC connection, or one of the job's servers)
+          <input list="job-servers" value={server} onChange={(e) => setServer(e.target.value)} />
+          <datalist id="job-servers">{servers.map((s) => <option key={s} value={s} />)}</datalist></label>
+        <label className="wide">Database names, one per line<textarea rows={4} value={names} onChange={(e) => setNames(e.target.value)} /></label>
       </div>
-      {how === "csv" ? (
-        <div className="form-grid">
-          <label className="wide">Databases file (CSV, one line per database)
-            <input type="file" accept=".csv,text/csv" onChange={async (e) => { const f = e.target.files?.[0]; if (f) setCsv(await f.text()); setPreview(null); }} />
-            <textarea rows={4} value={csv} placeholder={"server,database\nsql_01,sales_01"} onChange={(e) => { setCsv(e.target.value); setPreview(null); }} /></label>
-          <label>Column for the server<input value={columns.server} onChange={(e) => setColumns({ ...columns, server: e.target.value })} /></label>
-          <label>Column for the database<input value={columns.database} onChange={(e) => setColumns({ ...columns, database: e.target.value })} /></label>
-          <label>Column for enabled (optional)<input value={columns.enabled} placeholder="e.g. isActive" onChange={(e) => setColumns({ ...columns, enabled: e.target.value })} /></label>
-          <label className="checkbox wide"><input type="checkbox" checked={fullList} onChange={(e) => setFullList(e.target.checked)} />
-            The file is the full list: databases of this job that are not in it are disabled, never deleted</label>
-        </div>
-      ) : (
-        <div className="form-grid">
-          <label>Server (a UC connection, or one of the job's servers)
-            <input list="job-servers" value={server} onChange={(e) => setServer(e.target.value)} />
-            <datalist id="job-servers">{servers.map((s) => <option key={s} value={s} />)}</datalist></label>
-          <label className="wide">Database names, one per line<textarea rows={4} value={names} onChange={(e) => setNames(e.target.value)} /></label>
-        </div>
-      )}
       <div className="form-grid">
         <label>Groups per new server<input type="number" min={1} max={64} value={perServer} onChange={(e) => setPerServer(Number(e.target.value) || 1)} />
           <span className="help">A server new to the job gets this many groups; each database joins one by its name.</span></label>
       </div>
-      <p className="help">Each database gets every table of the job, with the job's target names and identity columns filled in.</p>
+      <p className="help">Each database gets every table of the job, with the job's target names and identity columns filled in.
+        To add a database's tables from a file instead, use Import a CSV of tables.</p>
       <div className="toolbar">
         <button className="ghost" disabled={check.isPending} onClick={() => check.mutate()}>Check</button>
         {preview && checked && !preview.applied && <ConfirmButton label={`Add ${fmtInt(preview.new_tables)} ${plural(preview.new_tables, "table")}`}
@@ -509,9 +487,9 @@ export default function JobEdit() {
 
       <Section title="What it ingests" note="Open a server to see its databases, and a database to see its tables. A table's load type is the same in every database: change it and it changes in all of them."
         actions={locked ? <button className="ghost" disabled title={locked}>Add tables ▾</button> : <Menu label="Add tables ▾" buttonClass="ghost" title="Add tables">
-          <button onClick={addTables.open}>Import a CSV of tables<span className="sub">one line per table: where it is; the job says how to ingest it</span></button>
-          <button onClick={() => setAddOpen(true)}>Import a CSV of databases<span className="sub">each database gets every table of the job, or pick them by hand</span></button>
-          <button onClick={addTables.discover}>Discover on a source<span className="sub">a UC connection, tested first; then the whole server, whole databases or single tables</span></button>
+          <button onClick={addTables.discover}>Discover on a source<span className="sub">the first choice: a UC connection, tested first, then the whole server, whole databases or single tables</span></button>
+          <button onClick={addTables.open}>Import a CSV of tables<span className="sub">the fallback, for a list Discover can't find: a UC connection, then one line per table or database</span></button>
+          <button onClick={() => setAddOpen(true)}>Pick databases by hand<span className="sub">each database gets every table of the job</span></button>
         </Menu>}>
         <p className="impact">Changes here apply as soon as you confirm them; Save does not cover them.</p>
         {addTables.dialog}{addTables.result}

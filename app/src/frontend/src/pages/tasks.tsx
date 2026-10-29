@@ -41,7 +41,9 @@ const KINDS: Record<string, string> = { create: "Creating the job", tables: "Add
 export function TaskProgress({ task, onResume }: { task: Row | null; onResume?: () => void }) {
   if (!task) return null;
   const progress: Row | null = task.progress ?? null;
-  if (task.status === "failed" && progress && !task.result) {
+  // A database-only file's size is unknown until its databases are discovered, so its task has no database count.
+  const byDatabase = progress?.databases_total != null;
+  if (task.status === "failed" && progress && byDatabase && !task.result) {
     const total = Number(progress.databases_total);
     return (
       <Notice tone="bad">Stopped with {fmtInt(progress.databases_written)} of {fmtInt(total)} {plural(total, "database")} written
@@ -55,8 +57,19 @@ export function TaskProgress({ task, onResume }: { task: Row | null; onResume?: 
       {task.result && onResume && <div className="toolbar"><button onClick={onResume}>Finish the write</button>
         <span className="sub">Sending the same write again syncs its Databricks jobs and writes nothing twice.</span></div>}</Notice>
   );
-  if (task.status === "succeeded") return <Notice tone="ok">Written: {fmtInt(task.total)} {plural(task.total, "table")}.</Notice>;
-  if (progress) {
+  if (task.status === "succeeded") {
+    const tables = task.result?.summary?.tables ?? task.total;
+    return <Notice tone="ok">Written: {fmtInt(tables)} {plural(tables, "table")}.</Notice>;
+  }
+  if (progress?.stage === "discovering") {
+    return (
+      <Notice>
+        {KINDS[task.kind] ?? "Writing"}: Discovering the tables of the databases
+        <span className="sub">Each database is read through the connection by name. Leaving this page doesn't stop it.</span>
+      </Notice>
+    );
+  }
+  if (progress && byDatabase) {
     const total = Number(progress.databases_total);
     return (
       <Notice>
@@ -68,11 +81,13 @@ export function TaskProgress({ task, onResume }: { task: Row | null; onResume?: 
       </Notice>
     );
   }
+  const total = Number(task.total);
   return (
     <Notice>
-      {KINDS[task.kind] ?? "Writing"}: {Number(task.done) > 0 ? <>writing <b>{fmtInt(task.done)}</b> of {fmtInt(task.total)} tables</>
+      {KINDS[task.kind] ?? "Writing"}: {Number(task.done) > 0 || progress?.stage === "writing"
+        ? <>writing <b>{fmtInt(task.done)}</b>{total > 0 ? <> of {fmtInt(total)}</> : null} {plural(total > 0 ? total : Number(task.done), "table")}</>
         : <>checking {fmtInt(task.total)} {plural(task.total, "table")}</>}
-      <progress className="task-progress" max={Number(task.total) || 1} value={Number(task.done) || 0} />
+      {total > 0 && <progress className="task-progress" max={total} value={Number(task.done) || 0} />}
       <span className="sub">In one transaction: all of it is written, or none of it. Leaving this page doesn't stop it.</span>
     </Notice>
   );
