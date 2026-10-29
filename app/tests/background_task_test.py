@@ -89,6 +89,8 @@ class Tasks:
             self.rows[task_id] = dict(id=task_id, kind=kind, request_id=request_id, job_id=job_id, status="running",
                                       done=0, total=total, result=None, error=None, created_by=user)
             return [{"id": task_id, "made": True}]
+        if sql == q.task_of_request_sql():
+            return [{"id": row["id"]} for row in self.rows.values() if row["request_id"] == params[0]]
         if sql == q.task_sql():
             return [dict(self.rows[params[0]])] if params[0] in self.rows else []
         return []
@@ -280,3 +282,64 @@ def test_the_job_page_reads_its_tasks_after_ending_stale_ones(job_client):
     assert job_client.get("/api/ingestion-jobs/7/tasks").status_code == 200
     assert [p for sql, p in job_client.tasks.executed if sql == q.stale_tasks_sql()] == [
         (main.TASK_ROLLED_BACK, main.TASK_UNSYNCED, main.TASK_STALE_S, None, 7)]
+
+
+# ---- uploads and selections (their SQL runs against Postgres in large_writes_pg_test.py) -------------------------
+
+def test_an_upload_keeps_each_line_with_its_server_and_why_it_cant_be_taken():
+    import new_job as nj
+    read = nj.read_upload("src_connection,src_host,src_port,src_database,src_schema,src_table,load_type\n"
+                          "SQL_A,,,db1,dbo,t1,cursor\n,h.example.com,1500,db1,dbo,t2,\n,,,db1,dbo,t3,\n\n"
+                          "sql_a,,,db2,dbo,,\n")
+    assert read["errors"] == [] and [line["line"] for line in read["lines"]] == [2, 3, 4, 5]
+    assert [(line["server"], line["load_type"], line["status"]) for line in read["lines"]] == [
+        ("sql_a", "cursor", "ok"), ("h.example.com:1500", None, "ok"), ("", None, "invalid"), ("sql_a", None, "invalid")]
+    assert read["lines"][3]["errors"] == ["src_table is required"]
+    assert nj.read_upload("database,table\nx,y\n")["errors"][0] == "unknown column database"
+    assert "more than 2 lines" in nj.read_upload(_csv(3), max_lines=2)["errors"][0]
+
+
+def test_a_selection_names_one_source_and_something_to_take():
+    with pytest.raises(ValueError):
+        main.Selection(upload_id="u1", discovery_id="d1", whole_server=True)
+    with pytest.raises(ValueError):
+        main.Selection(upload_id="u1")
+    assert main.Selection(discovery_id="d1", discovery_ids=["d2", "d1"], whole_server=True).source() == (
+        "discovery", ["d1", "d2"], "d1,d2")
+    assert q.selection_key("SQL_A", "Eng_1", "Gen.T1") == "sql_a\x1feng_1\x1fgen.t1"
+    with pytest.raises(ValueError):
+        main.NewJobRequest(name="x", csv="a", source={"upload_id": "u", "whole_server": True})
+
+
+def test_a_plan_of_an_upload_is_numbered_as_the_file_is():
+    plan = {"lines": [{"line": 2}, {"line": 3}]}
+    assert [line["line"] for line in main._file_lines(plan, {"kind": "upload", "lines": [7, 12]})["lines"]] == [7, 12]
+
+
+def test_create_by_reference_plans_the_lines_read_back_from_lakebase(client, monkeypatch):
+    asked = []
+
+    def query(sql, params=()):
+        if sql == q.upload_sql():
+            return [{"upload_id": "u1", "columns": ["src_connection", "src_database", "src_schema", "src_table", "select_list",
+                                                    "primary_key"]}]
+        if sql == q.selected_rows_sql("upload"):
+            asked.append(params)
+            return [{"server": "sql_a", "src_database": "eng_001", "src_schema": "gen", "src_table": f"t{i}", "line": 10 + i,
+                     "fields": {"src_connection": "sql_a", "src_database": "eng_001", "src_schema": "gen",
+                                "src_table": f"t{i}", "select_list": "id, a", "primary_key": "id"}} for i in range(3)]
+        return client.tasks.query(sql, params)
+
+    monkeypatch.setattr(main.db, "query", query)
+    source = {"upload_id": "u1", "databases": [{"server": "SQL_A", "database": "eng_001"}],
+              "tables": [{"server": "sql_a", "database": "eng_002", "tables": ["gen.t9"]}]}
+    r = client.post("/api/ingestion-jobs", json={"name": "Ref", "settings": FAN_IN, "source": source})
+    assert r.status_code == 200 and r.json()["summary"]["tables"] == 3 and client.db.statements == []
+    assert r.json()["summary"]["invalid"] == []
+    assert asked[0] == ("u1", False, "", ["sql_a\x1feng_001"], ["sql_a\x1feng_002\x1fgen.t9"])
+    r = client.post("/api/ingestion-jobs", json={"name": "Ref", "settings": FAN_IN, "source": source, "dry_run": False})
+    assert r.json()["created"] is True
+    kept = client.db.of("insert into lakefed_ingest.job_selection")
+    assert len(kept) == 1        # one statement: two parts of 9 values each
+    assert kept[0][:9] == (7, "database", "SQL_A", "eng_001", None, None, "upload", "u1", "op@example.com")
+    assert kept[0][9:13] == (7, "tables", "sql_a", "eng_002")

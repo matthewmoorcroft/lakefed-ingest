@@ -346,10 +346,35 @@ at once, and a thread in the app writes the tables in one transaction, 1,000 to 
   timeout) finds the same task instead of writing twice;
 - `status` (`running`, `succeeded` or `failed`), `done` of `total` tables, `result` (what the request would have
   answered), `error`;
-- `created_at`, `heartbeat_at` (moved after every statement), `finished_at`.
+- `created_at`, `heartbeat_at` (moved every 2 seconds while the thread runs), `finished_at`.
 
-A running task whose heartbeat stopped (the app restarted) reads as failed: its transaction was rolled back with
-the app, so nothing of it was written and it can be sent again.
+The write's last statement, in its own transaction, sets `result`, so the result commits with the tables or not at
+all. A running task whose heartbeat stopped for 2 minutes (the app restarted) is ended when it is next read: with
+no `result` it failed and its transaction was rolled back with the app, so nothing of it was written and it can be
+sent again; with a `result` its tables were written and only the sync of the job's Databricks jobs was missed.
+
+## `table_upload` and `table_upload_line`: CSV files of tables
+
+Written by the operations app (schema version 9). New ingestion job and Add tables post a CSV of tables once
+(`POST /api/uploads`); it is kept here, so the pages show its servers and databases and page its tables from
+Lakebase, and Create names the upload and what of it to take instead of sending the file again.
+- `table_upload`: one row per file: `upload_id`, `file_name`, `uploaded_by`, `uploaded_at`, `columns` (its header),
+  `lines`, `tables` (lines that can be taken) and `invalid`.
+- `table_upload_line`: one row per line, keyed by (`upload_id`, `line`, the file's line number): `server` (its UC
+  connection, or host and port), `src_database`, `src_schema`, `src_table`, `load_type` (the file's own, if any),
+  `fields` (the line as read, `{column: value}`), `status` (`ok`, or `invalid` when it can't name a table on a
+  server) and `errors`. Indexed by (`upload_id`, `server`, `src_database`) for the database view.
+
+Uploads are kept: the app has no DELETE privilege. Prune old ones by `uploaded_at` as the database's owner.
+
+## `job_selection`: what an ingestion job was made from
+
+Written by the operations app (schema version 9), in the transaction that writes the job's tables, when they were
+chosen from an upload or a discovery. One row per part: `job_id`, `scope` (`server`: every database of the server
+matching `filter`; `database`: a whole database; `tables`: the `tables` named, as schema.table), `server`,
+`src_database`, `source_kind` (`discovery` or `upload`) and `source_id`, `created_by`, `created_at`. A later
+re-discovery reads it: a whole server takes its new databases, a whole database its new tables, chosen tables
+nothing more. Tables given as CSV lines in the request body record nothing here.
 
 Telemetry tables grow with every run. To keep long-term history cheaply, snapshot them to Delta
 (see [monitoring.md](monitoring.md)) and prune old rows from Lakebase.

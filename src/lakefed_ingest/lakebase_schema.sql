@@ -543,3 +543,51 @@ create table if not exists lakefed_ingest.app_task (
 );
 create unique index if not exists app_task_request_uq on lakefed_ingest.app_task (request_id);
 create index if not exists app_task_job_idx on lakefed_ingest.app_task (job_id, created_at);
+
+-- A CSV of tables uploaded to the operations app for New ingestion job or Add tables: the file is posted once and
+-- kept here, one row per line, so the pages show its servers and databases from Lakebase and page its tables, and
+-- Create names the upload and what of it to take instead of sending the file again. A line's own problems (no
+-- database, schema or table, no connection or host) are found on upload; the job's settings are checked on Create.
+create table if not exists lakefed_ingest.table_upload (
+    upload_id     text        primary key,
+    file_name     text,
+    uploaded_by   text,
+    uploaded_at   timestamptz not null default now(),
+    columns       text[]      not null,                    -- the file's header
+    lines         int         not null default 0,
+    tables        int         not null default 0,          -- lines that can be taken (status ok)
+    invalid       int         not null default 0
+);
+create table if not exists lakefed_ingest.table_upload_line (
+    upload_id     text        not null,
+    line          int         not null,                    -- the file's line number (the header is line 1)
+    server        text,                                    -- its UC connection, or host:port
+    src_database  text,
+    src_schema    text,
+    src_table     text,
+    load_type     text,                                    -- the file's own, if it gives one
+    fields        jsonb       not null,                    -- the line as read: {column: value}
+    status        text        not null,                    -- ok or invalid
+    errors        text[],
+    constraint table_upload_line_pk primary key (upload_id, line)
+);
+create index if not exists table_upload_line_database_idx
+    on lakefed_ingest.table_upload_line (upload_id, server, src_database);
+
+-- What an ingestion job was made from, part by part, as chosen in New or Add tables: a whole server (with the database
+-- filter it was chosen under), a whole database, or some of a database's tables. A later re-discovery reads it: a whole
+-- server takes its new databases, a whole database its new tables, chosen tables nothing more.
+create table if not exists lakefed_ingest.job_selection (
+    id            bigserial   primary key,
+    job_id        bigint      not null,                    -- schedule.id
+    scope         text        not null,                    -- server, database or tables
+    server        text        not null,
+    src_database  text,                                    -- null for a whole server
+    tables        text[],                                  -- schema.table, for scope tables
+    filter        text,                                    -- the database filter a whole server was chosen under
+    source_kind   text        not null,                    -- discovery or upload
+    source_id     text,
+    created_by    text,
+    created_at    timestamptz not null default now()
+);
+create index if not exists job_selection_job_idx on lakefed_ingest.job_selection (job_id);

@@ -45,7 +45,7 @@ STATIC = Path(__file__).parent / "static"
 # The routes that take a CSV of tables, and the most a request to one may carry: a whole server of 120,000 lines
 # (new_job.MAX_LINES) of long select lists fits within it, and a larger upload is refused before it is read, not after.
 MAX_UPLOAD_BYTES = int(os.environ.get("MAX_UPLOAD_BYTES", str(64 * 1024 * 1024)))
-UPLOAD_ROUTES = re.compile(r"^/api/(import|ingestion-jobs|ingestion-jobs/\d+/(tables|databases))/?$")
+UPLOAD_ROUTES = re.compile(r"^/api/(import|uploads|ingestion-jobs|ingestion-jobs/\d+/(tables|databases))/?$")
 
 
 class UploadLimit:
@@ -413,6 +413,15 @@ def _in_background(kind: str, request_id: Optional[str], job_id: Optional[int], 
     return JSONResponse(status_code=202, content={"task": _task(made["id"]), "created": False, "applied": False})
 
 
+def _made_already(body) -> Optional[JSONResponse]:
+    """The answer to a write sent again with the request id of one that made a task: that task, before anything is
+    planned again (the first write's own tables would now make the plan refuse it)."""
+    if body.dry_run or not body.request_id:
+        return None
+    made = db.query(q.task_of_request_sql(), (body.request_id,))
+    return JSONResponse(status_code=202, content={"task": _task(made[0]["id"]), "created": False, "applied": False}) if made else None
+
+
 def _write_now_or_later(kind, request_id, job_id, total, user, write, after):
     """Write in the request when it is small (as before tasks, no task), else in the background (_in_background)."""
     if total <= BACKGROUND_ROWS:
@@ -432,6 +441,178 @@ def job_tasks(job_id: int):
     """A job's background writes of the last day, newest first, so its page shows one still running."""
     db.execute(q.stale_tasks_sql(), (TASK_ROLLED_BACK, TASK_UNSYNCED, TASK_STALE_S, None, int(job_id)))
     return db.query(q.job_tasks_sql(), (int(job_id),))
+
+
+# ---- uploads, the sources' top level and their pages, and selections by reference -----------------------------------
+# A CSV is posted once (POST /api/uploads) and kept in Lakebase; a discovery's tables are there already. New and Add
+# tables show a source's servers and databases and page a database's tables from there, and Create, Add tables and
+# their previews name what to take (a Selection), which the server reads back from Lakebase and plans as it would the
+# same lines sent in the body.
+
+class UploadRequest(BaseModel):
+    csv: str
+    file_name: Optional[str] = Field(None, max_length=255)
+
+
+@app.post("/api/uploads")
+def upload_tables(body: UploadRequest, request: Request):
+    """Keep a CSV of tables in Lakebase, one row per line, written q.CONTROL_BATCH lines to a statement: its header
+    problems refuse it (422); a line that can't name a table on a server is kept as invalid, with why."""
+    read = nj.read_upload(body.csv)
+    if read["errors"]:
+        raise HTTPException(422, {"errors": read["errors"]})
+    upload_id, lines = uuid.uuid4().hex, read["lines"]
+    ok = sum(line["status"] == "ok" for line in lines)
+    with _write() as cur:
+        cur.execute(q.insert_upload_sql(), (upload_id, body.file_name, _user(request) or None, read["columns"],
+                                            len(lines), ok, len(lines) - ok))
+        for at in range(0, len(lines), q.CONTROL_BATCH):
+            chunk = lines[at:at + q.CONTROL_BATCH]
+            cur.execute(q.insert_upload_lines_sql(len(chunk)), tuple(
+                v for line in chunk for v in (upload_id, line["line"], line["server"], line["src_database"],
+                                              line["src_schema"], line["src_table"], line["load_type"],
+                                              json.dumps(line["fields"]), line["status"], line["errors"])))
+    invalid = [{"line": line["line"], "table": ".".join(line[k] or "" for k in ("src_database", "src_schema", "src_table")),
+                "errors": line["errors"]} for line in lines if line["status"] != "ok"][:20]
+    return {"upload_id": upload_id, "file_name": body.file_name, "columns": read["columns"], "lines": len(lines),
+            "tables": ok, "invalid": len(lines) - ok, "invalid_lines": invalid}
+
+
+SOURCE_KINDS = ("upload", "discovery")
+
+
+def _source_param(kind: str, source_id: str):
+    """The parameter queries.source_rows_sql takes for a source: an upload's id (404 when there is none), or the list
+    of discovery ids (comma-separated in a path)."""
+    if kind == "upload":
+        if not db.query(q.upload_sql(), (source_id,)):
+            raise HTTPException(404, f"upload {source_id} not found")
+        return source_id
+    if kind == "discovery":
+        return [i.strip() for i in source_id.split(",") if i.strip()]
+    raise HTTPException(404, f"no source kind {kind}: {' or '.join(SOURCE_KINDS)}")
+
+
+@app.get("/api/sources/{kind}/{source_id}")
+def source_overview(kind: str, source_id: str, filter: str = "", offset: int = 0, limit: int = 100):
+    """The top level of an upload or a discovery: its servers (databases, tables, tables by load type), its totals,
+    and one page of its databases matching the filter, never its tables."""
+    param = _source_param(kind, source_id)
+    limit, offset = max(1, min(int(limit), 500)), max(0, int(offset))
+    every = db.query(q.source_servers_sql(kind), (param, ""))
+    matching = db.query(q.source_servers_sql(kind), (param, filter)) if filter else every
+    out = {"kind": kind, "source_id": source_id, "filter": filter, "offset": offset, "limit": limit,
+           "servers": matching,
+           "totals": {"servers": len(every), "databases": sum(s["databases"] for s in every),
+                      "tables": sum(s["tables"] for s in every)},
+           "matched": {"databases": sum(s["databases"] for s in matching), "tables": sum(s["tables"] for s in matching)},
+           "databases": db.query(q.source_databases_sql(kind), (param, filter, limit, offset))}
+    if kind == "upload":
+        out["upload"] = db.query(q.upload_sql(), (source_id,))[0]
+        out["invalid_lines"] = db.query(q.upload_invalid_sql(), (source_id, 20))
+    return out
+
+
+@app.get("/api/sources/{kind}/{source_id}/tables")
+def source_tables(kind: str, source_id: str, server: str, database: str, search: str = "", offset: int = 0,
+                  limit: int = 50):
+    """One page of a database's tables in an upload or a discovery, those matching the search."""
+    param = _source_param(kind, source_id)
+    limit, offset = max(1, min(int(limit), 500)), max(0, int(offset))
+    rows = db.query(q.source_tables_sql(kind), (param, server, database, search, limit, offset))
+    return {"tables": [{k: v for k, v in r.items() if k != "total"} for r in rows],
+            "total": rows[0]["total"] if rows else 0, "offset": offset, "limit": limit}
+
+
+class SelectedDatabase(BaseModel):
+    server: str
+    database: str
+
+
+class SelectedTables(SelectedDatabase):
+    tables: List[str] = Field(min_length=1)     # schema.table
+
+
+class Selection(BaseModel):
+    """What to take from an upload or from discoveries: every database of the source matching the filter
+    (whole_server), whole databases, and some tables of others."""
+    upload_id: Optional[str] = None
+    discovery_id: Optional[str] = None
+    discovery_ids: List[str] = []
+    whole_server: bool = False
+    filter: str = ""
+    databases: List[SelectedDatabase] = []
+    tables: List[SelectedTables] = []
+
+    @model_validator(mode="after")
+    def _one_source(self):
+        if bool(self.upload_id) == bool(self.discovery_id or self.discovery_ids):
+            raise ValueError("name an upload_id or a discovery_id, not both")
+        if not (self.whole_server or self.databases or self.tables):
+            raise ValueError("choose the whole server, databases or tables")
+        return self
+
+    def source(self):
+        """(kind, the parameter source_rows_sql takes, the id as job_selection keeps it)."""
+        if self.upload_id:
+            return "upload", self.upload_id, self.upload_id
+        ids = list(dict.fromkeys(([self.discovery_id] if self.discovery_id else []) + self.discovery_ids))
+        return "discovery", ids, ",".join(ids)
+
+
+def _selected(selection: Selection) -> dict:
+    """What a selection takes, read back from Lakebase: {"text": the CSV a plan reads, "lines": each of its lines'
+    line number in the uploaded file (or None), "parts": the job_selection rows to keep with the job, "kind",
+    "source_id"}. 422 when it takes no tables."""
+    kind, param, source_id = selection.source()
+    if kind == "upload":
+        upload = db.query(q.upload_sql(), (param,))
+        if not upload:
+            raise HTTPException(404, f"upload {param} not found")
+        columns = list(upload[0]["columns"])
+    else:
+        columns = list(nj.DISCOVERY_COLUMNS)
+    database_keys = [q.selection_key(d.server, d.database) for d in selection.databases]
+    table_keys = [q.selection_key(t.server, t.database, name) for t in selection.tables for name in t.tables]
+    rows = db.query(q.selected_rows_sql(kind), (param, selection.whole_server, selection.filter, database_keys, table_keys))
+    if not rows:
+        raise HTTPException(422, {"errors": ["the selection takes no tables"]})
+    whole = ([s["server"] for s in db.query(q.source_servers_sql(kind), (param, selection.filter))]
+             if selection.whole_server else [])
+    covered = lambda server, database: (server.lower() in {w.lower() for w in whole}
+                                        and selection.filter.lower() in database.lower())
+    parts = ([("server", server, None, None, selection.filter or None) for server in whole]
+             + [("database", d.server, d.database, None, None) for d in selection.databases if not covered(d.server, d.database)]
+             + [("tables", t.server, t.database, list(t.tables), None) for t in selection.tables
+                if not covered(t.server, t.database)])
+    return {"text": nj.csv_of(columns, [r["fields"] for r in rows]),
+            "lines": [r["line"] if kind == "upload" else None for r in rows],
+            "parts": parts, "kind": kind, "source_id": source_id}
+
+
+def _file_lines(plan: dict, selected: Optional[dict]) -> dict:
+    """A plan of an upload's selection, its lines numbered as in the uploaded file."""
+    if selected and selected["kind"] == "upload":
+        for line in plan["lines"]:
+            line["line"] = selected["lines"][line["line"] - 2]
+    return plan
+
+
+def _keep_selection(cur, job_id: int, selected: Optional[dict], user: str) -> None:
+    """In the job's transaction: what it was made from (job_selection), for a later re-discovery to follow."""
+    parts = (selected or {}).get("parts") or []
+    for at in range(0, len(parts), q.CONTROL_BATCH):
+        chunk = parts[at:at + q.CONTROL_BATCH]
+        cur.execute(q.insert_job_selection_sql(len(chunk)), tuple(
+            v for scope, server, database, tables, filter_ in chunk
+            for v in (int(job_id), scope, server, database, tables, filter_, selected["kind"], selected["source_id"],
+                      user or None)))
+
+
+@app.get("/api/ingestion-jobs/{job_id}/selection")
+def job_selection(job_id: int):
+    """What a job was made from, part by part: whole servers, whole databases, chosen tables."""
+    return db.query(q.job_selection_sql(), (int(job_id),))
 
 
 # Table states change at run cadence, so the one per-database scan they come from is shared for longer
@@ -1321,6 +1502,8 @@ def add_job_databases(job_id: int, body: JobDatabasesRequest, request: Request):
     to server, database and enabled) or a list picked by hand (job_settings.plan_databases). Applying is one
     transaction under every group's run lock: new tables inserted (a taken target is skipped), enabled flags
     set, new groups added to the job; then the job's wrapper jobs are synced."""
+    if (made := _made_already(body)) is not None:
+        return made
     if body.csv is not None:
         entries, errors = js.read_databases(body.csv, body.columns)
     else:
@@ -1386,8 +1569,26 @@ def add_job_databases(job_id: int, body: JobDatabasesRequest, request: Request):
     return _write_now_or_later("databases", body.request_id, job_id, len(plan["new"]), user, write, after)
 
 
-class JobTablesRequest(BaseModel):
-    csv: str
+class _TablesFrom(BaseModel):
+    """Tables given as CSV lines in the body (a small file, as before uploads), or by reference (source)."""
+    csv: Optional[str] = None
+    source: Optional[Selection] = None
+
+    @model_validator(mode="after")
+    def _csv_or_source(self):
+        if (self.csv is None) == (self.source is None):
+            raise ValueError("give the tables as csv or as a source, not both")
+        return self
+
+    def text(self):
+        """(the CSV a plan reads, the selection it came from or None)."""
+        if self.source is None:
+            return self.csv, None
+        selected = _selected(self.source)
+        return selected["text"], selected
+
+
+class JobTablesRequest(_TablesFrom):
     load_type: str = "ct"
     groups_per_server: int = nj.DEFAULT_GROUPS_PER_SERVER
     dry_run: bool = True
@@ -1399,12 +1600,17 @@ def add_job_tables(job_id: int, body: JobTablesRequest, request: Request):
     """Preview (dry_run, the default) or add a CSV of tables to a job, as Add tables does in the Edit view: each line
     says where a table is, and the table takes the job's settings (new_job.plan_for_job). A database the job has keeps
     its group, a new one joins its server's groups, a new server gets new groups. Applying is one transaction under
-    the job's lock and its groups' run locks; tables the job already writes are left; then new groups are synced."""
+    the job's lock and its groups' run locks; tables the job already writes are left; then new groups are synced. The
+    tables come as CSV lines (csv) or by reference to an upload or discovery (source), which is kept with the job."""
+    if (made := _made_already(body)) is not None:
+        return made
     job = _load_schedule(job_id)[0]
     taken = {r["task_collection"] for r in db.query(q.collections_sql())}
+    text, selected = body.text()
 
     def planned(rows):
-        plan = nj.plan_for_job(job["name"], body.csv, body.load_type, rows, body.groups_per_server, taken)
+        plan = _file_lines(nj.plan_for_job(job["name"], text, body.load_type, rows, body.groups_per_server, taken),
+                           selected)
         if plan["errors"]:
             raise HTTPException(422, {"errors": plan["errors"]})
         return plan
@@ -1435,6 +1641,7 @@ def add_job_tables(job_id: int, body: JobTablesRequest, request: Request):
                                    int(job["cadence_minutes"]), bool(job.get("stagger")), sch.start_minute(job))
                 for g in plan["new_groups"]:
                     cur.execute(q.insert_member_sql(), (job_id, g, offs[g]))
+            _keep_selection(cur, job_id, selected, user)
             _touch(cur, user, [job_id])
             result = {"summary": summary, "applied": True}
             _task_written(cur, task_id, result, job_id, len(rows))
@@ -2376,9 +2583,8 @@ class NewJobRun(BaseModel):
     stagger: bool = True
 
 
-class NewJobRequest(BaseModel):
+class NewJobRequest(_TablesFrom):
     name: str = Field(min_length=1, max_length=80)
-    csv: str
     settings: dict = {}
     groups_per_server: int = nj.DEFAULT_GROUPS_PER_SERVER
     run: NewJobRun = NewJobRun()
@@ -2392,15 +2598,19 @@ def create_ingestion_job(body: NewJobRequest, request: Request):
     """Preview (dry_run, the default) or create an ingestion job in one go, as New ingestion job does: its tables from
     a CSV of where each one is (new_job.plan), written with the job's settings into groups per server, and the job
     (a schedule with those groups). Creating is one transaction: the schedule, every table (all or nothing: a target
-    another table writes refuses the lot), the groups' members; then its Databricks jobs are synced."""
+    another table writes refuses the lot), the groups' members; then its Databricks jobs are synced. The tables come
+    as CSV lines (csv) or by reference to an upload or discovery (source), which is kept with the job."""
+    if (made := _made_already(body)) is not None:
+        return made
     import psycopg
     name = body.name.strip()
     run = body.run.model_copy()
     run.stagger = run.stagger and run.job_variant != sch.CHECK_VARIANT
     taken = {r["task_collection"] for r in db.query(q.collections_sql())}
+    text, selected = body.text()
 
     def planned():
-        plan = nj.plan(name, body.csv, body.settings, body.groups_per_server, taken)
+        plan = _file_lines(nj.plan(name, text, body.settings, body.groups_per_server, taken), selected)
         errors = list(plan["errors"])
         if not errors and plan["groups"]:
             schedule = {**run.model_dump(), "name": name, "members": plan["groups"],
@@ -2441,6 +2651,7 @@ def create_ingestion_job(body: NewJobRequest, request: Request):
                 _log_lines(cur, [(user, "schedule_create", None, group, "schedule", None,
                                   f"{name} ({sch.describe(run.cadence_minutes, offs[group], timezone_)})", None, batch)
                                  for group in plan["groups"]])
+                _keep_selection(cur, sid, selected, user)
                 _touch(cur, user, [sid])
                 result = {"id": sid, "summary": summary, "settings": plan["settings"], "created": True}
                 _task_written(cur, task_id, result, sid, len(rows))

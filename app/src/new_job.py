@@ -221,3 +221,61 @@ def summary(planned: dict) -> dict:
             "tables": sum(line["status"] != "in_job" for line in planned["lines"]), "groups": planned["groups"],
             "in_job": sum(line["status"] == "in_job" for line in planned["lines"]), "new_groups": planned.get("new_groups", []),
             "invalid": [{k: line[k] for k in ("line", "table", "errors")} for line in planned["lines"] if line["status"] == "invalid"]}
+
+
+# ---- a CSV kept in Lakebase (an upload), and the CSV a plan reads from what a selection takes ---------------------
+
+UPLOAD_COLUMNS = ci.CSV_COLUMNS + ("load_type",)
+
+
+def read_upload(text: str, max_lines: int = MAX_LINES) -> dict:
+    """An uploaded CSV, read line by line for table_upload_line: {"errors": the file's own problems (nothing is kept
+    while there are any), "columns": its header, "lines": [{line, server, src_database, src_schema, src_table,
+    load_type, fields, status, errors}]}. A line's status is invalid when it can't name a table on a server; the job's
+    settings are checked later, when Create or Add tables plans what it takes."""
+    reader = csv.DictReader(io.StringIO(text.lstrip("﻿")))
+    header = [h.strip() for h in (reader.fieldnames or [])]
+    reader.fieldnames = header
+    errors = ci._header_errors([h for h in header if h != "load_type"]) if header else ["the file is empty"]
+    for need in ("src_database", "src_schema", "src_table"):
+        if header and need not in header:
+            errors.append(f"the file has no {need} column")
+    if header and "src_connection" not in header and "src_host" not in header:
+        errors.append("the file has no src_connection or src_host column")
+    if errors:
+        return {"errors": errors, "columns": header, "lines": []}
+    out = []
+    for number, raw in enumerate((r for r in reader if any(str(v or "").strip() for v in r.values())), start=2):
+        if len(out) >= max_lines:
+            return {"errors": [f"more than {max_lines:,} lines: at most {max_lines:,} in one file"], "columns": header,
+                    "lines": []}
+        problems = ["this line has more cells than the header has columns"] if None in raw else []
+        fields = {k: str(v or "").strip() for k, v in raw.items() if k is not None}
+        problems += [f"{k} is required" for k in ("src_database", "src_schema", "src_table") if not fields.get(k)]
+        connection, host = fields.get("src_connection") or None, fields.get("src_host") or None
+        if not connection and not host:
+            problems.append("give the UC connection (src_connection) or the host (src_host)")
+        port = fields.get("src_port") or None
+        server = js.server_of({"src_connection": connection, "src_host": host,
+                               "src_port": int(port) if port and port.isdigit() else port,
+                               "use_remote_query": bool(connection) and not host})
+        out.append({"line": number, "server": server, "src_database": fields.get("src_database") or None,
+                    "src_schema": fields.get("src_schema") or None, "src_table": fields.get("src_table") or None,
+                    "load_type": fields.get("load_type") or None, "fields": fields,
+                    "status": "invalid" if problems else "ok", "errors": problems or None})
+    if not out:
+        errors.append("the file has no tables")
+    return {"errors": errors, "columns": header, "lines": out if not errors else []}
+
+
+def csv_of(columns: List[str], rows: List[dict]) -> str:
+    """The CSV a plan reads: the columns, then each row's fields in their order."""
+    out = io.StringIO()
+    writer = csv.writer(out, lineterminator="\n")
+    writer.writerow(columns)
+    writer.writerows([[("" if row.get(c) is None else row.get(c)) for c in columns] for row in rows])
+    return out.getvalue()
+
+
+DISCOVERY_COLUMNS = ("src_connection", "src_host", "src_port", "secret_key", "src_database", "src_schema", "src_table",
+                     "select_list", "primary_key", "cursor_column", "load_type")

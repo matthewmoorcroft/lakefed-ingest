@@ -1351,6 +1351,11 @@ def task_sql() -> str:
     return f"select {', '.join(APP_TASK_FIELDS)} from {SCHEMA}.app_task where id = %s"
 
 
+def task_of_request_sql() -> str:
+    """The task a request id made, if any. Param: request_id."""
+    return f"select id from {SCHEMA}.app_task where request_id = %s"
+
+
 def job_tasks_sql() -> str:
     """A job's tasks of the last day, newest first. Param: job_id."""
     return (f"select {', '.join(APP_TASK_FIELDS)} from {SCHEMA}.app_task where job_id = %s "
@@ -1930,3 +1935,131 @@ def database_checks_since_sql() -> str:
     since (timestamptz)."""
     return (f"select count(*) as databases from {SCHEMA}.database_check where task_collection = any(%s) "
             f"and checked_at >= %s")
+
+
+# ---- uploads and selections by reference ----------------------------------------------------------------------------
+# New and Add tables never hold a whole server's tables in the browser: an uploaded CSV is kept in table_upload_line,
+# a discovery's tables are in discovered_table, and the pages show their servers and databases, page their tables, and
+# name what to take (a selection) instead of sending the tables back.
+
+UPLOAD_LINE_COLUMNS = ("upload_id", "line", "server", "src_database", "src_schema", "src_table", "load_type", "fields",
+                       "status", "errors")
+JOB_SELECTION_COLUMNS = ("job_id", "scope", "server", "src_database", "tables", "filter", "source_kind", "source_id",
+                         "created_by")
+
+
+def insert_upload_sql() -> str:
+    """An upload's header row. Params: upload_id, file_name, uploaded_by, columns, lines, tables, invalid."""
+    return (f"insert into {SCHEMA}.table_upload (upload_id, file_name, uploaded_by, columns, lines, tables, invalid) "
+            f"values (%s, %s, %s, %s, %s, %s, %s)")
+
+
+def insert_upload_lines_sql(n: int) -> str:
+    """n lines of an upload in one statement. Params: each line's UPLOAD_LINE_COLUMNS in turn (fields as JSON text)."""
+    one = "(%s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s)"
+    return f"insert into {SCHEMA}.table_upload_line ({', '.join(UPLOAD_LINE_COLUMNS)}) values {', '.join([one] * n)}"
+
+
+def upload_sql() -> str:
+    """An upload's header row. Param: upload_id."""
+    return (f"select upload_id, file_name, uploaded_by, uploaded_at, columns, lines, tables, invalid "
+            f"from {SCHEMA}.table_upload where upload_id = %s")
+
+
+def upload_invalid_sql() -> str:
+    """An upload's first invalid lines, for the page to say why. Params: upload_id, limit."""
+    return (f"select line, concat_ws('.', src_database, src_schema, src_table) as table, errors "
+            f"from {SCHEMA}.table_upload_line where upload_id = %s and status = 'invalid' order by line limit %s")
+
+
+def source_rows_sql(kind: str) -> str:
+    """The tables of an upload (its ok lines; param upload_id) or of discoveries (param: list of discovery ids; a
+    table found by more than one, its latest finding), each with its server, database, schema, table, load type, and
+    what the CSV a plan reads takes from it: for an upload its line and fields, for a discovery its settings. The
+    subquery the views and the selection read from."""
+    if kind == "upload":
+        return (f"select server, src_database, src_schema, src_table, load_type, null::text as cursor_column, "
+                f"fields->>'primary_key' as primary_key, null::bigint as row_count, null::text as notes, line, fields "
+                f"from {SCHEMA}.table_upload_line where upload_id = %s and status = 'ok'")
+    return (f"select distinct on (lower(coalesce(d.src_connection, d.src_host)), lower(t.src_database), "
+            f"lower(t.src_schema), lower(t.src_table)) "
+            f"lower(coalesce(d.src_connection, d.src_host)) as server, t.src_database, t.src_schema, t.src_table, "
+            f"t.load_type, t.cursor_column, t.primary_key, t.row_count, t.notes, 0 as line, "
+            f"jsonb_build_object('src_connection', d.src_connection, "
+            f"'src_host', case when d.src_connection is null then d.src_host end, "
+            f"'src_port', case when d.src_connection is null then d.src_port::text end, "
+            f"'secret_key', case when d.src_connection is null then d.secret_key end, "
+            f"'src_database', t.src_database, 'src_schema', t.src_schema, 'src_table', t.src_table, "
+            f"'select_list', t.select_list, 'primary_key', t.primary_key, 'cursor_column', t.cursor_column, "
+            f"'load_type', t.load_type) as fields "
+            f"from {SCHEMA}.discovered_table t join {SCHEMA}.discovery d "
+            f"on d.discovery_id = t.discovery_id and d.src_database = t.src_database "
+            f"where t.discovery_id = any(%s) "
+            f"order by lower(coalesce(d.src_connection, d.src_host)), lower(t.src_database), lower(t.src_schema), "
+            f"lower(t.src_table), t.discovered_at desc")
+
+
+_LOAD_TYPE_COUNTS = ("count(*) filter (where load_type = 'ct') as ct, "
+                     "count(*) filter (where load_type = 'cursor') as cursor, "
+                     "count(*) filter (where load_type = 'full') as full, "
+                     "count(*) filter (where coalesce(load_type, '') not in ('ct', 'cursor', 'full')) as unset")
+_MATCHES = "position(lower(%s) in lower(r.src_database)) > 0"
+
+
+def source_servers_sql(kind: str) -> str:
+    """A source's servers: each one's databases, tables and tables by load type, over the databases matching the
+    filter. Params: the source's (see source_rows_sql), filter."""
+    return (f"select r.server, count(distinct lower(r.src_database)) as databases, count(*) as tables, "
+            f"{_LOAD_TYPE_COUNTS} from ({source_rows_sql(kind)}) r where {_MATCHES} group by r.server order by r.server")
+
+
+def source_databases_sql(kind: str) -> str:
+    """One page of a source's databases matching the filter, by server and name: each one's tables and tables by load
+    type. Params: the source's, filter, limit, offset."""
+    return (f"select r.server, r.src_database, count(*) as tables, {_LOAD_TYPE_COUNTS} "
+            f"from ({source_rows_sql(kind)}) r where {_MATCHES} group by r.server, r.src_database "
+            f"order by r.server, lower(r.src_database) limit %s offset %s")
+
+
+def source_tables_sql(kind: str) -> str:
+    """One page of a database's tables in a source, by schema and name, those matching the search (in schema.table).
+    Params: the source's, server, database, search, limit, offset. Each row carries the page's total as total."""
+    return (f"select r.src_schema, r.src_table, r.load_type, r.cursor_column, r.primary_key, r.row_count, r.notes, "
+            f"count(*) over () as total from ({source_rows_sql(kind)}) r "
+            f"where lower(r.server) = lower(%s) and r.src_database = %s "
+            f"and position(lower(%s) in lower(r.src_schema || '.' || r.src_table)) > 0 "
+            f"order by lower(r.src_schema), lower(r.src_table) limit %s offset %s")
+
+
+def selection_key(server: str, database: str, table: str = "") -> str:
+    """A database (or a table of it, schema.table) as selected_rows_sql matches it: lower case, chr(31) between."""
+    return "\x1f".join(str(part or "").lower() for part in ((server, database, table) if table else (server, database)))
+
+
+_SELECTED = ("(%s and position(lower(%s) in lower(r.src_database)) > 0) "
+             "or lower(r.server) || chr(31) || lower(r.src_database) = any(%s) "
+             "or lower(r.server) || chr(31) || lower(r.src_database) || chr(31) || lower(r.src_schema || '.' || r.src_table) "
+             "= any(%s)")
+
+
+def selected_rows_sql(kind: str, count: bool = False) -> str:
+    """The tables a selection takes from a source: with whole_server, every table of a database matching the filter;
+    the whole databases named; the tables named (selection_key). Params: the source's, whole_server, filter, database
+    keys, table keys. In the order a plan reads them; count gives only how many."""
+    if count:
+        return f"select count(*) as n from ({source_rows_sql(kind)}) r where {_SELECTED}"
+    return (f"select r.server, r.src_database, r.src_schema, r.src_table, r.line, r.fields "
+            f"from ({source_rows_sql(kind)}) r where {_SELECTED} "
+            f"order by r.server, lower(r.src_database), r.line, lower(r.src_schema), lower(r.src_table)")
+
+
+def insert_job_selection_sql(n: int) -> str:
+    """n parts of what a job was made from, in one statement. Params: each part's JOB_SELECTION_COLUMNS in turn."""
+    one = "(" + ", ".join(["%s"] * len(JOB_SELECTION_COLUMNS)) + ")"
+    return f"insert into {SCHEMA}.job_selection ({', '.join(JOB_SELECTION_COLUMNS)}) values {', '.join([one] * n)}"
+
+
+def job_selection_sql() -> str:
+    """What a job was made from, part by part, oldest first. Param: job_id."""
+    return (f"select id, {', '.join(JOB_SELECTION_COLUMNS)}, created_at from {SCHEMA}.job_selection "
+            f"where job_id = %s order by created_at, id")
