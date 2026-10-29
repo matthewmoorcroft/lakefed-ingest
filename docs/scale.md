@@ -55,6 +55,90 @@ At 0.9 s a call the 22,000-database discovery takes 31 minutes at 32 workers and
 | Planning time | 5.8 s (CSV 0.3 s, writes 1.0 s) | 0.5 s to the refusal at 120,001 lines; full planning about 21.6 s (extrapolated) |
 | Peak memory | 653 MB | about 35 GB (extrapolated linearly; not measured) |
 
+### Create by database: before and after the packing
+
+Both paths run in one process at each size. "Before" is `create_by_database`, one transaction per database, as the route
+ran it. "After" is `create_by_chunk`, the route now: the databases are read in batches of 100 and written in transactions
+of up to 5,000 tables, a database never split. Round trips are the statements plus a BEGIN and a COMMIT for each
+transaction. The round-trip time is those round trips at 2 ms each. It is not the server's work, which the last section
+estimates.
+
+| Measure | 417 before | 417 after |
+|---|---|---|
+| Tables | 99,360 | 99,360 |
+| Lakebase statements | 4,155 | 285 |
+| of which reads | 2,072 | 91 |
+| Transactions | 416 | 23 |
+| Round trips | 4,987 | 331 |
+| Round-trip time at 2 ms | 10.0 s | 0.7 s |
+| Check and write time (Python) | 3.5 s + 4.0 s | 3.3 s + 4.3 s |
+| Peak memory | 252 MB | 252 MB |
+
+Before packing, each database cost about ten statements (4,155 over 417 databases). After packing a transaction cost about
+twelve (285 over 23), and the reads of a whole batch are one statement. The round trips fell by about fifteen times at 417
+databases.
+
+At 22,000 databases (5,279,280 tables), the before run was measured once with the pre-packing runner: 176,404 statements,
+21,999 transactions, 220,402 round trips, about 441 s at 2 ms. The after run was not made on the Mac: database-shaped
+runs are left to the deployed app. Packing predicts about 1,056 transactions and about 15,000 round trips at 5,000 tables a
+transaction, which is the same factor again, but that is an estimate until main's Databricks run measures it.
+
+### Each statement of a database, at 1,000 tables a database
+
+The by-database create's statements, what each one does, and what it costs at 1,000 tables (the size the main test
+uses). "Before" is the per-database write. "After" is what each becomes once a transaction holds up to 5,000 tables.
+
+| Statement | Before (per database) | Index used before | Cost at 1,000 tables before | After |
+|---|---|---|---|---|
+| Read the database's rows, upload source | 2 (check pass, write pass) | none: `lower()` on server and name | reads every line of the upload (100,000 at 100 databases) | exact names, an index range on `table_upload_line_database_idx`; one read per batch of 100 in the check, one per transaction in the write |
+| Sink check of the group's rows | 1 | none: `lower(src_database)` skips `control_database_idx` and the partial collection index needs `task_enabled` | reads the group's control rows (about 12,500 a group) for each database | exact `src_database = any(...)` on `control_database_idx`; one per transaction |
+| Mixed-sink check | 1 | none: an expression over every control row | scans all of `control`, so it grows with the whole table | three-array lookups on `control_sink_client_uq`; one per transaction |
+| Split-database check | 1 | `control_database_idx` (exact name) | the database's own rows only | unchanged; one per transaction |
+| Control insert of the database's rows | 1 for 1,000 rows | `control_sink_client_uq` for the conflict check, plus the table's other indexes | the real write work: 1,000 index entries across the table's indexes; not overhead | 1,000-row statements, five per transaction |
+| Change log (`control_change`) | 1 | none needed (insert) | cheap | one per transaction |
+| Group member | 1 | `schedule_member_uq` | cheap | one per transaction, in one statement for the groups it lacks |
+| Run lock | 1 per group | advisory key | cheap | one per transaction, for all its groups |
+| Task progress | 1 | primary key | cheap | one per transaction |
+| Rollup rewrite | none on this branch; one per database on the `fixes` branch and main | the rewrite joins `control` on `coalesce(t.src_database, '')`, so no index applies | scans all of `control` and joins `checkpoint` and `database_check`: the likely heavy statement on main | not on this branch; after packing, once per transaction on `fixes`, which still needs its join made exact |
+
+The statements that scan a table are the ones that grow with the whole table rather than with the database, so they are
+the ones that make the cost rise faster than linearly. The control insert is the work the table really does, one index
+entry per row for each of its indexes.
+
+### Expected time for 100,000 and 5.28 million tables
+
+These are estimates, not measurements. Lakebase's per-statement time is not measured here, and the server's work per table
+is estimated, not timed. Main's real rerun is the test that decides.
+
+The model: round trips at 2 ms each, plus the server's work per table, which I estimate at 50 to 150 microseconds (a
+control row with its indexes, its change-log row, and its share of the upload read's index range).
+
+| Tables | Transactions | Round trips (about) | Round-trip time | Server work | Expected total |
+|---|---|---|---|---|---|
+| 100,000 | 20 | 300 | 0.6 s | 5 to 15 s | about 6 to 16 s; central 10 s |
+| 5,280,000 | 1,056 | 15,000 | 30 s | 4.4 to 13 min | about 5 to 14 min; central 9 min |
+
+The round-trip counts take the 417-database run's 14 round trips a transaction and the check's few reads. These
+figures assume three things that must hold on the real app:
+
+- An upload source. Its database reads are exact index ranges, so a transaction's read does not scan the whole upload.
+- The database rollup rewrite on `fixes` has an exact join (`t.src_database = k.src_database`, through
+  `control_database_idx`, with the empty-name case handled apart). Without it the rewrite scans all of `control` on every
+  transaction, and the time grows with the square of the table count.
+- Not a discovery source. The discovery branch of `source_rows_sql` is a DISTINCT ON over every discovered table of the
+  discovery, filtered by lower-case names, so every transaction reads the whole discovery. At 5.28 million tables that is
+  about 1,056 reads of 5.28 million rows, and the 5.28 million estimate does not hold until that read is made exact too.
+  The fix is to push `src_database = any(...)` into the DISTINCT ON's inner filter, which the discovered table's primary
+  key serves. It is not done here because it cannot be checked without a server.
+
+For main's own number: 84.2 s for 100,000 tables is 0.84 s a database, which is what one rollup rewrite per database
+(a scan of `control` with its joins) would cost. Packing alone cuts the rewrites from 100 to 20, which would bring 84.2 s
+to about 20 s if the rewrite is the cost. Main can confirm it by timing a create with the rewrite skipped, or by
+`EXPLAIN (ANALYZE, BUFFERS)` on the rewrite. The exact join is what keeps the time linear in tables.
+
+The new statements have not run against Postgres here (the `_pg` tests skip without a server), so their plans are reasoned
+from the indexes in `lakebase_schema.sql`, not observed.
+
 ### Upload
 
 | Measure | 417 databases (99,360 lines) | 22,000 databases (5,280,000 lines) |
@@ -146,3 +230,5 @@ The kinds are the statement verb and table, with the `lakefed_ingest.` schema le
 - Peak memory of the create and the selection read at 5,280,000 tables, on the app's real compute.
 - Monitoring pages' latency with 22,000 databases and 5,280,000 control rows in Lakebase (the state scan's cost).
 - The upload route's real 413 behaviour through the Apps proxy, and the real request size with JSON encoding.
+- The by-database create's time with the packed path: main's upload of 100 databases x 1,000 tables, Create by reference
+  over the whole server (84.2 s before the packing). The expected times in the section above are estimates until that rerun.
