@@ -40,7 +40,8 @@ export function WritesFields({ w, setW, stored, modeNote, targetsNote }: { w: Ro
       {modeNote}
       <div className="form-grid">
         <label>Target catalog<input value={w.sink_catalog ?? ""} placeholder="catalog" onChange={(e) => setW({ ...w, sink_catalog: e.target.value })} /><Mixed s={stored?.sink_catalog} /></label>
-        <label>Target schema<input value={w.sink_schema ?? ""} placeholder="schema" onChange={(e) => setW({ ...w, sink_schema: e.target.value })} /><Mixed s={stored?.sink_schema} /></label>
+        <label>Target schema<input value={w.sink_schema ?? ""} placeholder="schema" onChange={(e) => setW({ ...w, sink_schema: e.target.value })} /><Mixed s={stored?.sink_schema} />
+          <span className="help">A new schema is made by the first run, owned by the identity the runs use, which needs CREATE SCHEMA on the catalog.</span></label>
         <label>Target table<input value={w.sink_table ?? ""} onChange={(e) => setW({ ...w, sink_table: e.target.value })} /><Mixed s={stored?.sink_table} /></label>
         <label className="checkbox"><input type="checkbox" checked={!!w.lowercase} onChange={(e) => setW({ ...w, lowercase: e.target.checked })} /> Lower-case names</label>
       </div>

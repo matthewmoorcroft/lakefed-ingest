@@ -87,3 +87,8 @@ def test_discover_lists_by_a_name_filter_and_says_which_databases_it_couldnt_rea
     assert "Databases matching" in discover and "pattern" in discover
     assert "function Unread" in discover and "couldn't be read" in discover
     assert "function databasesOfCsv" in discover and "take them from a CSV file" in discover
+
+
+def test_the_target_schema_field_says_a_new_schema_is_made_by_the_first_run():
+    form = (FRONTEND / "pages" / "jobForm.tsx").read_text()
+    assert "A new schema is made by the first run" in form and "CREATE SCHEMA on the catalog" in form
