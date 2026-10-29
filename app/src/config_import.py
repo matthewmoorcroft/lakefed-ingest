@@ -175,10 +175,12 @@ def _lines_within(rows, max_lines: int) -> Optional[List[dict]]:
     return lines
 
 
-def plan_import(text: str, group: str, given: dict, group_rows: List[dict], max_lines: int = MAX_LINES) -> dict:
+def plan_import(text: str, group: str, given: dict, group_rows: List[dict], max_lines: int = MAX_LINES,
+                check_rows: bool = True) -> dict:
     """What importing this CSV into the group would write: {"errors": the file's own problems, "lines": one per
     line, with its file line number, the control row it makes, its status (valid, invalid or registered, for a
-    table the group already has) and its errors}. Nothing is valid while the file has errors."""
+    table the group already has) and its errors}. Nothing is valid while the file has errors. check_rows=False leaves
+    out the form checks of each row, for a caller that checks the row itself once its settings are applied."""
     reader = csv.DictReader(io.StringIO(text.lstrip("﻿")))
     header = [h.strip() for h in (reader.fieldnames or [])]
     reader.fieldnames = header
@@ -208,7 +210,8 @@ def plan_import(text: str, group: str, given: dict, group_rows: List[dict], max_
         if not settings["fan_in"] and not _blank(row["client_id"]):
             problems.append("client_id must be blank: this group does not fan in")
         problems += _source_errors(row, settings)
-        problems += [e for e in q.validate_control_row(row) if not e.startswith("task_collection")]
+        if check_rows:
+            problems += [e for e in q.validate_control_row(row) if not e.startswith("task_collection")]
         sink = ".".join(_text(row.get(k)).lower() for k in SINK_SETTINGS)
         key = (sink, _text(row.get("client_id")))
         if key in seen:

@@ -13,6 +13,114 @@ CSV = ("src_connection,src_database,src_schema,src_table,select_list,primary_key
        "sql_a,eng_002,gen,t0002,\"id, qty\",id\n")
 FAN_IN = {"fan_in": True, "sink_catalog": "main", "sink_schema": "engagements", "sink_table": "{table}",
           "identity": {"engagement": "{database}"}}
+HEAD = "src_connection,src_database,src_schema,src_table,select_list,primary_key\n"
+PLAIN = {"sink_catalog": "main", "sink_schema": "s", "sink_table": "{database}_{table}"}
+# A few files with problems of every kind, planned as the pre-check version planned them: each line's status, errors
+# (in order) and group, and the plan's errors and groups.
+VALIDATION_CASES = {
+    "clean": (HEAD + 'sql_a,eng_001,gen,t0001,"id, amount",id\nsql_a,eng_002,gen,t0001,"id, amount",id\n'
+              + 'sql_a,eng_002,gen,t0002,"id, qty",id\n', FAN_IN, set()),
+    "fan_in_problems": (
+        "src_connection,src_database,src_schema,src_table,select_list,primary_key,client_id,src_host\n"
+        + 'sql_a,eng_001,gen,t1,"*",id,,\n'
+        + 'sql_a,eng_002,gen,,"id",id,bad id!,\n'
+        + 'sql_a,eng_003,gen,t3,"id",,,\n'
+        + 'sql_a,eng_004,gen,t5,"id",id,,host1\n'
+        + 'sql_a,eng_004,gen,t5,"id",id,,\n', FAN_IN, set()),
+    "no_fan_in_problems": (
+        "src_connection,src_database,src_schema,src_table,select_list,primary_key,client_id,task_collection,"
+        "src_port,load_type\n"
+        + 'sql_a,eng_001,gen,t1,"id",id,x,other_group,70000,bogus\n'
+        + 'sql_a,eng_002,gen,t2,"id",id,,,,full\n'
+        + 'sql_a,eng_003,gen,t3,"id, a",id,,,,cursor\n'
+        + 'sql_a,eng_004,gen,t4,"id",id,,,,full,extra\n', PLAIN, set()),
+    "taken_group": (
+        HEAD + 'sql_a,eng_001,gen,t1,"id",id\nsql_a,eng_002,gen,t2,"id",id\nsql_a,eng_002,gen,t2,"id",id\n', PLAIN,
+        {"job_sql_a_c01", "job_sql_a_c02", "job_sql_a_c03", "job_sql_a_c04"}),
+}
+VALIDATION_EXPECTED = {
+    "clean": {
+        "errors": [],
+        "groups": ['job_sql_a_c01', 'job_sql_a_c03'],
+        "lines": [
+            (2, 'eng_001.gen.t0001', 'valid',
+             [],
+             'job_sql_a_c03', 'main.engagements.t0001'),
+            (3, 'eng_002.gen.t0001', 'valid',
+             [],
+             'job_sql_a_c01', 'main.engagements.t0001'),
+            (4, 'eng_002.gen.t0002', 'valid',
+             [],
+             'job_sql_a_c01', 'main.engagements.t0002'),
+        ],
+    },
+    "fan_in_problems": {
+        "errors": [],
+        "groups": ['job_host1_1433_c02', 'job_sql_a_c01', 'job_sql_a_c02', 'job_sql_a_c03'],
+        "lines": [
+            (2, 'eng_001.gen.t1', 'invalid',
+             ["select_list must list explicit columns (* isn't supported)"],
+             'job_sql_a_c03', 'main.engagements.t1'),
+            (3, 'eng_002.gen.', 'invalid',
+             [
+                 'src_table is required',
+                 'client_id may only use letters, digits and _ . : - (1-128 characters)',
+             ],
+             'job_sql_a_c01', 'main.engagements.t'),
+            (4, 'eng_003.gen.t3', 'invalid',
+             ['primary_key is required for load_type ct'],
+             'job_sql_a_c03', 'main.engagements.t3'),
+            (5, 'eng_004.gen.t5', 'invalid',
+             ['give the UC connection or the host, not both', 'secret_key is required'],
+             'job_host1_1433_c02', 'main.engagements.t5'),
+            (6, 'eng_004.gen.t5', 'invalid',
+             ['line 5 already writes c.s.t5_eng_004', 'line 5 already writes main.engagements.t5 for eng_004'],
+             'job_sql_a_c02', 'main.engagements.t5'),
+        ],
+    },
+    "no_fan_in_problems": {
+        "errors": [],
+        "groups": ['job_sql_a_c01', 'job_sql_a_c02', 'job_sql_a_c03'],
+        "lines": [
+            (2, 'eng_001.gen.t1', 'invalid',
+             [
+                 'task_collection is other_group, but this import is into _new',
+                 'src_port must be a whole number from 1 to 65535',
+                 'load_type must be one of ct, cursor, full',
+                 'client_id must be blank: this job has no fan-in',
+             ],
+             'job_sql_a_c03', 'main.s.eng_001_t1'),
+            (3, 'eng_002.gen.t2', 'valid',
+             [],
+             'job_sql_a_c01', 'main.s.eng_002_t2'),
+            (4, 'eng_003.gen.t3', 'invalid',
+             ['cursor_column is required for load_type cursor'],
+             'job_sql_a_c03', 'main.s.eng_003_t3'),
+            (5, 'eng_004.gen.t4', 'invalid',
+             ['this line has more cells than the header has columns'],
+             'job_sql_a_c02', 'main.s.eng_004_t4'),
+        ],
+    },
+    "taken_group": {
+        "errors": [],
+        "groups": ['job_sql_a_c01', 'job_sql_a_c03'],
+        "lines": [
+            (2, 'eng_001.gen.t1', 'invalid',
+             ['group job_sql_a_c03 is already in use: give the job another name'],
+             'job_sql_a_c03', 'main.s.eng_001_t1'),
+            (3, 'eng_002.gen.t2', 'invalid',
+             ['group job_sql_a_c01 is already in use: give the job another name'],
+             'job_sql_a_c01', 'main.s.eng_002_t2'),
+            (4, 'eng_002.gen.t2', 'invalid',
+             [
+                 'line 3 already writes c.s.t2_eng_002',
+                 'group job_sql_a_c01 is already in use: give the job another name',
+                 'line 3 already writes main.s.eng_002_t2: turn fan-in on, or put {database} in the target names',
+             ],
+             'job_sql_a_c01', 'main.s.eng_002_t2'),
+        ],
+    },
+}
 
 
 def test_each_line_becomes_a_row_with_the_jobs_settings_and_a_group_per_server():
@@ -105,6 +213,29 @@ def test_a_group_already_in_use_refuses_the_line():
     taken = {nj.group_name("Job", "sql_a", "eng_001", 4)}
     line = nj.plan("Job", CSV, FAN_IN, 4, taken)["lines"][0]
     assert line["status"] == "invalid" and "already in use" in line["errors"][-1]
+
+
+@pytest.mark.parametrize("case", list(VALIDATION_EXPECTED))
+def test_each_line_keeps_the_status_and_errors_it_had_when_a_row_was_checked_three_times(case):
+    text, settings, taken = VALIDATION_CASES[case]
+    plan = nj.plan("Job", text, settings, 4, taken)
+    assert {"errors": plan["errors"], "groups": plan["groups"],
+            "lines": [(line["line"], line["table"], line["status"], line["errors"], line["group"], line["sink"])
+                      for line in plan["lines"]]} == VALIDATION_EXPECTED[case]
+
+
+def test_each_row_is_checked_once_in_order_when_its_plan_is_made(monkeypatch):
+    checked = []
+    validate = nj.q.validate_control_row
+
+    def counting(row):
+        checked.append((row["src_database"], row["src_table"]))
+        return validate(row)
+
+    monkeypatch.setattr(nj.q, "validate_control_row", counting)
+    plan = nj.plan("Engagement extraction", CSV, FAN_IN, groups_per_server=4)
+    assert len(plan["lines"]) == 3
+    assert checked == [("eng_001", "t0001"), ("eng_002", "t0001"), ("eng_002", "t0002")]
 
 
 def test_the_summary_counts_tables_databases_and_groups_per_server():

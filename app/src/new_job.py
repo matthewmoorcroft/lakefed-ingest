@@ -117,7 +117,7 @@ def plan(job_name: str, text: str, given: dict, groups_per_server: int = DEFAULT
                                          "use_remote_query": False, "write_mode": "merge", "fan_in": False,
                                          "sink_catalog": "c", "sink_schema": "s", "sink_table": "{table}_{database}",
                                          "freshness_sla_minutes": settings["freshness_sla_minutes"]}, [],
-                         max_lines=MAX_LINES)
+                         max_lines=MAX_LINES, check_rows=False)
     if read["errors"]:
         out["errors"] = read["errors"]
         return out
@@ -125,9 +125,9 @@ def plan(job_name: str, text: str, given: dict, groups_per_server: int = DEFAULT
     groups = set()
     for line in read["lines"]:
         row = dict(line["row"])
-        # The reader's row checks ran before the job's settings were applied: keep only its own (the file's) problems.
-        before = set(q.validate_control_row(line["row"]))
-        problems = [e for e in line["errors"] if e not in before and not e.startswith("client_id ")]
+        # The reader judges client_id against its placeholder settings, not this job's fan-in, so its client_id
+        # messages are left out; the row is checked once, below, with the job's settings applied.
+        problems = [e for e in line["errors"] if not e.startswith("client_id ")]
         row["use_remote_query"] = bool(row.get("src_connection")) and not row.get("src_host")
         if row.get("src_connection") and row.get("src_host"):
             problems.append("give the UC connection or the host, not both")

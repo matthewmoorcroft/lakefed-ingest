@@ -43,6 +43,14 @@ def test_a_line_is_checked_as_add_table_checks_a_row():
     assert line["status"] == "invalid" and "primary_key is required for load_type ct" in line["errors"]
 
 
+def test_the_row_checks_can_be_left_to_the_caller_and_are_on_by_default():
+    text = "src_connection,src_database,src_schema,src_table,select_list,primary_key\nsql_a,Sales,dbo,,\"id\",id\n"
+    checked = ci.plan_import(text, "g1", SETTINGS, group_rows=[])["lines"][0]
+    unchecked = ci.plan_import(text, "g1", SETTINGS, group_rows=[], check_rows=False)["lines"][0]
+    assert checked["errors"] == ["src_table is required"] and checked["status"] == "invalid"
+    assert unchecked["errors"] == [] and unchecked["status"] == "valid"
+
+
 def test_a_line_for_another_group_and_a_duplicate_sink_are_refused():
     text = CSV + "sql_a,Sales,dbo,Orders,\"id,amount\",id\n"
     lines = ci.plan_import(text, "g1", SETTINGS, group_rows=[])["lines"]
