@@ -16,11 +16,14 @@ ingest cluster.
 from __future__ import annotations
 
 import json
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, Iterable, List, Optional
 
+import parallel
 import planner
+import state_store as ss
 
 
 def check_collection(configs: List[dict], checkpoints: Dict[int, dict], detect_one: Callable, *,
@@ -77,10 +80,52 @@ def check_collection(configs: List[dict], checkpoints: Dict[int, dict], detect_o
             "fast_exits": sum(int(o["fast_exit"]) for o in outputs)}
 
 
+class SourceCap:
+    """The check's share of ``max_queries_per_source``, so its source queries count under the same cap as the
+    ingest runs reading those servers. Like a run, the check joins each server's shared lock (on its own
+    connection, through ``join``), and takes the cap divided by the sessions reading the server now
+    (``state_store.source_shares``); each database's detection then holds one permit of its server
+    (``parallel.SourceLimiter``), since a database is asked one query at a time. ``source_of(cfg)`` names a row's
+    server as the runs count it (``ct_engine.source_key``). A cap of 0 caps nothing."""
+
+    def __init__(self, cap: int, join: Callable[[Iterable[str]], Dict[str, int]],
+                 runs: Callable[[Iterable[int]], Dict[int, int]], source_of: Callable[[dict], str]):
+        self.cap = int(cap or 0)
+        self.limiter = parallel.SourceLimiter()
+        self._join, self._runs, self._source_of = join, runs, source_of
+        self._keys: Dict[str, int] = {}
+        self._mu = threading.Lock()
+
+    def wrap(self, configs: List[dict], detect_one: Callable) -> Callable:
+        """``detect_one`` for one collection's rows, holding a permit of each database's server while it asks it."""
+        if self.cap <= 0:
+            return detect_one
+        with self._mu:
+            new = {self._source_of(c) for c in configs} - set(self._keys)
+            if new:
+                self._keys.update(self._join(new))
+            self._refresh()
+
+        def capped(members):
+            with self.limiter.hold([self._source_of(members[0][0])]):
+                return detect_one(members)
+        return capped
+
+    def _refresh(self) -> None:
+        try:
+            shares = ss.source_shares(self.cap, self._keys, self._runs(self._keys.values()))
+        except Exception as e:   # the sessions can't be counted: the check alone takes the whole cap
+            print(f"[caps] could not count the runs per source ({str(e)[:200]}); the check takes the whole cap")
+            shares = {source: self.cap for source in self._keys}
+        for source, share in shares.items():
+            self.limiter.set_limit(source, share)
+
+
 def run_check(store, lock_store, collections: List[str], detect_one: Callable, *,
               existing_sinks_of: Callable, job_run_id: str = "", cluster_id: str = "", parallelism: int = 32,
               interval_s: float = 0, reseed_on_new_columns: bool = True, snapshot_isolation: bool = False,
-              force=frozenset(), map_fn=map, collection_workers: int = 8) -> dict:
+              force=frozenset(), map_fn=map, collection_workers: int = 8, source_cap: Optional[SourceCap] = None,
+              hold_work_locks: bool = False) -> dict:
     """Check every collection of the group and write the unchanged databases' stamps.
 
     ``existing_sinks_of(configs) -> set or None`` lists the sink tables of a collection's rows (the
@@ -90,8 +135,14 @@ def run_check(store, lock_store, collections: List[str], detect_one: Callable, *
     ``ingest_run`` row whose ``detail.check`` records what was found; a collection whose lock another
     sweep holds is left to that sweep and listed as busy. ``map_fn`` runs ``detect_one`` over each
     collection's databases (pass a shared thread pool's map to check databases of every collection at
-    once); up to ``collection_workers`` collections are checked at a time. A failed check marks its run
-    failed, releases the collection's lock and fails the whole check, so nothing ingests on a half-known state.
+    once); up to ``collection_workers`` collections are checked at a time. ``source_cap`` counts the check's
+    source queries under ``max_queries_per_source``.
+
+    A collection whose check fails is marked failed and listed in ``failed`` with its error, and starts no run;
+    the other collections are checked as usual, so one bad row doesn't hold up the whole job. With
+    ``hold_work_locks`` a collection with work keeps its lock (listed in ``held``) until the caller has started
+    its run and releases it, so a second check of the same collection meanwhile finds it busy and starts
+    nothing.
 
     Returns the summary; ``per_collection`` holds each checked collection's ``work``.
     """
@@ -101,14 +152,15 @@ def run_check(store, lock_store, collections: List[str], detect_one: Callable, *
         started = time.monotonic()
         if not lock_store.try_lock_collection(collection):
             return None
-        run_id = None
+        run_id, keep_lock = None, False
         try:
             # Marked as the check's own record from the start, so a monitor tells it from a group run while it runs.
             run_id = store.start_run(collection, job_run_id, cluster_id, parallelism, work_id=f"check-{job_run_id}")
             _close_abandoned_runs(store, collection, run_id)
             configs = store.list_task_configs(collection)
             checkpoints = store.get_checkpoints([c["id"] for c in configs])
-            result = check_collection(configs, checkpoints, detect_one, existing_sinks=existing_sinks_of(configs),
+            detect = source_cap.wrap(configs, detect_one) if source_cap else detect_one
+            result = check_collection(configs, checkpoints, detect, existing_sinks=existing_sinks_of(configs),
                                       stamps=store.get_database_checks(collection), interval_s=interval_s,
                                       mixed_sinks=mixed_sinks,
                                       reseed_on_new_columns=reseed_on_new_columns,
@@ -127,20 +179,29 @@ def run_check(store, lock_store, collections: List[str], detect_one: Callable, *
             unchanged = result["unchanged_tables"]
             store.finish_run(run_id, total=unchanged, ok=unchanged, failed=0, skipped=unchanged, status="completed",
                              detail=json.dumps({"check": check}))
+            keep_lock = hold_work_locks and bool(check["work"])
             return {"collection": collection, "run_id": run_id, **check}
-        except BaseException as error:
+        except Exception as error:
+            if run_id is not None:
+                _finish_failed(store, run_id, error)
+            return {"collection": collection, "error": f"{type(error).__name__}: {str(error)[:400]}"}
+        except BaseException as error:      # the step itself is stopped: nothing more is checked
             if run_id is not None:
                 _finish_failed(store, run_id, error)
             raise
         finally:
-            _release_lock(lock_store, collection)
+            if not keep_lock:
+                _release_lock(lock_store, collection)
 
     started = time.monotonic()
     with ThreadPoolExecutor(max_workers=max(1, min(len(collections), collection_workers)),
                             thread_name_prefix="collection") as pool:
         checked = list(pool.map(check_one, collections))
-    results = [r for r in checked if r is not None]
+    failed = [r for r in checked if r is not None and "error" in r]
+    results = [r for r in checked if r is not None and "error" not in r]
     return {"collections": len(collections), "busy": [c for c, r in zip(collections, checked) if r is None],
+            "failed": failed,
+            "held": sorted(r["collection"] for r in results if hold_work_locks and r["work"]),
             "check_s": round(time.monotonic() - started, 1),
             "collections_with_work": sum(1 for r in results if r["work"]),
             "databases_with_work": sum(len(r["work"]) for r in results),
@@ -158,6 +219,18 @@ def _close_abandoned_runs(store, collection: str, run_id) -> None:
         store.close_abandoned_runs(collection, run_id)
     except Exception as e:
         print(f"[telemetry] could not close earlier unfinished runs of {collection}: {str(e)[:200]}")
+
+
+def release_locks(lock_store, collections: Iterable[str]) -> None:
+    """Release the locks ``run_check`` held for collections with work (``held``), once their runs are started."""
+    for collection in collections:
+        _release_lock(lock_store, collection)
+
+
+def failure_message(failed: List[dict]) -> str:
+    """One line per collection whose check failed, for the step's error."""
+    return "\n".join([f"{len(failed)} collection(s) could not be checked and started no run:"]
+                     + [f"  {r['collection']}: {r['error']}" for r in failed])
 
 
 def _release_lock(lock_store, collection: str) -> None:

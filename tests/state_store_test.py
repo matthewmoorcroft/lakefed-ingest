@@ -1141,3 +1141,9 @@ def test_a_check_without_a_group_takes_every_collection_with_an_enabled_row():
     assert ss.StateStore(conn).enabled_collections() == ["c1", "c2"]
     assert conn.calls == [(ss.enabled_collections_sql(), None)]
     assert "where task_enabled" in ss.enabled_collections_sql() and "order by" in ss.enabled_collections_sql()
+
+
+def test_the_check_reads_an_ingestion_jobs_groups_by_its_id_and_none_of_a_deleted_one():
+    sql = ss.schedule_collections_sql()
+    assert "m.schedule_id = %s" in sql and "m.removed_at is null" in sql and "s.deleted_at is null" in sql
+    assert sql.count("%s") == 1

@@ -280,7 +280,7 @@ def test_a_check_schedule_is_offered_only_with_the_check_job_and_syncs_one_job(a
     created = [s for s in api.jobs.jobs.values() if s["tags"].get(main.sch.TAG_COLLECTION) == main.sch.GROUP_TAG]
     assert len(created) == 1 and len(api.jobs.jobs) == 1
     assert created[0]["tasks"][0]["run_job_task"] == {"job_id": 777, "job_parameters": {
-        "task_collections": "c1,c2", "parallelism": "16"}}
+        "schedule_id": str(r.json()["id"]), "task_collections": "c1,c2", "parallelism": "16"}}
     # The one wrapper fires every member at once: a stagger asked for (the form keeps the last choice) is not kept.
     assert api.store.schedules[r.json()["id"]]["stagger"] is False
     assert {m["offset_minutes"] for m in api.store.members.values()} == {0}

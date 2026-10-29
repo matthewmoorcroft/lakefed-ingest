@@ -530,6 +530,13 @@ def enabled_collections_sql() -> str:
     return f"select distinct task_collection from {CONTROL_TABLE} where task_enabled order by task_collection"
 
 
+def schedule_collections_sql() -> str:
+    """The groups of one operations-app ingestion job (schedule) that is not deleted: its members not removed, in
+    name order. Param: schedule id."""
+    return (f"select m.task_collection from {SCHEMA}.schedule_member m join {SCHEMA}.schedule s on s.id = m.schedule_id "
+            "where m.schedule_id = %s and m.removed_at is null and s.deleted_at is null order by m.task_collection")
+
+
 def record_check_work_sql() -> str:
     """One database with work for a run the check job starts. Params: work_id, task_collection, source,
     src_database."""
@@ -917,6 +924,13 @@ class StateStore:
         """The collections with at least one enabled control row (a check over every collection)."""
         with self._cursor() as cur:
             cur.execute(enabled_collections_sql())
+            return [row[0] for row in cur.fetchall()]
+
+    def schedule_collections(self, schedule_id: int) -> list:
+        """The groups of an operations-app ingestion job, as the check job reads them when started with the
+        job's id (a long list of groups does not fit in one job parameter). None of a deleted job."""
+        with self._cursor() as cur:
+            cur.execute(schedule_collections_sql(), (int(schedule_id),))
             return [row[0] for row in cur.fetchall()]
 
     def record_check_work(self, work_id: str, task_collection: str, databases) -> None:

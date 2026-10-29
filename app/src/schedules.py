@@ -66,6 +66,7 @@ TAG_OWNER = "lakefed_ingest_app"     # instance/database: apps of other deployme
 JOB_NAME_PREFIX = "lakefed_ingest schedule"
 CHECK_VARIANT = "check"        # one wrapper per schedule, starting the check job (jobs.CHECK_JOB_ID)
 GROUP_TAG = "all-members"      # TAG_COLLECTION of that wrapper: it starts every member
+MAX_PARAMETER_CHARS = 10_000   # the Jobs API's limit on a job parameter value
 # Earlier wrappers carried "*", which AWS workspaces refuse in a tag value: still recognised, and re-tagged on sync.
 OLD_GROUP_TAGS = ("*",)
 
@@ -486,7 +487,11 @@ def group_job_settings(schedule: dict, collections: Iterable[str], check_job_id:
     job over every member. Members are not staggered: the check takes them in one go."""
     s = job_settings(schedule, "", start_minute(schedule) % int(schedule["cadence_minutes"]), check_job_id,
                      view_group, owner)
-    params = {"task_collections": ",".join(sorted(collections)),
+    members = ",".join(sorted(collections))
+    # The check reads the members from Lakebase by the schedule's id; the list rides along while it fits a job
+    # parameter value (at most 10,000 characters), so a check deployed before schedule_id still checks them.
+    params = {"schedule_id": str(schedule["id"]),
+              "task_collections": members if len(members) <= MAX_PARAMETER_CHARS else "",
               **{k: str(v) for k, v in sorted((schedule.get("parameters") or {}).items())}}
     if copy_job_id(schedule):     # the check starts the job's own copy of the ingestion job
         params["ingest_job_id"] = str(copy_job_id(schedule))

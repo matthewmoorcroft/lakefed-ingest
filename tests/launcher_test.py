@@ -352,6 +352,40 @@ def test_the_sdk_adapter_maps_the_jobs_api():
     assert sdk.max_concurrent_runs(7) == 100
 
 
+def test_a_run_given_no_collection_counts_as_its_default_collections_run():
+    # A run of the ingestion job's own schedule passes no task_collection: the Jobs API lists the parameter with
+    # its default and no value. It is that collection's run, so the check doesn't start a second one.
+    param = lambda name, value, default: type("P", (), {"name": name, "value": value, "default": default})()
+
+    class _Run:
+        run_id = 9
+        job_parameters = [param("task_collection", None, "example_cohort"), param("work_id", None, "")]
+
+    sdk = launcher.SdkJobs(type("W", (), {"jobs": type("J", (), {"list_runs": lambda self, **kw: iter([_Run()])})()})())
+    active = sdk.active_runs(7)
+    assert active == [{"run_id": 9, "job_parameters": {"task_collection": "example_cohort", "work_id": ""}}]
+    assert launcher.active_collections(active, work_of=_no_work) == {"example_cohort": None}
+    request = launcher.run_requests(_per_collection(example_cohort=["db1"]), launch_id="L")
+    summary = launcher.launch(_Jobs(), 1, request, launch_id="L",
+                              already_running=launcher.active_collections(active, work_of=_no_work))
+    assert [r["outcome"] for r in summary["runs"]] == ["already_running"]
+
+
+def test_each_collection_is_settled_right_after_its_start_or_at_once_when_not_started():
+    clock = _Clock()
+    jobs = _Jobs(script={"c1": ["RUNNING"]}, start_errors={"c2"})
+    settled = []
+
+    def on_settled(collection):
+        settled.append((collection, [s["job_parameters"]["task_collection"] for s in jobs.started]))
+
+    requests = launcher.run_requests(_per_collection(c1=["a"], c2=["b"], c3=["c"], c4=["d"]), launch_id="L")
+    launcher.launch(jobs, 1, requests, launch_id="L", confirm_s=0, already_running={"c3": None}, room=2,
+                    on_settled=on_settled, sleep=clock.sleep, clock=clock)
+    # c3 (already running) and c4 (no room) at once, before any start; c1 after its start; c2 after its failed one.
+    assert settled == [("c3", []), ("c4", []), ("c1", ["c1"]), ("c2", ["c1"])]
+
+
 def test_the_check_job_feeds_every_widget_and_brings_its_own_packages():
     job = (Path(__file__).parent.parent / "resources" / "lakefed_ingest_check.yml").read_text()
     passed = set(re.findall(r"^\s+([a-z_]+): ", job.split("base_parameters:")[1].split("environments:")[0], re.M))

@@ -1,5 +1,6 @@
 """Schedules: cron and offsets, next runs, wrapper job settings, drift, warnings, and sync with a fake client."""
 import json
+import re
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -381,10 +382,44 @@ GROUP = dict(SCHED, job_variant=sch.CHECK_VARIANT)
 def test_a_check_schedule_has_one_wrapper_that_starts_the_check_job_with_every_member():
     s = sch.group_job_settings(GROUP, ["c2", "c1"], 777, owner=OWNER)
     task = s["tasks"][0]
-    assert task["run_job_task"] == {"job_id": 777, "job_parameters": {"task_collections": "c1,c2", "parallelism": "32"}}
+    assert task["run_job_task"] == {"job_id": 777, "job_parameters": {"schedule_id": "7", "task_collections": "c1,c2",
+                                                                      "parallelism": "32"}}
     assert s["schedule"]["quartz_cron_expression"] == "0 0/15 * * * ?"     # no stagger: one start per cycle
     assert s["tags"][sch.TAG_COLLECTION] == sch.GROUP_TAG and s["name"] == sch.group_job_name(GROUP["name"])
     assert s["max_concurrent_runs"] == 1 and s["queue"] == {"enabled": False}
+
+
+def test_a_check_job_with_more_groups_than_a_parameter_holds_passes_only_its_id():
+    groups = [f"engagement_extraction_sql_engagements_c{i:03d}" for i in range(300)]    # about 13,500 characters
+    params = sch.group_job_settings(GROUP, groups, 777, owner=OWNER)["tasks"][0]["run_job_task"]["job_parameters"]
+    assert params["schedule_id"] == "7" and params["task_collections"] == ""
+    assert all(len(v) <= sch.MAX_PARAMETER_CHARS for v in params.values())
+
+
+# The tag rules Databricks applies to a job's tags, which it copies onto the job's clusters, so the cloud's rules
+# hold too. AWS: a key of 1 to 127 and a value of up to 255 characters, each of letters, digits, spaces and
+# _ . : / = + - @ only (so no "*"). Azure: a tag name has none of < > % & \ ? /. The fake Jobs API accepts any tag,
+# so this is the check against the real rules.
+_AWS_TAG_TEXT = re.compile(r"[\w .:/=+\-@]*")
+_AZURE_NAME_REFUSED = set("<>%&\\?/")
+
+
+def _tag_problems(tags: dict) -> list:
+    problems = []
+    for key, value in tags.items():
+        if not 1 <= len(key) <= 127 or not _AWS_TAG_TEXT.fullmatch(key) or set(key) & _AZURE_NAME_REFUSED:
+            problems.append(f"key {key!r}")
+        if len(value) > 255 or not _AWS_TAG_TEXT.fullmatch(value):
+            problems.append(f"value {value!r} of {key}")
+    return problems
+
+
+def test_every_tag_the_app_writes_meets_the_databricks_tag_rules():
+    group = "kpmg_1k_try_lfc_sqlserver_test_c01"            # as new_job.group_name names a group
+    default = sch.job_settings(SCHED, group, 0, 555, owner="mm-kpmg-lakefed-test/lakefed_ingest_kpmg_clean")
+    check = sch.group_job_settings(GROUP, [group, "calib_1db"], 777, owner="mm-kpmg-lakefed-test/lakefed_ingest_kpmg_clean")
+    assert _tag_problems(default["tags"]) == [] and _tag_problems(check["tags"]) == []
+    assert _tag_problems({sch.TAG_COLLECTION: "*"}) == ["value '*' of lakefed_ingest_collection"]   # what AWS refused
 
 
 def test_syncing_a_check_schedule_creates_one_job_for_all_members_and_deletes_their_own():
