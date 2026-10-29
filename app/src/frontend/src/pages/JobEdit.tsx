@@ -6,6 +6,7 @@ import { Crumbs, ConfirmButton, ErrorBox, Menu, Notice, PageHead, Pager, Section
 import { usePermissions } from "../permissions";
 import { CADENCES, IdentityFields, ParameterFields, RunFields, WritesFields, paramsSummary } from "./jobForm";
 import { ImportCsvDialog } from "./NewJob";
+import { TaskProgress, finished, newRequestId } from "./tasks";
 import { DiscoverDialog } from "./Discover";
 
 // Edit an ingestion job: what it ingests (a tree from its servers), how it writes, its identity columns, when it
@@ -196,11 +197,13 @@ function AddDatabases({ jobId, servers }: { jobId: string; servers: string[] }) 
   // The confirm applies exactly the request that was checked; any change to the inputs clears the check.
   const check = useMutation({
     mutationFn: () => { const b = body(false); return api.post<Row>(`/ingestion-jobs/${jobId}/databases`, { ...b, dry_run: true }).then((r) => ({ r, b })); },
-    onSuccess: ({ r, b }) => { setPreview(r.summary); setChecked(b); },
+    onSuccess: ({ r, b }) => { setPreview(r.summary); setChecked({ ...b, request_id: newRequestId() }); setTask(null); },
   });
   useEffect(() => { setPreview(null); setChecked(null); }, [how, csv, JSON.stringify(columns), server, names, fullList, perServer]);
+  const [task, setTask] = useState<Row | null>(null);
+  // One request id per checked request: applying it again (a retry after a timeout) finds the same task.
   const apply = useMutation({
-    mutationFn: () => api.post<Row>(`/ingestion-jobs/${jobId}/databases`, checked!),
+    mutationFn: async () => finished(await api.post<Row>(`/ingestion-jobs/${jobId}/databases`, checked!), setTask),
     onSuccess: (r) => { setPreview(r.summary); qc.invalidateQueries({ queryKey: ["job-tree", jobId] }); },
   });
   return (
@@ -242,21 +245,25 @@ function AddDatabases({ jobId, servers }: { jobId: string; servers: string[] }) 
         {preview.applied ? "Added: " : "Would add: "}{fmtInt(preview.new_tables)} {plural(preview.new_tables, "table")} from {fmtInt(preview.databases)} {plural(preview.databases, "database")}
         {preview.skipped ? `, ${fmtInt(preview.skipped)} skipped (target taken)` : ""}; enable {fmtInt(preview.enable)}, disable {fmtInt(preview.disable)}
         {preview.new_groups?.length ? `; new groups ${preview.new_groups.join(", ")}` : ""}.</Notice>}
+      {apply.isPending && <TaskProgress task={task} />}
       <ErrorBox error={check.error || apply.error} />
     </div>
   );
 }
 
-/** Add tables from a CSV of where each one is: checked first, then added after a confirm, with the job's settings. */
+/** Add tables from an uploaded CSV or a discovery, by reference: checked first, then added after a confirm, with the
+ *  job's settings; a large add is written by a background task, whose progress shows here. */
 function useAddTables(jobId: string) {
   const qc = useQueryClient();
   const confirm = useConfirm();
   const [open, setOpen] = useState(false);
   const [discovering, setDiscovering] = useState(false);
   const [found, setFound] = useState<Row | null>(null);
+  const [task, setTask] = useState<Row | null>(null);
   const add = useMutation({
-    mutationFn: async ({ csv, loadType }: { csv: string; loadType: string }) => {
-      const body = { csv, load_type: loadType };
+    mutationFn: async ({ source, loadType }: { source: Row; loadType: string }) => {
+      const body = { source, load_type: loadType, request_id: newRequestId() };
+      setTask(null);
       const preview = (await api.post<Row>(`/ingestion-jobs/${jobId}/tables`, { ...body, dry_run: true })).summary;
       setFound(preview);
       if (preview.invalid.length || !preview.tables) return null;
@@ -266,17 +273,18 @@ function useAddTables(jobId: string) {
           {Number(preview.in_job) > 0 && <p>{fmtInt(preview.in_job)} more {plural(preview.in_job, "line")} the job already has {Number(preview.in_job) === 1 ? "is" : "are"} left as {Number(preview.in_job) === 1 ? "it is" : "they are"}.</p>}
           {preview.new_groups.length > 0 && <p>A new server gets {fmtInt(preview.new_groups.length)} new {plural(preview.new_groups.length, "group")}.</p>}
           <p>Their first loads run at the job's next run.</p></> });
-      return ok ? api.post<Row>(`/ingestion-jobs/${jobId}/tables`, { ...body, dry_run: false }) : null;
+      return ok ? finished(await api.post<Row>(`/ingestion-jobs/${jobId}/tables`, { ...body, dry_run: false }), setTask) : null;
     },
     onSuccess: (r) => { if (r) { setFound(r.summary); qc.invalidateQueries({ queryKey: ["job-tree", jobId] });
       qc.invalidateQueries({ queryKey: ["job-settings", jobId] }); qc.invalidateQueries({ queryKey: ["schedules"] }); } },
   });
   const dialog = <>
-    {open && <ImportCsvDialog csv="" loadType="ct" onClose={(next) => { setOpen(false); if (next) add.mutate(next); }} />}
-    {discovering && <DiscoverDialog onClose={(lines) => { setDiscovering(false); if (lines) add.mutate({ csv: lines, loadType: "ct" }); }} />}
+    {open && <ImportCsvDialog loadType="ct" onClose={(next) => { setOpen(false); if (next) add.mutate(next); }} />}
+    {discovering && <DiscoverDialog onClose={(pick) => { setDiscovering(false); if (pick) add.mutate({ source: pick.source, loadType: "ct" }); }} />}
     {confirm.dialog}
   </>;
   const result = <>
+    {add.isPending && <TaskProgress task={task} />}
     <ErrorBox error={add.error} />
     {found && found.invalid.length > 0 && <Notice tone="bad">Nothing was added: {fmtInt(found.invalid.length)} {plural(found.invalid.length, "line")} can't be
       added.<ul>{found.invalid.slice(0, 20).map((l: Row) => <li key={l.line}>line {l.line}, {l.table}: {l.errors.join("; ")}</li>)}</ul></Notice>}

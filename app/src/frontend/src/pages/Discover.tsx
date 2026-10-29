@@ -3,13 +3,15 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, type Row } from "../api";
 import { ErrorBox, Modal, Notice, OutLink, Tag, fmtInt, plural } from "../components";
 import { useSettings } from "../App";
+import { DatabaseTables } from "./SourcePick";
 
 // Add tables, Discover on a source: as Lakeflow Connect's Connection and Source steps. Step 1 is the Unity Catalog
 // connection, tested before anything is discovered; step 2 picks the whole server, whole databases or single tables in
-// a tree, a row chosen in part showing a filled square. What is picked becomes the lines New and Edit take
-// (src_connection, database, schema, table, columns, key and the load type discovery recommends).
+// a tree, a row chosen in part showing a filled square. The tables found stay in Lakebase (discovered_table): a
+// database's tables are shown a page at a time when it is opened, and what is picked is handed to New and Edit by
+// reference (the discoveries, and the whole server, whole databases or tables chosen), never as the tables themselves.
 
-type Pick = "all" | "part" | "none";
+export type Pick = "all" | "part" | "none";
 const RUNNING = new Set(["PENDING", "QUEUED", "RUNNING", "TERMINATING", "BLOCKED", "WAITING_FOR_RETRY"]);
 const wait = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -30,12 +32,12 @@ async function discover(connection: string, request: Row): Promise<string> {
   }
 }
 
-/** Read the tables of some databases: those found, and each database that couldn't be read with the first line of
- *  why. A database the login can name but not open fails on its own; the others are still read. */
-async function readTables(connection: string, request: Row): Promise<{ tables: Row[]; failed: [string, string][] }> {
+/** Read the tables of some databases into Lakebase: the discovery's id, and each database that couldn't be read with
+ *  the first line of why. A database the login can name but not open fails on its own; the others are still read. */
+async function readTables(connection: string, request: Row): Promise<{ id: string; failed: [string, string][] }> {
   const id = await discover(connection, request);
-  const [tables, rows] = await Promise.all([api.get<Row[]>(`/discoveries/${id}/tables`), api.get<Row[]>(`/discoveries/${id}/databases`)]);
-  return { tables, failed: rows.filter((r) => r.status === "failed").map((r) => [r.src_database, String(r.error ?? "").split("\n")[0]]) };
+  const rows = await api.get<Row[]>(`/discoveries/${id}/databases`);
+  return { id, failed: rows.filter((r) => r.status === "failed").map((r) => [r.src_database, String(r.error ?? "").split("\n")[0]]) };
 }
 
 /** The databases that couldn't be read, and why: often that the login can see the name but not open the database. */
@@ -48,17 +50,8 @@ function Unread({ failed }: { failed: [string, string][] }) {
     {failed.length > 10 && <span className="muted">and {fmtInt(failed.length - 10)} more.</span>}</Notice>;
 }
 
-const cell = (v: unknown) => { const s = v == null ? "" : String(v); return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s; };
-
-/** The lines Add tables takes, one per discovered table. */
-export function linesOf(connection: string, tables: Row[]): string {
-  const head = ["src_connection", "src_database", "src_schema", "src_table", "select_list", "primary_key", "cursor_column", "load_type"];
-  return [head.join(","), ...tables.map((t) => [connection, t.src_database, t.src_schema, t.src_table, t.select_list,
-    t.primary_key, t.cursor_column, t.load_type].map(cell).join(","))].join("\n") + "\n";
-}
-
 /** A tick box with a third state: a filled square for a row chosen in part, a tick only when all of it is. */
-function TriBox({ pick, label, onClick }: { pick: Pick; label: string; onClick: () => void }) {
+export function TriBox({ pick, label, onClick }: { pick: Pick; label: string; onClick: () => void }) {
   return <button type="button" className={`tri-box ${pick}`} role="checkbox" aria-checked={pick === "all" ? true : pick === "part" ? "mixed" : false}
     aria-label={label} title={pick === "part" ? "Chosen in part" : undefined} onClick={onClick}>{pick === "all" ? "✓" : ""}</button>;
 }
@@ -181,9 +174,9 @@ function Step1({ chosen, setChosen, tested, setTested }: { chosen: string; setCh
 
 type Picks = Record<string, Pick | string[]>;
 
-function Step2({ connection, databases, picks, setPicks, tables, setTables, failed, setFailed }: { connection: string;
+function Step2({ connection, databases, picks, setPicks, read, setRead, failed, setFailed }: { connection: string;
   databases: string[]; picks: Picks; setPicks: (update: (p: Picks) => Picks) => void;
-  tables: Record<string, Row[]>; setTables: (update: (t: Record<string, Row[]>) => Record<string, Row[]>) => void;
+  read: Record<string, string>; setRead: (update: (t: Record<string, string>) => Record<string, string>) => void;
   failed: [string, string][]; setFailed: (update: (f: [string, string][]) => [string, string][]) => void }) {
   const [filter, setFilter] = useState("");
   const [open, setOpen] = useState<string | null>(null);
@@ -192,7 +185,7 @@ function Step2({ connection, databases, picks, setPicks, tables, setTables, fail
   const shown = databases.filter((d) => d.toLowerCase().includes(filter.toLowerCase()));
   const pickIn = (all: Picks, d: string): Pick => {
     const p = all[d];
-    if (Array.isArray(p)) return p.length === 0 ? "none" : tables[d] && p.length >= tables[d].length ? "all" : "part";
+    if (Array.isArray(p)) return p.length === 0 ? "none" : "part";
     return p ?? "none";
   };
   const pickOf = (d: string) => pickIn(picks, d);
@@ -203,19 +196,17 @@ function Step2({ connection, databases, picks, setPicks, tables, setTables, fail
   const openDatabase = async (d: string) => {
     if (open === d) return setOpen(null);
     setOpen(d);
-    if (tables[d]) return;
+    if (read[d]) return;
     setReading(d); setError(null);
     try {
-      const read = await readTables(connection, { databases: [d] });
-      if (read.failed.length) setFailed((now) => [...now.filter(([name]) => name !== d), ...read.failed]);
-      else setTables((now) => ({ ...now, [d]: read.tables }));
+      const got = await readTables(connection, { databases: [d] });
+      if (got.failed.length) setFailed((now) => [...now.filter(([name]) => name !== d), ...got.failed]);
+      else setRead((now) => ({ ...now, [d]: got.id }));
     } catch (e) { setError(e); } finally { setReading(null); }
   };
   const toggleTable = (d: string, key: string) => setPicks((now) => {
-    const all = (tables[d] ?? []).map((t) => `${t.src_schema}.${t.src_table}`);
-    const chosen = Array.isArray(now[d]) ? (now[d] as string[]) : pickIn(now, d) === "all" ? all : [];
-    const next = chosen.includes(key) ? chosen.filter((k) => k !== key) : [...chosen, key];
-    return { ...now, [d]: next.length === all.length ? "all" : next };
+    const chosen = Array.isArray(now[d]) ? (now[d] as string[]) : [];
+    return { ...now, [d]: chosen.includes(key) ? chosen.filter((k) => k !== key) : [...chosen, key] };
   });
   return (
     <>
@@ -230,26 +221,19 @@ function Step2({ connection, databases, picks, setPicks, tables, setTables, fail
             onClick={() => setAll(databases, server === "all" ? "none" : "all")} /> <b>{connection}, the whole server</b></td>
             <td className="num">{fmtInt(databases.length)} {plural(databases.length, "database")}</td>
             <td className="muted">{server === "part" ? "chosen in part" : ""}</td></tr>
-          {shown.map((d) => (
+          {shown.slice(0, 500).map((d) => (
             <Fragment key={d}>
               <tr className="l2"><td className="name" style={{ paddingLeft: 30 }}>
                 <TriBox pick={pickOf(d)} label={`The whole database ${d}`} onClick={() => setAll([d], pickOf(d) === "all" ? "none" : "all")} />{" "}
                 <button className="twisty" aria-expanded={open === d} onClick={() => openDatabase(d)}>{open === d ? "▾" : "▸"}</button>{d}</td>
-                <td className="num">{tables[d] ? fmtInt(tables[d].length) : reading === d ? "reading…" : ""}</td>
+                <td className="num">{reading === d ? "reading…" : ""}</td>
                 <td className="muted">{pickOf(d) === "part" ? `${fmtInt((picks[d] as string[]).length)} chosen` : ""}</td></tr>
-              {open === d && (tables[d] ?? []).map((t) => {
-                const key = `${t.src_schema}.${t.src_table}`;
-                const on = pickOf(d) === "all" || (Array.isArray(picks[d]) && (picks[d] as string[]).includes(key));
-                return (
-                  <tr key={key} className="l3"><td className="name" style={{ paddingLeft: 62 }}>
-                    <TriBox pick={on ? "all" : "none"} label={key} onClick={() => toggleTable(d, key)} /> {key}
-                    {t.notes && <span className="sub">{t.notes}</span>}</td>
-                    <td className="num">{t.row_count != null ? `${fmtInt(t.row_count)} rows` : ""}</td>
-                    <td>{t.load_type === "ct" ? "Change tracking" : t.load_type === "cursor" ? `Cursor column ${t.cursor_column}` : "Full reload"}</td></tr>
-                );
-              })}
+              {open === d && read[d] && <DatabaseTables kind="discovery" sourceId={read[d]} server={connection} database={d}
+                whole={pickOf(d) === "all"} chosen={Array.isArray(picks[d]) ? (picks[d] as string[]) : []} onToggle={(key) => toggleTable(d, key)} />}
             </Fragment>
           ))}
+          {shown.length > 500 && <tr className="l2"><td colSpan={3} className="muted" style={{ paddingLeft: 30 }}>
+            and {fmtInt(shown.length - 500)} more: filter to find one, or tick the whole server</td></tr>}
           {databases.length > shown.length && <tr className="l2"><td colSpan={3} className="muted" style={{ paddingLeft: 30 }}>
             {fmtInt(databases.length - shown.length)} more {plural(databases.length - shown.length, "database")} hidden by the filter</td></tr>}
         </tbody>
@@ -260,13 +244,16 @@ function Step2({ connection, databases, picks, setPicks, tables, setTables, fail
   );
 }
 
-/** Discover on a source: the two steps, then the lines of the tables chosen (onClose(lines)), or nothing on Cancel. */
-export function DiscoverDialog({ onClose }: { onClose: (lines: string | null) => void }) {
+/** What Discover hands to New and Edit: the discoveries the tables are in, and what of them was chosen (main.Selection). */
+export type DiscoveredPick = { source: Row; label: string };
+
+/** Discover on a source: the two steps, then what was chosen by reference (onClose(pick)), or nothing on Cancel. */
+export function DiscoverDialog({ onClose }: { onClose: (pick: DiscoveredPick | null) => void }) {
   const [step, setStep] = useState<1 | 2 | 3>(1);
   const [connection, setConnection] = useState("");
   const [tested, setTested] = useState<Row | null>(null);
   const [picks, setPicks] = useState<Picks>({});
-  const [tables, setTables] = useState<Record<string, Row[]>>({});
+  const [read, setRead] = useState<Record<string, string>>({});
   const [failed, setFailed] = useState<[string, string][]>([]);
   const [error, setError] = useState<unknown>(null);
   const databases: string[] = tested?.databases ?? [];
@@ -277,25 +264,28 @@ export function DiscoverDialog({ onClose }: { onClose: (lines: string | null) =>
   const finish = async () => {
     setStep(3); setError(null);
     try {
-      const unread = whole.filter((d) => !tables[d]);
-      const read: Row[] = [];
+      const unread = whole.filter((d) => !read[d]);
+      const ids = new Set(Object.values(read));
+      const all = whole.length === databases.length && !tested?.typed;
       if (unread.length) {
         // A whole server is listed from master (with the same name filter); databases typed by hand are read by name.
-        const all = unread.length === databases.length && !tested?.typed;
-        const got = await readTables(connection, all ? { whole_server: true, ...(tested?.pattern ? { pattern: tested.pattern } : {}) }
-          : { databases: unread });
-        read.push(...got.tables);
+        const got = await readTables(connection, unread.length === databases.length && !tested?.typed
+          ? { whole_server: true, ...(tested?.pattern ? { pattern: tested.pattern } : {}) } : { databases: unread });
+        ids.add(got.id);
         if (got.failed.length) {
           // Keep what was read, and say which databases weren't, before anything is added.
-          const byDatabase: Record<string, Row[]> = {};
-          for (const t of got.tables) (byDatabase[t.src_database] ??= []).push(t);
-          setTables((now) => ({ ...now, ...byDatabase })); setFailed(() => got.failed); setStep(2);
+          const bad = new Set(got.failed.map(([d]) => d));
+          setRead((now) => ({ ...now, ...Object.fromEntries(unread.filter((d) => !bad.has(d)).map((d) => [d, got.id])) }));
+          setFailed(() => got.failed); setStep(2);
           return;
         }
       }
-      const picked = [...whole.filter((d) => tables[d]).flatMap((d) => tables[d]), ...read,
-        ...handPicked.flatMap(([d, keys]) => (tables[d] ?? []).filter((t) => keys.includes(`${t.src_schema}.${t.src_table}`)))];
-      onClose(linesOf(connection, picked));
+      const tables = handPicked.map(([d, keys]) => ({ server: connection, database: d, tables: keys }));
+      const source = { discovery_ids: [...ids], whole_server: all, filter: "",
+                       databases: all ? [] : whole.map((d) => ({ server: connection, database: d })), tables };
+      const label = all ? `${connection}, the whole server` : `${fmtInt(whole.length)} whole ${plural(whole.length, "database")}`
+        + (tables.length ? ` and tables from ${fmtInt(tables.length)} more` : "") + ` on ${connection}`;
+      onClose({ source, label });
     } catch (e) { setError(e); setStep(2); }
   };
   const title = step === 1 ? "Add tables · Step 1 of 2: the connection" : `Add tables · Step 2 of 2: choose on ${connection}`;
@@ -310,9 +300,9 @@ export function DiscoverDialog({ onClose }: { onClose: (lines: string | null) =>
       }}>
       <div className="discover">
         {step === 1 && <Step1 chosen={connection} setChosen={setConnection} tested={tested} setTested={setTested} />}
-        {step >= 2 && <Step2 connection={connection} databases={databases} picks={picks} setPicks={setPicks} tables={tables} setTables={setTables}
+        {step >= 2 && <Step2 connection={connection} databases={databases} picks={picks} setPicks={setPicks} read={read} setRead={setRead}
           failed={failed} setFailed={setFailed} />}
-        {step === 3 && <p className="muted">Reading the tables of {fmtInt(whole.filter((d) => !tables[d]).length)} {plural(whole.length, "database")}:
+        {step === 3 && <p className="muted">Reading the tables of {fmtInt(whole.filter((d) => !read[d]).length)} {plural(whole.length, "database")}:
           a few minutes when the discovery cluster starts cold. The tables are added to the job's page when it ends.</p>}
         {step === 2 && chosen > 0 && <p className="muted">{fmtInt(whole.length)} whole {plural(whole.length, "database")}
           {handPicked.length ? `, and tables from ${fmtInt(handPicked.length)} more` : ""} chosen.</p>}

@@ -316,6 +316,7 @@ details.advanced .compute h4 { margin: var(--db-space-3) 0 var(--db-space-2); }
            border: 1px solid var(--db-border-strong, #8a96a3); background: var(--db-surface-base); color: var(--accent-text);
            font-size: 11px; line-height: 1; vertical-align: -3px; cursor: pointer; }
 .tri-box.all, .tri-box.part { background: var(--accent); border-color: var(--accent); }
+.task-progress { display: block; width: 100%; margin: var(--db-space-2) 0; accent-color: var(--accent); }
 .empty-drop { border: 1px dashed var(--border); border-radius: var(--db-shape-container-small); padding: var(--db-space-4); text-align: center; color: var(--muted); margin: 0; }
 .menu-note { padding: 6px 12px; overflow-wrap: anywhere; }
 .menu-note + .menu-note { border-top: 1px solid var(--border); }

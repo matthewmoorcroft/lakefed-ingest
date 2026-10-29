@@ -5,6 +5,7 @@ import { api, qs, type ApiError, type Row } from "../api";
 import { Refused } from "../permissions";
 import { Tree } from "./JobEdit";
 import { TargetTables } from "./TargetTables";
+import { RunningTasks } from "./tasks";
 import { OutLink,
   Crumbs, Badge, ErrorBox, Menu, Name, Notice, PageHead, ProgressBar, RunStatus, Section, StateBar, fmtClock, fmtDuration, fmtInt,
   fmtSlot, fmtSpeed, fmtTime, jobRunPath, plural, progressFrom, useConfirm, type ConfirmRequest
@@ -214,6 +215,7 @@ export default function IngestionJob() {
       {j && <p className="muted small">Created by {j.created_by ?? "unknown"}{j.created_at ? `, ${fmtTime(j.created_at)}` : ""} ·
         Last updated by {j.updated_by ?? "unknown"}{j.updated_at ? `, ${fmtTime(j.updated_at)}` : ""}</p>}
       {confirm.dialog}
+      <RunningTasks jobId={id} />
       <Refused action="Run now" refusal={j?.run_now?.blocked} />
       <Refused action="Edit and Delete" refusal={j?.change_blocked} />
       <ErrorBox error={remove.error} />
