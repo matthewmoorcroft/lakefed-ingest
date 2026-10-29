@@ -8,7 +8,7 @@ database access, so main.py writes the plan in one transaction."""
 import csv
 import io
 import json
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Tuple
 
 import config_import as ci
 import job_settings as js
@@ -224,7 +224,8 @@ def plan_for_job(job_name: str, text: str, load_type: str, job_rows: List[dict],
 
 
 def summary(planned: dict) -> dict:
-    """What the page shows before Create: tables, databases and groups per server, and the invalid lines."""
+    """What the page shows before Create: tables, databases and groups per server, the invalid lines (a line of the
+    file, or a database that could not be read, named with why), and what the file's database lines came to."""
     servers: Dict[str, dict] = {}
     for line in (line for line in planned["lines"] if line["status"] != "in_job"):
         s = servers.setdefault(line["server"], {"server": line["server"], "databases": set(), "tables": 0, "groups": set(),
@@ -238,52 +239,101 @@ def summary(planned: dict) -> dict:
                         for s in sorted(servers.values(), key=lambda s: s["server"])],
             "tables": sum(line["status"] != "in_job" for line in planned["lines"]), "groups": planned["groups"],
             "in_job": sum(line["status"] == "in_job" for line in planned["lines"]), "new_groups": planned.get("new_groups", []),
-            "invalid": [{k: line[k] for k in ("line", "table", "errors")} for line in planned["lines"] if line["status"] == "invalid"]}
+            "covered": planned.get("covered", 0), "discovered": planned.get("discovered", 0),
+            "invalid": [{k: line[k] for k in ("line", "table", "errors")} for line in planned["lines"] if line["status"] == "invalid"]
+                       + [{"line": u["line"], "table": u["database"], "errors": [u["error"]]} for u in planned.get("unreadable", [])]}
 
 
 # ---- a CSV kept in Lakebase (an upload), and the CSV a plan reads from what a selection takes ---------------------
 
 UPLOAD_COLUMNS = ci.CSV_COLUMNS + ("load_type",)
+# A file reads through the connection chosen before it, and the job sets its groups: these columns are not accepted.
+UPLOAD_REFUSED_COLUMNS = ("src_host", "src_port", "secret_key", "task_collection")
+# An upload line's kind: a table (ok), a database alone, every table of which is discovered by name at Create
+# (database), or one that can't be taken (invalid). Only ok lines are read as tables (queries.source_rows_sql).
+TABLE_LINE, DATABASE_LINE, INVALID_LINE = "ok", "database", "invalid"
 
 
-def read_upload(text: str, max_lines: int = MAX_LINES) -> dict:
+def read_upload(text: str, connection: str, max_lines: int = MAX_LINES) -> dict:
     """An uploaded CSV, read line by line for table_upload_line: {"errors": the file's own problems (nothing is kept
     while there are any), "columns": its header, "lines": [{line, server, src_database, src_schema, src_table,
-    load_type, fields, status, errors}]}. A line's status is invalid when it can't name a table on a server; the job's
-    settings are checked later, when Create or Add tables plans what it takes."""
-    reader = csv.DictReader(io.StringIO(text.lstrip("﻿")))
+    load_type, fields, status, errors}]}. The file is read through the connection chosen before it: a src_connection
+    column is accepted only when every row names that connection, else the lines are named in the errors. A line with
+    src_database alone is a database: every table of it, found by discovery at Create. A line that can't be taken
+    (no table where a schema is given, a database named twice) is kept as invalid with why; the job's settings are
+    checked later, when Create or Add tables plans what it takes."""
+    connection = str(connection or "").strip()
+    reader = csv.DictReader(io.StringIO(text.lstrip("\ufeff")))
     header = [h.strip() for h in (reader.fieldnames or [])]
     reader.fieldnames = header
     errors = ci._header_errors([h for h in header if h != "load_type"]) if header else ["the file is empty"]
-    for need in ("src_database", "src_schema", "src_table"):
-        if header and need not in header:
-            errors.append(f"the file has no {need} column")
-    if header and "src_connection" not in header and "src_host" not in header:
-        errors.append("the file has no src_connection or src_host column")
+    errors += [f"column {c} is not accepted: the file reads through the connection chosen before it, and the job sets "
+               f"its groups" for c in header if c in UPLOAD_REFUSED_COLUMNS]
+    if header and "src_database" not in header:
+        errors.append("the file has no src_database column")
+    if not connection:
+        errors.append("choose the connection the file reads through")
     if errors:
-        return {"errors": errors, "columns": header, "lines": []}
-    out = []
+        return {"errors": errors, "columns": header, "connection": connection, "lines": []}
+    out, mismatched, named = [], [], {}
     for number, raw in enumerate((r for r in reader if any(str(v or "").strip() for v in r.values())), start=2):
         if len(out) >= max_lines:
             return {"errors": [f"more than {max_lines:,} lines: at most {max_lines:,} in one file"], "columns": header,
-                    "lines": []}
+                    "connection": connection, "lines": []}
         problems = ["this line has more cells than the header has columns"] if None in raw else []
         fields = {k: str(v or "").strip() for k, v in raw.items() if k is not None}
-        problems += [f"{k} is required" for k in ("src_database", "src_schema", "src_table") if not fields.get(k)]
-        connection, host = fields.get("src_connection") or None, fields.get("src_host") or None
-        if not connection and not host:
-            problems.append("give the UC connection (src_connection) or the host (src_host)")
-        port = fields.get("src_port") or None
-        server = js.server_of({"src_connection": connection, "src_host": host,
-                               "src_port": int(port) if port and port.isdigit() else port,
-                               "use_remote_query": bool(connection) and not host})
-        out.append({"line": number, "server": server, "src_database": fields.get("src_database") or None,
-                    "src_schema": fields.get("src_schema") or None, "src_table": fields.get("src_table") or None,
+        given = fields.get("src_connection", "")
+        if given and given.lower() != connection.lower():
+            mismatched.append(f"line {number} names {given}, not {connection}")
+        fields["src_connection"] = connection
+        database, schema, table = (fields.get(k) or "" for k in ("src_database", "src_schema", "src_table"))
+        if not database:
+            problems.append("src_database is required")
+        if bool(schema) != bool(table):
+            problems.append("src_table is required with src_schema" if schema else "src_schema is required with src_table")
+        kind = TABLE_LINE if schema and table else DATABASE_LINE if database and not schema else INVALID_LINE
+        if kind == DATABASE_LINE and database.lower() in named:
+            problems.append(f"database {database} is already named on line {named[database.lower()]}: it is taken once")
+            kind = INVALID_LINE
+        if kind == DATABASE_LINE:
+            named.setdefault(database.lower(), number)
+        if problems:
+            kind = INVALID_LINE
+        out.append({"line": number, "server": js.server_of({"src_connection": connection, "use_remote_query": True}),
+                    "src_database": database or None, "src_schema": schema or None, "src_table": table or None,
                     "load_type": fields.get("load_type") or None, "fields": fields,
-                    "status": "invalid" if problems else "ok", "errors": problems or None})
+                    "status": kind, "errors": problems or None})
+    if mismatched:
+        return {"errors": [f"{len(mismatched)} {plural(len(mismatched), 'line')} "
+                           f"{'names' if len(mismatched) == 1 else 'name'} another connection: "
+                           + "; ".join(mismatched[:20]) + (f"; and {len(mismatched) - 20} more" if len(mismatched) > 20 else "")],
+                "columns": header, "connection": connection, "lines": []}
     if not out:
-        errors.append("the file has no tables")
-    return {"errors": errors, "columns": header, "lines": out if not errors else []}
+        errors.append("the file has no tables or databases")
+    return {"errors": errors, "columns": header, "connection": connection, "lines": out if not errors else []}
+
+
+def plural(count: int, word: str) -> str:
+    return word if count == 1 else f"{word}s"
+
+
+def discovered_tables(found: List[dict], explicit: set) -> Tuple[List[dict], int]:
+    """The discovered tables a plan takes, and how many were left out: a table the file names in a row of its own wins
+    over the one discovery recommends for it, so a discovered table with the same server, database, schema and table
+    as an explicit one is left out (the explicit row's settings are used). ``found`` are discovered rows (fields: the
+    CSV fields they take); ``explicit`` holds the (server, database, schema, table) keys of the file's table rows."""
+    kept, covered = [], 0
+    for row in found:
+        if table_key(row) in explicit:
+            covered += 1
+        else:
+            kept.append(row)
+    return kept, covered
+
+
+def table_key(row: dict) -> tuple:
+    """A row's (server, database, schema, table) key, lower case, as discovered_tables compares them."""
+    return tuple(str(part or "").lower() for part in (row["server"], row["src_database"], row["src_schema"], row["src_table"]))
 
 
 def csv_of(columns: List[str], rows: List[dict]) -> str:

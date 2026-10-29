@@ -537,13 +537,14 @@ def _answer_again(task_id: int, after) -> JSONResponse:
     return _task_answer(task_id)
 
 
-def _write_now_or_later(kind, request_id, job_id, total, user, write, after):
+def _write_now_or_later(kind, request_id, job_id, total, user, write, after, background: bool = False):
     """Every write is a task: recorded first (the request id is its key), then written in the request when it is small
-    (_run_now), else on a background thread. Sent again with the same request id, it answers with its task (_answer_again)."""
+    (_run_now), else on a background thread. Sent again with the same request id, it answers with its task (_answer_again).
+    A write that first discovers its tables (background) always runs on the thread, whatever its size."""
     made = db.query(q.insert_task_sql(), (kind, request_id or uuid.uuid4().hex, job_id, int(total), None, user or None))[0]
     if not made["made"]:
         return _answer_again(made["id"], after)
-    if total <= BACKGROUND_ROWS:
+    if total <= BACKGROUND_ROWS and not background:
         return _run_now(made["id"], write, after)
     _start_background(lambda: _run_task(made["id"], write, after))
     return _task_answer(made["id"])
@@ -580,31 +581,38 @@ def job_tasks(job_id: int):
 
 class UploadRequest(BaseModel):
     csv: str
+    # The UC connection the file reads through, chosen before the file: the file gives no connection of its own (one
+    # that names another connection on any row refuses it).
+    connection: str = Field(min_length=1, max_length=255)
     file_name: Optional[str] = Field(None, max_length=255)
 
 
 @app.post("/api/uploads")
 def upload_tables(body: UploadRequest, request: Request):
-    """Keep a CSV of tables in Lakebase, one row per line, written q.CONTROL_BATCH lines to a statement: its header
-    problems refuse it (422); a line that can't name a table on a server is kept as invalid, with why."""
-    read = nj.read_upload(body.csv)
+    """Keep a CSV of tables in Lakebase, one row per line, written q.CONTROL_BATCH lines to a statement, read through the
+    connection it was chosen with: its header problems, or a line naming another connection, refuse it (422). A line with
+    a database alone is kept to be discovered at Create; a line that can't name a table is kept as invalid, with why."""
+    read = nj.read_upload(body.csv, body.connection)
     if read["errors"]:
         raise HTTPException(422, {"errors": read["errors"]})
     upload_id, lines = uuid.uuid4().hex, read["lines"]
-    ok = sum(line["status"] == "ok" for line in lines)
+    tables = sum(line["status"] == nj.TABLE_LINE for line in lines)
+    databases = sum(line["status"] == nj.DATABASE_LINE for line in lines)
+    invalid = len(lines) - tables - databases
     with _write() as cur:
         cur.execute(q.insert_upload_sql(), (upload_id, body.file_name, _user(request) or None, read["columns"],
-                                            len(lines), ok, len(lines) - ok))
+                                            len(lines), tables, invalid))
         for at in range(0, len(lines), q.CONTROL_BATCH):
             chunk = lines[at:at + q.CONTROL_BATCH]
             cur.execute(q.insert_upload_lines_sql(len(chunk)), tuple(
                 v for line in chunk for v in (upload_id, line["line"], line["server"], line["src_database"],
                                               line["src_schema"], line["src_table"], line["load_type"],
                                               json.dumps(line["fields"]), line["status"], line["errors"])))
-    invalid = [{"line": line["line"], "table": ".".join(line[k] or "" for k in ("src_database", "src_schema", "src_table")),
-                "errors": line["errors"]} for line in lines if line["status"] != "ok"][:20]
-    return {"upload_id": upload_id, "file_name": body.file_name, "columns": read["columns"], "lines": len(lines),
-            "tables": ok, "invalid": len(lines) - ok, "invalid_lines": invalid}
+    invalid_lines = [{"line": line["line"], "table": ".".join(line[k] for k in ("src_database", "src_schema", "src_table") if line[k]),
+                      "errors": line["errors"]} for line in lines if line["status"] == nj.INVALID_LINE][:20]
+    return {"upload_id": upload_id, "file_name": body.file_name, "connection": read["connection"],
+            "columns": read["columns"], "lines": len(lines), "tables": tables, "databases": databases,
+            "invalid": invalid, "invalid_lines": invalid_lines}
 
 
 SOURCE_KINDS = ("upload", "discovery")
@@ -638,6 +646,7 @@ def source_overview(kind: str, source_id: str, filter: str = "", offset: int = 0
            "databases": db.query(q.source_databases_sql(kind), (param, filter, limit, offset))}
     if kind == "upload":
         out["upload"] = db.query(q.upload_sql(), (source_id,))[0]
+        out["upload"]["databases_only"] = db.query(q.upload_databases_count_sql(), (source_id,))[0]["n"]
         out["invalid_lines"] = db.query(q.upload_invalid_sql(), (source_id, 20))
     return out
 
@@ -677,7 +686,7 @@ class Selection(BaseModel):
     def _one_source(self):
         if bool(self.upload_id) == bool(self.discovery_id or self.discovery_ids):
             raise ValueError("name an upload_id or a discovery_id, not both")
-        if not (self.whole_server or self.databases or self.tables):
+        if not (self.whole_server or self.databases or self.tables or self.upload_id):
             raise ValueError("choose the whole server, databases or tables")
         return self
 
@@ -734,19 +743,25 @@ def _selected_rows(kind: str, param, selection: Selection) -> List[dict]:
 
 
 def _selected(selection: Selection) -> dict:
-    """What a selection takes, read back from Lakebase: {"text": the CSV a plan reads, "lines": each of its lines'
-    line number in the uploaded file (or None), "parts": the job_selection rows to keep with the job, "kind",
-    "source_id"}. 422 when it takes no tables."""
+    """What a selection takes, read back from Lakebase: {"text": the CSV of its table rows, "rows": those rows (server,
+    database, schema, table, line, fields), "columns": the header the CSV is written with, "lines": each row's line in
+    the uploaded file (or None), "database_lines": an upload's database-only lines ({line, database, connection}),
+    "parts": the job_selection rows to keep with the job, "kind", "source_id"}. 422 when it takes neither tables nor
+    database-only lines."""
     kind, param, source_id = selection.source()
+    database_lines = []
     if kind == "upload":
         upload = db.query(q.upload_sql(), (param,))
         if not upload:
             raise HTTPException(404, f"upload {param} not found")
         columns = list(upload[0]["columns"])
+        database_lines = [{"line": r["line"], "database": r["src_database"],
+                           "connection": (r["fields"] or {}).get("src_connection") or ""}
+                          for r in db.query(q.upload_database_lines_sql(), (param,))]
     else:
         columns = list(nj.DISCOVERY_COLUMNS)
     rows = _selected_rows(kind, param, selection)
-    if not rows:
+    if not rows and not database_lines:
         raise HTTPException(422, {"errors": ["the selection takes no tables"]})
     whole = ([s["server"] for s in db.query(q.source_servers_sql(kind), (param, selection.filter))]
              if selection.whole_server else [])
@@ -756,17 +771,134 @@ def _selected(selection: Selection) -> dict:
              + [("database", d.server, d.database, None, None) for d in selection.databases if not covered(d.server, d.database)]
              + [("tables", t.server, t.database, list(t.tables), None) for t in selection.tables
                 if not covered(t.server, t.database)])
-    return {"text": nj.csv_of(columns, [r["fields"] for r in rows]),
-            "lines": [r["line"] if kind == "upload" else None for r in rows],
+    return {"text": nj.csv_of(columns, [r["fields"] for r in rows]), "rows": rows, "columns": columns,
+            "lines": [r["line"] if kind == "upload" else None for r in rows], "database_lines": database_lines,
             "parts": parts, "kind": kind, "source_id": source_id}
 
 
 def _file_lines(plan: dict, selected: Optional[dict]) -> dict:
-    """A plan of an upload's selection, its lines numbered as in the uploaded file."""
+    """A plan of an upload's selection, its lines numbered as in the uploaded file (a discovered table's line is its
+    database's line), with what the file's database-only lines came to."""
     if selected and selected["kind"] == "upload":
         for line in plan["lines"]:
             line["line"] = selected["lines"][line["line"] - 2]
+        plan.update({k: selected[k] for k in ("covered", "discovered", "unreadable") if k in selected})
     return plan
+
+
+# A file's database-only lines are read by a discovery run through the connection. The previews and the Create share
+# that run for this long (per process), so the Create after a preview reads each database once.
+DATABASE_READ_MEMO_S = float(os.environ.get("DATABASE_READ_MEMO_S", str(2 * 3600)))
+_database_reads: dict = {}
+_database_reads_lock = threading.Lock()
+
+
+def _has_database_lines(selection: "Selection") -> bool:
+    """Whether an upload has database-only lines: those are discovered by name, so the table counts don't cover them."""
+    kind, param, _ = selection.source()
+    counted = db.query(q.upload_databases_count_sql(), (param,))
+    return kind == "upload" and bool(counted and counted[0]["n"])
+
+
+def _resolve_databases(selected: dict, wait: bool, request: Optional[Request] = None) -> Optional[dict]:
+    """The tables of a selection's database-only lines, found by name: a discovery run through the connection reads each
+    database, and its tables come back as rows, as a discovery's do. None when there are no such lines, else
+    {"discovering": bool, "databases": how many, "rows": the tables found ({line, server, src_database, src_schema,
+    src_table, fields}), "unreadable": [{line, database, error}]}. Not waiting (a preview), a run still going answers
+    discovering and the page asks again; waiting (the background Create or Add), the run is waited for."""
+    lines = selected["database_lines"]
+    if not lines:
+        return None
+    names: dict = {}
+    for line in lines:
+        names.setdefault(line["database"].lower(), line)
+    connection = lines[0]["connection"]
+    key = (connection.lower(), tuple(sorted(names)))
+    read = _database_read(key)
+    if read is None:
+        read = _start_database_read(key, connection, [line["database"] for line in names.values()], request)
+    if read["ended"] is None:
+        ended = _wait_for_run(read["run_id"]) if wait else jobs.run_ended(read["run_id"])
+        if ended is None:
+            return {"discovering": True, "databases": len(names), "rows": [], "unreadable": []}
+        read["ended"] = ended
+    ended = read["ended"]
+    if ended.get("result") != "SUCCESS":
+        _forget_database_read(key)
+        why = f"its discovery run ended {ended.get('result') or ended.get('state')}"
+        if ended.get("message"):
+            why += f": {ended['message']}"
+        return {"discovering": False, "databases": len(names), "rows": [],
+                "unreadable": [_unreadable(line, why) for line in names.values()]}
+    ids = [read["discovery_id"]]
+    statuses = {(s["src_database"] or "").lower(): s for s in db.query(q.discovery_statuses_sql(), (ids,))}
+    unreadable = []
+    for lower, line in names.items():
+        status = statuses.get(lower)
+        if status is None:
+            unreadable.append(_unreadable(line, "the connection did not list this database"))
+        elif status["status"] != "ok":
+            unreadable.append(_unreadable(line, status["error"] or f"it could not be read ({status['status']})"))
+    rows = [{"line": names[r["src_database"].lower()]["line"], "server": r["server"], "src_database": r["src_database"],
+             "src_schema": r["src_schema"], "src_table": r["src_table"], "fields": r["fields"]}
+            for r in db.query(q.source_rows_sql("discovery"), (ids,))
+            if r["src_database"].lower() in names and (statuses.get(r["src_database"].lower()) or {}).get("status") == "ok"]
+    return {"discovering": False, "databases": len(names), "rows": rows, "unreadable": unreadable}
+
+
+def _unreadable(line: dict, error: str) -> dict:
+    return {"line": line["line"], "database": line["database"], "error": error}
+
+
+def _database_read(key: tuple):
+    with _database_reads_lock:
+        read = _database_reads.get(key)
+        if read is not None and time.monotonic() - read["started"] > DATABASE_READ_MEMO_S:
+            del _database_reads[key]
+            read = None
+        return read
+
+
+def _forget_database_read(key: tuple) -> None:
+    with _database_reads_lock:
+        _database_reads.pop(key, None)
+
+
+def _start_database_read(key: tuple, connection: str, databases: List[str], request: Optional[Request]) -> dict:
+    """Starts a discovery run that reads these databases through the connection, and keeps it under the key."""
+    listed = connections()
+    if connection not in {c["name"] for c in listed["connections"]}:
+        raise HTTPException(422, {"errors": [_connection_unseen(connection, listed.get("error"))]})
+    job_id = _require(jobs.DISCOVER_JOB_ID, "discovery")
+    if request is not None:
+        _refuse_run_of(job_id, request)
+    discovery_id = uuid.uuid4().hex[:12]
+    spec = {"src_type": "sqlserver", "src_connection": connection, "kind": "tables", "databases": databases,
+            "requested_by": _user(request) if request is not None else ""}
+    run_id = jobs.run_now(job_id, {"discovery_id": discovery_id, "spec": json.dumps(spec)})
+    read = {"run_id": run_id, "discovery_id": discovery_id, "ended": None, "started": time.monotonic()}
+    with _database_reads_lock:
+        _database_reads[key] = read
+    return read
+
+
+def _with_databases(selected: dict, resolved: Optional[dict]) -> dict:
+    """The selection with the tables found for its database-only lines added after its table rows. A table the file
+    names in a row of its own is left to that row (nj.discovered_tables), so the explicit row's settings are used."""
+    if resolved is None:
+        return selected
+    kept, covered = nj.discovered_tables(resolved["rows"], {nj.table_key(row) for row in selected["rows"]})
+    rows = selected["rows"] + kept
+    columns = list(dict.fromkeys(selected["columns"] + list(nj.DISCOVERY_COLUMNS)))
+    return {**selected, "columns": columns, "text": nj.csv_of(columns, [row["fields"] for row in rows]),
+            "lines": [row["line"] for row in rows], "covered": covered, "discovered": len(kept),
+            "unreadable": resolved["unreadable"]}
+
+
+def _task_stage(task_id: Optional[int], stage: str) -> None:
+    """A background write's stage (discovering, then writing), which its task's progress shows."""
+    if task_id is not None:
+        db.execute(q.task_progress_json_sql(), (json.dumps({"stage": stage}), 0, task_id))
 
 
 def _keep_selection(cur, job_id: int, selected: Optional[dict], user: str) -> None:
@@ -1999,11 +2131,17 @@ class _TablesFrom(BaseModel):
             raise ValueError("give the tables as csv or as a source, not both")
         return self
 
-    def text(self):
-        """(the CSV a plan reads, the selection it came from or None)."""
+    def text(self, request: Optional[Request] = None, wait: bool = False):
+        """(the CSV a plan reads, the selection it came from or None). A selection's database-only lines have their
+        tables discovered first: while that discovery is still running (and not waited for) the text is None and the
+        selection says {"discovering": True, "databases": how many}."""
         if self.source is None:
             return self.csv, None
         selected = _selected(self.source)
+        resolved = _resolve_databases(selected, wait=wait, request=request)
+        if resolved is not None and resolved["discovering"]:
+            return None, {"discovering": True, "databases": resolved["databases"]}
+        selected = _with_databases(selected, resolved)
         return selected["text"], selected
 
 
@@ -2043,6 +2181,13 @@ def add_job_tables(job_id: int, body: JobTablesRequest, request: Request):
     its group, a new one joins its server's groups, a new server gets new groups. Applying is one transaction under
     the job's lock and its groups' run locks; tables the job already writes are left; then new groups are synced. The
     tables come as CSV lines (csv) or by reference to an upload or discovery (source), which is kept with the job."""
+    return _add_job_tables(job_id, body, request)
+
+
+def _add_job_tables(job_id: int, body: "JobTablesRequest", request: Request, inline: bool = False, progress=None,
+                    task_id=None):
+    """The add itself. A file with database-only lines is first discovered by name in a background task
+    (_add_after_discovery), which runs this again with inline=True, so the write happens in that task."""
     user = _user(request)
 
     def after(result):
@@ -2050,16 +2195,23 @@ def add_job_tables(job_id: int, body: JobTablesRequest, request: Request):
             _synced(_sync(job_id, user))
         return {k: v for k, v in result.items() if k != "new_groups"}
 
-    if body.source is not None:
+    if body.source is not None and not _has_database_lines(body.source):
         kind, param, source_id, rest = _selection_params(body.source)
         counted = db.query(q.selected_count_sql(kind), (param, *rest))
         if counted and counted[0]["n"] > BACKGROUND_ROWS:
             return _add_by_database(job_id, body, request, kind, param, source_id, rest, int(counted[0]["n"]))
-    if (made := _made_already(body, after)) is not None:
+    if not inline and (made := _made_already(body, after)) is not None:
         return made
     job = _load_schedule(job_id)[0]
+    if not inline and body.source is not None and not body.dry_run and _has_database_lines(body.source):
+        _refuse_job_tables(job, _job_groups(job_id), request)
+        return _write_now_or_later("tables", body.request_id, job_id, 0, user,
+                                   lambda progress, task_id: _add_after_discovery(job_id, body, request, progress, task_id),
+                                   after, background=True)
     taken = {r["task_collection"] for r in db.query(q.collections_sql())}
-    text, selected = body.text()
+    text, selected = body.text(request, wait=inline)
+    if selected is not None and selected.get("discovering"):
+        return {"summary": None, "applied": False, "discovering": True, "databases": selected["databases"]}
 
     def planned(rows):
         plan = _file_lines(nj.plan_for_job(job["name"], text, body.load_type, rows, body.groups_per_server, taken),
@@ -2089,8 +2241,19 @@ def add_job_tables(job_id: int, body: JobTablesRequest, request: Request):
             _task_written(cur, task_id, {**result, "new_groups": plan["new_groups"]}, job_id, len(written))
         return {**result, "new_groups": plan["new_groups"]}
 
+    if inline:
+        return write(progress, task_id)
     valid = sum(line["status"] == "valid" for line in plan["lines"])
     return _write_now_or_later("tables", body.request_id, job_id, valid, user, write, after)
+
+
+def _add_after_discovery(job_id: int, body: "JobTablesRequest", request: Request, progress, task_id) -> dict:
+    """The background half of an add with database-only lines: their tables are discovered by name, then the add is
+    written as an inline one is."""
+    _task_stage(task_id, "discovering")
+    _resolve_databases(_selected(body.source), wait=True, request=request)
+    _task_stage(task_id, "writing")
+    return _add_job_tables(job_id, body, request, inline=True, progress=progress, task_id=task_id)
 
 
 def _instant(value: str, name: str) -> datetime:
@@ -3414,7 +3577,7 @@ def create_ingestion_job(body: NewJobRequest, request: Request):
     another table writes refuses the lot), the groups' members; then its Databricks jobs are synced. The tables come
     as CSV lines (csv) or by reference to an upload or discovery (source), which is kept with the job. A source of more
     than BACKGROUND_ROWS tables is written database by database in a background task (_create_by_database)."""
-    if body.source is not None:
+    if body.source is not None and not _has_database_lines(body.source):
         kind, param, source_id, rest = _selection_params(body.source)
         counted = db.query(q.selected_count_sql(kind), (param, *rest))
         if counted and counted[0]["n"] > BACKGROUND_ROWS:
@@ -3427,12 +3590,29 @@ def create_ingestion_job(body: NewJobRequest, request: Request):
 
     if (made := _made_already(body, after_create)) is not None:
         return made
+    return _create_job(body, request)
+
+
+def _create_job(body: NewJobRequest, request: Request, inline: bool = False, progress=None, task_id=None):
+    """The Create itself. A file with database-only lines is first discovered by name in a background task
+    (_create_after_discovery), which runs this again with inline=True, so the write happens in that task."""
+    user = _user(request)
+    create_options = {k: v for k, v in (body.run.options or {}).items() if k not in MANAGED_OPTIONS}
+    if not inline and body.source is not None and not body.dry_run and _has_database_lines(body.source):
+        if not body.run.paused:
+            _refuse(_permission_refusals({"job_variant": body.run.job_variant}, user)["run"])
+        return _write_now_or_later("create", body.request_id, None, 0, user,
+                                   lambda progress, task_id: _create_after_discovery(body, request, progress, task_id),
+                                   lambda result: _created(result, user, create_options) if result.get("created")
+                                   else result, background=True)
     import psycopg
     name = body.name.strip()
     run = body.run.model_copy()
     run.stagger = run.stagger and run.job_variant != sch.CHECK_VARIANT
     taken = {r["task_collection"] for r in db.query(q.collections_sql())}
-    text, selected = body.text()
+    text, selected = body.text(request, wait=inline)
+    if selected is not None and selected.get("discovering"):
+        return {"discovering": True, "summary": None, "settings": {}, "created": False, "databases": selected["databases"]}
 
     def planned():
         plan = _file_lines(nj.plan(name, text, body.settings, body.groups_per_server, taken), selected)
@@ -3486,7 +3666,18 @@ def create_ingestion_job(body: NewJobRequest, request: Request):
     def after(result):
         return _created(result, user, options)
 
+    if inline:
+        return write(progress, task_id)
     return _write_now_or_later("create", body.request_id, None, len(rows), user, write, after)
+
+
+def _create_after_discovery(body: NewJobRequest, request: Request, progress, task_id) -> dict:
+    """The background half of a Create with database-only lines: their tables are discovered by name (the task's stage
+    says so), then the Create is written as an inline one is."""
+    _task_stage(task_id, "discovering")
+    _resolve_databases(_selected(body.source), wait=True, request=request)
+    _task_stage(task_id, "writing")
+    return _create_job(body, request, inline=True, progress=progress, task_id=task_id)
 
 
 @app.post("/api/schedules/{sid}")

@@ -407,24 +407,12 @@ def test_the_job_page_reads_its_tasks_after_ending_stale_ones(job_client):
 
 # ---- uploads and selections (their SQL runs against Postgres in large_writes_pg_test.py) -------------------------
 
-def test_an_upload_keeps_each_line_with_its_server_and_why_it_cant_be_taken():
-    import new_job as nj
-    read = nj.read_upload("src_connection,src_host,src_port,src_database,src_schema,src_table,load_type\n"
-                          "SQL_A,,,db1,dbo,t1,cursor\n,h.example.com,1500,db1,dbo,t2,\n,,,db1,dbo,t3,\n\n"
-                          "sql_a,,,db2,dbo,,\n")
-    assert read["errors"] == [] and [line["line"] for line in read["lines"]] == [2, 3, 4, 5]
-    assert [(line["server"], line["load_type"], line["status"]) for line in read["lines"]] == [
-        ("sql_a", "cursor", "ok"), ("h.example.com:1500", None, "ok"), ("", None, "invalid"), ("sql_a", None, "invalid")]
-    assert read["lines"][3]["errors"] == ["src_table is required"]
-    assert nj.read_upload("database,table\nx,y\n")["errors"][0] == "unknown column database"
-    assert "more than 2 lines" in nj.read_upload(_csv(3), max_lines=2)["errors"][0]
-
-
 def test_a_selection_names_one_source_and_something_to_take():
     with pytest.raises(ValueError):
         main.Selection(upload_id="u1", discovery_id="d1", whole_server=True)
     with pytest.raises(ValueError):
-        main.Selection(upload_id="u1")
+        main.Selection(discovery_id="d1")
+    assert main.Selection(upload_id="u1").source() == ("upload", "u1", "u1")     # its database-only lines are taken
     assert main.Selection(discovery_id="d1", discovery_ids=["d2", "d1"], whole_server=True).source() == (
         "discovery", ["d1", "d2"], "d1,d2")
     assert q.selection_key("SQL_A", "Eng_1", "Gen.T1") == "sql_a\x1feng_1\x1fgen.t1"

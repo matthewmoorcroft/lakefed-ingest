@@ -2369,6 +2369,18 @@ def upload_invalid_sql() -> str:
             f"from {SCHEMA}.table_upload_line where upload_id = %s and status = 'invalid' order by line limit %s")
 
 
+def upload_database_lines_sql() -> str:
+    """An upload's database-only lines (a database alone: every table of it is discovered by name at Create), in file
+    order. Param: upload_id."""
+    return (f"select line, src_database, fields from {SCHEMA}.table_upload_line "
+            f"where upload_id = %s and status = 'database' order by line")
+
+
+def upload_databases_count_sql() -> str:
+    """How many database-only lines an upload has. Param: upload_id."""
+    return f"select count(*) as n from {SCHEMA}.table_upload_line where upload_id = %s and status = 'database'"
+
+
 def source_rows_sql(kind: str) -> str:
     """The tables of an upload (its ok lines; param upload_id) or of discoveries (param: list of discovery ids; a
     table found by more than one, its latest finding), each with its server, database, schema, table, load type, and
