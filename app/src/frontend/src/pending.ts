@@ -272,7 +272,8 @@ export function discoveryWait(wait: RunWait | null, asked: Date, reading: string
   const time = `${elapsed(since, now)} so far, since ${clock(since)}`;
   if (!wait) return `Starting the discovery job: ${time}`;
   if (COMPUTE_WAIT.has(wait.state)) {
-    return `Waiting for compute: ${time}. The discovery job's serverless compute is starting, which can take a few minutes`;
+    return `Waiting for compute: ${time}. The discovery job's compute is starting (its cluster stops after an hour unused), `
+           + "which can take a few minutes";
   }
   return `${reading}: ${time}`;
 }

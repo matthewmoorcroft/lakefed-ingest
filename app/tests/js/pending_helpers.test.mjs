@@ -367,8 +367,8 @@ test("a discovery run says what it waits for, for how long and since when, from 
                "Starting the discovery job: 0 s so far, since 20:42");
   for (const state of ["QUEUED", "PENDING", "BLOCKED", "WAITING_FOR_RETRY"]) {
     assert.equal(discoveryWait({ state, since: ASKED }, ASKED, "Reading the server's databases", LATER),
-                 "Waiting for compute: 2 min 44 s so far, since 20:42. The discovery job's serverless compute is starting, "
-                 + "which can take a few minutes");
+                 "Waiting for compute: 2 min 44 s so far, since 20:42. The discovery job's compute is starting (its cluster "
+                 + "stops after an hour unused), which can take a few minutes");
   }
   const reading = { state: "RUNNING", since: RUNNING_FROM };
   assert.equal(discoveryWait(reading, ASKED, "Reading the server's databases", new Date(2026, 9, 29, 20, 45, 47)),
