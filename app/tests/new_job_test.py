@@ -243,3 +243,16 @@ def test_adding_tables_previews_then_writes_them_and_the_new_groups(job_client):
     assert [r["src_database"] for r in inserted] == ["eng_009", "ops_01"]
     members = job_client.db.of("insert into lakefed_ingest.schedule_member")
     assert [m[1] for m in members] == body["summary"]["new_groups"] and job_client.synced == [7]
+
+
+def test_a_line_may_give_its_own_load_type_as_discovery_recommends_it():
+    text = ("src_connection,src_database,src_schema,src_table,select_list,primary_key,cursor_column,load_type\n"
+            "sql_a,eng_001,gen,t0001,\"id, rv\",id,rv,cursor\n"
+            "sql_a,eng_001,gen,t0002,\"id, a\",id,,full\n"
+            "sql_a,eng_001,gen,t0003,\"id, a\",id,,\n"
+            "sql_a,eng_001,gen,t0004,\"id, a\",id,,cdc\n")
+    lines = nj.plan("Job", text, {**FAN_IN, "write_mode_full": "append"}, 4)["lines"]
+    assert [(line["row"]["load_type"], line["row"]["write_mode"]) for line in lines[:3]] == [
+        ("cursor", "merge"), ("full", "append"), ("ct", "merge")]
+    assert lines[0]["row"]["cursor_column"] == "rv" and lines[3]["status"] == "invalid"
+    assert "load_type must be one of" in " ".join(lines[3]["errors"])

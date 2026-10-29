@@ -1204,7 +1204,7 @@ def discovery_databases_sql() -> str:
 def discovered_tables_sql() -> str:
     """Discovered tables of one discovery, with the source connection and any existing control row
     for the same source table (``registered_id``). Param: discovery_id."""
-    return (f"select dt.*, d.src_type, d.src_host, d.src_port, d.secret_key, "
+    return (f"select dt.*, d.src_type, d.src_connection, d.src_host, d.src_port, d.secret_key, "
             f"(select min(c.id) from {SCHEMA}.control c where lower(c.src_host) = lower(d.src_host) "
             f"   and lower(c.src_database) = lower(dt.src_database) and lower(c.src_schema) = lower(dt.src_schema) "
             f"   and lower(c.src_table) = lower(dt.src_table)) as registered_id "

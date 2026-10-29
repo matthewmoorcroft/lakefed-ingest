@@ -1505,6 +1505,42 @@ def start_discovery(body: DiscoverRequest, request: Request):
     return {"discovery_id": did, "run_id": rid, "databases": len(names)}
 
 
+class SourceDiscoverRequest(BaseModel):
+    """A discovery through a Unity Catalog connection, as Add tables' Discover on a source starts it: list the
+    server's databases (Test connection), or read the tables of some databases or of the whole server."""
+    src_connection: str = Field(min_length=1)
+    kind: str = Field(default="tables", pattern="^(list|tables)$")
+    databases: List[str] = []
+    whole_server: bool = False
+
+
+@app.post("/api/discoveries/source")
+def start_source_discovery(body: SourceDiscoverRequest, request: Request):
+    names = list(dict.fromkeys(d.strip() for d in body.databases if d.strip()))
+    if body.kind == "tables" and not body.whole_server and not names:
+        raise HTTPException(422, "choose the whole server or at least one database")
+    known = {c["name"] for c in connections()["connections"]}
+    if body.src_connection not in known:
+        raise HTTPException(404, f"connection '{body.src_connection}' not found, or the app can't see it")
+    job_id = _require(jobs.DISCOVER_JOB_ID, "discovery")
+    _refuse_run_of(job_id, request)
+    did = uuid.uuid4().hex[:12]
+    spec = {"src_type": "sqlserver", "src_connection": body.src_connection, "kind": body.kind,
+            "databases": "*" if body.kind == "tables" and body.whole_server else names, "requested_by": _user(request)}
+    if body.kind == "list":
+        spec.pop("databases")
+    rid = jobs.run_now(job_id, {"discovery_id": did, "spec": json.dumps(spec)})
+    return {"discovery_id": did, "run_id": rid}
+
+
+@app.get("/api/discoveries/{discovery_id}/tables")
+def discovery_tables(discovery_id: str):
+    """The tables a discovery found, with the settings it recommends for each: what Add tables turns into lines."""
+    keep = ("src_database", "src_schema", "src_table", "select_list", "primary_key", "load_type", "cursor_column",
+            "row_count", "size_mb", "ct_enabled", "excluded_columns", "notes", "src_connection")
+    return [{k: r.get(k) for k in keep} for r in db.query(q.discovered_tables_sql(), (discovery_id,))]
+
+
 @app.get("/api/discoveries/runs/{run_id}")
 def discovery_run(run_id: int):
     """State of a discovery job run, so the page can tell a run that ended without results from one

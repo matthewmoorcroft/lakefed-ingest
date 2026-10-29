@@ -1,0 +1,60 @@
+"""Discover on a source: starting a discovery through a UC connection (POST /api/discoveries/source), and the tables
+it found (GET /api/discoveries/{id}/tables), with the discovery job and the database faked."""
+import json
+
+import pytest
+
+pytest.importorskip("fastapi")
+pytest.importorskip("httpx")
+from fastapi.testclient import TestClient  # noqa: E402
+
+import main  # noqa: E402
+import queries as q  # noqa: E402
+
+
+@pytest.fixture
+def client(monkeypatch):
+    started = []
+    monkeypatch.setattr(main, "connections", lambda: {"connections": [{"name": "sql_a"}], "error": None})
+    monkeypatch.setattr(main.jobs, "DISCOVER_JOB_ID", "555")
+    monkeypatch.setattr(main, "_refuse_run_of", lambda job_id, request: None)
+    monkeypatch.setattr(main.jobs, "run_now", lambda job_id, params: started.append((job_id, params)) or 42)
+    found = [dict(src_database="eng_001", src_schema="gen", src_table="t0001", select_list="id, a", primary_key="id",
+                  load_type="ct", cursor_column=None, row_count=10, size_mb=1, ct_enabled=True, excluded_columns=None,
+                  notes=None, src_connection="sql_a", secret_key=None, src_host=None, registered_id=None)]
+    monkeypatch.setattr(main.db, "query", lambda sql, params=(): found if sql == q.discovered_tables_sql() else [])
+    c = TestClient(main.app, headers={"X-Forwarded-Email": "op@example.com"})
+    c.started = started
+    return c
+
+
+def _spec(client):
+    job_id, params = client.started[-1]
+    return job_id, json.loads(params["spec"])
+
+
+def test_test_connection_lists_the_servers_databases_with_no_secret(client):
+    body = client.post("/api/discoveries/source", json={"src_connection": "sql_a", "kind": "list"}).json()
+    assert body["run_id"] == 42 and body["discovery_id"]
+    job_id, spec = _spec(client)
+    assert job_id == "555" and spec == {"src_type": "sqlserver", "src_connection": "sql_a", "kind": "list",
+                                        "requested_by": "op@example.com"}
+
+
+def test_the_whole_server_or_chosen_databases_are_read(client):
+    client.post("/api/discoveries/source", json={"src_connection": "sql_a", "whole_server": True})
+    assert _spec(client)[1]["databases"] == "*"
+    client.post("/api/discoveries/source", json={"src_connection": "sql_a", "databases": ["eng_001", " eng_001", "eng_002"]})
+    assert _spec(client)[1]["databases"] == ["eng_001", "eng_002"]
+
+
+def test_nothing_chosen_or_an_unknown_connection_is_refused(client):
+    assert client.post("/api/discoveries/source", json={"src_connection": "sql_a"}).status_code == 422
+    assert client.post("/api/discoveries/source", json={"src_connection": "nope", "kind": "list"}).status_code == 404
+    assert client.post("/api/discoveries/source", json={"src_connection": "sql_a", "kind": "drop"}).status_code == 422
+    assert client.started == []
+
+
+def test_a_discoverys_tables_keep_only_what_add_tables_needs(client):
+    tables = client.get("/api/discoveries/d1/tables").json()
+    assert tables[0]["select_list"] == "id, a" and "secret_key" not in tables[0] and "registered_id" not in tables[0]

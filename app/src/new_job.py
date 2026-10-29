@@ -5,6 +5,8 @@ A CSV line says only where a table is: its UC connection or host, database, sche
 columns and identity values. How to ingest and write it is the job's, as in the Edit view: load type, fan-in, write
 modes, target names (templates over {server} {database} {schema} {table}), client_id and identity columns. Pure: no
 database access, so main.py writes the plan in one transaction."""
+import csv
+import io
 import json
 from typing import Callable, Dict, List, Optional
 
@@ -49,6 +51,20 @@ def _write_mode(load_type: str, settings: dict) -> str:
     return settings["write_mode_changes"] if load_type in js.CHANGE_LOAD_TYPES else "merge"
 
 
+def _line_load_types(text: str):
+    """(the file without its load_type column, {file line number: load type}). A discovered table carries the load
+    type discovery recommends for it; a plain CSV has none, and every line takes the job's."""
+    reader = csv.reader(io.StringIO(text.lstrip("\ufeff")))
+    rows = list(reader)
+    if not rows or "load_type" not in [h.strip() for h in rows[0]]:
+        return text, {}
+    at = [h.strip() for h in rows[0]].index("load_type")
+    types = {number: (row[at].strip() if at < len(row) else "") for number, row in enumerate(rows[1:], start=2)}
+    out = io.StringIO()
+    csv.writer(out, lineterminator="\n").writerows([row[:at] + row[at + 1:] for row in rows])
+    return out.getvalue(), {n: t for n, t in types.items() if t}
+
+
 def plan(job_name: str, text: str, given: dict, groups_per_server: int = DEFAULT_GROUPS_PER_SERVER,
          taken_groups: Optional[set] = None, group_of: Optional[Callable[[str, str], str]] = None,
          have: Optional[set] = None) -> dict:
@@ -66,6 +82,7 @@ def plan(job_name: str, text: str, given: dict, groups_per_server: int = DEFAULT
         out["errors"].append(f"groups per server must be from 1 to {MAX_GROUPS_PER_SERVER}")
     if out["errors"]:
         return out
+    text, line_types = _line_load_types(text)
     # The file is read as Import CSV reads it; its sink names are made again below, with the job's templates.
     read = ci.plan_import(text, "_new", {"src_type": settings["src_type"], "load_type": settings["load_type"],
                                          "use_remote_query": False, "write_mode": "merge", "fan_in": False,
@@ -84,6 +101,10 @@ def plan(job_name: str, text: str, given: dict, groups_per_server: int = DEFAULT
         row["use_remote_query"] = bool(row.get("src_connection")) and not row.get("src_host")
         if row.get("src_connection") and row.get("src_host"):
             problems.append("give the UC connection or the host, not both")
+        if line["line"] in line_types:
+            row["load_type"] = line_types[line["line"]]
+            if row["load_type"] not in LOAD_TYPES:
+                problems.append(f"load_type must be one of {', '.join(LOAD_TYPES)}")
         server = js.server_of(row)
         row["task_collection"] = group_of(server, row.get("src_database") or "")
         row["write_mode"] = _write_mode(row["load_type"], settings)
