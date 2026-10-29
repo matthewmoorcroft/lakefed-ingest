@@ -735,17 +735,18 @@ class MigrationDb:
     """A scripted Postgres for migrate(): answers the catalog queries, records statements and whether they
     ran inside the transaction. ``lock_timeouts`` makes the first attempts fail on their first DDL statement,
     as a lock wait that runs out does; ``probe_rows`` are substrings of the UPDATE_PROBES queries that find a row.
-    ``schema_lock_timeouts`` makes the schema lock wait run out that many times, but only once a lock_timeout is set
-    in the transaction, as Postgres applies lock_timeout to advisory-lock waits too."""
+    ``schema_lock_held_s`` is how long another migrator holds the schema lock: the wait for it runs out when the
+    transaction's lock_timeout is shorter, as Postgres applies lock_timeout to advisory-lock waits too, and else
+    the lock is taken once the other migrator is done."""
 
     def __init__(self, version=None, schemas=("lakefed_ingest",), relations=(), columns=(), fail_on=None,
-                 catalog=None, probe_rows=(), lock_timeouts=0, schema_lock_timeouts=0):
+                 catalog=None, probe_rows=(), lock_timeouts=0, schema_lock_held_s=0):
         self.version, self.schemas, self.relations, self.columns = version, set(schemas), set(relations), set(columns)
         self.catalog = catalog or ss.SchemaCatalog(
             schema_exists=bool(schemas), relations=set(relations), tables=set(relations),
             columns={(table, column): ("text", None, False) for table, column in columns})
         self.fail_on, self.probe_rows, self.lock_timeouts = fail_on, probe_rows, lock_timeouts
-        self.schema_lock_timeouts, self.lock_timeout_set = schema_lock_timeouts, False
+        self.schema_lock_held_s, self.lock_timeout_s = schema_lock_held_s, None
         self.statements, self.in_tx, self.committed, self.rows = [], False, None, []
         self.attempts, self.outcomes = 0, []
         self.connection = self
@@ -764,7 +765,7 @@ class MigrationDb:
 
         class Tx:
             def __enter__(self):
-                db.in_tx, db.lock_timeout_set = True, False
+                db.in_tx, db.lock_timeout_s = True, None
                 db.attempts += 1
 
             def __exit__(self, exc_type, *exc):
@@ -777,11 +778,10 @@ class MigrationDb:
         if self.fail_on and self.fail_on in sql:
             raise RuntimeError("check constraint violated")
         if sql.startswith("set local lock_timeout"):
-            self.lock_timeout_set = True
+            self.lock_timeout_s = int(sql.split("'")[1].rstrip("s"))
         if sql.startswith("select pg_advisory_xact_lock"):
             self.lock = params
-            if self.lock_timeout_set and self.schema_lock_timeouts:
-                self.schema_lock_timeouts -= 1
+            if self.lock_timeout_s is not None and self.lock_timeout_s < self.schema_lock_held_s:
                 self.statements.append((sql, self.in_tx))
                 raise FakeLockTimeout("canceling statement due to lock timeout")
         self.statements.append((sql, self.in_tx))
@@ -834,9 +834,10 @@ def test_migrate_from_an_unversioned_database_applies_renames_ddl_and_version_in
                             "do update set applied_at = now(), applied_by = current_user"]
     assert all(in_tx for _, in_tx in db.statements) and db.committed is True
     # Serialized by the schema lock, taken before the version is read; the table waits are bounded.
-    first = [s for s, _ in db.statements[:3]]
-    assert first[0] == "select pg_advisory_xact_lock(%s::int, %s::int)" and first[1] == "set local lock_timeout = '3s'"
-    assert first[2].startswith("select to_regclass")
+    first = [s for s, _ in db.statements[:4]]
+    assert first[:3] == [f"set local lock_timeout = '{ss.SCHEMA_LOCK_WAIT_S}s'",
+                         "select pg_advisory_xact_lock(%s::int, %s::int)", "set local lock_timeout = '3s'"]
+    assert first[3].startswith("select to_regclass")
     # Two int keys: never the one-key lock of a collection (even one named "schema"), nor a source lock.
     assert db.lock == ss.SCHEMA_LOCK and len(db.lock) == 2 and db.lock[0] != ss.SOURCE_LOCK_CLASS
 
@@ -979,10 +980,32 @@ def test_a_lock_timeout_is_retried_with_backoff_until_the_migration_commits():
 
 
 def test_a_migrator_waiting_for_the_schema_lock_is_not_cut_short_by_the_table_lock_timeout():
-    db = MigrationDb(version=ss.SCHEMA_VERSION - 1, schema_lock_timeouts=1)
+    db = MigrationDb(version=ss.SCHEMA_VERSION - 1, schema_lock_held_s=30)
     sleeps = []
     out = ss.StateStore(db).migrate("create table t (a int);", sleep=sleeps.append)
     assert out is not None and sleeps == [] and db.outcomes == [True]
+
+
+def test_the_schema_lock_wait_has_its_own_bound_and_the_tables_keep_theirs():
+    db = MigrationDb(version=ss.SCHEMA_VERSION - 1)
+    ss.StateStore(db).migrate("create table t (a int);", sleep=lambda s: None)
+    ran = [sql for sql, _ in db.statements]
+    wait, lock, tables, ddl = (next(i for i, sql in enumerate(ran) if sql.startswith(start)) for start in (
+        f"set local lock_timeout = '{ss.SCHEMA_LOCK_WAIT_S}s'", "select pg_advisory_xact_lock",
+        f"set local lock_timeout = '{ss.LOCK_TIMEOUT_S}s'", "create table t"))
+    assert wait < lock < tables < ddl
+
+
+def test_a_migration_held_past_the_schema_lock_bound_ends_waiting_at_once_and_changes_nothing():
+    # Another migrator stalled in its transaction (a hung run): the waiter gives up after SCHEMA_LOCK_WAIT_S, with
+    # MigrationLockTimeout (the ingest and check runs end migration_waiting), instead of waiting with it.
+    db = MigrationDb(version=ss.SCHEMA_VERSION - 1, schema_lock_held_s=ss.SCHEMA_LOCK_WAIT_S + 1)
+    sleeps = []
+    with pytest.raises(ss.MigrationLockTimeout, match="another migration held the schema lock") as caught:
+        ss.StateStore(db).migrate("create table t (a int);", sleep=sleeps.append)
+    assert "Run the setup job again." in str(caught.value) and isinstance(caught.value.__cause__, FakeLockTimeout)
+    assert sleeps == [] and db.attempts == 1 and db.outcomes == [False]
+    assert "create table t (a int)" not in db.ran()
 
 
 def test_a_migration_that_keeps_timing_out_gives_up_with_a_plain_message_and_changes_nothing():

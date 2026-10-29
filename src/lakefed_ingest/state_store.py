@@ -150,6 +150,9 @@ SCHEMA_LOCK = (0x6C667363, 0)
 # (about five minutes), so a waiting ALTER never holds up the loads queued behind it for long.
 LOCK_TIMEOUT_S = 3
 MIGRATE_ATTEMPTS = 10
+# A migrator waits this long for another migrator's attempt (the schema lock) before it gives up at once with
+# MigrationLockTimeout: long enough for a slow attempt to finish, and a bound for one that stalled in its transaction.
+SCHEMA_LOCK_WAIT_S = 300
 LOCK_NOT_AVAILABLE = "55P03"  # SQLSTATE: lock_timeout expired (psycopg's LockNotAvailable)
 
 
@@ -172,7 +175,8 @@ def is_lock_timeout(error) -> bool:
 
 
 class MigrationLockTimeout(RuntimeError):
-    """The migration gave up: a running load kept holding the schema's tables. The transaction was rolled back."""
+    """The migration gave up: a running load kept holding the schema's tables, or another migration the schema lock.
+    The transaction was rolled back."""
 
 
 # Updates that backfill or rename once, keyed by the whole statement (lower case, whitespace collapsed) with a
@@ -1172,9 +1176,18 @@ class StateStore:
     def _migrate_once(self, ddl: str, force: bool, lock_timeout_s: int) -> Optional[dict]:
         """One migration attempt, in one transaction (see ``migrate``)."""
         with self._cursor() as cur, cur.connection.transaction():
-            # Before lock_timeout is set: Postgres applies lock_timeout to this wait too, and a migrator queued
-            # behind another's attempt should wait for that attempt, not give up after lock_timeout_s.
-            cur.execute("select pg_advisory_xact_lock(%s::int, %s::int)", SCHEMA_LOCK)
+            # Postgres applies lock_timeout to this wait too: a migrator queued behind another's attempt waits for
+            # that attempt up to SCHEMA_LOCK_WAIT_S, not lock_timeout_s, and past it gives up without retrying.
+            cur.execute(f"set local lock_timeout = '{SCHEMA_LOCK_WAIT_S}s'")
+            try:
+                cur.execute("select pg_advisory_xact_lock(%s::int, %s::int)", SCHEMA_LOCK)
+            except Exception as error:
+                if not is_lock_timeout(error):
+                    raise
+                raise MigrationLockTimeout(
+                    f"could not migrate the Lakebase schema to version {SCHEMA_VERSION}: another migration held the "
+                    f"schema lock for more than {SCHEMA_LOCK_WAIT_S} s. Nothing changed. Run the setup job again.") \
+                    from error
             cur.execute(f"set local lock_timeout = '{int(lock_timeout_s)}s'")
             before = self._applied_version(cur)
             if before > SCHEMA_VERSION:
