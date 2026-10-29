@@ -1,6 +1,6 @@
 """Schedule endpoints (main.py) with a fake Lakebase and a fake Jobs API: create, edit, pause, delete."""
 import contextlib
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -515,6 +515,7 @@ def test_a_cluster_of_its_own_starts_the_copies_job_and_a_forged_copy_id_is_igno
     body = dict(BODY, options={"cluster": BIG, "ingest_copy_job_id": 1})
     r = api.post(f"/api/schedules/{sid}", json=body)
     assert r.status_code == 200 and r.json()["cluster_error"] is None and started == [sid]
+    assert r.json()["cluster_started"] is True
     options = sch.options_of(api.store.schedules[sid])
     assert options == {"cluster": BIG, "cluster_copy_run_id": 8001, "updated_by": "op@example.com"}
     # Saving again with the same cluster starts nothing; the wrappers keep the bundle's job until the copy exists.
@@ -716,3 +717,52 @@ def test_delete_refused_by_permission_starts_nothing(api, monkeypatch):
     monkeypatch.setattr(main.jobs, "user_job_permission", lambda job_id, user: "CAN_MANAGE_RUN")
     assert api.post(f"/api/schedules/{sid}/delete", json={"drop_targets": True}).status_code == 403
     assert api.delete_runs == {} and api.store.schedules[sid]["deleted_at"] is None
+
+
+def _copy_run(monkeypatch, state):
+    monkeypatch.setattr(main.run_poller, "run_state_of", lambda run_id: dict(state, run_id=run_id))
+    monkeypatch.setattr(main.jobs, "job_settings", lambda job_id: {"job_clusters": [{"new_cluster": {
+        "driver_node_type_id": "Standard_D16ds_v5", "node_type_id": "Standard_D8ds_v5", "num_workers": 1}}]})
+
+
+def test_a_copies_run_that_succeeds_with_a_wrapper_that_did_not_sync_says_so(api, monkeypatch):
+    _cluster_setup(monkeypatch)
+    sid = api.post("/api/schedules", json=BODY).json()["id"]
+    api.store.schedules[sid]["options"] = '{"cluster": {"num_workers": 4}, "cluster_copy_run_id": 8001}'
+    _copy_run(monkeypatch, {"state": "TERMINATED", "result": "SUCCESS", "message": "", "url": "https://h/run/8001",
+                            "started": None})
+    monkeypatch.setattr(main, "_sync", lambda job_id, user: [
+        {"task_collection": "sales", "action": "error", "detail": "job is locked"}])
+    body = api.get(f"/api/ingestion-jobs/{sid}/cluster").json()
+    assert body["applying"] is None
+    assert body["error"] == "the job's Databricks jobs did not sync: sales: job is locked"
+    assert "cluster_copy_run_id" not in sch.options_of(api.store.schedules[sid])
+
+
+def test_a_copies_run_that_failed_is_named_and_the_wrappers_are_not_synced_to_it(api, monkeypatch):
+    _cluster_setup(monkeypatch)
+    sid = api.post("/api/schedules", json=BODY).json()["id"]
+    api.store.schedules[sid]["options"] = '{"cluster": {"num_workers": 4}, "cluster_copy_run_id": 8001}'
+    _copy_run(monkeypatch, {"state": "TERMINATED", "result": "FAILED", "message": "node type unavailable",
+                            "url": "https://h/run/8001", "started": None})
+    synced = []
+    monkeypatch.setattr(main, "_sync", lambda job_id, user: synced.append(job_id) or [])
+    body = api.get(f"/api/ingestion-jobs/{sid}/cluster").json()
+    assert body["applying"] is None
+    assert body["error"] == "the cluster copies run did not apply the cluster: node type unavailable"
+    assert synced == []
+    assert "cluster_copy_run_id" not in sch.options_of(api.store.schedules[sid])
+
+
+def test_a_copies_run_still_listed_past_its_limit_is_a_timeout_and_keeps_the_save_not_done(api, monkeypatch):
+    _cluster_setup(monkeypatch)
+    sid = api.post("/api/schedules", json=BODY).json()["id"]
+    api.store.schedules[sid]["options"] = '{"cluster": {"num_workers": 4}, "cluster_copy_run_id": 8001}'
+    _copy_run(monkeypatch, {"state": "RUNNING", "result": None, "message": "", "url": "https://h/run/8001",
+                            "started": datetime.now(timezone.utc) - timedelta(hours=1)})
+    synced = []
+    monkeypatch.setattr(main, "_sync", lambda job_id, user: synced.append(job_id) or [])
+    body = api.get(f"/api/ingestion-jobs/{sid}/cluster").json()
+    assert body["applying"]["outcome"]["state"] == "timeout"
+    assert body["error"] is None and synced == []
+    assert sch.options_of(api.store.schedules[sid])["cluster_copy_run_id"] == 8001

@@ -145,3 +145,51 @@ export function setupRunNotice(outcome: SetupRunOutcome | null | undefined, star
                + "Run setup job stays off until Databricks reports it ended." };
   }
 }
+
+/** The wrapper jobs a save could not sync, as the page names them ("sales: job is locked"). Empty when all synced. */
+export function syncFailureLines(results: { task_collection?: string | null; action?: string; detail?: string }[] | undefined): string[] {
+  return (results ?? []).filter((r) => r.action === "error")
+    .map((r) => (r.task_collection ? `${r.task_collection}: ${r.detail || "its Databricks job was not synced"}` : r.detail || "a Databricks job was not synced"));
+}
+
+/** The Edit view's line for a Save. Saved only once the table settings are written, the wrapper jobs are synced, and the
+ * cluster copies run has ended; until then the page reads pending, and a failed copy or sync is said plainly. */
+export function saveNotice(state: {
+  pending: boolean;
+  done: boolean;
+  savedText: string;
+  applying: boolean;
+  applyTimeout?: string | null;
+  applyError?: string | null;
+  syncFailures?: string[];
+  error?: unknown;
+}): { tone: "info" | "ok" | "warn" | "bad"; text: string } | null {
+  if (state.error) {
+    return isUnconfirmed(state.error)
+      ? { tone: "warn", text: "Saving: not confirmed. The app did not answer in time, so the save may have finished. "
+          + "Reload the page to see what was saved." }
+      : null;
+  }
+  if (state.pending) {
+    return { tone: "info", text: "Saving: writing the changes and syncing the job's Databricks jobs. It shows as saved once both have finished." };
+  }
+  if (state.applying) {
+    if (state.applyTimeout) {
+      return { tone: "warn", text: `Saving: not confirmed yet. The cluster copies run has not ended: ${state.applyTimeout}. `
+               + "It is not saved until Databricks reports the run ended." };
+    }
+    return { tone: "info", text: "Saving: applying the job cluster. The cluster copies job is making this job's copy; "
+             + "it shows as saved once Databricks reports that run ended." };
+  }
+  if (!state.done) return null;
+  if (state.applyError) {
+    return { tone: "bad", text: `Saved, but the job cluster was not applied: ${state.applyError}. The job's Databricks jobs `
+             + "still use the cluster they had before. Change the cluster and save again to retry." };
+  }
+  const failures = state.syncFailures ?? [];
+  if (failures.length) {
+    return { tone: "bad", text: `Saved, but ${failures.length === 1 ? "a Databricks job did" : `${failures.length} Databricks jobs did`} `
+             + `not sync: ${failures.join("; ")}. Save again to retry.` };
+  }
+  return { tone: "ok", text: state.savedText };
+}

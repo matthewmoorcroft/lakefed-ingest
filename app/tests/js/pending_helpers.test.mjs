@@ -2,7 +2,7 @@
 // strips the types in pending.ts as it loads it). frontend_pending_test.py runs this file from pytest.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { changeInProgress, deleteNotice, isUnconfirmed, requestWriteNotice, runButton, runTimeoutNotice, setupRunBlocks, setupRunNotice }
+import { changeInProgress, deleteNotice, isUnconfirmed, requestWriteNotice, runButton, runTimeoutNotice, saveNotice, setupRunBlocks, setupRunNotice, syncFailureLines }
   from "../../src/frontend/src/pending.ts";
 
 const IDLE = { phase: "idle", timed_out: false, run_url: null, blocked: null, refused: null };
@@ -229,4 +229,60 @@ test("a setup start the server refused shows failed to start with its message", 
 
 test("with nothing started here there is nothing to say", () => {
   assert.equal(setupRunNotice(undefined, NO_START), null);
+});
+
+const SAVED = "Saved: 2 tables changed.";
+
+test("a save is pending while its settings are written and its wrapper jobs synced", () => {
+  const notice = saveNotice({ pending: true, done: false, savedText: SAVED, applying: false });
+  assert.equal(notice.tone, "info");
+  assert.match(notice.text, /syncing the job's Databricks jobs/);
+});
+
+test("a save is not done while the cluster copies run is still going", () => {
+  const notice = saveNotice({ pending: false, done: true, savedText: SAVED, applying: true });
+  assert.equal(notice.tone, "info");
+  assert.match(notice.text, /shows as saved once Databricks reports that run ended/);
+});
+
+test("a save whose cluster copies run is past its limit says not confirmed, not saved", () => {
+  const notice = saveNotice({ pending: false, done: true, savedText: SAVED, applying: true,
+    applyTimeout: "Databricks has not reported it ended after 30 minutes: it is still listed as running" });
+  assert.equal(notice.tone, "warn");
+  assert.match(notice.text, /not confirmed yet/);
+  assert.match(notice.text, /It is not saved until Databricks reports the run ended\.$/);
+});
+
+test("a save is done with its summary once everything under it has finished", () => {
+  assert.deepEqual(saveNotice({ pending: false, done: true, savedText: SAVED, applying: false }),
+    { tone: "ok", text: SAVED });
+});
+
+test("a save whose cluster copies run failed says the cluster was not applied, plainly", () => {
+  const notice = saveNotice({ pending: false, done: true, savedText: SAVED, applying: false,
+    applyError: "the cluster copies run did not apply the cluster: node type unavailable" });
+  assert.equal(notice.tone, "bad");
+  assert.equal(notice.text, "Saved, but the job cluster was not applied: the cluster copies run did not apply the cluster: "
+    + "node type unavailable. The job's Databricks jobs still use the cluster they had before. Change the cluster and save again to retry.");
+});
+
+test("a save whose wrapper jobs did not sync names each one", () => {
+  const failures = syncFailureLines([{ task_collection: "sales", action: "error", detail: "job is locked" },
+    { task_collection: "hr", action: "updated", detail: "" }]);
+  assert.deepEqual(failures, ["sales: job is locked"]);
+  const notice = saveNotice({ pending: false, done: true, savedText: SAVED, applying: false, syncFailures: failures });
+  assert.deepEqual(notice, { tone: "bad", text: "Saved, but a Databricks job did not sync: sales: job is locked. Save again to retry." });
+  const two = saveNotice({ pending: false, done: true, savedText: SAVED, applying: false, syncFailures: ["a: x", "b: y"] });
+  assert.match(two.text, /^Saved, but 2 Databricks jobs did not sync: a: x; b: y\./);
+});
+
+test("a save whose answer never came is not confirmed, and never a failure", () => {
+  const notice = saveNotice({ pending: false, done: false, savedText: SAVED, applying: false,
+    error: Object.assign(new Error("gateway"), { status: 504 }) });
+  assert.equal(notice.tone, "warn");
+  assert.match(notice.text, /may have finished/);
+});
+
+test("a save the server refused shows no notice here, the error box carries it", () => {
+  assert.equal(saveNotice({ pending: false, done: false, savedText: SAVED, applying: false, error: new Error("422") }), null);
 });

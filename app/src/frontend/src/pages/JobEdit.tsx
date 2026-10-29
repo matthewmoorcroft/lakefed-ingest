@@ -8,7 +8,7 @@ import { CADENCES, IdentityFields, ParameterFields, RunFields, WritesFields, par
 import { ImportCsvDialog } from "./NewJob";
 import { TaskProgress, finished, newRequestId, resumableWrite } from "./tasks";
 import { DiscoverDialog } from "./Discover";
-import { isUnconfirmed, requestWriteNotice } from "../pending";
+import { isUnconfirmed, requestWriteNotice, saveNotice, syncFailureLines } from "../pending";
 
 // Edit an ingestion job: what it ingests (a tree from its servers), how it writes, its identity columns, when it
 // runs and its advanced configuration. A change in the tree applies once its dialog is confirmed, as Catalog Explorer
@@ -337,9 +337,12 @@ export default function JobEdit() {
   // The settings form as it loaded, so "unsaved" means the user changed something, not that a default differs.
   const [loaded, setLoaded] = useState("");
   const locked: Locked = usePermissions().data?.jobs[id]?.change ?? null;
+  // The cluster copies run a save started: from the save's answer until a read taken after it shows the run ended.
+  const [applyStartedAt, setApplyStartedAt] = useState<number | null>(null);
+  const [applyError, setApplyError] = useState<string | null>(null);
   const clusterInfo = useQuery({
     queryKey: ["job-cluster", id], queryFn: () => api.get<Row>(`/ingestion-jobs/${id}/cluster`),
-    refetchInterval: (query) => (query.state.data?.applying ? 5000 : false),
+    refetchInterval: (query) => (query.state.data?.applying || applyStartedAt != null ? 5000 : false),
   });
   const [cluster, setCluster] = useState<Row | null>(null);
   useEffect(() => {
@@ -382,8 +385,12 @@ export default function JobEdit() {
 
   const save = useMutation({
     mutationFn: async () => {
+      setApplyError(null);
+      // A cluster read already in flight would answer from before this save, so it can't end the wait.
+      await qc.cancelQueries({ queryKey: ["job-cluster", id] });
       const edits = changed();
       let result: Row | null = null;
+      let scheduleResult: Row | null = null;
       if (Object.keys(edits).length) {
         // The preview refuses (422, with its reasons) anything the tables can't take, before any write.
         await api.post<Row>(`/ingestion-jobs/${id}/settings`, { settings: edits, dry_run: true });
@@ -394,7 +401,7 @@ export default function JobEdit() {
         const { cluster: stored, rediscover_hour: _storedHour, ...kept } = schedule.options ?? {};
         // Until the cluster is read, keep what's stored; at the Databricks job's own values, the job has no cluster of its own.
         const own = !clusterInfo.data || !cluster ? stored : ownCluster(cluster, clusterInfo.data.defaults);
-        await api.post(`/schedules/${schedule.id}`, {
+        scheduleResult = await api.post<Row>(`/schedules/${schedule.id}`, {
           name: name.trim() || schedule.name, cadence_minutes: cadence, timezone: cadence <= 60 ? "UTC" : run.timezone || "Europe/London",
           stagger: schedule.stagger, paused: run.paused, notify_emails: run.notify_emails || null, job_variant: schedule.job_variant,
           options: { ...kept, ...(own ? { cluster: own } : {}),
@@ -406,13 +413,30 @@ export default function JobEdit() {
           throw new Error(result ? `The table settings were saved, but When it runs and Advanced configuration were not: ${e.message}` : e.message);
         });
       }
-      return result;
+      return { settings: result, schedule: scheduleResult };
     },
-    onSuccess: () => { qc.invalidateQueries({ queryKey: ["job-settings", id] }); qc.invalidateQueries({ queryKey: ["schedules"] });
+    onSuccess: (data) => {
+      if (data.schedule?.cluster_started) setApplyStartedAt(Date.now());
+      if (data.schedule?.cluster_error) setApplyError(String(data.schedule.cluster_error));
+      qc.invalidateQueries({ queryKey: ["job-settings", id] }); qc.invalidateQueries({ queryKey: ["schedules"] });
       qc.invalidateQueries({ queryKey: ["job-tree", id] }); qc.invalidateQueries({ queryKey: ["ingestion-job", id] });
       qc.invalidateQueries({ queryKey: ["job-cluster", id] }); qc.invalidateQueries({ queryKey: ["job-compute", id] }); },
   });
 
+  useEffect(() => {
+    const info = clusterInfo.data;
+    if (applyStartedAt == null || !info || info.applying || clusterInfo.dataUpdatedAt < applyStartedAt) return;
+    setApplyError(info.error ?? null);
+    setApplyStartedAt(null);
+  }, [clusterInfo.data, clusterInfo.dataUpdatedAt, applyStartedAt]);
+  const saving = save.isPending || applyStartedAt != null;
+  const savedSummary = save.data?.settings?.summary;
+  const saveLine = saveNotice({
+    pending: save.isPending, done: save.isSuccess, error: save.error, applying: applyStartedAt != null,
+    applyTimeout: clusterInfo.data?.applying?.outcome?.state === "timeout" ? clusterInfo.data.applying.outcome.reason : null,
+    applyError, syncFailures: syncFailureLines(save.data?.schedule?.sync),
+    savedText: savedSummary ? `Saved: ${fmtInt(savedSummary.changed)} ${plural(savedSummary.changed, "table")} changed${savedSummary.reseed ? `, ${fmtInt(savedSummary.reseed)} to load again` : ""}.` : "Saved.",
+  });
   // As the Databricks editors do: Save only with something to save, a sign of unsaved changes, and a question before
   // leaving with them (a link in the app, or closing the tab).
   const info = clusterInfo.data;
@@ -470,12 +494,12 @@ export default function JobEdit() {
           <strong>{fmtInt(settings.data.groups.length)}</strong> {plural(settings.data.groups.length, "group")}.</>}
         right={<span className="card-actions">{dirty && <span className="muted">Unsaved changes</span>}
           <button onClick={() => leave(`/ingestion-jobs/${id}`)}>Cancel</button>
-          <button className="primary" disabled={save.isPending || !s || !!locked || !dirty} title={locked ?? (!dirty ? "Nothing to save yet" : undefined)}
-            onClick={() => save.mutate()}>{save.isPending ? "Saving…" : "Save"}</button></span>} />
+          <button className="primary" disabled={saving || !s || !!locked || !dirty} title={locked ?? (!dirty ? "Nothing to save yet" : undefined)}
+            onClick={() => save.mutate()}>{saving ? "Saving…" : "Save"}</button></span>} />
       {confirm.dialog}
       {locked && <Notice tone="info">You can see this job's settings but not change them: {locked}.</Notice>}
-      <ErrorBox error={settings.error || save.error} />
-      {save.isSuccess && <Notice tone="ok">Saved{save.data ? `: ${fmtInt(save.data.summary.changed)} ${plural(save.data.summary.changed, "table")} changed${save.data.summary.reseed ? `, ${fmtInt(save.data.summary.reseed)} to load again` : ""}` : ""}.</Notice>}
+      <ErrorBox error={settings.error || (isUnconfirmed(save.error) ? null : save.error)} />
+      {saveLine && <Notice tone={saveLine.tone}>{saveLine.text}</Notice>}
 
       {schedule && <Section title="Name">
         <div className="form-grid"><label>Job name<input value={name} onChange={(e) => setName(e.target.value)} />

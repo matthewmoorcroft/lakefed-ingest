@@ -1557,25 +1557,34 @@ def ingestion_job_compute(job_id: int):
     return {"jobs": out}
 
 
+# Where the cluster copies run has not ended this long after its start, the Edit view says so, and the save is not done.
+CLUSTER_LIMIT_S = 30 * 60
+
+
 @app.get("/api/ingestion-jobs/{job_id}/cluster")
 def ingestion_job_cluster(job_id: int, request: Request):
     """A job's own cluster for the Edit view: what it asks for (None = the ingestion job's own), the ingestion job's
-    values as the defaults, the workspace's node types, the copy it runs, and the copies job's run applying a change.
-    Once that run has ended, the job's wrapper jobs are synced to start the copy (or the ingestion job again)."""
+    values as the defaults, the workspace's node types, the copy it runs, and the copies job's run applying a change
+    (with its outcome: pending, timed out, or not done). Once that run has ended, the job's wrapper jobs are synced to
+    start the copy (or the ingestion job again); a failed copy or sync is the error, and the copy is not applied."""
     s = _load_schedule(job_id)[0]
     applying, error = None, None
     run_id = sch.options_of(s).get("cluster_copy_run_id")
     if run_id:
         state = run_poller.run_state_of(run_id)
-        applying = {"run_id": run_id, "state": state["state"], "result": state["result"], "url": state["url"]}
-        if state["state"] in ("TERMINATED", "SKIPPED", "INTERNAL_ERROR"):
+        outcome = action_states.run_outcome(state, datetime.now(timezone.utc), CLUSTER_LIMIT_S)
+        applying = {"run_id": run_id, "state": state["state"], "result": state["result"], "url": state["url"],
+                    "outcome": outcome}
+        if state["state"] in run_poller.ENDED_STATES or state["state"] == run_poller.NOT_FOUND:
             with _write() as cur:
                 cur.execute(q.clear_schedule_option_sql(), ("cluster_copy_run_id", int(job_id)))
             if state["result"] == "SUCCESS":
-                _sync(job_id, _user(request))
+                problems = action_states.sync_failures(_sync(job_id, _user(request)))
                 s = _load_schedule(job_id)[0]
+                if problems:
+                    error = "the job's Databricks jobs did not sync: " + "; ".join(problems)
             else:
-                error = f"the cluster copies run ended {state['result'] or state['state']}: {state['message'] or ''}".strip()
+                error = f"the cluster copies run did not apply the cluster: {outcome['reason']}"
             applying = None
     choices = _cluster_choices()
     copy = sch.copy_job_id(s)
@@ -3399,7 +3408,8 @@ def update_schedule(sid: int, body: ScheduleBody, request: Request):
         raise HTTPException(409, f"a schedule named '{body.name}' already exists")
     synced = _sync(sid, user)
     cluster = _apply_cluster(sid) if cluster_changed else None
-    return {"id": sid, "changed": changed, "added": added, "removed": gone, "sync": synced, "cluster_error": cluster}
+    return {"id": sid, "changed": changed, "added": added, "removed": gone, "sync": synced, "cluster_error": cluster,
+            "cluster_started": cluster_changed and cluster is None}
 
 
 def _set_paused(sid: int, paused: bool, request: Request):
