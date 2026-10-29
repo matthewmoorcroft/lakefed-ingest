@@ -159,7 +159,7 @@ def test_an_upload_writes_its_header_and_each_line_a_thousand_to_a_statement(sma
 
 def test_the_line_caps_refuse_the_file_past_them():
     errors, _ = apps.create_refusal(nj.MAX_LINES + 1)
-    assert errors == [f"{nj.MAX_LINES + 1:,} lines: at most {nj.MAX_LINES:,} in one import"]
+    assert errors == [f"more than {nj.MAX_LINES:,} lines: at most {nj.MAX_LINES:,} in one import"]
     errors, _ = apps.upload_refusal(nj.MAX_LINES + 1)
     assert errors == [f"more than {nj.MAX_LINES:,} lines: at most {nj.MAX_LINES:,} in one file"]
 

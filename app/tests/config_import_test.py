@@ -91,7 +91,21 @@ def test_importing_into_a_group_takes_its_shared_settings_and_names_mixed_ones_n
 def test_a_large_file_is_refused_with_its_limit():
     text = CSV.splitlines()[0] + "\n" + "".join(f"sql_a,S,dbo,T{i},id,id\n" for i in range(ci.MAX_LINES + 1))
     assert ci.plan_import(text, "g1", SETTINGS, group_rows=[])["errors"] == [
-        f"{ci.MAX_LINES + 1:,} lines: at most {ci.MAX_LINES:,} in one import"]
+        f"more than {ci.MAX_LINES:,} lines: at most {ci.MAX_LINES:,} in one import"]
+
+
+def test_the_cap_is_checked_as_each_line_is_read_so_the_rest_of_the_file_is_not_read():
+    read = []
+
+    def rows():
+        for number in range(1_000_000):
+            read.append(number)
+            yield {"src_table": f"T{number}"}
+
+    assert ci._lines_within(rows(), 5) is None
+    assert len(read) == 6
+    assert ci._lines_within([{"src_table": ""}, {"src_table": "a"}], 1) == [{"src_table": "a"}]
+    assert len(ci._lines_within(({"src_table": f"T{n}"} for n in range(5)), 5)) == 5
 
 
 def test_an_exported_group_imports_back_into_the_same_rows():
