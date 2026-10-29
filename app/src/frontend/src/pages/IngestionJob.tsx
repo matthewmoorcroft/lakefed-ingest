@@ -1,8 +1,9 @@
-import { Fragment, useEffect, useState } from "react";
+import { Fragment, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import { api, qs, type ApiError, type Row } from "../api";
 import { Refused } from "../permissions";
+import { changeInProgress, deleteNotice, runButton, runTimeoutNotice } from "../pending";
 import { Tree } from "./JobEdit";
 import { TargetTables } from "./TargetTables";
 import { RunningTasks } from "./tasks";
@@ -168,38 +169,27 @@ export default function IngestionJob() {
   const before = pages[pages.length - 1];
   const qc = useQueryClient();
   const confirm = useConfirm();
-  // Between pressing Run now or Cancel run and the live view showing the change, the button waits ("Starting…",
-  // "Cancelling…"), for two minutes at most.
-  const [changing, setChanging] = useState<"start" | "stop" | null>(null);
+  // Run now and Cancel run wait on the server's run phase (the poller's state of the job's Databricks runs), not on a
+  // timer: "Starting…" until Databricks reports a run going, "Cancelling…" until it reports every run ended.
   const refresh = () => ["ingestion-job", "ingestion-job-live", "ingestion-job-runs"].forEach((k) => qc.invalidateQueries({ queryKey: [k, id] }));
   const runNow = useMutation({
     mutationFn: () => api.post<Row>(`/ingestion-jobs/${encodeURIComponent(id)}/run`, {}),
-    onSuccess: () => { setChanging("start"); refresh(); },
+    onSuccess: () => refresh(),
   });
   const stop = useMutation({
     mutationFn: () => api.post<Row>(`/ingestion-jobs/${encodeURIComponent(id)}/stop`, {}),
-    onSuccess: () => { setChanging("stop"); refresh(); },
+    onSuccess: () => refresh(),
   });
   const [deleting, setDeleting] = useState(false);
   const remove = useMutation({
     mutationFn: (dropTargets: boolean) => api.post<Row>(`/schedules/${encodeURIComponent(id)}/delete`, { drop_targets: dropTargets }),
-    onSuccess: () => { qc.invalidateQueries(); navigate("/ingestion-jobs"); },
+    onSuccess: () => { qc.invalidateQueries(); },
   });
   const job = useQuery({ queryKey: ["ingestion-job", id], queryFn: () => api.get<Row>(`/ingestion-jobs/${encodeURIComponent(id)}`),
-                         refetchInterval: changing ? 3_000 : 60_000 });
+                         refetchInterval: (q) => (changeInProgress((q.state.data as Row | undefined)?.run_now, runNow.isPending || stop.isPending) ? 3_000 : 60_000) });
+  const busy = changeInProgress(job.data?.run_now, runNow.isPending || stop.isPending);
   const live = useQuery({ queryKey: ["ingestion-job-live", id], queryFn: () => api.get<Row>(`/ingestion-jobs/${encodeURIComponent(id)}/live`),
-                          refetchInterval: (q) => (changing ? 3_000 : (q.state.data as Row | undefined)?.active ? 5_000 : 30_000) });
-  const going = !!live.data?.active || !!job.data?.run_now?.going;
-  useEffect(() => {
-    if ((changing === "start" && going) || (changing === "stop" && !going)) setChanging(null);
-  }, [changing, going]);
-  useEffect(() => {
-    if (!changing) return;
-    const timer = setTimeout(() => setChanging(null), 120_000);
-    return () => clearTimeout(timer);
-  }, [changing]);
-  const starting = runNow.isPending || changing === "start";
-  const stopping = stop.isPending || changing === "stop";
+                          refetchInterval: (q) => (busy ? 3_000 : (q.state.data as Row | undefined)?.active ? 5_000 : 30_000) });
   const refusal = (runNow.error as ApiError | null)?.detail;
   const runs = useQuery({
     queryKey: ["ingestion-job-runs", id, before],
@@ -208,6 +198,9 @@ export default function IngestionJob() {
   });
   const j = job.data;
   const last = j?.last_job_run;
+  const button = runButton(j?.run_now, { starting: runNow.isPending, cancelling: stop.isPending });
+  const timeout = runTimeoutNotice(j?.run_now);
+  const deletion = deleteNotice(j?.delete);
   return (
     <>
       <PageHead crumb={<Crumbs steps={[["Ingestion jobs", "/ingestion-jobs"]]} />} tab={j?.name}
@@ -223,25 +216,30 @@ export default function IngestionJob() {
         right={j && <span className="card-actions">
           {/* As a Databricks job page: Delete in the more-actions menu, Edit beside Run now, Run now the primary action,
               which becomes Cancel run while a run of the job is going. */}
-          <Menu label="⋮" title="More actions">
-            <button className="danger-text" disabled={!!j.delete_blocked || remove.isPending} title={j.delete_blocked ?? undefined}
-              onClick={() => setDeleting(true)}>{remove.isPending ? "Deleting…" : "Delete job"}</button>
-          </Menu>
-          <button disabled={!!j.change_blocked} title={j.change_blocked ?? undefined}
-            onClick={() => navigate(`/ingestion-jobs/${id}/edit`)}>Edit</button>
-          {starting || stopping
-            ? <button className="primary" disabled title={starting ? "Waiting for the run to show as going" : "Waiting for the runs to end"}>
-                {starting ? "Starting…" : "Cancelling…"}</button>
-            : going
-              ? <button className="danger" disabled={!!j.run_now?.refused} title={j.run_now?.refused ?? "Cancel the run of this job going now"}
-                  onClick={() => confirm.ask(cancelRunRequest(j, live.data)).then((ok) => ok && stop.mutate())}>Cancel run</button>
-              : <button className="primary" disabled={!!j.run_now?.blocked} title={j.run_now?.blocked ?? undefined}
-                  onClick={() => confirm.ask(runNowRequest(j)).then((ok) => ok && runNow.mutate())}>Run now</button>}</span>} />
+          {j.delete ? (deletion?.runAgain
+            ? <button className="danger" disabled={remove.isPending} onClick={() => remove.mutate(!!j.delete.drop_targets)}>
+                {remove.isPending ? "Starting the delete…" : "Run again"}</button>
+            : <button disabled title="The job's delete is pending: this page is read only until it has finished">Deleting…</button>)
+            : <>
+                <Menu label="⋮" title="More actions">
+                  <button className="danger-text" disabled={!!j.delete_blocked || remove.isPending} title={j.delete_blocked ?? undefined}
+                    onClick={() => setDeleting(true)}>{remove.isPending ? "Deleting…" : "Delete job"}</button>
+                </Menu>
+                <button disabled={!!j.change_blocked} title={j.change_blocked ?? undefined}
+                  onClick={() => navigate(`/ingestion-jobs/${id}/edit`)}>Edit</button>
+                <button className={button.tone} disabled={button.disabled} title={button.title ?? undefined}
+                  onClick={() => (button.action === "cancel"
+                    ? confirm.ask(cancelRunRequest(j, live.data)).then((ok) => ok && stop.mutate())
+                    : button.action === "run" && confirm.ask(runNowRequest(j)).then((ok) => ok && runNow.mutate()))}>{button.label}</button>
+              </>}</span>} />
       {j && <p className="muted small">Created by {j.created_by ?? "unknown"}{j.created_at ? `, ${fmtTime(j.created_at)}` : ""} ·
         Last updated by {j.updated_by ?? "unknown"}{j.updated_at ? `, ${fmtTime(j.updated_at)}` : ""}</p>}
       {confirm.dialog}
       <RunningTasks jobId={id} />
       {deleting && j && <DeleteJobDialog job={j} onClose={(drop) => { setDeleting(false); if (drop !== null) remove.mutate(drop); }} />}
+      {deletion && <Notice tone={deletion.tone}>{deletion.text}{deletion.runAgain ? " Run again starts the delete job again." : ""}
+        {j?.delete?.run?.url && <> <OutLink href={j.delete.run.url}>Open the delete job's run</OutLink>.</>}</Notice>}
+      {timeout && <Notice tone="warn">{timeout}</Notice>}
       <Refused action="Run now" refusal={j?.run_now?.blocked} />
       <Refused action="Edit and Delete" refusal={j?.change_blocked} />
       <ErrorBox error={remove.error} />
