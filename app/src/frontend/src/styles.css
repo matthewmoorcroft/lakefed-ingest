@@ -274,8 +274,8 @@ table.tree tr.l2 td[colspan] { padding-left: 28px; } table.tree tr.l3 td[colspan
 .twisty { height: 22px; width: 22px; padding: 0; margin-right: 6px; border: 0; background: transparent; color: var(--muted); }
 .help { display: block; font-size: 12px; color: var(--muted); line-height: 1.35; }
 .impact { font-size: var(--db-font-size-sm); color: var(--warn); background: var(--warn-bg); border-radius: 4px; padding: 4px 8px; }
-.info { display: inline-grid; place-items: center; width: 16px; height: 16px; border-radius: 50%; border: 1px solid var(--border);
-        font-size: 11px; margin-right: 4px; }
+span.info { display: inline-grid; place-items: center; width: 16px; height: 16px; border-radius: 50%; border: 1px solid var(--border);
+            font-size: 11px; margin-right: 4px; }
 .mono { font-family: var(--db-font-family-mono, ui-monospace, Menlo, monospace); }
 .tree-search { width: min(420px, 100%); }
 table.tree td .target-path { padding-left: 28px; }
