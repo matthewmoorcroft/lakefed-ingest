@@ -1,5 +1,5 @@
 import { Fragment, useState } from "react";
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, type Row } from "../api";
 import { ErrorBox, Modal, Notice, OutLink, Tag, fmtInt, plural } from "../components";
 import { useSettings } from "../App";
@@ -52,7 +52,15 @@ function Step1({ chosen, setChosen, tested, setTested }: { chosen: string; setCh
   const [search, setSearch] = useState("");
   const [testing, setTesting] = useState(false);
   const [error, setError] = useState<unknown>(null);
+  const qc = useQueryClient();
   const list = useQuery({ queryKey: ["connections"], queryFn: () => api.get<Row>("/connections") });
+  const [refreshing, setRefreshing] = useState(false);
+  // Lists the connections again now, so one just made in Catalog Explorer shows up without leaving the form.
+  const refresh = async () => {
+    setRefreshing(true);
+    try { qc.setQueryData(["connections"], await api.get<Row>("/connections?fresh=true")); }
+    finally { setRefreshing(false); }
+  };
   const found: Row[] = (list.data?.connections ?? []).filter((c: Row) => c.discoverable && c.name.toLowerCase().includes(search.toLowerCase()));
   const test = async () => {
     setTesting(true); setError(null); setTested(null);
@@ -69,7 +77,9 @@ function Step1({ chosen, setChosen, tested, setTested }: { chosen: string; setCh
       <label className="radio-row"><input type="radio" checked={how === "existing"} onChange={() => setHow("existing")} /> Use an existing connection</label>
       {how === "existing" && (
         <div className="radio-body">
-          <input className="search" placeholder="Search connections" value={search} onChange={(e) => setSearch(e.target.value)} />
+          <div className="toolbar"><input className="search" placeholder="Search connections" value={search} onChange={(e) => setSearch(e.target.value)} />
+            <button className="ghost" disabled={refreshing} onClick={refresh}>{refreshing ? "Refreshing…" : "Refresh"}</button>
+            <span className="muted">A connection made in Catalog Explorer shows here after Refresh, once this app has USE CONNECTION on it.</span></div>
           <ErrorBox error={list.error} />
           {list.data?.error && <Notice tone="warn">The app can't list connections: {list.data.error}</Notice>}
           <div className="table-wrap"><table className="data">
@@ -100,7 +110,7 @@ function Step1({ chosen, setChosen, tested, setTested }: { chosen: string; setCh
             CONNECTION on the metastore. Make it there, give this app USE CONNECTION on it, then come back and choose it above.</p>
           <div className="toolbar">
             {config?.workspace_url && <OutLink href={`${config.workspace_url}/explore/connections`}>Open Connections in Catalog Explorer</OutLink>}
-            <button className="ghost" onClick={() => { list.refetch(); setHow("existing"); }}>I made it: refresh the list</button>
+            <button className="ghost" disabled={refreshing} onClick={() => { refresh(); setHow("existing"); }}>I made it: refresh the list</button>
           </div>
         </div>
       )}

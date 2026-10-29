@@ -95,6 +95,8 @@ class FakeDB:
 def client(monkeypatch):
     import contextlib
     fake = FakeDB()
+    # These tests are about the writes; that every group belongs to a job is tested in group_rule_test.py.
+    monkeypatch.setattr(main, "_refuse_groups_outside_jobs", lambda groups: None)
     monkeypatch.setattr(main.db, "query", lambda sql, params=(): DISCOVERED if "discovered_table" in sql else [])
     monkeypatch.setattr(main.db, "transaction", contextlib.contextmanager(lambda: (yield FakeCursor(fake))))
     c = TestClient(main.app, headers={"X-Forwarded-Email": "op@example.com"})

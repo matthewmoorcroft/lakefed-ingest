@@ -249,6 +249,20 @@ def test_connections_list_sorted_with_tracked_counts_and_discoverable_flag(api):
     assert api.get("/api/connections/nope/databases").status_code == 404
 
 
+def test_refresh_lists_a_connection_made_since_the_shared_read(api, monkeypatch):
+    import main
+
+    monkeypatch.setattr(main, "MONITOR_CACHE_S", 60)
+    made = [{"name": "sql_b", "connection_type": "SQLSERVER", "host": "h", "port": "1433", "discoverable": True}]
+    monkeypatch.setattr(main, "_connections", lambda: list(made))
+    main._shared_reads.pop("connections", None)
+    assert [c["name"] for c in api.get("/api/connections").json()["connections"]] == ["sql_b"]
+    made.append(dict(made[0], name="sql_new"))
+    assert [c["name"] for c in api.get("/api/connections").json()["connections"]] == ["sql_b"]
+    assert [c["name"] for c in api.get("/api/connections?fresh=true").json()["connections"]] == ["sql_b", "sql_new"]
+    main._shared_reads.pop("connections", None)
+
+
 def test_connections_listing_error_is_returned_not_raised(api, monkeypatch):
     import main
 

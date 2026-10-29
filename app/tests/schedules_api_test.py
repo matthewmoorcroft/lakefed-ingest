@@ -20,6 +20,7 @@ class Store:
 
     def __init__(self):
         self.schedules, self.members, self.log, self.unique, self.locks = {}, {}, [], False, []
+        self.with_tables = {"c1", "c2", "c3"}           # groups with control rows
 
     def now(self):
         return datetime.now(timezone.utc).isoformat()
@@ -84,7 +85,7 @@ class Store:
 
     def query(self, sql, params=()):
         if "from lakefed_ingest.control" in sql and "distinct task_collection" in sql:
-            return [{"task_collection": c} for c in ("c1", "c2", "c3")]
+            return [{"task_collection": c} for c in sorted(self.with_tables)]
         if sql == q.schedules_sql():
             return [dict(s) for s in self.schedules.values() if s["deleted_at"] is None]
         if sql == q.schedule_sql():
@@ -157,6 +158,7 @@ def test_validation_and_duplicate_name(api):
 
 def test_edit_adds_and_removes_members_restaggers_and_resets_jobs(api):
     sid = api.post("/api/schedules", json=BODY).json()["id"]
+    api.store.with_tables.discard("c1")      # its tables have moved on, so it may leave the job
     before = {m["task_collection"]: m["job_id"] for m in api.store.members.values()}
     r = api.post(f"/api/schedules/{sid}", json=dict(BODY, cadence_minutes=30, members=["c2", "c3"])).json()
     assert r["changed"] == ["cadence_minutes"] and r["added"] == ["c3"] and r["removed"] == ["c1"]
@@ -206,10 +208,18 @@ def test_the_timeline_has_one_lane_per_job_with_its_planned_triggers(api, monkey
     assert lane["description"].startswith("Every 15 minutes")
 
 
+def test_a_group_with_tables_cant_leave_its_job(api):
+    sid = api.post("/api/schedules", json=BODY).json()["id"]
+    r = api.post(f"/api/schedules/{sid}", json=dict(BODY, members=["c2"]))
+    assert r.status_code == 422 and "c1 still has tables" in r.text
+    assert {m["task_collection"] for m in api.store.members.values() if m["removed_at"] is None} == {"c1", "c2"}
+
+
 def test_sync_takes_the_schedule_lock_and_a_failed_delete_is_retried(api):
     sid = api.post("/api/schedules", json=BODY).json()["id"]
     assert api.store.locks and api.store.locks[-1] == (q.SCHEDULE_LOCK_CLASS, sid)
     c1 = next(m for m in api.store.members.values() if m["task_collection"] == "c1")
+    api.store.with_tables.discard("c1")
     real = api.jobs.delete
     api.jobs.delete = lambda job_id: (_ for _ in ()).throw(RuntimeError("503 temporarily unavailable"))
     r = api.post(f"/api/schedules/{sid}", json=dict(BODY, members=["c2"])).json()
@@ -440,6 +450,17 @@ def test_a_cluster_of_its_own_starts_the_copies_job_and_a_forged_copy_id_is_igno
     # Saving again with the same cluster starts nothing; the wrappers keep the bundle's job until the copy exists.
     assert api.post(f"/api/schedules/{sid}", json=body).status_code == 200 and started == [sid]
     assert main._wrapper_target(api.store.schedules[sid]) == 555
+
+
+def test_new_offers_the_job_cluster_fields_before_the_job_exists(api, monkeypatch):
+    _cluster_setup(monkeypatch)
+    monkeypatch.setattr(main.jobs, "job_settings", lambda job_id: {"job_clusters": [{"new_cluster": {
+        "driver_node_type_id": "Standard_D16ds_v5", "node_type_id": "Standard_D8ds_v5", "num_workers": 1}}]})
+    r = api.get("/api/cluster-options")
+    assert r.status_code == 200
+    got = r.json()
+    assert got["defaults"] == {"driver_node_type_id": "Standard_D16ds_v5", "node_type_id": "Standard_D8ds_v5", "num_workers": 1}
+    assert got["node_types"] and got["cluster"] is None and got["applying"] is None and got["error"] is None
 
 
 def test_a_cluster_must_name_this_workspaces_node_types_and_at_most_eight_workers(api, monkeypatch):

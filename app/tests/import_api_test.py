@@ -39,6 +39,8 @@ GROUP_ROWS = [dict(id=1, task_collection="g1", src_type="sqlserver", src_host=No
 @pytest.fixture
 def client(monkeypatch):
     fake = FakeDB()
+    # These tests are about the writes; that every group belongs to a job is tested in group_rule_test.py.
+    monkeypatch.setattr(main, "_refuse_groups_outside_jobs", lambda groups: None)
 
     def query(sql, params=()):
         if sql == q.collection_control_rows_sql():

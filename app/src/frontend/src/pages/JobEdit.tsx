@@ -497,7 +497,7 @@ export default function JobEdit() {
 const CLUSTER_KEYS = ["driver_node_type_id", "node_type_id", "num_workers"];
 
 /** The cluster each run uses, in a few words for the closed Advanced configuration. */
-function clusterSummary(info: Row | undefined, cluster: Row | null) {
+export function clusterSummary(info: Row | undefined, cluster: Row | null) {
   const c = cluster ?? info?.defaults;
   if (!c) return "the Databricks job's cluster";
   const at = info?.defaults && !ownCluster(c, info.defaults) ? ", the tested defaults" : "";
@@ -505,7 +505,7 @@ function clusterSummary(info: Row | undefined, cluster: Row | null) {
 }
 
 /** The cluster to save as the job's own, or null when it is the Databricks job's (so the job runs that job itself). */
-function ownCluster(cluster: Row, defaults: Row): Row | null {
+export function ownCluster(cluster: Row, defaults: Row): Row | null {
   if (CLUSTER_KEYS.every((k) => String(cluster[k] ?? "") === String(defaults[k] ?? ""))) return null;
   return { driver_node_type_id: cluster.driver_node_type_id || null, node_type_id: cluster.node_type_id || null,
     num_workers: cluster.num_workers === "" || cluster.num_workers == null ? null : Number(cluster.num_workers) };
@@ -513,8 +513,8 @@ function ownCluster(cluster: Row, defaults: Row): Row | null {
 
 // The job's ingestion cluster, set like a Databricks job cluster. A change gives the job its own copy of the Databricks
 // job (made by the cluster copies job after Save), since a run of that job can't change its cluster.
-function ClusterFields({ info, error, cluster, setCluster, locked }: { info?: Row; error: unknown; cluster: Row | null;
-                        setCluster: (c: Row) => void; locked: Locked }) {
+export function ClusterFields({ info, error, cluster, setCluster, locked, after = "Save" }: { info?: Row; error: unknown;
+                        cluster: Row | null; setCluster: (c: Row) => void; locked: Locked; after?: string }) {
   if (!info || !cluster) return <ErrorBox error={error} />;
   const d = info.defaults ?? {};
   const off = !!locked || !info.configured;
@@ -537,7 +537,7 @@ function ClusterFields({ info, error, cluster, setCluster, locked }: { info?: Ro
       <h3>Job cluster</h3>
       <p className="muted">The driver and worker types and the number of workers each run uses. The defaults are the Databricks
         job's own: {d.driver_node_type_id} driver, {d.node_type_id} workers, {d.num_workers} {Number(d.num_workers) === 1 ? "worker" : "workers"}.
-        A change gives this job its own copy of the Databricks job, made a minute or so after Save.</p>
+        A change gives this job its own copy of the Databricks job, made a minute or so after {after}.</p>
       <div className="form-grid">
         <label>Driver type{typeSelect("driver_node_type_id")}</label>
         <label>Worker type{typeSelect("node_type_id")}</label>

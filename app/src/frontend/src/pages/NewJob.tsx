@@ -5,6 +5,7 @@ import { api, type Row } from "../api";
 import { Crumbs, ErrorBox, Menu, Modal, Notice, PageHead, Section, fmtInt, plural, useConfirm } from "../components";
 import { CADENCES, IdentityFields, ParameterFields, RunFields, WritesFields, paramsSummary } from "./jobForm";
 import { DiscoverDialog } from "./Discover";
+import { ClusterFields, clusterSummary, ownCluster } from "./JobEdit";
 
 // New ingestion job: the Edit view, empty, with Create in place of Save. Its tables are added in What it ingests
 // (Add tables: a CSV of where each table is), the rest is set as in Edit, and nothing is written until Create, which
@@ -30,6 +31,11 @@ export default function NewJob() {
   const [groupsPerServer, setGroupsPerServer] = useState(4);
   const [importing, setImporting] = useState(false);
   const [discovering, setDiscovering] = useState(false);
+  // The job's own cluster, as in Edit's Job cluster: at the Databricks job's values unless changed here.
+  const clusterInfo = useQuery({ queryKey: ["cluster-options"], queryFn: () => api.get<Row>("/cluster-options") });
+  const [clusterChoice, setCluster] = useState<Row | null>(null);
+  const cluster = clusterChoice ?? clusterInfo.data?.defaults ?? null;
+  const own = clusterInfo.data && cluster ? ownCluster(cluster, clusterInfo.data.defaults) : null;
   const variants: string[] = options.data?.variants ?? [];
   // The check job is how the 1,000- and 100,000-table jobs were tested, so it is the default where there is one.
   const jobVariant = variant ?? (variants.includes("check") ? "check" : "default");
@@ -43,7 +49,7 @@ export default function NewJob() {
                   identity: Object.fromEntries(identity.filter(([n]) => n.trim()).map(([n, t]) => [n.trim(), t.trim()])) },
       run: { cadence_minutes: cadence, timezone: cadence <= 60 ? "UTC" : run.timezone || "Europe/London", paused: run.paused,
              notify_emails: run.notify_emails || null, job_variant: jobVariant,
-             options: cadence > 60 ? { start_minute: (h || 0) * 60 + (m || 0) } : {},
+             options: { ...(cadence > 60 ? { start_minute: (h || 0) * 60 + (m || 0) } : {}), ...(own ? { cluster: own } : {}) },
              parameters: Object.fromEntries(Object.entries(params).filter(([, v]) => v.trim() !== "").map(([k, v]) => [k, v.trim()])) },
     };
   };
@@ -131,8 +137,9 @@ export default function NewJob() {
 
       <details className="card advanced">
         <summary><b>Advanced configuration</b> <span className="muted">compute and tuning, at the defaults we tested: {groupsPerServer} groups per
-          server, runs through the {jobVariant === "check" ? "check job" : "Databricks job"}, the Databricks job's own cluster;
+          server, runs through the {jobVariant === "check" ? "check job" : "Databricks job"}, {clusterSummary(clusterInfo.data, cluster)};
           {" "}{paramsSummary(params) || "every key at its default"}</span></summary>
+        <h3>Compute</h3>
         <div className="form-grid">
           <label>Groups per server<input type="number" min={1} max={64} value={groupsPerServer}
             onChange={(e) => setGroupsPerServer(Number(e.target.value) || 1)} />
@@ -140,7 +147,7 @@ export default function NewJob() {
           {variants.length > 1 && <label>Runs start<select value={jobVariant} onChange={(e) => setVariant(e.target.value)}>
             {variants.map((v) => <option key={v} value={v}>{v === "check" ? "through the check job: only databases with changes" : "the Databricks job for every group"}</option>)}</select></label>}
         </div>
-        <p className="help">The job's own cluster can be set in Edit once it is created.</p>
+        <ClusterFields info={clusterInfo.data} error={clusterInfo.error} cluster={cluster} setCluster={setCluster} locked={null} after="Create" />
         <h3>Tuning</h3>
         <ParameterFields params={params} setParams={setParams} options={options.data} />
       </details>

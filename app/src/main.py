@@ -662,6 +662,25 @@ def _refuse_groups(groups: Iterable[str], request: Request) -> None:
     _refuse(_groups_refusal(groups, _user(request)))
 
 
+OUTSIDE_A_JOB = ("every ingestion group belongs to an ingestion job, and {groups} is in none: add tables through a "
+                 "job's Add tables, or make a job for them with New ingestion job")
+
+
+def _refuse_groups_outside_jobs(groups: Iterable[str]) -> None:
+    """Refuse a write that would put tables into a group no ingestion job holds, so no group is ever outside a job.
+    New ingestion job makes its groups with the job, in one transaction, and Add tables puts tables only into the
+    job's own groups, so neither comes here. Read fresh, not shared."""
+    wanted = {g for g in groups if g}
+    if not wanted:
+        return
+    schedules = db.query(q.schedules_sql())
+    members = db.query(q.schedule_members_sql(), ([s["id"] for s in schedules],)) if schedules else []
+    held = {m["task_collection"] for m in members if m["removed_at"] is None}
+    outside = sorted(wanted - held)
+    if outside:
+        raise HTTPException(422, OUTSIDE_A_JOB.format(groups=", ".join(outside)))
+
+
 def _run_now_blocker(job: dict, members: List[dict]) -> Optional[str]:
     """Why the job can't be started by hand right now (a run of it is going, or its wrapper jobs aren't synced)."""
     groups = {m["task_collection"] for m in members}
@@ -730,21 +749,35 @@ def ingestion_job_cluster(job_id: int, request: Request):
             else:
                 error = f"the cluster copies run ended {state['result'] or state['state']}: {state['message'] or ''}".strip()
             applying = None
+    choices = _cluster_choices()
+    copy = sch.copy_job_id(s)
+    host = db.workspace().config.host.rstrip("/")
+    return {**choices, "cluster": sch.own_cluster(s), "copy_job_id": copy, "copy_url": f"{host}/jobs/{copy}" if copy else None,
+            "applying": applying, "error": error or choices["error"]}
+
+
+@app.get("/api/cluster-options")
+def cluster_options():
+    """What New offers for a job's own cluster before the job exists: the ingestion job's values as the defaults and the
+    workspace's node types, as the Edit view's Job cluster shows them."""
+    return {**_cluster_choices(), "cluster": None, "copy_job_id": None, "copy_url": None, "applying": None}
+
+
+def _cluster_choices() -> dict:
+    """The ingestion job's cluster values (the defaults a job's own cluster starts from) and the workspace's node types."""
+    error = None
     try:
         bundle_cluster = ((jobs.job_settings(jobs.ingest_variants().get("default")).get("job_clusters") or [{}])[0]
                           .get("new_cluster") or {})
         defaults = {k: bundle_cluster.get(k) for k in sch.CLUSTER_KEYS}
     except Exception as e:
-        defaults, error = {}, error or f"can't read the ingestion job's cluster: {str(e).split('. ')[0]}"
+        defaults, error = {}, f"can't read the ingestion job's cluster: {str(e).split('. ')[0]}"
     try:
         node_types = jobs.node_type_details()
     except Exception:
         node_types = []
-    copy = sch.copy_job_id(s)
-    host = db.workspace().config.host.rstrip("/")
-    return {"cluster": sch.own_cluster(s), "defaults": defaults, "node_types": node_types,
-            "max_workers": sch.MAX_WORKERS, "copy_job_id": copy, "copy_url": f"{host}/jobs/{copy}" if copy else None,
-            "applying": applying, "error": error, "configured": bool(jobs.CLUSTER_COPIES_JOB_ID)}
+    return {"defaults": defaults, "node_types": node_types, "max_workers": sch.MAX_WORKERS, "error": error,
+            "configured": bool(jobs.CLUSTER_COPIES_JOB_ID)}
 
 
 class JobSettingsRequest(BaseModel):
@@ -1358,6 +1391,7 @@ def reseed(body: Ids, request: Request):
 
 @app.post("/api/tables")
 def add_table(row: dict, request: Request):
+    _refuse_groups_outside_jobs([row.get("task_collection")])
     _refuse_groups([row.get("task_collection")], request)
     errs = q.validate_control_row(row)
     if errs:
@@ -1408,6 +1442,7 @@ def edit_tables(body: EditRequest, request: Request):
                 cur.connection.rollback()
                 return {"summary": summary, "plans": plans}
             new_coll = body.changes.get("task_collection")
+            _refuse_groups_outside_jobs([new_coll])
             _refuse_groups([r["task_collection"] for r in rows] + [new_coll], request)
             _lock_collections(cur, [r["task_collection"] for r in rows] + ([new_coll] if new_coll else []))
             _apply_plans(cur, rows, plans, _user(request), batch)
@@ -1607,6 +1642,7 @@ def register(discovery_id: str, body: RegisterRequest, request: Request):
         else:
             valid.append((name, row))
     if not body.dry_run and valid:
+        _refuse_groups_outside_jobs([body.task_collection])
         _refuse_groups([body.task_collection], request)
         batch = uuid.uuid4().hex[:12]
         with db.transaction() as cur:
@@ -1663,6 +1699,7 @@ def import_csv(body: ImportRequest, request: Request):
     if body.dry_run:
         plan = planned(db.query(q.collection_control_rows_sql(), (group,)))
     else:
+        _refuse_groups_outside_jobs([group])
         _refuse_groups([group], request)
         batch = uuid.uuid4().hex[:12]
         with db.transaction() as cur:
@@ -2072,6 +2109,10 @@ def update_schedule(sid: int, body: ScheduleBody, request: Request):
     active = {m["task_collection"]: m for m in members if m["removed_at"] is None}
     added = sorted(set(body.members) - set(active))
     gone = sorted(set(active) - set(body.members))
+    with_tables = sorted(set(gone) & {r["task_collection"] for r in db.query(q.collections_sql())})
+    if with_tables:
+        raise HTTPException(422, f"every ingestion group belongs to an ingestion job: {', '.join(with_tables)} still "
+                                 "has tables, so it can't leave this job")
     offs = sch.offsets(body.members, body.cadence_minutes, body.stagger, sch.start_minute(new))
     batch = uuid.uuid4().hex[:12]
     try:
@@ -2239,10 +2280,14 @@ def _connections() -> List[dict]:
 
 
 @app.get("/api/connections")
-def connections():
+def connections(fresh: bool = False):
     """UC connections with what lakefed tracks on each (control rows naming the connection or its host).
     A listing error (no rights on any connection, for example) is returned, not raised, so the page
-    still offers discovery by host and secret."""
+    still offers discovery by host and secret. `fresh` lists them again now (the picker's Refresh, after a
+    connection is made in Catalog Explorer) instead of from the shared read."""
+    if fresh:
+        with _shared_lock:
+            _shared_reads.pop("connections", None)
     def compute():
         try:
             found = _connections()
