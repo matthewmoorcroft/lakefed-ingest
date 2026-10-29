@@ -651,8 +651,8 @@ export function Pager({ offset, limit, total, noun, onPage }: { offset: number; 
       <span className="muted">{total ? `${fmtInt(offset + 1)} to ${fmtInt(last)} of ${fmtInt(total)}` : "0"} {plural(total, noun)}</span>
       {total > limit && (
         <span className="pager-buttons">
-          <button className="ghost" disabled={offset === 0} onClick={() => onPage(Math.max(0, offset - limit))}>Previous</button>
-          <button className="ghost" disabled={last >= total} onClick={() => onPage(offset + limit)}>Next</button>
+          <button className="ghost" disabled={offset === 0} onClick={() => onPage(Math.max(0, offset - limit))}>Previous page</button>
+          <button className="ghost" disabled={last >= total} onClick={() => onPage(offset + limit)}>Next page</button>
         </span>
       )}
     </div>

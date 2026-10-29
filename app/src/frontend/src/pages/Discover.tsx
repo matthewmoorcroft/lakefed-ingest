@@ -63,13 +63,17 @@ async function readTables(connection: string, request: Row, onWait?: (wait: RunW
 }
 
 /** The databases that couldn't be read, and why: often that the login can see the name but not open the database. */
-function Unread({ failed }: { failed: [string, string][] }) {
+function Unread({ failed, reading, onReadAgain }: { failed: [string, string][]; reading: boolean; onReadAgain: () => void }) {
   if (!failed.length) return null;
-  return <Notice tone="warn">{fmtInt(failed.length)} {plural(failed.length, "database")} couldn't be read, so none of
-    {failed.length === 1 ? " its" : " their"} tables are added. The login can see {failed.length === 1 ? "its name" : "their names"} on the
-    server but may not open {failed.length === 1 ? "it" : "them"}: untick {failed.length === 1 ? "it" : "them"}, or give the login access and
-    read again.<ul>{failed.slice(0, 10).map(([d, why]) => <li key={d}><b>{d}</b>: {why}</li>)}</ul>
-    {failed.length > 10 && <span className="muted">and {fmtInt(failed.length - 10)} more.</span>}</Notice>;
+  const one = failed.length === 1;
+  const named = failed.slice(0, 3).map(([d]) => d).join(", ");
+  return <Notice tone="warn"><p>{fmtInt(failed.length)} {plural(failed.length, "database")} couldn't be read ({named}
+    {failed.length > 3 ? `, and ${fmtInt(failed.length - 3)} more` : ""}), so none of {one ? "its" : "their"} tables are added.
+    The login can see {one ? "its name" : "their names"} on the server but may not open {one ? "it" : "them"}: untick{" "}
+    {one ? "it" : "them"}, or give the login access and read {one ? "it" : "them"} again.</p>
+    <div className="toolbar"><button disabled={reading} onClick={onReadAgain}>{reading ? "Reading again…" : "Read them again"}</button></div>
+    <details className="unread-all"><summary>Show all {fmtInt(failed.length)}, with why</summary>
+      <ul>{failed.map(([d, why]) => <li key={d}><b>{d}</b>: {why}</li>)}</ul></details></Notice>;
 }
 
 /** A tick box with a third state: a filled square for a row chosen in part, a tick only when all of it is. */
@@ -267,6 +271,18 @@ function Step2({ connection, discoveryId, typedNames, picks, setPicks, wholeServ
       else setRead((now) => ({ ...now, [d]: got.id }));
     } catch (e) { setError(e); } finally { setReading(null); }
   };
+  // Read the databases that failed once more, by name: the ones that open now are kept, the rest stay listed.
+  const [readingAgain, setReadingAgain] = useState(false);
+  const readAgain = async () => {
+    const names = failed.map(([d]) => d);
+    setReadingAgain(true); setError(null);
+    try {
+      const got = await readTables(connection, { databases: names });
+      const still = new Set(got.failed.map(([d]) => d));
+      setRead((now) => ({ ...now, ...Object.fromEntries(names.filter((d) => !still.has(d)).map((d) => [d, got.id])) }));
+      setFailed(() => got.failed);
+    } catch (e) { setError(e); } finally { setReadingAgain(false); }
+  };
   const toggleTable = (d: string, key: string) => setPicks((now) => {
     const chosen = Array.isArray(now[d]) ? (now[d] as string[]) : [];
     return { ...now, [d]: chosen.includes(key) ? chosen.filter((k) => k !== key) : [...chosen, key] };
@@ -305,7 +321,7 @@ function Step2({ connection, discoveryId, typedNames, picks, setPicks, wholeServ
       </table></div>
       {discoveryId != null && <Pager offset={offset} limit={DATABASES_PER_PAGE} total={Number(listing.data?.matched ?? 0)} noun="database"
         onPage={setOffset} />}
-      <Unread failed={failed} />
+      <Unread failed={failed} reading={readingAgain} onReadAgain={readAgain} />
       <ErrorBox error={listing.error ?? error} />
     </>
   );

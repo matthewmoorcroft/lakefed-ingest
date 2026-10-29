@@ -69,8 +69,8 @@ export default function Tables() {
       {message && <Notice tone="ok">{message}</Notice>}
       <Section title={tables.data ? `Page ${pages.length + 1}: ${tables.data.tables.length} ${plural(tables.data.tables.length, "table")}` : "Tables"}
         actions={<>
-          <button className="ghost" disabled={!pages.length} onClick={() => setPages(pages.slice(0, -1))}>Previous</button>
-          <button className="ghost" disabled={!tables.data?.next_after} onClick={() => setPages([...pages, JSON.stringify(tables.data!.next_after)])}>Next</button>
+          <button className="ghost" disabled={!pages.length} onClick={() => setPages(pages.slice(0, -1))}>Previous page</button>
+          <button className="ghost" disabled={!tables.data?.next_after} onClick={() => setPages([...pages, JSON.stringify(tables.data!.next_after)])}>Next page</button>
           {ids.length > 0 && <>
           <span className="muted">{ids.length} selected</span>
           <button className="primary" disabled={!!locked} title={locked ?? undefined} onClick={() => setEditing(ids.length === 1 ? "one" : "bulk")}>

@@ -331,9 +331,13 @@ button.th-sort { border: 0; background: transparent; padding: 0; font: inherit; 
 /* Dialogs, as the Databricks UI asks before a change: a title, what it does, Cancel and the action at the right. */
 .modal-backdrop { position: fixed; inset: 0; background: rgb(0 0 0 / 35%); z-index: 1000; display: grid; place-items: center; padding: 16px; }
 .modal { background: var(--db-surface-base); border-radius: var(--db-shape-container-small); box-shadow: var(--db-elevation-high, 0 8px 32px rgb(0 0 0 / 25%));
-  width: min(520px, 100%); padding: var(--db-space-5, 20px) var(--db-space-6, 24px); }
+  width: min(520px, 100%); padding: var(--db-space-5, 20px) var(--db-space-6, 24px);
+  /* As Databricks' own dialogs: the dialog fits the window, its body scrolls, and its title and actions stay put. */
+  max-height: calc(100vh - 32px); display: flex; flex-direction: column; }
+.modal h2, .modal-actions { flex-shrink: 0; }
 .modal h2 { margin-bottom: var(--db-space-3); overflow-wrap: anywhere; }
-.modal-body { color: var(--text); }
+.modal-body { color: var(--text); overflow: auto; min-height: 0; flex: 1 1 auto; }
+.unread-all ul { max-height: 240px; overflow: auto; margin: var(--db-space-2) 0 0; }
 .modal-body p { margin: 0 0 var(--db-space-2); }
 .modal-actions { display: flex; justify-content: flex-end; gap: var(--db-space-2); margin-top: var(--db-space-4); }
 /* Why the dialog's action is off, said beside it rather than only in a tooltip. */
