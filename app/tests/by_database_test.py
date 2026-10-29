@@ -157,11 +157,26 @@ class Source:
 
 
 class Store:
-    """Lakebase, faked: the control rows, the schedule members, the schedules made, the transactions, and a database
-    whose write fails (fail_on) as a dropped connection would."""
+    """Lakebase, faked: the control rows, the schedule members, the schedules made, the transactions, a database
+    whose write fails (fail_on) as a dropped connection would, and the heartbeats that fired after a commit (beats) and
+    the done counts they lowered (lowered)."""
     def __init__(self):
         self.controls, self.sinks, self.members, self.schedules = [], {}, set(), []
         self.transactions, self.fail_on, self.control_statements = 0, None, 0
+        self.beats, self.lowered = 0, []
+
+
+def _beat_after_commit(store, tasks):
+    """A heartbeat that fires right after a commit. It holds no progress of its own (a by-database write reports its
+    progress inside its transaction, not to the beat), so it writes the zero it started with: it must not take the
+    task's done count back down."""
+    if 1 not in tasks.rows:
+        return
+    before = tasks.rows[1]["done"]
+    main.db.execute(q.task_progress_sql(), (0, 1))
+    store.beats += 1
+    if tasks.rows[1]["done"] < before:
+        store.lowered.append((before, tasks.rows[1]["done"]))
 
 
 class ByDatabaseTasks(Tasks):
@@ -318,6 +333,7 @@ def big(monkeypatch):
         except Exception:
             store.controls, store.sinks, store.members, store.schedules, tasks.rows = saved
             raise
+        _beat_after_commit(store, tasks)
 
     monkeypatch.setattr(main.db, "query", query)
     monkeypatch.setattr(main.db, "fetch", fetch)
@@ -436,21 +452,19 @@ def test_a_line_that_cannot_be_taken_stops_the_job_before_anything_is_written(bi
     assert big.store.controls == [] and big.store.schedules == []
 
 
+def test_a_heartbeat_after_a_commit_never_lowers_a_big_create_progress(big):
+    r = _create(big)
+    big.tasks.run()
+    assert big.get(f"/api/tasks/{r.json()['task']['id']}").json()["status"] == "succeeded"
+    assert big.store.beats > 1 and big.store.lowered == []
+
+
 def test_adding_tables_by_reference_to_a_job_writes_each_database_as_its_own_task(big, monkeypatch):
-    from new_job_test import _job_rows
-    monkeypatch.setattr(main, "_refuse_job_tables", lambda job, groups, request: None)
-    job_rows = _job_rows()
-    own = {r["task_collection"] for r in job_rows}
-    big.store.schedules.append(7)
-    big.store.members.update((7, g) for g in own)
-    answer = main.db.query
-    monkeypatch.setattr(main.db, "query",
-                        lambda sql, params=(): job_rows if sql == q.groups_control_rows_sql() else answer(sql, params))
+    own = _job_for_a_big_add(big, monkeypatch)
     dry = big.post("/api/ingestion-jobs/7/tables", json={"source": {"upload_id": "u1", "whole_server": True}})
     assert dry.status_code == 200 and dry.json()["summary"]["by_database"] is True and dry.json()["summary"]["tables"] == 150
     assert big.tasks.rows == {} and big.store.controls == []
-    r = big.post("/api/ingestion-jobs/7/tables", json={"source": {"upload_id": "u1", "whole_server": True},
-                                                       "dry_run": False, "request_id": "add-big-1"})
+    r = _add(big, "add-big-1")
     assert r.status_code == 202 and r.json()["task"]["kind"] == "tables" and r.json()["task"]["total"] == 150
     big.tasks.run()
     done = big.get(f"/api/tasks/{r.json()['task']['id']}").json()
@@ -461,3 +475,30 @@ def test_adding_tables_by_reference_to_a_job_writes_each_database_as_its_own_tas
     groups = {g for sid, g in big.store.members if sid == 7}
     assert own <= groups and groups == own
     assert big.tasks.rows[1]["progress"]["databases_written"] == 30
+
+
+def test_a_heartbeat_after_a_commit_never_lowers_a_big_add_progress(big, monkeypatch):
+    _job_for_a_big_add(big, monkeypatch)
+    _add(big, "add-beat")
+    big.tasks.run()
+    assert big.tasks.rows[1]["status"] == "succeeded" and big.store.beats > 1 and big.store.lowered == []
+
+
+def _job_for_a_big_add(client, monkeypatch) -> set:
+    """Job 7 holds the engagement job's groups (its tables, read as the job's own rows), so the big source's server is
+    one the job already has: its databases go into those groups. Returns the groups."""
+    from new_job_test import _job_rows
+    monkeypatch.setattr(main, "_refuse_job_tables", lambda job, groups, request: None)
+    job_rows = _job_rows()
+    own = {r["task_collection"] for r in job_rows}
+    client.store.schedules.append(7)
+    client.store.members.update((7, g) for g in own)
+    answer = main.db.query
+    monkeypatch.setattr(main.db, "query",
+                        lambda sql, params=(): job_rows if sql == q.groups_control_rows_sql() else answer(sql, params))
+    return own
+
+
+def _add(client, request_id: str):
+    return client.post("/api/ingestion-jobs/7/tables", json={"source": {"upload_id": "u1", "whole_server": True},
+                                                             "dry_run": False, "request_id": request_id})

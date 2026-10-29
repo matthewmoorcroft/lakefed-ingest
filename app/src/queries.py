@@ -1561,8 +1561,10 @@ def job_tasks_sql() -> str:
 
 
 def task_progress_sql() -> str:
-    """A running task's progress and heartbeat. Params: done, id."""
-    return f"update {SCHEMA}.app_task set done = %s, heartbeat_at = now() where id = %s and status = 'running'"
+    """A running task's progress and heartbeat. Params: done, id. The count only goes up: the beat sends the count its
+    thread last held, which a by-database write's commits can already have passed."""
+    return (f"update {SCHEMA}.app_task set done = greatest(done, %s), heartbeat_at = now() "
+            f"where id = %s and status = 'running'")
 
 
 def finish_task_sql() -> str:

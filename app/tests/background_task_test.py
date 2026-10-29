@@ -111,7 +111,7 @@ class Tasks:
                 row.update(status=status, job_id=job_id or row["job_id"], error=error,
                            result=json.loads(result) if result else row["result"])
         elif sql == q.task_progress_sql():
-            self.rows[params[1]]["done"] = params[0]
+            self.rows[params[1]]["done"] = max(self.rows[params[1]]["done"], params[0])     # greatest(done, %s)
 
     def run(self):
         for work in self.started:
@@ -285,6 +285,12 @@ def test_the_stale_rule_tells_a_rolled_back_write_from_one_that_committed():
     # A late finish can't undo a stale task's verdict, nor a stale read undo a finish.
     assert q.finish_task_sql().endswith("where id = %s and status = 'running'")
     assert q.insert_task_sql().count("%s") == 6 and "on conflict (request_id)" in q.insert_task_sql()
+
+
+def test_a_heartbeat_never_lowers_the_done_count():
+    """The beat writes the progress its thread holds, which can be behind a by-database write's committed count: the
+    count only goes up, so an older beat can't take it back."""
+    assert "set done = greatest(done, %s)" in q.task_progress_sql()
 
 
 # ---- Add tables and the databases file -----------------------------------------------------------------------------
