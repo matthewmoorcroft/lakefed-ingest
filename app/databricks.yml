@@ -44,6 +44,11 @@ variables:
       cluster (looked up by name, like ingest_job_id).
     lookup:
       job: lakefed_ingest_cluster_copies
+  delete_job_id:
+    description: Id of the delete job, which deletes a deleted app job's groups and, if asked, their target tables
+      (looked up by name, like ingest_job_id).
+    lookup:
+      job: lakefed_ingest_delete_job
 
 targets:
   dev:

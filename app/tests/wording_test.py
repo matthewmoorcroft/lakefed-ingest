@@ -110,3 +110,13 @@ def test_discover_offers_typed_or_csv_databases_on_the_lab_logins_real_errors():
                             "SQLSTATE: HV000")
     assert cant_list.search("Login failed for user 'lfc_ingest'.")
     assert not cant_list.search("the discovery run ended CANCELED")
+
+
+def test_delete_says_what_goes_and_what_stays_and_offers_the_target_tables():
+    page = (FRONTEND / "pages" / "IngestionJob.tsx").read_text()
+    assert "Also delete the target tables" in page and "drop_targets: dropTargets" in page
+    assert "with their checkpoints. Run history and the change log stay." in page
+    assert "another job also writes" in page and "kept_names" in page and "schemas stay" in page
+    assert "move to Not in any job" not in page                    # groups always belong to a job: none are left behind
+    jobs_page = (FRONTEND / "pages" / "IngestionJobs.tsx").read_text()
+    assert "Deleted jobs" in jobs_page and "Run again" in jobs_page

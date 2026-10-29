@@ -116,6 +116,12 @@ secret). See `README.md`, `docs/deploy.md`, `docs/monitoring.md`, `docs/lakebase
   `lakefed_ingest` per app schedule with its own cluster (`options.cluster`), only the cluster's types and workers
   changed (`cluster_copies.py`); records the copy in `options.ingest_copy_job_id`. The check job takes the job to
   start as its `ingest_job_id` job parameter.
+- `lakefed_ingest_delete_job` → `delete_job.ipynb` (serverless, runs as the deployer, queued, one at a time):
+  finishes an app job's Delete (`delete_job.py`). The app marks the job deleted and starts it with `schedule_id` and
+  `drop_targets`. In one transaction, under each group's run lock (a run of any group refuses the lot), it deletes
+  the groups no other live job holds: their control, checkpoint, reseed_queue, database_check and check_work rows.
+  Run history (ingest_run, ingest_event) and control_change stay. With `drop_targets`, after the commit, it drops
+  (`DROP TABLE IF EXISTS`) only the target tables no other group's rows write, never a schema.
 - `lakefed_ingest_discover` → `discover_tables.ipynb`: table discovery for bulk onboarding (params
   `discovery_id`, `spec` JSON); writes `discovery` / `discovered_table`. Runs on the bundle's
   single-node all-purpose cluster `lakefed_ingest utility` (`resources.clusters.lakefed_ingest_utility`,
@@ -175,6 +181,7 @@ secret). See `README.md`, `docs/deploy.md`, `docs/monitoring.md`, `docs/lakebase
 | `src/lakefed_ingest/parallel.py` | Thread pool, FAIR pools, `WorkSlots` budget, `SourceLimiter` (per-source permits) |
 | `src/lakefed_ingest/partitions.py` | Partitioned-seed planning |
 | `src/lakefed_ingest/discovery.py` | Table discovery for bulk onboarding (catalog queries + recommended control-row settings); run by `discover_tables.ipynb` / job `lakefed_ingest_discover` |
+| `src/lakefed_ingest/delete_job.py` | A deleted app job's groups: which go, the run locks, the row deletes, which target tables are dropped and which kept (pure; run by `delete_job.ipynb`) |
 | `src/lakefed_ingest/state_store.py` | Lakebase accessor (psycopg, SDK-minted OAuth token) + pure helpers |
 | `tests/conftest.py` | Puts `src/lakefed_ingest` on `sys.path` |
 | `tests/synthetic/` | Synthetic SQL Server DB generator, change generator, reconcile |

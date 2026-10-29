@@ -594,6 +594,36 @@ def groups_not_in_job():
     return {**not_in_job, "name": "Not in any job", "groups_detail": rows}
 
 
+@app.get("/api/ingestion-jobs/deletions")
+def job_deletions():
+    """The latest deleted jobs whose Delete runs the delete job, newest first: each one's delete job run (going,
+    finished or failed, with its message), whether it drops the target tables, and how many of its tables are left
+    (none once the delete job has finished)."""
+    out = []
+    for s in db.query(q.deletions_sql(), (DELETIONS_LISTED,)):
+        plan = _delete_plan(s["id"])
+        out.append({"id": s["id"], "name": s["name"], "deleted_at": s["deleted_at"],
+                    "drop_targets": bool(sch.options_of(s).get("delete_drop_targets")), "run": _delete_run(s),
+                    "tables_left": plan["tables"], "groups_left": len(plan["groups"])})
+    return {"deletions": out, "configured": bool(jobs.DELETE_JOB_ID)}
+
+
+@app.get("/api/ingestion-jobs/{job_id}/delete-preview")
+def delete_preview(job_id: int):
+    """What Delete would remove, for its dialog: the groups it deletes and those it keeps (another job holds them),
+    their tables, the target tables only they write, and the target tables another job's rows also write (kept and
+    named); and why it can't be deleted now, if so."""
+    job, members = _load_schedule(job_id)
+    active = [m for m in members if m["removed_at"] is None]
+    plan = _delete_plan(job_id)
+    kept_groups = sorted({m["task_collection"] for m in active} - set(plan["groups"]))
+    blocker = _delete_blocker(job, active, plan["groups"])
+    if not blocker and plan["tables"] and not jobs.DELETE_JOB_ID:
+        blocker = NO_DELETE_JOB
+    return {**plan, "groups_kept": kept_groups, "configured": bool(jobs.DELETE_JOB_ID),
+            "blocked": blocker.get("message") if isinstance(blocker, dict) else blocker}
+
+
 @app.get("/api/permissions")
 def permissions(request: Request):
     """What the signed-in user may do, from their Databricks permissions, so each page can show a button disabled
@@ -2032,8 +2062,8 @@ def _validate_schedule(body: ScheduleBody):
 
 
 # Options only the app's own steps write: who last changed the job, the copies job's copy and the app's run
-# applying it. A request's values for them are ignored, and the stored ones kept.
-MANAGED_OPTIONS = ("updated_by", sch.COPY_OPTION, "cluster_copy_run_id")
+# applying it, and a deleted job's delete job run and whether it drops the target tables. A request's values for them are ignored, and the stored ones kept.
+MANAGED_OPTIONS = ("updated_by", sch.COPY_OPTION, "cluster_copy_run_id", "delete_run_id", "delete_drop_targets")
 
 
 def _requested_options(body: "ScheduleBody") -> dict:
@@ -2392,23 +2422,114 @@ def resume_schedule(sid: int, request: Request):
     return _set_paused(sid, False, request)
 
 
+class DeleteJobBody(BaseModel):
+    drop_targets: bool = False
+
+
 @app.post("/api/schedules/{sid}/delete")
-def delete_schedule(sid: int, request: Request):
-    """Delete a schedule (an ingestion job) and its wrapper jobs; the schedule row is kept, marked deleted. Its groups
-    move to Not in any job, and their tables, control rows, checkpoints and run history all stay."""
+def delete_schedule(sid: int, request: Request, body: Optional[DeleteJobBody] = None):
+    """Delete a schedule (an ingestion job): it is marked deleted (the row is kept), its wrapper jobs are deleted, and
+    the delete job starts, which deletes its groups' tables and their state as the deployer (the app has no DELETE
+    privilege) and, with ``drop_targets``, the target tables only those groups write. Run history and the change log
+    stay. Refused while a run of the job is going. On a job already deleted, it starts the delete job again (Run
+    again on Ingestion jobs), with the flag it was deleted with unless the body sets it."""
     user = _user(request)
     s, members = _load_schedule(sid)
     _refuse_job(s, request, "delete")
-    active = [m["id"] for m in members if m["removed_at"] is None]
+    active = [m for m in members if m["removed_at"] is None]
+    plan = _delete_plan(sid)
+    blocker = _delete_blocker(s, active, plan["groups"])
+    if blocker:
+        raise HTTPException(409, blocker)
+    if plan["tables"] and not jobs.DELETE_JOB_ID:
+        raise HTTPException(409, NO_DELETE_JOB)
+    if s.get("deleted_at") is not None:
+        if not plan["tables"]:
+            return {"id": sid, "deleted": True, "sync": [], "delete_run": None}
+        drop = body.drop_targets if body else bool(sch.options_of(s).get("delete_drop_targets"))
+        with _write() as cur:
+            _record_delete(cur, sid, drop)
+        return {"id": sid, "deleted": True, "sync": [], "delete_run": _start_delete_job(sid, drop)}
+    drop = bool(body and body.drop_targets)
     with _write() as cur:
         cur.execute(q.delete_schedule_sql(), (int(sid),))
         if active:
-            cur.execute(q.remove_members_sql(), (active,))   # their jobs are deleted by the sync below
-        _log(cur, user, "schedule_delete", None, None, s["name"], None, None)
+            cur.execute(q.remove_members_sql(), ([m["id"] for m in active],))   # their jobs are deleted by the sync below
+        if plan["tables"]:
+            _record_delete(cur, sid, drop)
+        _log(cur, user, "schedule_delete", None, None, s["name"], None, "drop_targets" if drop else None)
     synced = _sync(sid, user)
     if sch.options_of(s).get(sch.COPY_OPTION):     # its copy of the ingestion job goes too
         _apply_cluster(sid)
-    return {"id": sid, "deleted": True, "sync": synced}
+    return {"id": sid, "deleted": True, "sync": synced,
+            "delete_run": _start_delete_job(sid, drop) if plan["tables"] else None}
+
+
+NO_DELETE_JOB = ("no delete job is configured for this app, so the job's groups and their tables would stay behind "
+                 "outside any job: deploy the engine bundle, then the app, and delete again")
+# Deleted jobs the Ingestion jobs page lists with their delete job run.
+DELETIONS_LISTED = 10
+
+
+def _delete_plan(sid: int) -> dict:
+    """What a job's Delete removes, read fresh: the groups no other live job holds, their tables (control rows), the
+    target tables only they write, and those another group's rows also write (kept, the first DELETE_KEPT_LISTED
+    named)."""
+    groups = [r["task_collection"] for r in db.query(q.delete_groups_sql(), (int(sid), int(sid)))]
+    if not groups:
+        return {"groups": [], "tables": 0, "targets": 0, "kept": 0, "kept_names": []}
+    row = db.query(q.delete_targets_sql(), (groups, groups, groups))[0]
+    names = row.get("kept_names") or []
+    return {"groups": groups, "tables": int(row.get("tables") or 0), "targets": int(row.get("targets") or 0),
+            "kept": int(row.get("kept") or 0), "kept_names": json.loads(names) if isinstance(names, str) else list(names)}
+
+
+def _delete_blocker(job: dict, active: List[dict], groups: List[str]):
+    """Why the job can't be deleted right now: a run of it, or of a group it deletes, is going (Lakebase sees a run
+    once its cluster is up, the Jobs API from its start), or its delete job is still running."""
+    if any(r["task_collection"] in {m["task_collection"] for m in active} | set(groups) for r in _running()):
+        return "a run of this job is going: wait for it to end, or stop it, then delete the job"
+    going = _active_wrapper_runs(active)
+    if going:
+        return {"message": f"a run of this job is going, started {going[0].get('started') or 'just now'}: wait for it "
+                           "to end, or stop it, then delete the job",
+                "run_url": going[0].get("url"), "run_id": going[0].get("run_id")}
+    run = _delete_run(job)
+    if run and ij.is_active(run):
+        return {"message": "this job's delete is still running", "run_url": run.get("url"), "run_id": run.get("run_id")}
+    return None
+
+
+def _record_delete(cur, sid: int, drop: bool) -> None:
+    """Record that the job's Delete runs the delete job, and with which flag; the earlier run is forgotten, so a start
+    that fails shows as not started."""
+    cur.execute(q.set_schedule_flag_sql(), (["delete_drop_targets"], bool(drop), int(sid)))
+    cur.execute(q.clear_schedule_option_sql(), ("delete_run_id", int(sid)))
+
+
+def _start_delete_job(sid: int, drop: bool) -> dict:
+    """Start the delete job for a deleted job and record its run. A start that fails is reported, not raised: the job
+    is deleted already, and Run again on Ingestion jobs starts it later."""
+    try:
+        run_id = jobs.start_delete_job(sid, drop)
+    except Exception as e:
+        return {"run_id": None, "url": None, "error": f"the delete job didn't start: {str(e).split('. ')[0]}"}
+    with _write() as cur:
+        cur.execute(q.set_schedule_option_sql(), (["delete_run_id"], run_id, int(sid)))
+    host = jobs.workspace_url()
+    return {"run_id": run_id, "url": f"{host}/jobs/{jobs.DELETE_JOB_ID}/runs/{run_id}" if host else None, "error": None}
+
+
+def _delete_run(job: dict) -> Optional[dict]:
+    """The job's latest delete job run, as the Jobs API has it, or None (not started, or unreadable: error set)."""
+    run_id = sch.options_of(job).get("delete_run_id")
+    if not run_id:
+        return None
+    try:
+        return jobs.run_state(run_id)
+    except Exception as e:
+        return {"run_id": run_id, "state": None, "result": None, "url": None,
+                "message": f"can't read the delete job's run: {str(e).split('. ')[0]}"}
 
 
 @app.post("/api/schedules/{sid}/sync")
