@@ -109,6 +109,11 @@ The one-time and ad hoc jobs shouldn't wait several minutes for a job cluster to
   you already have, override the task's `existing_cluster_id` in your target. A source that is paused
   or resuming (Azure SQL serverless) is retried three times, with pauses doubling from 15-30 s.
 - **Ingestion** runs on job clusters with the source network path (scheduled, recurring work).
+- **The operations app's helper jobs**, `lakefed_ingest_cluster_copies` and `lakefed_ingest_delete_job`, run on
+  serverless as the deployer. The delete job finishes an app job's Delete: it deletes the job's groups' rows in
+  Lakebase (it owns the state database; the app has no `DELETE` privilege) and, when asked, drops the target tables
+  only those groups write, so the deployer needs to be able to drop those tables (`MANAGE` or ownership in Unity
+  Catalog). Deploy this bundle before the app, which looks both jobs up by name.
 - **The check** (`lakefed_ingest_check`) runs on serverless and reads every source database it checks, so
   serverless compute needs a network path to the sources, not only to Lakebase: for example private
   endpoints through a network connectivity configuration (NCC), or source firewall rules that allow the

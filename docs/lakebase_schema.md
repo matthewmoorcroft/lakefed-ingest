@@ -351,6 +351,9 @@ before versions were recorded) counts as version 0.
 
 Neither the ingestion job nor the operations app deletes configuration or history (a re-run
 discovery replaces only its own `discovered_table` rows), and the app has no `DELETE` privilege.
+The one exception is an app job's Delete: the `lakefed_ingest_delete_job` job, run as the deployer, deletes that
+job's groups' control rows and their state (run history and `control_change` stay), and, when asked, the target
+tables only they write (`src/lakefed_ingest/delete_job.py`).
 
 **To stop ingesting a table,** disable it: `task_enabled = false`, or **Disable** in the app. Runs skip
 it from then on; it's reversible and logged.

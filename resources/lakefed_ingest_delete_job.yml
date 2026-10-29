@@ -1,0 +1,43 @@
+# Delete job: finishes an operations-app job's Delete (delete_job.ipynb). The app has no DELETE privilege on the
+# Lakebase tables, so it marks the job deleted and starts this job, which runs as the deployer (the state database's
+# owner): it deletes the job's groups' rows in one transaction under their run locks, keeps run history and the change
+# log, and, when asked, drops the target tables only those groups wrote. The app needs CAN_MANAGE_RUN on it (an app
+# resource).
+resources:
+  jobs:
+    lakefed_ingest_delete_job:
+      name: "lakefed_ingest_delete_job"
+      description: "Deletes a deleted app job's groups (control rows and their state) and, if asked, their target tables."
+      # One at a time, queued: two deletes whose groups share a target table must not both decide it is theirs alone.
+      max_concurrent_runs: 1
+      queue:
+        enabled: true
+      tasks:
+        - task_key: delete
+          environment_key: lakebase_client
+          notebook_task:
+            notebook_path: ../src/lakefed_ingest/delete_job.ipynb
+            base_parameters:
+              schedule_id: "{{job.parameters.schedule_id}}"
+              drop_targets: "{{job.parameters.drop_targets}}"
+              db_instance: "{{job.parameters.db_instance}}"
+              db_name: "{{job.parameters.db_name}}"
+      environments:
+        - environment_key: lakebase_client
+          spec:
+            environment_version: "4"
+            dependencies:
+              - "psycopg[binary]"
+              - "databricks-sdk==0.145.0"
+      tags:
+        project: lakefed_ingest
+      parameters:
+        # The deleted app job, and whether to drop its target tables too. The app passes both.
+        - name: schedule_id
+          default: ""
+        - name: drop_targets
+          default: "false"
+        - name: db_instance
+          default: ${var.lakebase_instance}
+        - name: db_name
+          default: ${var.lakebase_database}
