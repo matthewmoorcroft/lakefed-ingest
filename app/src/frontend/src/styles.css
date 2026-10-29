@@ -268,6 +268,7 @@ table.tree tr.l2 td[colspan] { padding-left: 28px; } table.tree tr.l3 td[colspan
         font-size: 11px; margin-right: 4px; }
 .mono { font-family: var(--db-font-family-mono, ui-monospace, Menlo, monospace); }
 .tree-search { width: min(420px, 100%); }
+table.tree td .target-path { padding-left: 28px; }
 table.tree tr.l3 td { padding-top: 3px; padding-bottom: 3px; }
 .add-databases { border: 1px solid var(--border); border-radius: 6px; padding: var(--db-space-3); margin-bottom: var(--db-space-3); }
 details.advanced summary { cursor: pointer; display: flex; gap: var(--db-space-2); align-items: baseline; }

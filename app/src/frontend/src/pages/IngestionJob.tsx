@@ -3,6 +3,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import { api, qs, type Row } from "../api";
 import { Refused } from "../permissions";
+import { TargetTables } from "./TargetTables";
 import { OutLink,
   Crumbs, Badge, ErrorBox, Menu, Name, Notice, PageHead, RunStatus, Section, StateBar, StateKey, fmtClock, fmtDuration, fmtInt, fmtSlot, fmtSpeed,
   fmtTime, jobRunPath, plural, useConfirm, type ConfirmRequest
@@ -167,6 +168,7 @@ export default function IngestionJob() {
           </table></div>
         </Section>
       )}
+      {j && <TargetTables jobId={id} />}
     </>
   );
 }

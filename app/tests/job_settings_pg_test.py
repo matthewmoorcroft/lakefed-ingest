@@ -236,3 +236,27 @@ def test_a_schedule_save_without_options_keeps_the_start_time(client, monkeypatc
     with psycopg.connect(client.target) as conn:
         assert conn.execute("select options from lakefed_ingest.schedule where id = %s", (client.sid,)).fetchone()[0] == {
             "updated_by": "op@example.com"}
+
+
+def test_a_jobs_target_tables_count_their_sources_inside_and_outside_it_and_seven_days_of_rows(client, monkeypatch):
+    import psycopg
+    monkeypatch.setattr(main.db, "workspace", lambda: type("W", (), {"config": type("C", (), {"host": "https://h"})()})())
+    with psycopg.connect(client.target, autocommit=True) as conn:
+        order_line = conn.execute("select id from lakefed_ingest.control where task_collection = 'cust_c01' "
+                                  "and src_table = 'OrderLine'").fetchone()[0]
+        for rows, status, age in ((10, "ok", "1 hour"), (99, "failed", "1 hour"), (5, "ok", "8 days")):
+            conn.execute("insert into lakefed_ingest.ingest_event (run_id, task_collection, control_id, status, "
+                         "rows_merged, finished_at) values (1, 'cust_c01', %s, %s, %s, now() - %s::interval)",
+                         (order_line, status, rows, age))
+    body = client.get(f"/api/ingestion-jobs/{client.sid}/targets").json()
+    by_target = {t["target"]: t for t in body["items"]}
+    assert body["total"] == 2 and list(by_target) == ["bronze.extraction.invoice", "bronze.extraction.orderline"]
+    order = by_target["bronze.extraction.orderline"]
+    assert (order["sources"], order["databases"], order["with_client_id"], order["outside_sources"]) == (2, 2, 2, 1)
+    assert order["rows_written_7d"] == 10 and by_target["bronze.extraction.invoice"]["rows_written_7d"] is None
+    assert order["url"] == "https://h/explore/data/bronze/extraction/orderline"
+    found = client.get(f"/api/ingestion-jobs/{client.sid}/targets", params={"search": "INVO"}).json()
+    assert [t["target"] for t in found["items"]] == ["bronze.extraction.invoice"]
+    sources = client.get(f"/api/ingestion-jobs/{client.sid}/targets/sources",
+                         params={"target": "bronze.extraction.orderline"}).json()
+    assert [(s["database"], s["rows_written_7d"]) for s in sources["items"]] == [("db_1", 10), ("db_2", None)]

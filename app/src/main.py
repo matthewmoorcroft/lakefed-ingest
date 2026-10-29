@@ -785,6 +785,34 @@ def ingestion_job_tree(job_id: int, server: str = "", database: str = "", search
             "offset": offset, "limit": limit, "items": [{k: v for k, v in r.items() if k != "total"} for r in rows]}
 
 
+@app.get("/api/ingestion-jobs/{job_id}/targets")
+def ingestion_job_targets(job_id: int, search: str = "", offset: int = 0, limit: int = 25):
+    """A job's target tables: each with the source tables of the job writing it (and how many outside it), their
+    states, the rows the run records say were written over 7 days, and a link to the table in Catalog Explorer.
+    Searched by name and paged."""
+    groups = _job_groups(job_id)
+    offset, limit = max(0, int(offset)), max(1, min(int(limit), 200))
+    rows = (db.query(q.job_targets_sql(), (groups, groups, groups, f"%{search.strip()}%", limit, offset))
+            if groups else [])
+    host = db.workspace().config.host.rstrip("/")
+    items = [{**{k: v for k, v in r.items() if k != "total"},
+              "url": f"{host}/explore/data/{r['catalog']}/{r['schema']}/{r['table']}"} for r in rows]
+    return {"total": rows[0]["total"] if rows else 0, "offset": offset, "limit": limit, "items": items}
+
+
+@app.get("/api/ingestion-jobs/{job_id}/targets/sources")
+def ingestion_job_target_sources(job_id: int, target: str, offset: int = 0, limit: int = 25):
+    """The job's source tables writing one target (catalog.schema.table), paged."""
+    parts = target.split(".")
+    if len(parts) != 3 or not all(parts):
+        raise HTTPException(400, "give the target as catalog.schema.table")
+    groups = _job_groups(job_id)
+    offset, limit = max(0, int(offset)), max(1, min(int(limit), 200))
+    rows = db.query(q.job_target_sources_sql(), (groups, groups, *parts, limit, offset)) if groups else []
+    return {"target": target, "total": rows[0]["total"] if rows else 0, "offset": offset, "limit": limit,
+            "items": [{k: v for k, v in r.items() if k != "total"} for r in rows]}
+
+
 class JobScope(BaseModel):
     server: str = ""
     database: str = ""

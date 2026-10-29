@@ -251,3 +251,28 @@ def test_the_job_page_says_why_run_now_or_delete_cannot_start(client, monkeypatc
         raise RuntimeError("403")
     monkeypatch.setattr(main.jobs, "user_job_permission", unreadable)
     assert client.get("/api/ingestion-jobs/1").json()["run_now"]["blocked"].startswith("can't read your permission")
+
+
+def test_a_jobs_target_tables_come_with_their_sources_and_a_catalog_explorer_link(monkeypatch):
+    target = dict(target="bronze.sales.orders", catalog="bronze", schema="sales", table="orders", sources=100,
+                  databases=100, with_client_id=100, outside_sources=0, rows_written_7d=4253, total=1)
+    seen = {}
+
+    def query(sql, params=()):
+        if sql == q.schedule_sql():
+            return [dict(SCHEDULES[0])]
+        if sql == q.schedule_members_sql():
+            return [m for m in MEMBERS if m["schedule_id"] in params[0]]
+        seen[sql] = params
+        return [dict(target)] if sql == q.job_targets_sql() else [dict(id=7, database="db_1", total=1)]
+    monkeypatch.setattr(main.db, "query", query)
+    monkeypatch.setattr(main.db, "workspace", lambda: type("W", (), {"config": type("C", (), {"host": "https://h/"})()})())
+    client = TestClient(main.app)
+    body = client.get("/api/ingestion-jobs/1/targets", params={"search": "ord"}).json()
+    assert body["total"] == 1 and "total" not in body["items"][0]
+    assert body["items"][0]["url"] == "https://h/explore/data/bronze/sales/orders"
+    assert seen[q.job_targets_sql()] == (["c1", "c2"], ["c1", "c2"], ["c1", "c2"], "%ord%", 25, 0)
+    sources = client.get("/api/ingestion-jobs/1/targets/sources", params={"target": "bronze.sales.orders"}).json()
+    assert sources["items"] == [{"id": 7, "database": "db_1"}]
+    assert seen[q.job_target_sources_sql()] == (["c1", "c2"], ["c1", "c2"], "bronze", "sales", "orders", 25, 0)
+    assert client.get("/api/ingestion-jobs/1/targets/sources", params={"target": "orders"}).status_code == 400
