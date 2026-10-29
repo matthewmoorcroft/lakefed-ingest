@@ -344,9 +344,10 @@ driver first.
 
 ### Table retries
 
-By default a table that fails waits for the next run. Set the job parameter `table_retries` (default
-`0`, off) to try it again in the same run when the failure is a transient source error: a refused or
-dropped connection, a timeout, or Azure SQL throttling (`table_retry.py`). Errors that would fail again
+A table that fails with a transient source error is tried again in the same run, up to `table_retries`
+more times (job parameter, default `2`; `0` turns it off and the table waits for the next run): a
+refused or dropped connection, a timeout, Azure SQL throttling, or Unity Catalog throttling a
+`remote_query` read ("TEMPORARILY_UNAVAILABLE: Too many requests") (`table_retry.py`). Errors that would fail again
 (a missing table, a denied permission, a schema error, a failed login when Spark passes on its cause)
 and errors it doesn't recognise fail at once, as without retries.
 

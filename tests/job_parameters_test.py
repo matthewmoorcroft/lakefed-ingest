@@ -32,6 +32,7 @@ def test_every_notebook_widget_is_a_job_parameter_with_a_bundle_variable():
     assert tuning - variables == set()
 
 
-def test_table_retries_are_off_by_default():
+def test_table_retries_default_to_two():
     bundle = (ROOT / "databricks.yml").read_text()
-    assert re.search(r'^  table_retries:\n    description: .*\n    default: "0"$', bundle, re.M)
+    assert re.search(r'^  table_retries:\n    description: .*\n    default: "2"$', bundle, re.M)
+    assert re.search(r'^  table_retry_budget:\n    description: .*\n    default: "20"$', bundle, re.M)
