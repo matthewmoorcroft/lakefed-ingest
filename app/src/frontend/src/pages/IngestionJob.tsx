@@ -267,9 +267,8 @@ export default function IngestionJob() {
       {stop.isSuccess && <Notice tone={stop.data.errors?.length ? "warn" : "ok"}>Cancelled {fmtInt(stop.data.cancelled.length)}{" "}
         {plural(stop.data.cancelled.length, "Databricks run")}{stop.data.closed ? `, and closed ${fmtInt(stop.data.closed)} ${plural(stop.data.closed, "group run")} as ended without finishing` : ""}.
         {stop.data.errors?.length ? <> Not cancelled: {stop.data.errors.join("; ")}.</> : null}</Notice>}
-      {runNow.isSuccess && <Notice tone="ok">Started {fmtInt(runNow.data.started.length)} {plural(runNow.data.started.length, "Databricks job run")}:{" "}
-        {runNow.data.started.map((r: Row, i: number) => <Fragment key={r.run_id}>{i ? ", " : ""}{r.url ? <OutLink href={r.url}>run {r.run_id}</OutLink> : `run ${r.run_id}`}</Fragment>)}.
-        Running now follows it below.</Notice>}
+      {runNow.isSuccess && <Notice tone="ok">Started the ingestion run; Running now follows it below.
+        {runNow.data.started.length === 1 && runNow.data.started[0].url && <> <OutLink href={runNow.data.started[0].url}>Open in Databricks</OutLink></>}</Notice>}
       <ErrorBox error={job.error} />
       {j && (
         <div className="metrics">

@@ -129,7 +129,7 @@ export default function RunDetail() {
           {dbs.length ? <>, <strong>{fmtInt(dbs.length)}</strong> {plural(dbs.length, "database")}</> : null}
           {p ? <>, <strong>{fmtInt(p.total)}</strong> {plural(p.total, "table")}</> : null}
           , started {fmtWhen(r.started_at)}
-          {r.job_run_id ? <>, <OutLink href={databricksRunUrl(r.job_run_id)}>Databricks job run {r.job_run_id}</OutLink></> : null}
+          {r.job_run_id ? <>, <OutLink href={databricksRunUrl(r.job_run_id)}>Open in Databricks</OutLink></> : null}
           {r.cluster_id ? <>, <OutLink href={clusterUrl(config?.workspace_url, r.cluster_id)}>cluster {r.cluster_id}</OutLink></> : null}
           {r.parallelism ? <>, parallelism <strong>{fmtInt(r.parallelism)}</strong></> : null}.
           {!live && r.outcome?.note ? <> {r.outcome.label}: {r.outcome.note}.</> : null}

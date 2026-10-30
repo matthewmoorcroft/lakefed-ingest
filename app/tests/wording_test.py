@@ -85,6 +85,27 @@ def test_one_trigger_of_an_ingestion_job_is_an_ingestion_run():
     assert not offenders, "say 'ingestion run' for one trigger of an ingestion job:\n" + "\n".join(offenders)
 
 
+
+# The app shows ingestion jobs and ingestion runs; a Databricks job's title (prefixed in a development deploy) is
+# under-the-hood detail. Manage's list of the Databricks jobs, for managers only, is the one place that names them.
+DATABRICKS_JOB_LABELS = re.compile(r"Databricks job run|Open in Jobs|lakefed_ingest|\[dev |\bjob \d")
+
+
+def test_no_page_renders_a_databricks_job_name():
+    offenders = []
+    for path in sorted(FRONTEND.rglob("*.tsx")):
+        if path.name.startswith("Manage"):
+            continue
+        source = path.read_text()
+        offenders += [f"{path.name}: {text.strip()[:80]}" for text in visible_text(source)
+                      if DATABRICKS_JOB_LABELS.search(text)]
+        # The Databricks job's summary (its title), the Compute block's job names, and links labelled with a job or
+        # a Databricks job run.
+        offenders += [f"{path.name}: {shown}" for shown in ('"/jobs/ingest"', "job.name ?? job.job_id", ">job {",
+                                                            ">Databricks job run") if shown in source]
+    assert not offenders, "name the ingestion job or run, not the Databricks job:\n" + "\n".join(offenders)
+
+
 def test_the_backend_names_the_databricks_job():
     main_py = (FRONTEND.parent.parent / "main.py").read_text()
     assert "no ingestion job configured" not in main_py and "no Databricks ingestion job configured" in main_py

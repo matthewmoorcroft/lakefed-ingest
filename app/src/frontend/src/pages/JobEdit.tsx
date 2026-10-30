@@ -3,7 +3,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate, useParams } from "react-router-dom";
 import { api, qs, type Row } from "../api";
 import { Crumbs, ConfirmButton, ErrorBox, Info, Menu, Notice, PageHead, Pager, Section, StateBar, fmtInt, plural, useConfirm, Twisty,
-         Chevron, Required } from "../components";
+         Chevron, OutLink, Required } from "../components";
 import { usePermissions } from "../permissions";
 import { CADENCES, IdentityFields, ParameterFields, RunFields, WritesFields } from "./jobForm";
 import { ImportCsvDialog } from "./NewJob";
@@ -601,7 +601,7 @@ export function ClusterFields({ info, error, cluster, setCluster, locked, after 
       <div className="toolbar">
         <span className="muted">{info.applying ? <>Applying: the cluster copies job is making this job's copy (<a href={info.applying.url}
           target="_blank" rel="noreferrer">run {info.applying.run_id}</a>).</>
-          : info.copy_job_id ? <>Runs its own copy of the Databricks job, <a href={info.copy_url} target="_blank" rel="noreferrer">job {info.copy_job_id}</a>.</>
+          : info.copy_job_id ? <>Runs its own copy of the Databricks job. <OutLink href={info.copy_url}>Open in Databricks</OutLink></>
           : info.cluster ? "Saved; its copy of the Databricks job is not made yet." : "Runs the Databricks job's own cluster."}</span>
       </div>
       {!info.configured && <p className="muted small">This app has no cluster copies job, so the cluster can't be changed here.</p>}
@@ -707,7 +707,7 @@ function Compute({ jobId }: { jobId: string }) {
       <ErrorBox error={compute.error} />
       {(compute.data?.jobs ?? []).map((job: Row) => (
         <Fragment key={job.role}>
-          <h4>{job.role === "check" ? "Check job" : "Ingestion job"} <span className="muted mono">{job.name ?? job.job_id}</span></h4>
+          <h4>{job.role === "check" ? "The check" : "Each group run"}</h4>
           {job.error && <p className="muted">{job.error}</p>}
           <table className="data">
             <thead><tr><th>Task</th><th>Setting</th><th>Value</th><th>Set by</th></tr></thead>

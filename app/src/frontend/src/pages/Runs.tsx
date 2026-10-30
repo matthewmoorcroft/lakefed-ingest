@@ -72,7 +72,7 @@ export default function Runs() {
         </label>} />
       <ErrorBox error={runs.error} />
       {job === "none" ? (
-        <Section title="Group runs of groups in no job" note={<>Started by Run now on Databricks jobs, or by the Databricks job's own schedule.
+        <Section title="Group runs of groups in no job" note={<>Started outside any ingestion job: by hand in Databricks, or by the Databricks job's own schedule.
           Speed: tables loaded (failed ones not counted) a minute, from the first table's start to the last one's finish. Took is blank for a run another
           run closed: it ended without finishing. Rows written: "at least" when some loads recorded none.</>}>
           <Grid rows={d?.group_runs} columns={COLUMNS.map((c) => ({ ...c, filter: false }))} getRowId={(r) => String(r.run_id)} options={{ autoSizeStrategy: { type: "fitGridWidth" } }} />
