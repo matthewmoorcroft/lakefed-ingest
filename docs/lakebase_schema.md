@@ -472,8 +472,8 @@ when this one was written, and `saved` otherwise. There is no password or secret
 secret back.
 
 The app's role gets SELECT, INSERT and UPDATE on every table in the schema from the grants job (its default privileges
-cover tables the setup job creates later), and no DELETE, so a record can't be removed through the app. Status:
-pending the audit check.
+cover tables the setup job creates later), and no DELETE, so a record can't be removed through the app. The audit log
+records each write with the value redacted (checked 30 Oct 2026).
 
 ## `schema_version` — schema versions applied
 
