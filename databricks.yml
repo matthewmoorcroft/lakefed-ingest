@@ -82,7 +82,7 @@ variables:
     description: Extra attempts per table after a transient source error, in the same run ("0" = off). Used only when table_retry_budget is above 0.
     default: "2"
   table_retry_budget:
-    description: Table retries in the whole run ("0" = none: no table is retried, and a failing table fails the run at once). Each job can raise it in the app's Advanced configuration.
+    description: Table retries in the whole run. At "0", the default, no table is retried and a failing table fails the run at once. Each job can raise it in the app's Advanced configuration.
     default: "0"
   fail_on_table_errors:
     description: Accepted so that existing job definitions load; it no longer decides anything, as a run with failed tables always ends as failed.
