@@ -403,3 +403,57 @@ def test_the_check_job_feeds_every_widget_and_brings_its_own_packages():
     assert '"psycopg[binary]"' in job and "environment_key: lakebase_client" in job
     assert not any(c.lstrip().startswith("%pip") for c in _code_cells("check_launch.ipynb"))
     assert "for_each_task" not in job
+
+
+def _weights(collection, *databases):
+    return {"collection": collection, "weights": [["s", name, tables, 0] for name, tables in databases]}
+
+
+def test_a_cycle_shares_its_changed_databases_out_as_runs_with_their_own_work_lists():
+    per = [_weights("g1", *[(f"a{i}", 500) for i in range(4)]), _weights("g2", ("b0", 10)), _weights("g3")]
+    cycle = launcher.cycle_requests(per, 1000, parameters={"parallelism": "64"}, launch_id="L")
+    requests = cycle["requests"]
+    assert [r["work_id"] for r in requests] == ["L:run1", "L:run2", "L:run3"]
+    # 2,010 changed tables over a group size of 1,000: three runs, g1's four databases and g2's one shared out.
+    assert [r["tables"] for r in requests] == [1000, 510, 500]
+    placed = [(c, d) for r in requests for c, w in r["work"].items() for _, d in w]
+    assert sorted(placed) == sorted([("g1", f"a{i}") for i in range(4)] + [("g2", "b0")])   # each once
+    for r in requests:
+        single = r["collections"][0] if len(r["collections"]) == 1 else ""
+        assert r["job_parameters"] == {"parallelism": "64", "task_collection": single, "work_id": r["work_id"]}
+
+
+def test_a_share_spanning_groups_runs_with_no_task_collection_and_its_whole_list():
+    per = [_weights(f"g{n}", (f"d{n}", 3)) for n in range(1, 4)]
+    [request] = launcher.cycle_requests(per, 12500, launch_id="L")["requests"]
+    assert request["collections"] == ["g1", "g2", "g3"] and request["job_parameters"]["task_collection"] == ""
+    assert request["work"] == {"g1": [("s", "d1")], "g2": [("s", "d2")], "g3": [("s", "d3")]}
+    assert request["collection"] == "3 groups, run 1"
+
+
+def test_what_a_run_going_has_waits_for_it():
+    per = [_weights("g1", ("a", 5), ("b", 5)), _weights("g2", ("c", 5))]
+    cycle = launcher.cycle_requests(per, 100, launch_id="L", running={"g1": frozenset({("s", "a")}), "g2": None})
+    assert cycle["deferred"] == [["g1", "s", "a"], ["g2", "s", "c"]]
+    assert [r["work"] for r in cycle["requests"]] == [{"g1": [("s", "b")]}]
+
+
+def test_a_run_of_a_share_covers_every_database_of_its_list():
+    runs = [{"run_id": 1, "job_parameters": {"task_collection": "", "work_id": "L:run1"}},
+            {"run_id": 2, "job_parameters": {"task_collection": "g3"}}]
+    covered = launcher.active_collections(runs, work_of=lambda w, c: set(),
+                                          work_all_of=lambda w: {("g1", "s", "a"), ("g2", "s", "b"), ("g3", "s", "c")})
+    assert covered == {"g1": frozenset({("s", "a")}), "g2": frozenset({("s", "b")}), "g3": None}
+
+
+def test_a_collection_is_settled_once_every_run_with_it_has_started():
+    per = [_weights("g1", ("a", 600), ("b", 600)), _weights("g2", ("c", 10))]
+    requests = launcher.cycle_requests(per, 700, launch_id="L")["requests"]
+    jobs, clock, settled = _Jobs(), _Clock(), []
+    jobs.run_now = (lambda original: lambda job_id, parameters, token: original(
+        job_id, {**parameters, "task_collection": parameters["task_collection"] or parameters["work_id"]}, token)
+    )(jobs.run_now)
+    launcher.launch(jobs, 7, requests, launch_id="L", confirm_s=0, on_settled=settled.append, sleep=clock.sleep,
+                    clock=clock)
+    assert sorted(settled) == ["g1", "g2"] and len(settled) == 2
+    assert len({s["token"] for s in jobs.started}) == len(requests)        # one token per run, from its work list

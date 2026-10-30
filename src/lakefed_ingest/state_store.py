@@ -937,6 +937,12 @@ def get_check_work_sql() -> str:
     return f"select source, src_database from {CHECK_WORK_TABLE} where work_id = %s and task_collection = %s"
 
 
+def get_check_work_all_sql() -> str:
+    """Every database of one work list, whatever its collection: a run of a cycle's share can span collections.
+    Param: work_id."""
+    return f"select task_collection, source, src_database from {CHECK_WORK_TABLE} where work_id = %s"
+
+
 def prune_check_work_sql() -> str:
     """Work lists older than a number of days, deleted. Param: days."""
     return f"delete from {CHECK_WORK_TABLE} where created_at < now() - make_interval(days => %s)"
@@ -1424,6 +1430,12 @@ class StateStore:
         with self._cursor() as cur:
             cur.execute(get_check_work_sql(), (work_id, task_collection))
             return {(source, database) for source, database in cur.fetchall()}
+
+    def get_check_work_all(self, work_id: str) -> set:
+        """{(task_collection, source, src_database)}: every database of a work list, across its collections."""
+        with self._cursor() as cur:
+            cur.execute(get_check_work_all_sql(), (work_id,))
+            return {(collection, source, database) for collection, source, database in cur.fetchall()}
 
     def prune_check_work(self, days: int = 7) -> int:
         """Delete work lists older than ``days``; returns how many rows went."""

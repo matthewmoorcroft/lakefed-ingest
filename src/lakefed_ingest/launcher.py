@@ -75,6 +75,47 @@ def run_requests(per_collection: Iterable[dict], parameters: Optional[Dict[str, 
     return out
 
 
+def cycle_requests(per_collection: Iterable[dict], group_size: int, parameters: Optional[Dict[str, str]] = None,
+                   launch_id: str = "", running: Optional[Dict[str, Optional[frozenset]]] = None) -> dict:
+    """A cycle's runs shared out by its changes (groups B): ``initial_check.plan_cycle`` over the databases with work,
+    one ingest run per share, each database whole on one run.
+
+    ``running`` (``active_collections``) leaves out what a run already going has: a database it was given, or a whole
+    collection it sweeps without a work list; those are ``deferred``, and the run going ingests them. A run with one
+    collection is started as today (``task_collection`` set); a run spanning collections gets ``task_collection``
+    blank and its ``work_id``, and takes them in turn on its cluster (ingest.ipynb). Every request's work is recorded
+    per collection under its ``work_id`` (``StateStore.record_check_work``) before it starts.
+
+    Returns {requests: [{collection (a label, unique in the cycle), collections, databases, work (per collection),
+    tables, first_loads, work_id, job_parameters}], deferred: [[collection, source, src_database]]}."""
+    import initial_check     # its planner; imported here so the launcher stays importable on its own
+    running = running or {}
+    deferred, kept = [], []
+    for result in per_collection:
+        collection = result["collection"]
+        covered = running.get(collection, frozenset())
+        weights = []
+        for source, database, *rest in result.get("weights") or []:
+            if covered is None or (source, database) in covered:
+                deferred.append([collection, source, database])
+            else:
+                weights.append([source, database, *rest])
+        kept.append({"collection": collection, "weights": weights})
+    requests = []
+    for number, run in enumerate(initial_check.plan_cycle(kept, group_size), start=1):
+        work: Dict[str, List[tuple]] = {}
+        for collection, source, database in run["databases"]:
+            work.setdefault(collection, []).append((source, database))
+        list_id = f"{launch_id}:run{number}"
+        single = run["collections"][0] if len(run["collections"]) == 1 else ""
+        requests.append({"collection": single or f"{len(run['collections'])} groups, run {number}",
+                         "collections": run["collections"], "databases": len(run["databases"]),
+                         "work": {c: sorted(w) for c, w in sorted(work.items())}, "tables": run["tables"],
+                         "first_loads": run["first_loads"], "work_id": list_id,
+                         "job_parameters": {**(parameters or {}), "task_collection": single, "work_id": list_id}})
+    return {"requests": requests, "deferred": sorted(deferred)}
+
+
 def idempotency_token(launch_id: str, collection: str) -> str:
     """The run-now token for one collection in one attempt of the launching step (``launch_id``, its task
     run id). Databricks starts at most one run per token, so the start call's own retries can't start a
@@ -83,16 +124,23 @@ def idempotency_token(launch_id: str, collection: str) -> str:
     return "lfi-" + hashlib.sha256(f"{launch_id}:{collection}".encode()).hexdigest()[:60]
 
 
-def active_collections(runs: Iterable[dict], work_of: Callable[[str, str], set]) -> Dict[str, Optional[frozenset]]:
+def active_collections(runs: Iterable[dict], work_of: Callable[[str, str], set],
+                       work_all_of: Optional[Callable[[str], set]] = None) -> Dict[str, Optional[frozenset]]:
     """The collections that already have an ingest run going, from ``jobs.active_runs``, each with the
     databases its run has: a run without a work list has the whole collection (None), else its work list
-    as ``work_of(work_id, collection)`` reads it. A run still starting its cluster has not taken its
-    collection's lock yet, so the check can't see it."""
+    as ``work_of(work_id, collection)`` reads it. A run of a cycle's share spanning collections (no
+    task_collection, a work list) has every database of its list, read with ``work_all_of(work_id)``. A run still
+    starting its cluster has not taken its collection's lock yet, so the check can't see it."""
     covered: Dict[str, Optional[frozenset]] = {}
     for run in runs:
         parameters = run.get("job_parameters", {})
         collection = str(parameters.get("task_collection") or "").strip()
         work = str(parameters.get("work_id") or "").strip()
+        if not collection and work and work_all_of is not None:
+            for name, source, database in work_all_of(work):
+                if covered.get(name, frozenset()) is not None:
+                    covered[name] = covered.get(name, frozenset()) | {(source, database)}
+            continue
         if not collection or (collection in covered and covered[collection] is None):
             continue
         if not work:
@@ -161,9 +209,17 @@ def launch(jobs, job_id: int, requests: List[dict], *, launch_id: str = "", max_
     pending = []
     already_running = already_running or {}
 
+    # A request of a cycle's share can span collections: a collection is settled once every request with it is.
+    left: Dict[str, int] = {}
+    for entry in runs:
+        for name in entry["request"].get("collections") or [entry["collection"]]:
+            left[name] = left.get(name, 0) + 1
+
     def settled(entry):
-        if on_settled:
-            on_settled(entry["collection"])
+        for name in entry["request"].get("collections") or [entry["collection"]]:
+            left[name] -= 1
+            if on_settled and not left[name]:
+                on_settled(name)
 
     for entry in runs:
         if entry["collection"] in already_running:
@@ -187,7 +243,9 @@ def launch(jobs, job_id: int, requests: List[dict], *, launch_id: str = "", max_
     def start(entry):
         try:
             entry["run_id"] = int(jobs.run_now(job_id, entry["request"]["job_parameters"],
-                                               idempotency_token(launch_id, entry["collection"])))
+                                               idempotency_token(launch_id, entry["request"].get("work_id")
+                                                                 if entry["request"].get("collections")
+                                                                 else entry["collection"])))
         except Exception as e:
             entry["outcome"], entry["state_message"] = "start_failed", str(e)[:500]
             return

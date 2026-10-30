@@ -219,7 +219,7 @@ def run_check(store, lock_store, collections: List[str], detect_one: Callable, *
               existing_sinks_of: Callable, job_run_id: str = "", cluster_id: str = "", parallelism: int = 32,
               interval_s: float = 0, reseed_on_new_columns: bool = True, snapshot_isolation: bool = False,
               force=frozenset(), map_fn=map, collection_workers: int = 8, source_cap: Optional[SourceCap] = None,
-              hold_work_locks: bool = False) -> dict:
+              hold_work_locks: bool = False, share_locks: bool = False) -> dict:
     """Check every collection of the group and write the unchanged databases' stamps.
 
     ``existing_sinks_of(configs) -> set or None`` lists the sink tables of a collection's rows (the
@@ -238,20 +238,35 @@ def run_check(store, lock_store, collections: List[str], detect_one: Callable, *
     its run and releases it, so a second check of the same collection meanwhile finds it busy and starts
     nothing.
 
+    With ``share_locks`` (a cycle shared out by its changes, ``plan_cycle``) the check holds each collection's lock
+    shared, as a work-list run does, and an exclusive lock on each database while it checks it: a database a run of
+    an earlier cycle still holds is left out (``busy_databases``) and checked again next cycle, the rest are checked
+    as usual, and every lock is let go when the collection is done (``hold_work_locks`` doesn't apply: the runs take
+    their databases' locks themselves, and a database two overlapping checks both give out is taken by one run and
+    skipped by the other). Each result also has the collection's ``tables``, for the job's group size.
+
     Returns the summary; ``per_collection`` holds each checked collection's ``work``.
     """
     mixed_sinks = store.mixed_sinks()
 
     def check_one(collection):
         started = time.monotonic()
-        if not lock_store.try_lock_collection(collection):
+        if not (lock_store.try_lock_collection_shared(collection) if share_locks
+                else lock_store.try_lock_collection(collection)):
             return None
-        run_id, keep_lock = None, False
+        run_id, keep_lock, held, busy = None, False, [], []
         try:
             # Marked as the check's own record from the start, so a monitor tells it from a group run while it runs.
             run_id = store.start_run(collection, job_run_id, cluster_id, parallelism, work_id=f"check-{job_run_id}")
-            _close_abandoned_runs(store, collection, run_id)
+            if not share_locks or lock_store.alone_on_collection(collection):
+                _close_abandoned_runs(store, collection, run_id)
             configs = store.list_task_configs(collection)
+            tables = len(configs)
+            if share_locks:
+                keys = planner.work_database_keys(collection, planner.database_keys(configs))
+                held = sorted(lock_store.try_lock_databases(keys))
+                free, busy = planner.work_after_locks(planner.database_keys(configs), keys, set(held))
+                configs = [c for c in configs if planner.database_key(c) in free]
             checkpoints = store.get_checkpoints([c["id"] for c in configs])
             detect = source_cap.wrap(configs, detect_one) if source_cap else detect_one
             result = check_collection(configs, checkpoints, detect, existing_sinks=existing_sinks_of(configs),
@@ -271,13 +286,14 @@ def run_check(store, lock_store, collections: List[str], detect_one: Callable, *
                                   | {database_of[int(row[0])] for row in result["rows"]})
             check = {k: result[k] for k in ("work", "weights", "unchanged_databases", "unchanged_tables", "work_tables",
                                             "detected", "queries", "fast_exits")}
-            check.update(table_rows=len(result["rows"]), database_stamps=len(result["database_stamps"]),
+            check.update(tables=tables, busy_databases=len(busy),
+                         table_rows=len(result["rows"]), database_stamps=len(result["database_stamps"]),
                          write_ms=int((time.monotonic() - writes_started) * 1000),
                          check_s=round(time.monotonic() - started, 1))
             unchanged = result["unchanged_tables"]
             store.finish_run(run_id, total=unchanged, ok=unchanged, failed=0, skipped=unchanged, status="completed",
                              detail=json.dumps({"check": check}))
-            keep_lock = hold_work_locks and bool(check["work"])
+            keep_lock = hold_work_locks and not share_locks and bool(check["work"])
             return {"collection": collection, "run_id": run_id, **check}
         except Exception as error:
             if run_id is not None:
@@ -288,7 +304,9 @@ def run_check(store, lock_store, collections: List[str], detect_one: Callable, *
                 _finish_failed(store, run_id, error)
             raise
         finally:
-            if not keep_lock:
+            if share_locks:
+                _release_shared(lock_store, collection, held)
+            elif not keep_lock:
                 _release_lock(lock_store, collection)
 
     started = time.monotonic()
@@ -299,7 +317,8 @@ def run_check(store, lock_store, collections: List[str], detect_one: Callable, *
     results = [r for r in checked if r is not None and "error" not in r]
     return {"collections": len(collections), "busy": [c for c, r in zip(collections, checked) if r is None],
             "failed": failed,
-            "held": sorted(r["collection"] for r in results if hold_work_locks and r["work"]),
+            "held": sorted(r["collection"] for r in results if hold_work_locks and not share_locks and r["work"]),
+            "busy_databases": sum(r.get("busy_databases", 0) for r in results),
             "check_s": round(time.monotonic() - started, 1),
             "collections_with_work": sum(1 for r in results if r["work"]),
             "databases_with_work": sum(len(r["work"]) for r in results),
@@ -338,6 +357,15 @@ def _release_lock(lock_store, collection: str) -> None:
         lock_store.unlock_collection(collection)
     except Exception as e:
         print(f"[telemetry] could not release the lock of {collection}: {str(e)[:200]}")
+
+
+def _release_shared(lock_store, collection: str, database_keys: List[str]) -> None:
+    """Let go of a collection's shared lock and the database locks the check held. Best effort, as _release_lock."""
+    try:
+        lock_store.unlock_databases(database_keys)
+        lock_store.unlock_collection_shared(collection)
+    except Exception as e:
+        print(f"[telemetry] could not release the locks of {collection}: {str(e)[:200]}")
 
 
 def _finish_failed(store, run_id, error: BaseException) -> None:

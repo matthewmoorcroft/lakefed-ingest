@@ -426,3 +426,51 @@ def test_the_same_work_always_makes_the_same_runs():
 def test_a_jobs_group_size_is_its_tables_over_its_groups():
     assert ic.group_size_of({"g1": 12500, "g2": 12400, "g3": 100}) == 8334
     assert ic.group_size_of({}) == 1 and ic.group_size_of({"g1": 0}) == 1
+
+
+class _SharedStore(_Store):
+    """The check's Lakebase calls with the shared and per-database locks of groups B: ``busy`` are the databases a
+    run of an earlier cycle holds, ``others`` the collections another session holds shared."""
+
+    def __init__(self, configs, checkpoints, busy=(), others=()):
+        super().__init__(configs, checkpoints)
+        self.busy, self.others, self.calls = set(busy), set(others), []
+
+    def try_lock_collection_shared(self, collection):
+        self.calls.append(("shared", collection))
+        return True
+
+    def unlock_collection_shared(self, collection):
+        self.calls.append(("unshared", collection))
+
+    def alone_on_collection(self, collection):
+        return collection not in self.others
+
+    def try_lock_databases(self, keys):
+        return {k for k in keys if k.rsplit("|", 1)[1] not in self.busy}
+
+    def unlock_databases(self, keys):
+        self.calls.append(("unlock", tuple(sorted(keys))))
+
+
+def test_with_shared_locks_the_check_leaves_out_the_databases_a_run_holds_and_lets_every_lock_go():
+    configs = [_cfg(1, "quiet", "a"), _cfg(2, "busy", "a"), _cfg(3, "new", "a")]
+    store = _SharedStore(configs, _recorded(configs, {1: _cp(10), 2: _cp(10)}), busy={"busy"}, others={"c1"})
+    summary = ic.run_check(store, store, ["c1"], _detector({"quiet": 10, "busy": 11}), existing_sinks_of=_sinks,
+                           job_run_id="77", share_locks=True, hold_work_locks=True)
+    result = summary["per_collection"][0]
+    assert result["work"] == [[SOURCE, "new"]] and result["busy_databases"] == 1 and result["tables"] == 3
+    assert store.stamped == {"c1": ["quiet"]}                         # busy is neither checked nor stamped
+    assert store.closed == []                                         # another run holds c1: no abandoned-run close
+    assert store.calls[0] == ("shared", "c1") and store.calls[-1] == ("unshared", "c1")
+    assert ("unlock", tuple(sorted(ss.database_lock_key("c1", SOURCE, d) for d in ("new", "quiet")))) in store.calls
+    assert summary["held"] == [] and store.unlocked == []              # nothing held for the runs: they lock their own
+
+
+def test_a_run_of_a_share_takes_its_collections_in_turn_and_fails_only_for_a_part_that_failed():
+    assert planner.cycle_parts({("g2", "s", "a"), ("g1", "s", "b"), ("g2", "s", "c")}) == ["g1", "g2"]
+    summary = planner.cycle_summary("w1", {"g1": {"run_id": 5, "total": 3, "ok": 2, "failed": 1},
+                                           "g2": {"run_id": 6, "status": "skipped"},
+                                           "g3": {"status": "failed", "error": "boom"}})
+    assert summary["failed"] == ["g3"] and summary["skipped"] == ["g2"]   # g1's failed table isn't a failed part
+    assert summary["tables"] == 3 and summary["ok"] == 2 and summary["run_ids"] == {"g1": 5, "g2": 6, "g3": None}

@@ -122,6 +122,15 @@ secret). See `README.md`, `docs/deploy.md`, `docs/monitoring.md`, `docs/lakebase
   `lakefed_ingest` once per collection with work by run-now (`work_id`; `launcher.py`), watches the
   runs for `confirm_s` (a run Databricks skips fails the check) and ends. No For each. Its own schedule
   (paused) is the fallback cadence; an app schedule in group mode starts it with its members.
+  With `runs_by` `changes` (the default; `group` keeps one run per collection with work) the cycle is shared out
+  by its changes (`initial_check.plan_cycle`, `launcher.cycle_requests`): each database's tables with work
+  (`check_collection`'s `weights`), as many runs as those tables over the job's group size (its tables over its
+  groups, `group_size_of`), each database whole on one run, a collection with a first load on a run of its own.
+  The check then holds each collection shared and each database it checks exclusively (`share_locks`), leaving out
+  the databases a run still holds; a database a run going was given waits for it (`deferred`). A run spanning
+  collections gets `task_collection` blank and its `work_id`: `ingest.ipynb` takes its collections in turn on its
+  cluster, each as a run of its own (`dbutils.notebook.run`, `cycle_part`: a part that is locked or has nothing
+  left is skipped, not failed), with its own locks and `ingest_run` record.
 - `lakefed_ingest_cluster_copies` → `cluster_copies.ipynb` (serverless, runs as the deployer): one copy of
   `lakefed_ingest` per app schedule with its own cluster (`options.cluster`), only the cluster's types and workers
   changed (`cluster_copies.py`); records the copy in `options.ingest_copy_job_id`. The check job takes the job to

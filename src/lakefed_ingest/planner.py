@@ -153,6 +153,25 @@ def work_after_locks(work: Iterable[tuple], keys: Dict[str, tuple], held: set) -
     return {tuple(item) for item in work if tuple(item) in kept}, sorted(set(keys.values()) - kept)
 
 
+def cycle_parts(work_all: Iterable[tuple]) -> List[str]:
+    """The collections a run of a cycle's share takes, in turn and in name order, from its whole work list
+    ({(task_collection, source, src_database)}, ``StateStore.get_check_work_all``)."""
+    return sorted({str(collection) for collection, _, _ in work_all})
+
+
+def cycle_summary(work_id: str, parts: Dict[str, dict]) -> dict:
+    """How a run of a cycle's share ended, from each part's own answer (its notebook exit, or the error that
+    stopped it): the parts that failed fail the run; skipped ones (locked, or nothing of theirs left) don't. A part
+    that ended with failed tables failed only if it raised (fail_on_table_errors), as a run of one collection."""
+    status = {name: str(answer.get("status") or "completed") for name, answer in parts.items()}
+    return {"work_id": work_id, "parts": len(parts),
+            "failed": sorted(name for name, s in status.items() if s == "failed"),
+            "skipped": sorted(name for name, s in status.items() if s in ("skipped", "migration_waiting")),
+            "tables": sum(int(a.get("total") or 0) for a in parts.values()),
+            "ok": sum(int(a.get("ok") or 0) for a in parts.values()),
+            "run_ids": {name: a.get("run_id") for name, a in parts.items()}}
+
+
 def sink_checked_configs(configs: List[dict]) -> List[dict]:
     """The rows whose sink table must exist for them to continue (``route_tables`` reseeds a missing
     one): the incremental strategies, ct and cursor. The sweep and the check list the sinks of these."""

@@ -97,3 +97,24 @@ def test_the_run_holds_its_collection_shared_with_a_work_list_and_alone_without(
     # The databases are locked before the rows are narrowed to them, and an all-taken list is a skip, not a failure.
     assert source.index("try_lock_databases") < source.index("configs = planner.select_work(configs, work)")
     assert 'status="skipped",\n                         detail="every database of the work list' in source
+
+
+def test_a_run_of_a_share_runs_each_collection_as_a_part_of_its_own_and_a_part_skips_rather_than_fails():
+    source = _run_source()
+    start = source.index("if work_id and not task_collection.strip():")
+    parts = source[start:source.index("# Per-collection run lock", start)]
+    assert "planner.cycle_parts(store.get_check_work_all(work_id))" in parts
+    assert '{**_widgets, "task_collection": _part, "cycle_part": "true"}' in parts
+    assert start < source.index("lock_store = StateStore.connect_lakebase(")     # before any lock is taken
+    assert 'status = "skipped" if cycle_part else planner.locked_run_status(work_id)' in source
+    assert "if cycle_part and not planner.database_keys(configs) & work:" in source
+
+
+def test_the_check_shares_a_cycle_out_by_its_changes_unless_told_one_run_per_group():
+    notebook = json.loads((NOTEBOOK.parent / "check_launch.ipynb").read_text())
+    code = "\n".join(c["source"] if isinstance(c["source"], str) else "".join(c["source"]) for c in notebook["cells"])
+    assert 'runs_by = widget("runs_by", "changes")' in code
+    assert 'hold_work_locks=runs_by == "group", share_locks=runs_by == "changes"' in code
+    assert "launcher.cycle_requests(summary[\"per_collection\"], group_size" in code
+    job = (NOTEBOOK.parents[2] / "resources" / "lakefed_ingest_check.yml").read_text()
+    assert 'runs_by: "{{job.parameters.runs_by}}"' in job and '- name: runs_by\n          default: "changes"' in job
