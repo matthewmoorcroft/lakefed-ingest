@@ -1387,12 +1387,17 @@ def discovery_databases_sql() -> str:
 
 def discovery_totals_sql() -> str:
     """How many databases a discovery has, how many of them match a filter (in their name), how many the login was
-    found able and unable to open, and the tables of those it can. Params: filter, discovery_id."""
-    return (f"select count(*) as total, count(*) filter (where position(lower(%s) in lower(src_database)) > 0) as matched, "
+    found able and unable to open and the tables of those it can, and the same for the databases the filter keeps
+    (matched_closed, matched_unknown: not checked yet, matched_tables). Params: filter, discovery_id."""
+    kept = "position(lower(f.filter) in lower(src_database)) > 0"
+    return (f"select count(*) as total, count(*) filter (where {kept}) as matched, "
             f"count(*) filter (where (listing ->> 'open')::boolean) as open, "
             f"count(*) filter (where not (listing ->> 'open')::boolean) as closed, "
-            f"coalesce(sum(tables) filter (where (listing ->> 'open')::boolean), 0) as tables "
-            f"from {SCHEMA}.discovery where discovery_id = %s")
+            f"coalesce(sum(tables) filter (where (listing ->> 'open')::boolean), 0) as tables, "
+            f"count(*) filter (where {kept} and not (listing ->> 'open')::boolean) as matched_closed, "
+            f"count(*) filter (where {kept} and status = 'listed' and (listing -> 'open') is null) as matched_unknown, "
+            f"coalesce(sum(tables) filter (where {kept} and (listing ->> 'open')::boolean), 0) as matched_tables "
+            f"from {SCHEMA}.discovery, (select %s::text as filter) f where discovery_id = %s")
 
 
 def discovery_listing_sql() -> str:

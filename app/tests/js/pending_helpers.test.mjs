@@ -2,7 +2,7 @@
 // strips the types in pending.ts as it loads it). frontend_pending_test.py runs this file from pytest.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { changeInProgress, connectionNextBlock, deleteNotice, discoveryWait, warehouseRunState, waitingSince, isUnconfirmed, requestWriteNotice, runButton, runTimeoutNotice, rediscoveryBusy, rediscoveryButton, rediscoveryNotice, saveNotice, setupRunBlocks, setupRunNotice, syncFailureLines }
+import { changeInProgress, connectionNextBlock, deleteNotice, discoveryWait, readsProgress, warehouseReadsState, warehouseRunState, waitingSince, isUnconfirmed, requestWriteNotice, runButton, runTimeoutNotice, rediscoveryBusy, rediscoveryButton, rediscoveryNotice, saveNotice, setupRunBlocks, setupRunNotice, syncFailureLines }
   from "../../src/frontend/src/pending.ts";
 
 const IDLE = { phase: "idle", timed_out: false, run_url: null, blocked: null, refused: null };
@@ -414,4 +414,14 @@ test("a statement on the SQL warehouse says whether the warehouse is starting or
   assert.equal(connectionNextBlock(false, discoveryWait({ state: "WAREHOUSE_STARTING", since: ASKED }, ASKED, "Reading", LATER)),
                "Next needs a passed connection test. Testing now: The SQL warehouse is starting: 2 min 44 s so far, since 20:42. "
                + "It usually takes a few seconds");
+});
+
+test("reading tables through the warehouse waits for it to start, then counts the databases read", () => {
+  assert.equal(warehouseReadsState({ warehouse: "STARTING", done: 0, failed: 0 }), "WAREHOUSE_STARTING");
+  assert.equal(warehouseReadsState({ warehouse: "STOPPED" }), "WAREHOUSE_STARTING");
+  assert.equal(warehouseReadsState({ warehouse: "STARTING", done: 1 }), "RUNNING");
+  assert.equal(warehouseReadsState({ warehouse: "RUNNING" }), "RUNNING");
+  assert.equal(readsProgress("Reading", { databases: 100, done: 10, failed: 2, tables: 3400 }),
+               "Reading (12 of 100 databases read, 3,400 tables)");
+  assert.equal(readsProgress("Reading", { databases: 1, done: 0 }), "Reading (0 of 1 database read, 0 tables)");
 });

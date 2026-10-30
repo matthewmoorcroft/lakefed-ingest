@@ -340,6 +340,10 @@ details.advanced .compute h4 { margin: var(--db-space-3) 0 var(--db-space-2); }
 .discover .radio-row { display: flex; gap: 8px; align-items: center; font-weight: var(--db-font-weight-semibold); margin: var(--db-space-2) 0; }
 .discover .radio-body { margin: 0 0 var(--db-space-3) 24px; }
 .discover .tree-pick { max-height: 46vh; overflow: auto; }
+/* A database the connection's login can't open: greyed out and not choosable; its reason shows on hover. */
+.tree-pick tr.closed td.name { color: var(--muted); }
+.tree-pick tr.closed .tri-box { opacity: .35; pointer-events: none; }
+.discover .pick-counts { margin: var(--db-space-1) 0 var(--db-space-2); }
 .pick-row { cursor: pointer; }
 .tri-box { display: inline-grid; place-items: center; width: 16px; height: 16px; min-height: 0; padding: 0; border-radius: 3px;
            border: 1px solid var(--db-border-strong, #8a96a3); background: var(--db-surface-base); color: var(--accent-text);

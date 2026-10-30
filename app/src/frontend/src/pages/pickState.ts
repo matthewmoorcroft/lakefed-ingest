@@ -25,3 +25,35 @@ export function serverRowPick(whole: { on: boolean; filter: string }, pageFilter
   if (covers) return "all";
   return whole.on || anythingElseChosen ? "part" : "none";
 }
+
+/** What a database's check said: the login can open it, can't (it is greyed out and can't be chosen), or not known
+ *  yet (still being checked, or listed without a check). */
+export type Access = "open" | "closed" | "unknown";
+export const accessOf = (row: { open?: boolean | null } | undefined): Access =>
+  row?.open === true ? "open" : row?.open === false ? "closed" : "unknown";
+
+/** The whole server's part of a choice: the databases its filter keeps, less those the login can't open; their
+ *  tables as counted so far, and how many of them aren't checked yet. */
+export type ServerCount = { matched: number; closed: number; unknown: number; tables: number };
+
+/** How much a choice takes, counted as the step shows it at its top: databases chosen (whole or in part) and their
+ *  tables. A whole database's tables are its check's count; one not counted yet makes the tables "counting". */
+export function selectionCounts(server: ServerCount | null, wholeTables: (number | null)[], pickedTables: number[]):
+    { databases: number; tables: number; counting: boolean; leftOut: number } {
+  const serverDatabases = server ? Math.max(0, server.matched - server.closed) : 0;
+  const known = wholeTables.filter((n): n is number => n != null);
+  return {
+    databases: serverDatabases + wholeTables.length + pickedTables.length,
+    tables: (server?.tables ?? 0) + known.reduce((a, b) => a + b, 0) + pickedTables.reduce((a, b) => a + b, 0),
+    counting: Boolean(server?.unknown) || known.length < wholeTables.length,
+    leftOut: server?.closed ?? 0,
+  };
+}
+
+const n = (value: number) => value.toLocaleString("en-US");
+
+/** "Chosen: 3 of 201 databases, 3,000 tables" (or "tables: counting, 2,000 so far" while some aren't counted). */
+export function countsText(counts: { databases: number; tables: number; counting: boolean }, listed: number): string {
+  const tables = counts.counting ? `tables: counting, ${n(counts.tables)} so far` : `${n(counts.tables)} ${counts.tables === 1 ? "table" : "tables"}`;
+  return `Chosen: ${n(counts.databases)} of ${n(listed)} ${listed === 1 ? "database" : "databases"}, ${tables}`;
+}

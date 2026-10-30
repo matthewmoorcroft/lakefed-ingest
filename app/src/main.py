@@ -2957,6 +2957,8 @@ def discovery_listing(discovery_id: str, filter: str = "", offset: int = 0, limi
     totals = db.query(q.discovery_totals_sql(), (filter, discovery_id))[0]
     return {"discovery_id": discovery_id, "filter": filter, "offset": offset, "limit": limit,
             "total": totals["total"], "matched": totals["matched"],
+            "access": {k: totals.get(k) for k in ("open", "closed", "tables", "matched_closed", "matched_unknown",
+                                                  "matched_tables")},
             "databases": db.query(q.discovery_listing_sql(), (discovery_id, filter, limit, offset))}
 
 

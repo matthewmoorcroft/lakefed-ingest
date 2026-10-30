@@ -294,3 +294,19 @@ export function warehouseRunState(answer: { state?: string; warehouse?: string }
   if (answer.state === "PENDING") return answer.warehouse === "RUNNING" ? "WAREHOUSE_QUEUED" : "WAREHOUSE_STARTING";
   return String(answer.state ?? "");
 }
+
+/** Where reading the chosen databases' tables through the warehouse stands, as the wait reads it: the warehouse is
+ *  starting while nothing has ended yet and it isn't running; after that, it reads. */
+export function warehouseReadsState(answer: { warehouse?: string; done?: number; failed?: number }): string {
+  const ended = Number(answer.done ?? 0) + Number(answer.failed ?? 0);
+  return !ended && answer.warehouse && answer.warehouse !== "RUNNING" ? "WAREHOUSE_STARTING" : "RUNNING";
+}
+
+/** "Reading the chosen databases' tables (12 of 100 databases read, 3,400 tables)", for the wait to add its time to. */
+export function readsProgress(reading: string, answer: { databases?: number; done?: number; failed?: number; tables?: number }): string {
+  const ended = Number(answer.done ?? 0) + Number(answer.failed ?? 0);
+  const databases = Number(answer.databases ?? 0);
+  const tables = Number(answer.tables ?? 0);
+  return `${reading} (${ended.toLocaleString("en-US")} of ${databases.toLocaleString("en-US")} `
+    + `${databases === 1 ? "database" : "databases"} read, ${tables.toLocaleString("en-US")} ${tables === 1 ? "table" : "tables"})`;
+}
