@@ -120,6 +120,10 @@ The one-time and ad hoc jobs shouldn't wait several minutes for a job cluster to
   Lakebase (it owns the state database; the app has no `DELETE` privilege) and, when asked, drops the target tables
   only those groups write, so the deployer needs to be able to drop those tables (`MANAGE` or ownership in Unity
   Catalog). Deploy this bundle before the app, which looks both jobs up by name.
+  The same job also removes one table from a live job (the Failing tables list's Remove), with its `control_ids`
+  parameter: the table's control row, checkpoint and reseed rows go, its target table stays. The app's Remove needs
+  this bundle, so deploy it first. A Remove started before it fails and removes nothing: the older job refuses a
+  live job's run, and the app records the failure on the row.
 - **The check** (`lakefed_ingest_check`) runs on serverless and reads every source database it checks, so
   serverless compute needs a network path to the sources, not only to Lakebase: for example private
   endpoints through a network connectivity configuration (NCC), or source firewall rules that allow the
