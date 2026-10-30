@@ -86,8 +86,8 @@ def test_a_check_claims_only_the_names_asked_for_and_never_one_claimed_twice(pg)
 
 def test_a_read_claims_the_names_asked_for_first_then_the_rest(pg):
     did = uuid.uuid4().hex[:12]
-    pg.execute(q.warehouse_named_rows_sql(3), (did, "sql_a", "eng_001", "op", did, "sql_a", "eng_002", "op",
-                                               did, "sql_a", "eng_003", "op"))
+    pg.execute(q.warehouse_named_rows_sql(3), (did, "sql_a", "eng_001", "op", "{}", did, "sql_a", "eng_002", "op", "{}",
+                                               did, "sql_a", "eng_003", "op", "{}"))
     assert sorted(_claim(pg, wr.READ, did, first=["eng_003"], limit=2)) == ["eng_001", "eng_003"]
     assert _claim(pg, wr.READ, did) == ["eng_002"]
 
@@ -138,11 +138,11 @@ def test_a_whole_server_read_takes_its_listing_under_the_filter_less_the_databas
     pg.execute(q.warehouse_check_done_sql(), (True, None, 5, listing, "eng_001"))
     pg.execute(q.warehouse_check_done_sql(), (False, "no access", None, listing, "eng_002"))
     did = uuid.uuid4().hex[:12]
-    pg.execute(q.warehouse_read_rows_sql(), (did, "op@example.com", listing, "eng"))
+    pg.execute(q.warehouse_read_rows_sql(), (did, "op@example.com", "{}", listing, "eng"))
     rows = _rows(pg, "select src_database, status, src_connection, requested_by, listing, finished_at "
                      "from lakefed_ingest.discovery where discovery_id = %s order by src_database", (did,))
     assert [(r["src_database"], r["status"]) for r in rows] == [("eng_001", "running"), ("eng_003", "running")]
-    assert rows[0]["src_connection"] == "sql_a" and rows[0]["listing"] == {"via": "warehouse"}
+    assert rows[0]["src_connection"] == "sql_a" and rows[0]["listing"] == {"via": "warehouse", "whole_server": True}
     assert rows[0]["finished_at"] is None
     assert _rows(pg, q.warehouse_left_out_sql(), (listing, "eng")) == [{"left_out": 1}]
     assert _rows(pg, q.warehouse_left_out_sql(), (listing, "fin")) == [{"left_out": 0}]
@@ -150,8 +150,8 @@ def test_a_whole_server_read_takes_its_listing_under_the_filter_less_the_databas
 
 def test_a_read_of_named_databases_saves_each_ones_tables_once_and_finishes_once(pg):
     did = uuid.uuid4().hex[:12]
-    pg.execute(q.warehouse_named_rows_sql(2), (did, "sql_a", "eng_001", "op", did, "sql_a", "eng_002", "op"))
-    pg.execute(q.warehouse_named_rows_sql(1), (did, "sql_a", "eng_001", "op"))
+    pg.execute(q.warehouse_named_rows_sql(2), (did, "sql_a", "eng_001", "op", "{}", did, "sql_a", "eng_002", "op", "{}"))
+    pg.execute(q.warehouse_named_rows_sql(1), (did, "sql_a", "eng_001", "op", "{}"))
     assert sorted(_claim(pg, wr.READ, did)) == ["eng_001", "eng_002"]
     pg.execute(q.warehouse_started_sql(), ("s-1", did, "eng_001"))
     assert _rows(pg, q.warehouse_in_flight_sql(wr.READ), (did,)) == [{"src_database": "eng_001", "statement_id": "s-1"}]

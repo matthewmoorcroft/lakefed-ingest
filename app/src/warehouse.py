@@ -54,6 +54,11 @@ def read(statement_id: str) -> dict:
     return _view(workspace().statement_execution.get_statement(statement_id))
 
 
+def cancel(statement_id: str) -> None:
+    """Stop a statement still going (a discarded draft's read). One that has ended already is left as it is."""
+    workspace().statement_execution.cancel_execution(statement_id)
+
+
 def warehouse_state() -> str:
     """The warehouse's state (STARTING, RUNNING, STOPPED, ...), so the page can say it is starting; blank when it
     can't be read."""

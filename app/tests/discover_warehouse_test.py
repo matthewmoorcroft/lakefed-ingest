@@ -182,8 +182,8 @@ def test_reading_named_databases_goes_through_the_warehouse_one_running_row_each
     assert body["via"] == "warehouse" and body["state"] == "RUNNING" and body["left_out"] == 0
     sql, params = client.written[0]
     assert sql.startswith(f"insert into {q.SCHEMA}.discovery ") and "'running'" in sql
-    assert params == (body["discovery_id"], "sql_a", "eng_002", "op@example.com",
-                      body["discovery_id"], "sql_a", "eng_001", "op@example.com")
+    assert params == (body["discovery_id"], "sql_a", "eng_002", "op@example.com", "{}",
+                      body["discovery_id"], "sql_a", "eng_001", "op@example.com", "{}")
     assert calls == [("read", body["discovery_id"], "sql_a", [])]
 
 
@@ -195,7 +195,7 @@ def test_reading_the_whole_server_takes_its_listing_less_the_databases_the_login
                                                         "listing_id": "abc123", "filter": "eng"}).json()
     assert body["left_out"] == 101
     sql, params = client.written[0]
-    assert sql == q.warehouse_read_rows_sql() and params == (body["discovery_id"], "op@example.com", "abc123", "eng")
+    assert sql == q.warehouse_read_rows_sql() and params == (body["discovery_id"], "op@example.com", "{}", "abc123", "eng")
     assert "coalesce((listing ->> 'open')::boolean, true)" in sql
 
 

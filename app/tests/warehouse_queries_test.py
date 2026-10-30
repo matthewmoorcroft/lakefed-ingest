@@ -15,8 +15,8 @@ def test_each_statement_takes_the_parameters_the_store_passes():
         assert _marks(q.warehouse_progress_sql(kind)) == 1
     assert _marks(q.warehouse_started_sql()) == 3 and _marks(q.warehouse_clear_sql()) == 2
     assert _marks(q.warehouse_check_done_sql()) == 5 and _marks(q.warehouse_read_done_sql()) == 5
-    assert _marks(q.warehouse_read_rows_sql()) == 4 and _marks(q.warehouse_left_out_sql()) == 2
-    assert _marks(q.warehouse_named_rows_sql(3)) == 12
+    assert _marks(q.warehouse_read_rows_sql()) == 5 and _marks(q.warehouse_left_out_sql()) == 2
+    assert _marks(q.warehouse_named_rows_sql(3)) == 15
     assert _marks(q.insert_discovered_tables_sql(wr.TABLE_COLUMNS, 2)) == 2 * len(wr.TABLE_COLUMNS)
 
 

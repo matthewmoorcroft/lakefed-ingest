@@ -910,7 +910,10 @@ def _task_stage(task_id: Optional[int], stage: str) -> None:
 
 
 def _keep_selection(cur, job_id: int, selected: Optional[dict], user: str) -> None:
-    """In the job's transaction: what it was made from (job_selection), for a later re-discovery to follow."""
+    """In the job's transaction: what it was made from (job_selection), for a later re-discovery to follow. The drafts
+    it was chosen from become the job's in the same transaction, so no purge takes them."""
+    if (selected or {}).get("kind") == "discovery" and selected.get("source_id"):
+        cur.execute(q.draft_claim_sql(), (int(job_id), str(selected["source_id"]).split(",")))
     parts = (selected or {}).get("parts") or []
     for at in range(0, len(parts), q.CONTROL_BATCH):
         chunk = parts[at:at + q.CONTROL_BATCH]
@@ -2882,6 +2885,11 @@ class SourceDiscoverRequest(BaseModel):
     # whole-server tick was made under (in the database's name).
     listing_id: str = Field(default="", max_length=64, pattern=r"^[0-9a-f]*$")
     filter: str = Field(default="", max_length=128)
+    # A read through the warehouse started as databases are chosen, before the job exists (a draft): it belongs to no
+    # job until Create takes it, and a page cancelled or left discards it. draft_id adds databases to a draft already
+    # started, so one choice is one draft however many times it grows.
+    draft: bool = False
+    draft_id: str = Field(default="", max_length=64, pattern=r"^[0-9a-f]*$")
 
 
 def _connection_unseen(name: str, listing_error: Optional[str]) -> str:
@@ -2997,25 +3005,96 @@ def check_access(discovery_id: str, body: AccessCheckRequest, connection: str):
 def warehouse_reads_step(discovery_id: str, connection: str):
     """One step of reading the chosen databases' tables through the warehouse: the page asks until it has ended."""
     _require_connection(connection)
+    db.execute(q.draft_touch_sql(), (discovery_id, discovery_id))
     return {"discovery_id": discovery_id, "via": "warehouse",
             **warehouse_reads.advance(WarehouseReadStore(), warehouse, warehouse_reads.READ, discovery_id, connection)}
+
+
+@app.post("/api/discoveries/{discovery_id}/discard")
+def discard_draft(discovery_id: str):
+    """Discard a draft (the page was cancelled or left before Create): nothing more is read for it, the statements
+    still going are cancelled, and the delete job purges its rows within DRAFT_TTL_S (the app has no DELETE). A draft
+    a Create or an Add has taken is not a draft any more, so this changes nothing then. Sent by navigator.sendBeacon
+    too, so it takes no body."""
+    going = [r["statement_id"] for r in db.query(q.draft_discard_sql(), (discovery_id,)) if r.get("statement_id")]
+    for statement_id in going:
+        try:
+            warehouse.cancel(statement_id)
+        except Exception as e:     # it may have ended meanwhile; the rows are discarded either way
+            logging.getLogger(__name__).info("could not cancel statement %s of draft %s: %s", statement_id, discovery_id,
+                                             str(e)[:200])
+    return {"discovery_id": discovery_id, "cancelled": len(going)}
+
+
+# A draft nobody has asked about for this long counts as discarded, and the delete job purges it.
+DRAFT_TTL_S = int(os.environ.get("DRAFT_TTL_S", str(2 * 3600)))
+
+
+def _draft_reading(selection: "Selection", advance: bool = True) -> Optional[dict]:
+    """Where the reads of the discoveries a choice names stand, for a preview or a Create: None when every database is
+    read. With ``advance`` it first does a step of each read still going (the page that started them may be gone),
+    and marks the drafts still wanted. A database a whole-server read couldn't open is left out, as the check would
+    have left it out; any other database that couldn't be read is a failure, named."""
+    kind, ids, _ = selection.source()
+    if kind != "discovery" or not ids:
+        return None
+    reads = db.query(q.draft_reads_sql(), (ids,))
+    if advance:
+        for r in reads:
+            if int(r["pending"] or 0) and r.get("src_connection"):
+                db.execute(q.draft_touch_sql(), (r["discovery_id"], r["discovery_id"]))
+                warehouse_reads.advance(WarehouseReadStore(), warehouse, warehouse_reads.READ, r["discovery_id"],
+                                        r["src_connection"])
+        if any(int(r["pending"] or 0) for r in reads):
+            reads = db.query(q.draft_reads_sql(), (ids,))
+    total = {k: sum(int(r[k] or 0) for r in reads)
+             for k in ("databases", "pending", "done", "failed", "discarded", "tables")}
+    if not total["pending"] and not total["failed"] and not total["discarded"]:
+        return None
+    rows = db.query(q.draft_failed_sql(), (ids,)) if total["failed"] else []
+    left_out = [r for r in rows if r["whole_server"] and warehouse_reads.no_access(r.get("error"))]
+    failed = [r for r in rows if r not in left_out]
+    return {**total, "failed": len(failed), "left_out": len(left_out),
+            "failed_databases": [[r["src_database"], warehouse_reads.first_line(r.get("error"))] for r in failed[:50]]}
+
+
+def _draft_problems(reading: Optional[dict]) -> List[str]:
+    """Why a Create can't take a choice's reads as they are: databases that couldn't be read, by name, or a draft
+    discarded meanwhile."""
+    if not reading:
+        return []
+    problems = [f"{name}: couldn't be read: {why}" for name, why in reading["failed_databases"]]
+    if reading["failed"] > len(reading["failed_databases"]):
+        problems.append(f"and {reading['failed'] - len(reading['failed_databases'])} more databases couldn't be read")
+    if reading["discarded"]:
+        problems.append("the tables read for this choice were discarded (the page was left or cancelled): "
+                        "choose them again")
+    return problems
 
 
 def _start_warehouse_read(body: "SourceDiscoverRequest", names: List[str], user: Optional[str]) -> dict:
     """Start reading tables through the warehouse: the whole server (the databases of its listing that the filter keeps
     and the login wasn't found unable to open) or the databases named, then the first step of the reads."""
     did = uuid.uuid4().hex[:12]
+    if body.draft_id:
+        drafts = db.query(q.draft_of_sql(), (body.draft_id,))
+        if not drafts or drafts[0]["src_connection"] != body.src_connection:
+            raise HTTPException(409, f"draft {body.draft_id} is not an open draft of {body.src_connection}: "
+                                     "choose again")
+        did = body.draft_id
+    marks = json.dumps({"draft": True, "draft_by": user, "touched_at": datetime.now(timezone.utc).isoformat()}
+                       if body.draft or body.draft_id else {})
     left_out = 0
     if body.whole_server:
         if not body.listing_id:
             raise HTTPException(422, "reading the whole server through the warehouse takes the listing its test made "
                                      "(listing_id)")
-        db.execute(q.warehouse_read_rows_sql(), (did, user, body.listing_id, body.filter))
+        db.execute(q.warehouse_read_rows_sql(), (did, user, marks, body.listing_id, body.filter))
         left_out = int(db.query(q.warehouse_left_out_sql(), (body.listing_id, body.filter))[0]["left_out"])
     for at in range(0, len(names), q.CONTROL_BATCH):
         chunk = names[at:at + q.CONTROL_BATCH]
         db.execute(q.warehouse_named_rows_sql(len(chunk)),
-                   tuple(v for name in chunk for v in (did, body.src_connection, name, user)))
+                   tuple(v for name in chunk for v in (did, body.src_connection, name, user, marks)))
     step = warehouse_reads.advance(WarehouseReadStore(), warehouse, warehouse_reads.READ, did, body.src_connection)
     return {"discovery_id": did, "via": "warehouse", "left_out": left_out, **step}
 
@@ -3636,14 +3715,16 @@ def _rows_of_units(kind, param, units: List) -> List[Tuple[object, List[dict]]]:
     return by_database.rows_by_unit(units, rows)
 
 
-def _create_by_database(body: NewJobRequest, request: Request, selection: Selection, kind, param, source_id, rest):
+def _create_by_database(body: NewJobRequest, request: Request, selection: Selection, kind, param, source_id, rest,
+                        inline=None):
     """A big job, by reference to more tables than BACKGROUND_ROWS: its groups are sized by tables (by_database), and it
     is written in a background task, one database at a time, each database's rows in its own transaction. First every
     database is checked (read and planned, nothing written); then the job is made (its schedule and what it was chosen
     from, in one transaction), and each database is written with its group's run lock, its group's member, and the
     task's progress, all committed together. The job's Databricks jobs are synced once, at the end. A restart leaves
     the databases written so far, and the same request id finishes the job: a database a job already has is skipped,
-    so it is never written twice (the task's progress is what the page shows)."""
+    so it is never written twice (the task's progress is what the page shows). ``inline`` (progress, task_id) writes in
+    the calling task (a Create that waited for its draft's read) instead of a task of its own."""
     import psycopg
     name = body.name.strip()
     run = body.run.model_copy()
@@ -3757,6 +3838,8 @@ def _create_by_database(body: NewJobRequest, request: Request, selection: Select
     def after(result):
         return _created(result, user, options)
 
+    if inline is not None:
+        return write(*inline)
     made = db.query(q.insert_task_sql(), ("create", body.request_id or uuid.uuid4().hex, None,
                                           summary["tables"], None, user or None))[0]
     if made["made"] or db.query(q.resume_task_sql(), (made["id"],)):
@@ -3886,12 +3969,35 @@ def create_ingestion_job(body: NewJobRequest, request: Request):
     (a schedule with those groups). Creating is one transaction: the schedule, every table (all or nothing: a target
     another table writes refuses the lot), the groups' members; then its Databricks jobs are synced. The tables come
     as CSV lines (csv) or by reference to an upload or discovery (source), which is kept with the job. A source of more
-    than BACKGROUND_ROWS tables is written database by database in a background task (_create_by_database)."""
+    than BACKGROUND_ROWS tables is written database by database in a background task (_create_by_database).
+
+    Chosen from a draft whose read hasn't ended (the tables are read as they are chosen), a preview counts what is read
+    so far and says how far the read is (reading), and a Create waits for the read in a background task, with its
+    progress, then writes (_create_after_reading). A database that couldn't be read stops it by name first."""
+    reading = _draft_reading(body.source) if body.source is not None and not _has_database_lines(body.source) else None
+    if not body.dry_run and reading:
+        problems = _draft_problems(reading)
+        if problems:
+            raise HTTPException(422, {"errors": problems})
+        if reading["pending"]:
+            return _create_after_reading(body, request)
+    result = _create_now(body, request)
+    if body.dry_run and reading and isinstance(result, dict):
+        result["reading"] = reading
+    return result
+
+
+def _create_now(body: NewJobRequest, request: Request, inline=None):
+    """create_ingestion_job's write once every table is read: by database for more than BACKGROUND_ROWS tables, else in
+    one go. ``inline`` (progress, task_id) writes in the calling task instead of a task of its own."""
     if body.source is not None and not _has_database_lines(body.source):
         kind, param, source_id, rest = _selection_params(body.source)
         counted = db.query(q.selected_count_sql(kind), (param, *rest))
         if counted and counted[0]["n"] > BACKGROUND_ROWS:
-            return _create_by_database(body, request, body.source, kind, param, source_id, rest)
+            return _create_by_database(body, request, body.source, kind, param, source_id, rest, inline=inline)
+    if inline is not None:
+        progress, task_id = inline
+        return _create_job(body, request, inline=True, progress=progress, task_id=task_id)
     user = _user(request)
     create_options = {k: v for k, v in (body.run.options or {}).items() if k not in MANAGED_OPTIONS}
 
@@ -3992,6 +4098,39 @@ def _create_job(body: NewJobRequest, request: Request, inline: bool = False, pro
     if inline:
         return write(progress, task_id)
     return _write_now_or_later("create", body.request_id, None, len(rows), user, write, after)
+
+
+# How often a Create waiting on a draft's read does a step of it.
+DRAFT_POLL_S = 1.5
+
+
+def _create_after_reading(body: NewJobRequest, request: Request):
+    """A Create chosen from a draft whose read hasn't ended: a background task does the read's steps until no database
+    is left (the task's stage says how far), then writes as an inline Create does. A database that couldn't be read,
+    or a draft discarded meanwhile, fails it by name before anything is written."""
+    user = _user(request)
+    if not body.run.paused:
+        _refuse(_permission_refusals({"job_variant": body.run.job_variant}, user)["run"])
+    options = {k: v for k, v in (body.run.options or {}).items() if k not in MANAGED_OPTIONS}
+
+    def write(progress, task_id):
+        while True:
+            reading = _draft_reading(body.source)
+            if not reading or not reading["pending"]:
+                break
+            db.execute(q.task_progress_json_sql(), (json.dumps({
+                "stage": "reading", "databases": reading["databases"], "read": reading["done"] + reading["failed"],
+                "tables": reading["tables"]}), 0, task_id))
+            time.sleep(DRAFT_POLL_S)
+        problems = _draft_problems(reading)
+        if problems:
+            raise HTTPException(422, {"errors": problems})
+        _task_stage(task_id, "writing")
+        return _create_now(body, request, inline=(progress, task_id))
+
+    return _write_now_or_later("create", body.request_id, None, 0, user, write,
+                               lambda result: _created(result, user, options) if result.get("created") else result,
+                               background=True)
 
 
 def _create_after_discovery(body: NewJobRequest, request: Request, progress, task_id) -> dict:

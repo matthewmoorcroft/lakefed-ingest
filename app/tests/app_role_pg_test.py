@@ -167,3 +167,56 @@ def test_a_job_by_database_then_add_tables_and_a_new_number_of_groups_run_as_the
                                                                            "request_id": "role-3"})
     assert regrouped.status_code == 200, regrouped.text
     assert client.sql("select count(*), count(distinct src_database) from lakefed_ingest.control") == [(6, 3)]
+
+
+def _draft(client, databases):
+    """The read started as the databases are chosen (a draft), one step done: its discovery id, its reads not ended."""
+    listing = client.post("/api/discoveries/source", json={"src_connection": "sql_a", "kind": "list"}).json()
+    access = client.post(f"/api/discoveries/{listing['discovery_id']}/access?connection=sql_a",
+                         json={"first": databases})
+    assert access.status_code == 200, access.text
+    read = client.post("/api/discoveries/source", json={"src_connection": "sql_a", "kind": "tables", "draft": True,
+                                                        "databases": databases[:1]})
+    assert read.status_code == 200, read.text
+    did = read.json()["discovery_id"]
+    grown = client.post("/api/discoveries/source", json={"src_connection": "sql_a", "kind": "tables", "draft_id": did,
+                                                         "databases": databases[1:]})
+    assert grown.status_code == 200 and grown.json()["discovery_id"] == did, grown.text
+    return did
+
+
+@pytest.mark.parametrize("by_database", [False, True])
+def test_create_from_a_draft_still_reading_waits_for_it_then_takes_it_as_the_apps_role(client, monkeypatch, by_database):
+    monkeypatch.setattr(main, "DRAFT_POLL_S", 0)
+    if by_database:
+        monkeypatch.setattr(main, "BACKGROUND_ROWS", 1)
+    did = _draft(client, ["eng_001", "eng_002"])
+    assert client.sql("select count(*) from lakefed_ingest.discovery where discovery_id = %s and status = 'running'",
+                      (did,))[0][0] > 0, "the draft's read should still be going when Create is pressed"
+    selection = {"discovery_id": did, "databases": [{"server": "sql_a", "database": d} for d in ("eng_001", "eng_002")]}
+    preview = client.post("/api/ingestion-jobs", json={"name": "Draft", "settings": SETTINGS, "source": selection})
+    assert preview.status_code == 200, preview.text
+    made = client.post("/api/ingestion-jobs", json={"name": "Draft", "settings": SETTINGS, "dry_run": False,
+                                                    "request_id": f"draft-{by_database}", "source": selection})
+    assert made.status_code in (200, 202), made.text
+    assert client.sql("select count(*), count(distinct src_database) from lakefed_ingest.control") == [(4, 2)]
+    marks = client.sql("select distinct listing ? 'draft', (listing ->> 'job_id') is not null "
+                       "from lakefed_ingest.discovery where discovery_id = %s", (did,))
+    assert marks == [(False, True)], "Create takes the draft: no draft mark left, the job named"
+
+
+def test_a_discarded_draft_reads_no_more_and_cant_be_created_from_as_the_apps_role(client, monkeypatch):
+    cancelled = []
+    monkeypatch.setattr(main.warehouse, "cancel", cancelled.append)
+    did = _draft(client, ["eng_001", "eng_002"])
+    gone = client.post(f"/api/discoveries/{did}/discard")
+    assert gone.status_code == 200 and gone.json()["cancelled"] == len(cancelled), gone.text
+    step = client.get(f"/api/discoveries/{did}/reads?connection=sql_a").json()
+    assert step["state"] in ("SUCCEEDED", "RUNNING")
+    assert client.sql("select count(*) from lakefed_ingest.discovery where discovery_id = %s "
+                      "and not listing ? 'discarded'", (did,)) == [(0,)]
+    made = client.post("/api/ingestion-jobs", json={"name": "Gone", "settings": SETTINGS, "dry_run": False,
+                                                    "request_id": "draft-gone", "source": {"discovery_id": did,
+                                                    "databases": [{"server": "sql_a", "database": "eng_001"}]}})
+    assert made.status_code == 422 and "discarded" in made.text, made.text
+    assert client.sql("select count(*) from lakefed_ingest.control") == [(0,)]

@@ -39,6 +39,11 @@ def first_line(error: Optional[str]) -> str:
     return str(error or "").strip().split("\n")[0][:500]
 
 
+def no_access(error: Optional[str]) -> bool:
+    """Whether a database's error says the connection's login can't open it."""
+    return bool(_NO_ACCESS.search(first_line(error)))
+
+
 def why_closed(error: Optional[str]) -> str:
     """Why the login can't open a database, in plain words, then the server's own message."""
     message = first_line(error)
