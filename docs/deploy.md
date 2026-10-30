@@ -125,6 +125,16 @@ The one-time and ad hoc jobs shouldn't wait several minutes for a job cluster to
   parameter: the table's control row, checkpoint and reseed rows go, its target table stays. The app's Remove needs
   this bundle, so deploy it first. A Remove started before it fails and removes nothing: the older job refuses a
   live job's run, and the app records the failure on the row.
+- **The operations app's login scope** (the app bundle's `jdbc_login_scope`, default `lakefed_ingest_jdbc_logins`) holds
+  the JDBC logins typed into the app. The app bundle creates it. The app's service principal gets `WRITE` on that one
+  scope and nothing else: not `MANAGE`, which would let it change who reads the scope, and not `READ`. The scope has
+  `prevent_destroy`, so destroying the app bundle won't delete the logins. The deployer of the app bundle becomes the
+  scope's creator and holds `MANAGE`. This assumes the ingestion jobs run as that same deployer, so they can read the
+  logins; deploy the app bundle as the user who runs the ingestion jobs, and check the jobs' run-as identity on your
+  deployment. The grant refers to the app's service principal with
+  `${resources.apps.lakefed_ingest_app.service_principal_client_id}`, which is not yet checked against a live deploy.
+  The audit log records each write with the value redacted (checked 30 Oct 2026). See the app's README, "JDBC
+  connections entered by hand".
 - **The check** (`lakefed_ingest_check`) runs on serverless and reads every source database it checks, so
   serverless compute needs a network path to the sources, not only to Lakebase: for example private
   endpoints through a network connectivity configuration (NCC), or source firewall rules that allow the

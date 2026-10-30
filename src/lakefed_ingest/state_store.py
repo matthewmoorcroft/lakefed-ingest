@@ -146,7 +146,8 @@ def split_sql_statements(ddl: str) -> List[str]:
 #   14 = ingest_event.error_kind and error_class (how a failed attempt was classified, for the failing-tables list)
 #   15 = databricks_run.cancel_requested_at (a Cancel run is recorded as cancelled, not failed)
 #   16 = jdbc_connection (JDBC connections entered by hand in the operations app: a host, port, secret scope and key)
-SCHEMA_VERSION = 16
+#   17 = jdbc_login_write (who wrote each JDBC login into the dedicated secret scope, and whether it rotated one)
+SCHEMA_VERSION = 17
 # Advisory lock that serializes migrations (the setup job and ingestion runs of any collection): two
 # int keys, so it can't collide with a collection's one-key lock whatever the collection is named,
 # and a class of its own (not SOURCE_LOCK_CLASS).

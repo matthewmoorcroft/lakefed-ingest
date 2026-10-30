@@ -696,3 +696,19 @@ create table if not exists lakefed_ingest.jdbc_connection (
     constraint jdbc_connection_port_range check (src_port between 1 and 65535),
     constraint jdbc_connection_trust_values check (trust_server_certificate in ('true', 'false'))
 );
+
+-- One row per time the operations app wrote a JDBC login into the dedicated secret scope (app/src/jdbc_logins.py): who
+-- entered it, when, and whether it replaced an earlier login for the same scope and key ('rotated'). The password is
+-- never here; it lives only in the secret. The app's role inserts and reads this table, and never deletes from it.
+create table if not exists lakefed_ingest.jdbc_login_write (
+    id           text        primary key,
+    connection   text        not null,
+    secret_scope text        not null,
+    secret_key   text        not null,
+    entered_by   text        not null,
+    entered_at   timestamptz not null default now(),
+    outcome      text        not null,
+    constraint jdbc_login_write_outcome_values check (outcome in ('saved', 'rotated'))
+);
+create index if not exists jdbc_login_write_key_idx
+    on lakefed_ingest.jdbc_login_write (secret_scope, secret_key, entered_at desc);

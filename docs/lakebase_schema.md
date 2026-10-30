@@ -20,6 +20,7 @@ as `lakefed_ingest_lakebase.lakefed_ingest.<table>` (see [monitoring.md](monitor
 | `discovery`, `discovered_table` | **Onboarding.** Tables found by the discovery job, with recommended control-row settings | The discovery job |
 | `schedule`, `schedule_member` | **Scheduling.** Cadences for running collections, and the wrapper job per (schedule, collection) | The operations app |
 | `databricks_run` | **Telemetry.** The Databricks runs the operations app shows, with their state | The operations app's run poller |
+| `jdbc_login_write` | **Audit.** One row per JDBC login the operations app writes into its dedicated secret scope: who, when, and whether it replaced one. No password | The operations app |
 | `schema_version` | **Bookkeeping.** Schema versions applied | The setup job, or the first ingestion run after an upgrade |
 
 ```mermaid
@@ -459,6 +460,18 @@ The operations app's pages read these instead of scanning `control` and `checkpo
   test keeps them equal) recounts the named databases from their own rows, then the groups. Nothing is kept by
   deltas, so a missed write only delays the counts until the next write of that database. A group with no rollup
   row yet is counted from its control rows by the app until a write or a check gives it one.
+
+## `jdbc_login_write`: JDBC logins the app wrote
+
+One row per login the operations app writes (`POST /api/jdbc-logins`), added by schema version 17: `id`, `connection`
+(the JDBC connection's name), `secret_scope` and `secret_key` (where the login is kept), `entered_by` (the signed-in
+user), `entered_at`, and `outcome`. The outcome is `rotated` when a login was already recorded for that scope and key
+when this one was written, and `saved` otherwise. There is no password or secret column, and the app never reads a
+secret back.
+
+The app's role gets SELECT, INSERT and UPDATE on every table in the schema from the grants job (its default privileges
+cover tables the setup job creates later), and no DELETE, so a record can't be removed through the app. Status:
+pending the audit check.
 
 ## `schema_version` — schema versions applied
 
