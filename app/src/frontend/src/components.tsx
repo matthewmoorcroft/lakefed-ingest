@@ -1,4 +1,5 @@
 import { Fragment, useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { type BarPart, type BarSummary, type StateCounts, progressParts, progressSummary, stateParts, stateSummary } from "./bars";
 import { createPortal } from "react-dom";
 import { Link } from "react-router-dom";
 import { AgGridReact } from "ag-grid-react";
@@ -362,25 +363,40 @@ export function fmtLeft(seconds: unknown): string {
   return `about ${(s / 3600).toFixed(1)} h`;
 }
 
-export interface StateCounts {
-  state_current?: unknown; state_loaded?: unknown; state_late?: unknown; state_first_load?: unknown; state_failing?: unknown;
+export type { StateCounts } from "./bars";
+
+/** The counts under a bar, in the bar's colours (bars.ts says what they are). */
+function BarCountsLine({ summary, stacked }: { summary: BarSummary; stacked?: boolean }) {
+  const className = `bar-counts${stacked ? " stacked" : ""}`;
+  if (summary.allDone) return <span className={className}><span className="tone-loaded all-done"><Check /> {summary.allDone}</span></span>;
+  return <span className={className}>{summary.items.map((entry) => <span key={entry.text} className={`tone-${entry.tone}`}>{entry.text}</span>)}</span>;
 }
 
-const STATES = [
-  ["seg-current", "loaded"], ["seg-late", "late"], ["seg-first", "waiting for a first load"], ["seg-failing", "failing"],
-] as const;
-
-/** Each state now as one bar. A table's row counts its tables (current, late, waiting, failing); a rollup row (a
- *  group, job, server or instance) counts its loaded tables, late ones included, and its late databases are shown
- *  beside the bar, not in it. */
-export function StateBar({ row }: { row: StateCounts }) {
-  const counts = [row.state_current ?? row.state_loaded, row.state_late, row.state_first_load, row.state_failing]
-    .map((value) => Number(value || 0));
-  const total = counts.reduce((a, b) => a + b, 0);
-  const title = STATES.map(([, label], i) => `${fmtInt(counts[i])} ${label}`).join(", ");
+function Check() {
   return (
-    <div className="bar" title={title} role="img" aria-label={title}>
-      {total > 0 && STATES.map(([cls], i) => counts[i] > 0 && <span key={cls} className={cls} style={{ width: `${(100 * counts[i]) / total}%` }} />)}
+    <svg width="12" height="12" viewBox="0 0 16 16" aria-hidden="true" focusable="false">
+      <path d="M3 8.5 6.5 12 13 4.5" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
+    </svg>
+  );
+}
+
+/** The segments of a bar, in the Databricks UI's status colours. */
+function Segments({ parts, total, big }: { parts: BarPart[]; total: number; big?: boolean }) {
+  const label = parts.map((p) => `${fmtInt(p.count)} ${p.word}`).join(", ");
+  return (
+    <div className={`bar${big ? " big" : ""}`} role="img" aria-label={label}>
+      {total > 0 && parts.map((p) => p.count > 0 && <span key={p.word} className={`seg-${p.tone}`} style={{ width: `${(100 * p.count) / total}%` }} />)}
+    </div>
+  );
+}
+
+/** Each state now as one bar, with its counts written under it. full: a card's bar, every state counted. */
+export function StateBar({ row, full }: { row: StateCounts; full?: boolean }) {
+  const { parts } = stateParts(row);
+  return (
+    <div className="state-bar">
+      <Segments parts={parts} total={parts.reduce((a, p) => a + p.count, 0)} big={full} />
+      <BarCountsLine summary={stateSummary(row, full)} stacked={full} />
     </div>
   );
 }
@@ -388,8 +404,8 @@ export function StateBar({ row }: { row: StateCounts }) {
 export function StateKey() {
   return (
     <div className="key">
-      <span><i className="seg-current" />Loaded</span><span><i className="seg-late" />Late</span>
-      <span><i className="seg-first" />Waiting for a first load</span><span><i className="seg-failing" />Failing</span>
+      <span><i className="seg-loaded" />Loaded</span><span><i className="seg-late" />Late</span>
+      <span><i className="seg-waiting" />Waiting for a first load</span><span><i className="seg-failing" />Failing</span>
     </div>
   );
 }
@@ -405,19 +421,14 @@ export function progressOf(run: Row): Progress {
            failed: Number(run.tables_failed || 0) };
 }
 
+/** A run's progress as one bar in the Databricks UI's status colours: unchanged and loaded (done), in flight, failed,
+ *  not run, and the rest to go (the track). A table row writes its counts under it; a big bar has its key below. */
 export function ProgressBar({ p, big }: { p: Progress; big?: boolean }) {
-  const pct = (n: number) => `${p.total ? (100 * n) / p.total : 0}%`;
-  const notRun = p.notRun ?? 0;
-  const left = Math.max(0, p.total - p.unchanged - p.loaded - p.inFlight - p.failed - notRun);
-  const title = `${fmtInt(p.unchanged)} unchanged, ${fmtInt(p.loaded)} loaded, ${fmtInt(p.inFlight)} in flight, `
-    + `${fmtInt(p.failed)} failed${notRun ? `, ${fmtInt(notRun)} not run` : ""}${left ? `, ${fmtInt(left)} to go` : ""}`;
+  const parts = progressParts(p);
   return (
-    <div className={`bar${big ? " big" : ""}`} title={title} role="img" aria-label={title}>
-      {p.unchanged > 0 && <span className="seg-unchanged" style={{ width: pct(p.unchanged) }} />}
-      {p.loaded > 0 && <span className="seg-loaded" style={{ width: pct(p.loaded) }} />}
-      {p.inFlight > 0 && <span className="seg-flight" style={{ width: pct(p.inFlight) }} />}
-      {p.failed > 0 && <span className="seg-failing" style={{ width: pct(p.failed) }} />}
-      {notRun > 0 && <span className="seg-notrun" style={{ width: pct(notRun) }} />}
+    <div className="state-bar">
+      <Segments parts={parts} total={Math.max(p.total, parts.reduce((a, part) => a + part.count, 0))} big={big} />
+      {!big && <BarCountsLine summary={progressSummary(p)} />}
     </div>
   );
 }
@@ -429,7 +440,7 @@ export function ProgressKey({ p, finished }: { p?: Progress; finished?: boolean 
   return (
     <div className="key">
       <span><i className="seg-unchanged" />Unchanged{n(p?.unchanged)}</span><span><i className="seg-loaded" />Loaded{n(p?.loaded)}</span>
-      {!finished && <span><i className="seg-flight" />In flight{n(p?.inFlight)}</span>}<span><i className="seg-failing" />Failed{n(p?.failed)}</span>
+      {!finished && <span><i className="seg-running" />In flight{n(p?.inFlight)}</span>}<span><i className="seg-failing" />Failed{n(p?.failed)}</span>
       {finished ? <span><i className="seg-notrun" />Not run{n(p?.notRun ?? 0)}</span>
         : <span><i className="seg-track" />{p ? "To go" : "Not checked yet"}{n(left)}</span>}
     </div>
@@ -667,6 +678,29 @@ export const databasePath = (group: unknown, server: unknown, database: unknown)
 export function Name({ children }: { children: unknown }) {
   const words = String(children ?? "").split(" ");
   return <>{words.map((w, i) => <Fragment key={i}>{i > 0 && " "}<span className="word">{w}</span></Fragment>)}</>;
+}
+
+/** The Databricks UI's disclosure chevron, as Catalog Explorer's tree and a job page's collapsible panels draw it:
+ * pointing right when closed and down when open. A menu's button shows it pointing down. */
+export function Chevron({ open }: { open: boolean }) {
+  return (
+    <svg className={`chevron${open ? " open" : ""}`} width="16" height="16" viewBox="0 0 16 16" aria-hidden="true" focusable="false">
+      <path d="M6 3.5 10.5 8 6 12.5" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" />
+    </svg>
+  );
+}
+
+/** A row that opens to show what is under it: the chevron and the row's name in one button, so the whole name is the
+ * hit area and Enter or Space opens it, with aria-expanded as the Databricks UI sets it. With no children it is the
+ * chevron alone, for a row whose name is a link; give it a label then. */
+export function Twisty({ open, onToggle, label, children }: { open: boolean; onToggle: () => void; label?: string;
+                        children?: ReactNode }) {
+  return (
+    <button type="button" className={`twisty${children ? " named" : ""}`} aria-expanded={open} aria-label={label}
+      title={label} onClick={onToggle}>
+      <Chevron open={open} />{children}
+    </button>
+  );
 }
 
 /** A menu behind a button, as the Databricks UI keeps a job's less common and destructive actions (the kebab) and the

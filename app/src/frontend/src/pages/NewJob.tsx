@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "react-router-dom";
 import { api, type Row } from "../api";
-import { Crumbs, ErrorBox, Menu, Modal, Notice, PageHead, Section, fmtInt, plural, useConfirm } from "../components";
+import { Crumbs, ErrorBox, Menu, Modal, Notice, PageHead, Section, fmtInt, plural, useConfirm, Chevron } from "../components";
 import { CADENCES, IdentityFields, ParameterFields, RunFields, WritesFields, paramsSummary } from "./jobForm";
 import { DiscoverDialog } from "./Discover";
 import { serverRowCells, targetBlock } from "./previewRows";
@@ -140,7 +140,7 @@ export default function NewJob() {
       </Section>
 
       <Section title="What it ingests" note="The servers, databases and tables this job ingests."
-        actions={<Menu label="Add tables ▾" buttonClass="ghost" title="Add tables">
+        actions={<Menu label={<>Add tables <Chevron open /></>} buttonClass="ghost" title="Add tables">
           <button onClick={() => setDiscovering(true)}>Discover on a source<span className="sub">the first choice: a UC connection, tested first; then the whole server, whole databases or single tables</span></button>
           <button onClick={() => setImporting(true)}>Import a CSV<span className="sub">the fallback: one line per table or database, read through a connection; uploaded once, then choose from it</span></button>
         </Menu>}>

@@ -45,8 +45,7 @@ export default function Database() {
       <ErrorBox error={found.error} />
       {d && (
         <div className="metrics">
-          <div className="metric"><div className="metric-label">Tables now</div><StateBar row={d} />
-            <div className="metric-sub">{fmtInt(d.state_current)} current, {fmtInt(d.state_late)} late, {fmtInt(d.state_first_load)} waiting for a first load, {fmtInt(d.state_failing)} failing</div></div>
+          <div className="metric"><div className="metric-label">Tables now</div><StateBar row={d} full /></div>
         </div>
       )}
       <Section title="Tables" note={running ? "Failing first, then in flight, then to go, then the rest. Its part in the group run going now." : "Failing first, then by name."}

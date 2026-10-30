@@ -158,12 +158,12 @@ export function NeedsAttention({ jobs, total }: { jobs: Row[]; total: number }) 
 /** Every enabled table by state, each state linking to the tables in it, as the Jobs UI's run summary counts. */
 function Freshness({ totals }: { totals: Row }) {
   const states: [string, string, string, string][] = [
-    ["state_loaded", "seg-current", "Loaded", "/tables"],
-    ["state_first_load", "seg-first", "Waiting for a first load", "/tables?status=seeding"],
+    ["state_loaded", "seg-loaded", "Loaded", "/tables"],
+    ["state_first_load", "seg-waiting", "Waiting for a first load", "/tables?status=seeding"],
     ["state_failing", "seg-failing", "Failing", "/tables?status=failing"]];
   return (
     <Section title="Freshness" note="Every enabled table of every job, by its state now. A database is late when one of its tables is past its freshness target; its database page lists those tables.">
-      <StateBar row={totals} />
+      <StateBar row={totals} full />
       <div className="key" style={{ marginTop: 8 }}>
         {states.map(([key, cls, label, to]) => (
           <span key={key}><i className={cls} /><Link to={to}>{label}</Link> <b>{fmtInt(totals[key])}</b></span>

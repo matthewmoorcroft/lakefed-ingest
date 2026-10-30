@@ -8,10 +8,7 @@ import { changeInProgress, deleteNotice, rediscoveryBusy, rediscoveryButton, red
 import { Tree } from "./JobEdit";
 import { TargetTables } from "./TargetTables";
 import { RunningTasks } from "./tasks";
-import { OutLink,
-  Crumbs, Badge, ErrorBox, Menu, Modal, Name, Notice, PageHead, ProgressBar, RunStatus, Section, StateBar, fmtClock, fmtDuration, fmtInt,
-  fmtSlot, fmtSpeed, fmtTime, jobRunPath, plural, progressFrom, useConfirm, type ConfirmRequest
-} from "../components";
+import { OutLink, Crumbs, Badge, ErrorBox, Menu, Modal, Name, Notice, PageHead, ProgressBar, RunStatus, Section, StateBar, fmtClock, fmtDuration, fmtInt, fmtSlot, fmtSpeed, fmtTime, jobRunPath, plural, progressFrom, useConfirm, type ConfirmRequest, Twisty } from "../components";
 
 const PAGE = 25;
 
@@ -51,8 +48,8 @@ export function JobRunsTable({ runs, showJob }: { runs: Row[]; showJob?: boolean
           </tr>
         ) : (
           <Fragment key={`${r.job_id}-${r.slot}`}><tr>
-            <td className="name"><button className="twisty" aria-expanded={open === `${r.job_id}-${r.slot}`} title="Its group runs"
-              onClick={() => setOpen(open === `${r.job_id}-${r.slot}` ? null : `${r.job_id}-${r.slot}`)}>{open === `${r.job_id}-${r.slot}` ? "▾" : "▸"}</button>
+            <td className="name"><Twisty open={open === `${r.job_id}-${r.slot}`} label="Its group runs"
+              onToggle={() => setOpen(open === `${r.job_id}-${r.slot}` ? null : `${r.job_id}-${r.slot}`)} />
               <Link to={jobRunPath(r.job_id, r.slot)}>{new Date(r.slot).toLocaleString([], { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" })}</Link>
               {r.outside && <span className="sub">outside its schedule: Run now or started by hand</span>}</td>
             {showJob && <td className="name"><Link to={`/ingestion-jobs/${r.job_id}`}><Name>{r.job_name}</Name></Link></td>}
@@ -107,58 +104,67 @@ function RunGroups({ jobId, slot }: { jobId: unknown; slot: string }) {
   );
 }
 
-/** The job run going now, read from its Databricks runs every few seconds: the run, its check and what the check
- * found, then the group runs it started, as the Jobs UI's run page shows a run with its tasks and a for-each task's
- * iterations. Shown only while something is going. */
+/** The job run going now, read from its Databricks runs every few seconds, in the order it runs, as a Databricks job
+ * run's page lists its tasks: the job's run as the heading, then step 1 the check and what it found, then step 2 the
+ * group runs the check starts (a job without the check has only the group runs). Shown only while something is going. */
 function RunningNow({ live }: { live: Row }) {
   const check: Row | null = live.check;
   const found: Row | null = live.found;
   const runs: Row[] = live.group_runs ?? [];
   const going = runs.filter((g) => g.active).length;
+  const checking = check && (check.status?.label === "Running" || check.status?.label === "Starting");
   return (
     <Section title="Running now" note={`Read from its Databricks runs every few seconds, so a run shows while its clusters are still starting. ${fmtClock(live.read_at)}.`}>
-      <div className="table-wrap"><table className="data dense">
-        <thead><tr><th>Run</th><th>Status</th><th>Started</th><th>What it did</th><th></th></tr></thead>
-        <tbody>
-          {(live.wrappers ?? []).map((w: Row) => (
-            <tr key={`w-${w.run_id}`}><td className="name"><b>The job's run</b><span className="sub">its Databricks job, which starts {check ? "the check" : "the group run"}</span></td>
-              <td><RunStatus status={null} outcome={w.status} /></td><td>{fmtClock(w.started)}</td><td></td>
-              <td>{w.url && <OutLink href={w.url}>Open run</OutLink>}</td></tr>
-          ))}
-          {check && (
-            <tr><td className="name"><b>Check</b><span className="sub">looks at each database for changes, then starts a group run for each group with work</span></td>
-              <td><RunStatus status={null} outcome={check.status} /></td><td>{fmtClock(check.started)}</td>
-              <td>{found && check.status?.label !== "Running" && check.status?.label !== "Starting"
-                ? <>{fmtInt(found.databases_with_work)} {plural(found.databases_with_work, "database")} changed
-                  {found.unchanged_databases != null && <>, {fmtInt(found.unchanged_databases)} unchanged and stamped</>};{" "}
-                  started {fmtInt(found.started)} of {fmtInt(found.groups)} {plural(found.groups, "group")}</>
-                : <span className="muted">checking the job's databases</span>}</td>
-              <td>{check.url && <OutLink href={check.url}>Open run</OutLink>}</td></tr>
-          )}
-        </tbody>
-      </table></div>
-      <h3>Group runs: {fmtInt(runs.length)}{runs.length ? `, ${fmtInt(going)} going` : ""}</h3>
-      <div className="table-wrap"><table className="data dense">
-        <thead><tr><th>Ingestion group</th><th>Status</th><th>Started</th><th>Progress</th><th className="num">Failed</th><th></th></tr></thead>
-        <tbody>
-          {runs.map((g) => {
-            const p = g.progress;
-            return (
-              <tr key={g.run_id}>
-                <td className="name"><Link to={`/collections/${encodeURIComponent(g.task_collection)}`}>{g.task_collection}</Link></td>
-                <td><RunStatus status={null} outcome={g.status} />{g.status?.note && <span className="sub">{g.status.note}</span>}</td>
-                <td>{fmtClock(g.started)}</td>
-                <td style={{ minWidth: 200 }}>{p ? <><ProgressBar p={progressFrom({ total: p.planned, loaded: p.done, failed: p.failed })} />
-                  <span className="sub">{fmtInt(p.done)} of {fmtInt(p.planned)} {plural(p.planned, "table")}</span></>
-                  : <span className="muted">{g.active ? "shown once the run has started on its cluster" : ""}</span>}</td>
-                <td className="num" style={{ color: Number(p?.failed) ? "var(--bad)" : undefined }}>{p ? fmtInt(p.failed) : ""}</td>
-                <td>{g.url && <OutLink href={g.url}>Open run</OutLink>}</td>
-              </tr>
-            );
-          })}
-          {!runs.length && <tr><td colSpan={6} className="muted">{check ? "No group run yet: the check starts them once it has looked." : "No group run yet."}</td></tr>}
-        </tbody>
-      </table></div>
+      {(live.wrappers ?? []).map((w: Row) => (
+        <div className="run-head" key={`w-${w.run_id}`}>
+          <b>The job's run</b><RunStatus status={null} outcome={w.status} /><span className="muted">started {fmtClock(w.started)}</span>
+          {w.url && <OutLink href={w.url}>Open run</OutLink>}
+        </div>
+      ))}
+      <ol className="run-steps">
+        {check && (
+          <li>
+            <h3><span className="step-number">1</span>Check</h3>
+            <p className="muted small">Looks at each database for changes, then starts a group run for each group with work.</p>
+            <div className="table-wrap"><table className="data dense">
+              <thead><tr><th>Status</th><th>Started</th><th>What it found</th><th></th></tr></thead>
+              <tbody><tr>
+                <td><RunStatus status={null} outcome={check.status} /></td><td>{fmtClock(check.started)}</td>
+                <td>{found && !checking
+                  ? <>{fmtInt(found.databases_with_work)} {plural(found.databases_with_work, "database")} changed
+                    {found.unchanged_databases != null && <>, {fmtInt(found.unchanged_databases)} unchanged and stamped</>};{" "}
+                    started {fmtInt(found.started)} of {fmtInt(found.groups)} {plural(found.groups, "group")}</>
+                  : <span className="muted">checking the job's databases</span>}</td>
+                <td>{check.url && <OutLink href={check.url}>Open run</OutLink>}</td>
+              </tr></tbody>
+            </table></div>
+          </li>
+        )}
+        <li>
+          <h3>{check && <span className="step-number">2</span>}Group runs: {fmtInt(runs.length)}{runs.length ? `, ${fmtInt(going)} going` : ""}</h3>
+          {check && !runs.length
+            ? <p className="muted small">{checking || !found ? "Starts when the check ends: one run for each group with changes." : "The check found no group with work, so none started."}</p>
+            : <div className="table-wrap"><table className="data dense">
+              <thead><tr><th>Ingestion group</th><th>Status</th><th>Started</th><th>Progress</th><th></th></tr></thead>
+              <tbody>
+                {runs.map((g) => {
+                  const p = g.progress;
+                  return (
+                    <tr key={g.run_id}>
+                      <td className="name"><Link to={`/collections/${encodeURIComponent(g.task_collection)}`}>{g.task_collection}</Link></td>
+                      <td><RunStatus status={null} outcome={g.status} />{g.status?.note && <span className="sub">{g.status.note}</span>}</td>
+                      <td>{fmtClock(g.started)}</td>
+                      <td style={{ minWidth: 220 }}>{p ? <ProgressBar p={progressFrom({ total: p.planned, loaded: p.done, failed: p.failed })} />
+                        : <span className="muted">{g.active ? "shown once the run has started on its cluster" : ""}</span>}</td>
+                      <td>{g.url && <OutLink href={g.url}>Open run</OutLink>}</td>
+                    </tr>
+                  );
+                })}
+                {!runs.length && <tr><td colSpan={5} className="muted">No group run yet.</td></tr>}
+              </tbody>
+            </table></div>}
+        </li>
+      </ol>
     </Section>
   );
 }
@@ -267,8 +273,7 @@ export default function IngestionJob() {
       <ErrorBox error={job.error} />
       {j && (
         <div className="metrics">
-          <div className="metric"><div className="metric-label">Tables now</div><StateBar row={j} />
-            <div className="metric-sub">{fmtInt(j.state_loaded)} loaded, {fmtInt(j.late_databases)} late databases, {fmtInt(j.state_first_load)} waiting, {fmtInt(j.state_failing)} failing</div></div>
+          <div className="metric"><div className="metric-label">Tables now</div><StateBar row={j} full /></div>
           <div className="metric"><div className="metric-label">Last job run</div>
             <div className="metric-value small-value">{last ? <Link to={jobRunPath(j.id, last.slot)}><RunStatus status={null} outcome={last.outcome} /></Link> : "Never run"}</div>
             <div className="metric-sub">{last ? `${fmtSlot(last.slot)}${last.took_s != null ? `, took ${fmtDuration(last.took_s)}` : ""}` : ""}</div></div>

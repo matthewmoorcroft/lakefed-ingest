@@ -12,7 +12,7 @@ interface Lane { job_id: number; name: string; description: string; paused: bool
 interface Timeline { start: string; end: string; jobs: Lane[]; not_in_job: { groups: string[]; group_runs: Row[] } | null }
 
 const LABEL_W = 260, MIN_CHART_W = 600, ROW_H = 40, AXIS_H = 26, MIN_TICK_W = 64;
-const TONE: Record<string, string> = { ok: "var(--s-current)", warn: "var(--s-late)", bad: "var(--s-failing)", run: "var(--s-flight)" };
+const TONE: Record<string, string> = { ok: "var(--s-loaded)", warn: "var(--s-late)", bad: "var(--s-failing)", run: "var(--s-running)" };
 const GROUP_RUN: Record<string, string> = { completed: TONE.ok, failed: TONE.bad, running: TONE.run, skipped: TONE.warn };
 
 const groupsText = (run: Row) => (run.groups ?? []).map((g: Row) => `${g.group}: ${g.status ? statusName(g.status) : "did not run"}`).join("\n");

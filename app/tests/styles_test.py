@@ -12,11 +12,22 @@ def rule(selector: str) -> str:
     return match.group(1)
 
 
-def test_waiting_for_a_first_load_is_a_solid_pale_accent_with_no_outline():
-    assert "box-shadow" not in rule(".seg-first")
-    assert "border" not in rule(".seg-first")
-    first = re.search(r"--s-first:\s*([^;]+);", STYLES).group(1)
-    assert first.replace(" ", "") == "color-mix(insrgb,var(--db-accent-surface)32%,white)"
+def test_waiting_for_a_first_load_is_a_solid_grey_with_no_outline():
+    assert "box-shadow" not in rule(".seg-waiting")
+    assert "border" not in rule(".seg-waiting")
+    waiting = re.search(r"--s-waiting:\s*([^;]+);", STYLES).group(1)
+    assert waiting.replace(" ", "") == "color-mix(insrgb,var(--db-text-subtle)55%,white)"
+
+
+def test_the_states_take_the_databricks_status_colours():
+    """Green loaded, blue running, grey waiting, amber late, red failed: the design system's status tokens."""
+    colours = dict(re.findall(r"--s-([a-z]+):\s*([^;]+);", STYLES))
+    assert colours["loaded"] == "var(--db-positive-border)"
+    assert colours["running"] == "var(--db-accent-surface)"
+    assert colours["late"] == "var(--db-caution-surface-strong)"
+    assert colours["failing"] == "var(--db-negative-surface)"
+    for tone, token in (("loaded", "--ok"), ("late", "--warn"), ("failing", "--bad")):
+        assert f"var({token})" in rule(f".tone-{tone}")
 
 
 COMPONENTS = (Path(__file__).resolve().parent.parent / "src" / "frontend" / "src" / "components.tsx").read_text()

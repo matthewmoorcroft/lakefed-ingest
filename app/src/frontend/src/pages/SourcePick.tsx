@@ -1,7 +1,7 @@
 import { Fragment, useState } from "react";
 import { keepPreviousData, useQuery } from "@tanstack/react-query";
 import { api, qs, type Row } from "../api";
-import { ErrorBox, Notice, Pager, fmtInt, plural } from "../components";
+import { ErrorBox, Notice, Pager, fmtInt, plural, Twisty } from "../components";
 import { TriBox } from "./Discover";
 import { serverRowPick, underFilter } from "./pickState";
 
@@ -139,8 +139,7 @@ export function SourcePick({ kind, sourceId, picked, setPicked }: { kind: "uploa
               <tr className="l2"><td className="name" style={{ paddingLeft: 30 }}>
                 <TriBox pick={isWhole(d) ? "all" : tablesOf(d).length ? "part" : "none"} label={`The whole database ${d.src_database}`}
                   onClick={() => !(picked.whole_server && underFilter(d.src_database, picked.filter)) && toggleDatabase(d)} />{" "}
-                <button className="twisty" aria-expanded={open === key(d)} onClick={() => setOpen(open === key(d) ? null : key(d))}>
-                  {open === key(d) ? "▾" : "▸"}</button>{d.src_database}
+                <Twisty open={open === key(d)} onToggle={() => setOpen(open === key(d) ? null : key(d))}>{d.src_database}</Twisty>
                 {servers.length > 1 && <span className="sub">{d.server}</span>}</td>
                 <td className="num">{fmtInt(d.tables)}{tablesOf(d).length > 0 && <span className="sub">{fmtInt(tablesOf(d).length)} chosen</span>}</td>
                 <td className="muted">{loadTypes(d)}</td></tr>

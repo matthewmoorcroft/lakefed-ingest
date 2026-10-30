@@ -1,7 +1,7 @@
 import { Fragment, useEffect, useState } from "react";
 import { keepPreviousData, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, qs, type Row } from "../api";
-import { ErrorBox, Modal, Notice, OutLink, Pager, Tag, fmtInt, plural } from "../components";
+import { ErrorBox, Modal, Notice, OutLink, Pager, Tag, fmtInt, plural, Twisty } from "../components";
 import { useSettings } from "../App";
 import { DatabaseTables } from "./SourcePick";
 import { serverRowPick, underFilter, type Pick } from "./pickState";
@@ -305,7 +305,7 @@ function Step2({ connection, discoveryId, typedNames, picks, setPicks, wholeServ
             <Fragment key={d}>
               <tr className="l2"><td className="name" style={{ paddingLeft: 30 }}>
                 <TriBox pick={pickOf(d)} label={`The whole database ${d}`} onClick={() => !covered(d) && setAll([d], pickOf(d) === "all" ? "none" : "all")} />{" "}
-                <button className="twisty" aria-expanded={open === d} onClick={() => openDatabase(d)}>{open === d ? "▾" : "▸"}</button>{d}</td>
+                <Twisty open={open === d} onToggle={() => openDatabase(d)}>{d}</Twisty></td>
                 <td className="num">{reading === d ? "reading…" : ""}</td>
                 <td className="muted">{pickOf(d) === "part" ? `${fmtInt((picks[d] as string[]).length)} chosen` : ""}</td></tr>
               {open === d && read[d] && <DatabaseTables kind="discovery" sourceId={read[d]} server={connection} database={d}

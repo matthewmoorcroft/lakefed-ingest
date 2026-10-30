@@ -2,7 +2,7 @@ import { Fragment, useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate, useParams } from "react-router-dom";
 import { api, qs, type Row } from "../api";
-import { Crumbs, ConfirmButton, ErrorBox, Menu, Notice, PageHead, Pager, Section, StateBar, fmtInt, plural, useConfirm } from "../components";
+import { Crumbs, ConfirmButton, ErrorBox, Menu, Notice, PageHead, Pager, Section, StateBar, fmtInt, plural, useConfirm, Twisty, Chevron } from "../components";
 import { usePermissions } from "../permissions";
 import { CADENCES, IdentityFields, ParameterFields, RunFields, WritesFields, paramsSummary } from "./jobForm";
 import { ImportCsvDialog } from "./NewJob";
@@ -124,8 +124,7 @@ function DatabaseRows({ jobId, server, locked, readOnly }: { jobId: string; serv
       {(dbs.data?.items ?? []).map((d: Row) => (
         <Fragment key={d.database}>
           <tr className="l2">
-            <td className="name"><button className="twisty" aria-expanded={open === d.database}
-              onClick={() => setOpen(open === d.database ? null : d.database)}>{open === d.database ? "▾" : "▸"}</button>{d.database}</td>
+            <td className="name"><Twisty open={open === d.database} onToggle={() => setOpen(open === d.database ? null : d.database)}>{d.database}</Twisty></td>
             <td className="muted">{d.client_id ? `client_id ${d.client_id}` : ""}</td>
             <td></td>
             <td className="num">{fmtInt(d.tables)} {Number(d.missing) > 0 && <span className="tag warn">{fmtInt(d.missing)} missing</span>}</td>
@@ -160,8 +159,7 @@ export function Tree({ jobId, locked, readOnly }: { jobId: string; locked: Locke
           {(servers.data?.items ?? []).map((s: Row) => (
             <Fragment key={s.server}>
               <tr>
-                <td className="name"><button className="twisty" aria-expanded={open === s.server}
-                  onClick={() => setOpen(open === s.server ? null : s.server)}>{open === s.server ? "▾" : "▸"}</button><b>{s.server}</b></td>
+                <td className="name"><Twisty open={open === s.server} onToggle={() => setOpen(open === s.server ? null : s.server)}><b>{s.server}</b></Twisty></td>
                 <td>{s.src_connection ? `UC connection ${s.src_connection}` : `JDBC ${s.src_host}`}</td>
                 <td></td>
                 <td className="num">{fmtInt(s.databases)} · {fmtInt(s.tables)}</td>
@@ -501,7 +499,7 @@ export default function JobEdit() {
       </Section>}
 
       <Section title="What it ingests" note="Open a server to see its databases, and a database to see its tables. A table's load type is the same in every database: change it and it changes in all of them."
-        actions={locked ? <button className="ghost" disabled title={locked}>Add tables ▾</button> : <Menu label="Add tables ▾" buttonClass="ghost" title="Add tables">
+        actions={locked ? <button className="ghost" disabled title={locked}>Add tables <Chevron open /></button> : <Menu label={<>Add tables <Chevron open /></>} buttonClass="ghost" title="Add tables">
           <button onClick={addTables.discover}>Discover on a source<span className="sub">the first choice: a UC connection, tested first, then the whole server, whole databases or single tables</span></button>
           <button onClick={addTables.open}>Import a CSV of tables<span className="sub">the fallback, for a list Discover can't find: a UC connection, then one line per table or database</span></button>
           <button onClick={() => setAddOpen(true)}>Pick databases by hand<span className="sub">each database gets every table of the job</span></button>

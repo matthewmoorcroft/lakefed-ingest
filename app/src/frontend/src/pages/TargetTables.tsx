@@ -1,7 +1,7 @@
 import { Fragment, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { api, qs, type Row } from "../api";
-import { ErrorBox, OutLink, Pager, Section, StateBar, StateKey, fmtAgo, fmtInt, plural } from "../components";
+import { ErrorBox, OutLink, Pager, Section, StateBar, StateKey, fmtAgo, fmtInt, plural, Twisty } from "../components";
 
 // A job's target tables: where its data lands, each with its state and the rows the run records say were written over
 // 7 days. Opening one lists the source tables and databases written into it. Names follow Catalog Explorer.
@@ -60,8 +60,7 @@ export function TargetTables({ jobId }: { jobId: string }) {
           {(targets.data?.items ?? []).map((t: Row) => (
             <Fragment key={t.target}>
               <tr>
-                <td className="name"><button className="twisty" aria-expanded={open === t.target} title={t.target}
-                  onClick={() => setOpen(open === t.target ? null : t.target)}>{open === t.target ? "▾" : "▸"}</button><b>{t.table}</b>
+                <td className="name"><Twisty open={open === t.target} onToggle={() => setOpen(open === t.target ? null : t.target)}><b>{t.table}</b></Twisty>
                   <span className="sub target-path">{t.catalog}.{t.schema}</span></td>
                 <td><StateBar row={t} /></td>
                 <td className="num">{t.rows_written_7d != null ? fmtInt(t.rows_written_7d) : ""}
