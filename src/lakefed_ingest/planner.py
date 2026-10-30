@@ -162,7 +162,7 @@ def cycle_parts(work_all: Iterable[tuple]) -> List[str]:
 def cycle_summary(work_id: str, parts: Dict[str, dict]) -> dict:
     """How a run of a cycle's share ended, from each part's own answer (its notebook exit, or the error that
     stopped it): the parts that failed fail the run; skipped ones (locked, or nothing of theirs left) don't. A part
-    that ended with failed tables failed only if it raised (fail_on_table_errors), as a run of one collection."""
+    with failed tables ends as failed (its run raises, see ``failure_message``), so it fails the cycle too."""
     status = {name: str(answer.get("status") or "completed") for name, answer in parts.items()}
     return {"work_id": work_id, "parts": len(parts),
             "failed": sorted(name for name, s in status.items() if s == "failed"),
@@ -170,6 +170,22 @@ def cycle_summary(work_id: str, parts: Dict[str, dict]) -> dict:
             "tables": sum(int(a.get("total") or 0) for a in parts.values()),
             "ok": sum(int(a.get("ok") or 0) for a in parts.values()),
             "run_ids": {name: a.get("run_id") for name, a in parts.items()}}
+
+
+FAILURE_TABLES_NAMED = 5
+
+
+def failure_message(run_id, task_collection: str, failed: List[tuple], link: str = "") -> str:
+    """The error a run ends with when tables failed: how many, the first few with their errors, and where to
+    look for the rest. ``failed`` is (control row, error) pairs in the order they failed."""
+    lines = [f"{len(failed)} table(s) failed in run {run_id} of {task_collection}:"]
+    for cfg, error in failed[:FAILURE_TABLES_NAMED]:
+        lines.append(f"{cfg['src_database']}.{cfg['src_schema']}.{cfg['src_table']}: {str(error)[:200]}")
+    if len(failed) > FAILURE_TABLES_NAMED:
+        lines.append(f"and {len(failed) - FAILURE_TABLES_NAMED} more")
+    lines.append(f"Job page: {link}" if link else
+                 "See the run in the operations app or lakefed_ingest.ingest_event.")
+    return "\n".join(lines)
 
 
 def sink_checked_configs(configs: List[dict]) -> List[dict]:
