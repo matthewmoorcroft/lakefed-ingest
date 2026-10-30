@@ -27,6 +27,10 @@ DELETE_JOB_ID = os.environ.get("DELETE_JOB_ID")
 APP_NAME = os.environ.get("DATABRICKS_APP_NAME")
 # The source this app was deployed from: the bundle's git commit, or what the deploy passed (app_version).
 APP_VERSION = os.environ.get("APP_VERSION") or None
+# Who manages the app besides workspace admins: users or groups, comma separated (the bundle's app_managers, by default
+# the deployer). The app's service principal can't read its own app's access list without Can Manage on the app, which
+# it isn't given, so this list is how Manage knows its managers.
+APP_MANAGERS = {name.strip().lower() for name in os.environ.get("APP_MANAGERS", "").split(",") if name.strip()}
 # Group given CAN_VIEW on the wrapper jobs the app creates for schedules (blank = owner and admins only).
 SCHEDULE_JOB_VIEW_GROUP = os.environ.get("SCHEDULE_JOB_VIEW_GROUP", "users") or None
 
@@ -196,16 +200,23 @@ def user_job_permission(job_id, user: str) -> Optional[str]:
 
 
 def user_app_permission(user: str) -> Optional[str]:
-    """The signed-in user's highest permission on this app (Can Use or Can Manage), from the app's access list as its
-    service principal reads it. A workspace admin manages every app, so an admin's is known without the list."""
+    """The signed-in user's highest permission on this app (Can Use or Can Manage). A workspace admin, and a user or a
+    member of a group in APP_MANAGERS, manages it, with no call to Databricks. Anyone else is asked of the app's access
+    list as its service principal reads it; when it may not read it (it has no Can Manage on its own app), a signed-in
+    user has Can Use, since the Apps proxy let them in."""
     groups = user_groups(user)
-    if (user or "").strip() and "admins" in groups:
+    if not (user or "").strip():
+        return None
+    if "admins" in groups or {user.strip().lower(), *(g.lower() for g in groups)} & APP_MANAGERS:
         return "CAN_MANAGE"
 
     def read():
         acl = workspace().permissions.get("apps", str(APP_NAME)).access_control_list or []
         return [entry.as_dict() for entry in acl]
-    return highest_permission(_cached(("app-acl", str(APP_NAME)), read), user, groups)
+    try:
+        return highest_permission(_cached(("app-acl", str(APP_NAME)), read), user, groups)
+    except Exception:
+        return "CAN_USE"
 
 
 def app_deployment() -> dict:

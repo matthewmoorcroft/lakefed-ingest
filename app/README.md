@@ -307,9 +307,10 @@ The app runs as its own service principal (created with the app):
   so a grant to `data-eng` counts for a member of `team-x` inside it. A lookup that fails or passes those caps
   keeps the groups found so far: it can refuse something Databricks would allow, never the reverse.
 
-  Manage and its endpoints (`/api/manage/...`) need `CAN_MANAGE` on the app itself (its
-  Databricks permission; workspace admins have it). The service principal reads the app's access list through the
-  Permissions API: where it isn't allowed that read, only workspace admins see Manage, and the refusal says why.
+  Manage and its endpoints (`/api/manage/...`) are for the app's managers: workspace admins, and the users or groups
+  in the bundle's `app_managers` (by default the user who deploys it). Anyone else is asked of the app's access list
+  (`CAN_MANAGE` on the app itself), which the service principal can read only with Can Manage on its own app; it isn't
+  given that, so without a place in `app_managers` a user is refused, and the refusal says how to get one.
 
   Running the discovery job, or cancelling a run, needs `CAN_MANAGE_RUN` on that job. Groups in no
   ingestion job, and new paused jobs, are open to everyone with `CAN_USE` on the app. The server checks every
@@ -332,6 +333,8 @@ Prerequisites: the ingestion bundle is deployed and its setup job has run (Lakeb
      bundle prefixes job names (`[dev your_name] lakefed_ingest`), so set the ids or the prefixed
      names for dev targets.
    - `app_name`: 30 characters max.
+   - `app_managers`: who sees Manage besides workspace admins, users or groups, comma separated; by default the user
+     who deploys.
    - `app_version`: what Manage shows as the version, by default the git commit deployed from. It is blank when the
      bundle is deployed from a folder that isn't a git checkout: pass `--var app_version=<commit>` there.
 2. Deploy and start the app, then grant it Lakebase access. Run these from `app/`, as the user who

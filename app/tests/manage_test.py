@@ -6,6 +6,7 @@ import io
 import json
 
 import pytest
+from pathlib import Path
 
 pytest.importorskip("fastapi")
 pytest.importorskip("httpx")
@@ -75,9 +76,11 @@ def test_only_can_manage_on_the_app_manages_it(monkeypatch):
     monkeypatch.setattr(main.jobs, "user_app_permission", lambda user: levels.get(user))
     assert main._manage_refusal("admin@example.com") is None and main._manage_refusal("owner@example.com") is None
     assert main._manage_refusal("op@example.com") == (
-        "managing the app needs Can Manage on the app lakefed-ops; you have Can Use")
+        "managing the app needs Can Manage on the app lakefed-ops, or a place in its managers (the bundle's "
+        "app_managers); you have Can Use")
     assert main._manage_refusal("nobody@example.com") == (
-        "managing the app needs Can Manage on the app lakefed-ops; you have no access to it")
+        "managing the app needs Can Manage on the app lakefed-ops, or a place in its managers (the bundle's "
+        "app_managers); you have no access to it")
     assert main._manage_refusal(" ") == main.NO_IDENTITY
 
 
@@ -113,6 +116,39 @@ def test_the_app_acl_is_read_from_the_apps_permissions_and_admins_manage_it(monk
     assert main.jobs.user_app_permission("other@example.com") == "CAN_USE"
     assert calls == [("apps", "lakefed-ops")], "the access list is read once, then cached"
 
+
+
+def _refusing_acl(monkeypatch):
+    """The deployed app's case: its service principal may not read its own app's access list."""
+    class Permissions:
+        def get(self, kind, name):
+            raise PermissionError("User 1 does not have apps.ruleSets/get on workspaces/1/apps/2/ruleSets/default")
+    monkeypatch.setattr(main.jobs, "APP_NAME", "lakefed-ops")
+    monkeypatch.setattr(main.jobs, "workspace", lambda: type("W", (), {"permissions": Permissions()})())
+    monkeypatch.setattr(main.jobs, "_permission_cache", {})
+
+
+def test_a_listed_manager_manages_the_app_when_its_access_list_cant_be_read(monkeypatch):
+    _refusing_acl(monkeypatch)
+    monkeypatch.setattr(main.jobs, "APP_MANAGERS", {"owner@example.com", "ops-leads"})
+    monkeypatch.setattr(main.jobs, "user_groups", lambda user: ["ops-leads"] if user == "lead@example.com" else [])
+    assert main._manage_refusal("Owner@Example.com") is None, "the deployer, listed by default, manages it"
+    assert main._manage_refusal("lead@example.com") is None, "a member of a listed group manages it"
+
+
+def test_an_unlisted_user_is_refused_plainly_when_the_access_list_cant_be_read(monkeypatch):
+    _refusing_acl(monkeypatch)
+    monkeypatch.setattr(main.jobs, "APP_MANAGERS", {"owner@example.com"})
+    monkeypatch.setattr(main.jobs, "user_groups", lambda user: [])
+    refusal = main._manage_refusal("op@example.com")
+    assert refusal.endswith("app_managers); you have Can Use") and "ruleSets" not in refusal
+
+
+def test_the_bundle_lists_the_deployer_as_the_apps_manager_by_default():
+    bundle = (Path(main.__file__).parent.parent / "databricks.yml").read_text()
+    app = (Path(main.__file__).parent.parent / "resources" / "lakefed_ingest_app.yml").read_text()
+    assert "app_managers:" in bundle and "default: ${workspace.current_user.userName}" in bundle
+    assert "- name: APP_MANAGERS\n            value: ${var.app_managers}" in app
 
 def test_every_manage_endpoint_refuses_those_who_dont_manage_the_app(monkeypatch):
     monkeypatch.setattr(main.jobs, "APP_NAME", "lakefed-ops")

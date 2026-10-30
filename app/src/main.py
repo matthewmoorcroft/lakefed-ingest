@@ -1537,7 +1537,8 @@ def _manage_refusal(user: str) -> Optional[str]:
     if jobs.PERMISSION_RANK.get(level or "", 0) >= jobs.PERMISSION_RANK["CAN_MANAGE"]:
         return None
     have = f"you have {jobs.PERMISSION_LABEL.get(level, level)}" if level else "you have no access to it"
-    return f"managing the app needs Can Manage on the app {jobs.APP_NAME}; {have}"
+    return (f"managing the app needs Can Manage on the app {jobs.APP_NAME}, or a place in its managers (the bundle's "
+            f"app_managers); {have}")
 
 
 def _refuse(refusal: Optional[str]) -> None:

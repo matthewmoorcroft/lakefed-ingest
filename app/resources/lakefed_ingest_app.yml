@@ -47,6 +47,8 @@ resources:
             value_from: discovery-warehouse
           - name: APP_VERSION
             value: ${var.app_version}
+          - name: APP_MANAGERS
+            value: ${var.app_managers}
       resources:
         - name: ingest-job
           description: The lakefed_ingest ingestion job.

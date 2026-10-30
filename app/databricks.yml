@@ -12,6 +12,10 @@ variables:
   app_name:
     description: App name (lowercase letters, digits and dashes; 30 characters max).
     default: lakefed-ingest-ops
+  app_managers:
+    description: Who manages the app (sees Manage) besides workspace admins, users or groups, comma separated. By
+      default the user who deploys the bundle.
+    default: ${workspace.current_user.userName}
   app_version:
     description: The version the app shows under Manage. By default the commit deployed from; it is blank when the
       bundle is deployed from a folder that isn't a git checkout, so pass --var app_version=<commit> there.
