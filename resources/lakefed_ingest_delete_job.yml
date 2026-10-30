@@ -23,6 +23,7 @@ resources:
               drop_targets: "{{job.parameters.drop_targets}}"
               purge_drafts: "{{job.parameters.purge_drafts}}"
               draft_ttl_s: "{{job.parameters.draft_ttl_s}}"
+              control_ids: "{{job.parameters.control_ids}}"
               # Fixed here, not job parameters: whoever may start a run (the app) can't point it at another database.
               db_instance: ${var.lakebase_instance}
               db_name: ${var.lakebase_database}
@@ -47,3 +48,7 @@ resources:
           default: "false"
         - name: draft_ttl_s
           default: "7200"
+        # The third mode: remove some tables from a live job (schedule_id names it, control_ids are its control rows,
+        # comma-separated). Their rows and state go and their target tables stay; the app starts it per request.
+        - name: control_ids
+          default: ""

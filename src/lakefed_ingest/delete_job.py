@@ -16,6 +16,9 @@ stay behind, as groups in no job. This job runs as the deployer (the state datab
   changes can still be read after it is gone; their rows keep the group and control id of rows that no longer exist.
 - **Target tables, when asked:** after the commit, the tables only these groups write; one another job's rows also
   write is kept and named. A schema is never dropped.
+- **One table (control_ids, with schedule_id):** a live job's table removed in the app. Its control row and its
+  checkpoint and reseed_queue rows go, in one transaction under its group's run lock; the rollups of its database
+  and group are recounted; its target table and the job's other tables stay (delete_table_rows).
 - **Drafts (purge_drafts):** the app reads a choice's tables as they are chosen, into discovery rows marked draft,
   before the job exists. A draft discarded (the page was cancelled or left) or that nobody has asked about for
   draft_ttl_s is purged: its discovery and discovered_table rows. A draft a Create or an Add took has no mark, so it
@@ -29,7 +32,9 @@ from __future__ import annotations
 from typing import Dict, List, Optional
 
 from ct_engine import sink_fqn
-from state_store import ROLLUP_DATABASE_TABLE, ROLLUP_GROUP_TABLE, collection_lock_key, delete_rollups_sql
+from state_store import (ROLLUP_DATABASE_TABLE, ROLLUP_GROUP_TABLE, ROLLUP_LOCK_NAMESPACE, collection_lock_key,
+                         delete_rollups_sql, rollup_database_rewrite_sql, rollup_group_lock_sql,
+                         rollup_group_rewrite_sql)
 
 SCHEMA = "lakefed_ingest"
 
@@ -151,6 +156,79 @@ def delete_rows(cur, schedule_id: int) -> dict:
         deleted[table] = cur.rowcount
     deleted.update(_forget_selection(cur, schedule_id))
     return {"job": job["name"], "groups": groups, "deleted": deleted, "targets": targets}
+
+
+def job_groups_sql() -> str:
+    """The groups of a live job that no other live job holds: the only groups a table can leave without changing
+    another job's tables. Params: schedule id, schedule id."""
+    return (f"select distinct m.task_collection from {SCHEMA}.schedule_member m where m.schedule_id = %s "
+            f"and m.removed_at is null and not exists (select 1 from {SCHEMA}.schedule_member o "
+            f"join {SCHEMA}.schedule s on s.id = o.schedule_id where o.task_collection = m.task_collection "
+            f"and o.removed_at is null and s.deleted_at is null and o.schedule_id <> %s) order by 1")
+
+
+def table_rows_sql() -> str:
+    """The control rows named by id, with the group and database each belongs to and its target. Param: control ids."""
+    return (f"select id, task_collection, coalesce(src_database, '') as src_database, sink_catalog, sink_schema, "
+            f"sink_table from {SCHEMA}.control where id = any(%s) order by id")
+
+
+# A removed table's own state, keyed by its control row. The target table, database_check (a whole database's stamp,
+# still true for the tables that stay) and check_work (keyed by database) are not touched.
+TABLE_DELETES = (
+    ("reseed_queue", f"delete from {SCHEMA}.reseed_queue where control_id = any(%s)"),
+    ("checkpoint", f"delete from {SCHEMA}.checkpoint where control_id = any(%s)"),
+    ("control", f"delete from {SCHEMA}.control where id = any(%s)"),
+)
+
+
+def delete_table_rows(cur, schedule_id: int, control_ids) -> dict:
+    """Inside the caller's transaction: remove some tables from a live job. Their control rows and their own state go
+    (checkpoint, reseed_queue), the rollups of their databases and groups are recounted, and the target tables are
+    kept. The job, its other tables and run history stay. Takes the same run locks as a job's Delete: a run of a
+    table's group refuses the lot. Returns {"job", "groups", "control_ids", "missing", "deleted", "databases",
+    "targets"}. Raises ValueError for a deleted job, a row outside the job's own groups, or no ids; RunGoing while a
+    group is loading."""
+    ids = sorted({int(i) for i in control_ids})
+    if not ids:
+        raise ValueError("no control ids to remove")
+    cur.execute(schedule_sql(), (int(schedule_id),))
+    found = _rows(cur)
+    if not found:
+        raise ValueError(f"ingestion job {schedule_id} doesn't exist")
+    job = found[0]
+    if job["deleted_at"] is not None:
+        raise ValueError(f"ingestion job {job['name']} ({schedule_id}) is deleted: its delete job removes its tables")
+    cur.execute(job_groups_sql(), (int(schedule_id), int(schedule_id)))
+    own = {r["task_collection"] for r in _rows(cur)}
+    cur.execute(table_rows_sql(), (ids,))
+    rows = _rows(cur)
+    stray = sorted({r["task_collection"] for r in rows} - own)
+    if stray:
+        raise ValueError(f"group(s) {', '.join(stray)} aren't held by ingestion job {job['name']} alone: remove the "
+                         "table in the other job, or delete that group's job")
+    missing = sorted(set(ids) - {r["id"] for r in rows})
+    if not rows:
+        return {"job": job["name"], "groups": [], "control_ids": [], "missing": missing,
+                "deleted": {table: 0 for table, _ in TABLE_DELETES}, "databases": 0,
+                "targets": {"drop": [], "kept": []}}
+    groups = sorted({r["task_collection"] for r in rows})
+    for group in groups:
+        cur.execute(lock_sql(), (collection_lock_key(group),))
+        if not cur.fetchone()[0]:
+            raise RunGoing(f"a run of group {group} is loading: nothing was removed; remove the table again once it ends")
+    live = [r["id"] for r in rows]
+    cur.execute(rollup_group_lock_sql(), (ROLLUP_LOCK_NAMESPACE, groups))
+    deleted = {}
+    for table, sql in TABLE_DELETES:
+        cur.execute(sql, (live,))
+        deleted[table] = cur.rowcount
+    databases = sorted({(r["task_collection"], r["src_database"]) for r in rows})
+    cur.execute(rollup_database_rewrite_sql(), ([g for g, _ in databases], [d for _, d in databases]))
+    cur.execute(rollup_group_rewrite_sql(), (groups,))
+    kept = list(dict.fromkeys(sink_fqn(r) for r in rows))
+    return {"job": job["name"], "groups": groups, "control_ids": live, "missing": missing, "deleted": deleted,
+            "databases": len(databases), "targets": {"drop": [], "kept": kept}}
 
 
 DRAFT_TTL_S = 2 * 3600
