@@ -2,8 +2,10 @@
 connection, a timeout, Azure SQL throttling) is tried again in the same run after a pause, instead
 of waiting for the next run. Job parameter ``table_retries`` (default 2) sets the attempts; 0 turns it off.
 
-* ``classify`` (pure): "transient" or "permanent". The rules that rule a retry out are checked
-  first and win; an error no rule recognises is permanent, so it fails as it always has.
+* ``classify`` (pure): "transient", "permanent" or "unknown". The rules that rule a retry out are
+  checked first and win. An error no rule recognises is "unknown": it gets one retry within the run's
+  budget, then fails as permanent, so a new kind of failure is tried once more without being retried
+  for good.
 * ``RetryPolicy``: one run's limits, shared by its threads: attempts per table, a budget of retries
   for the whole run, and a stop per source server after repeated failed retries, so a source outage
   costs a few extra queries, not one per table. ``claim`` decides whether a failure is retried and
@@ -37,7 +39,7 @@ BASE_S = float(os.environ.get("LAKEFED_TABLE_RETRY_BASE_S", "10"))
 MAX_S = float(os.environ.get("LAKEFED_TABLE_RETRY_MAX_S", "120"))
 DEFAULT_BUDGET = 20
 
-TRANSIENT, PERMANENT = "transient", "permanent"
+TRANSIENT, PERMANENT, UNKNOWN = "transient", "permanent", "unknown"
 
 # Never retried, whatever else the error says: the run must stop writing, or another path owns it.
 _NEVER = (
@@ -53,6 +55,8 @@ _PERMANENT = (
     ct_engine.CT_NOT_ENABLED_MSG, ct_engine.CT_TABLE_NOT_ENABLED_MSG, "source table not found",
     "TABLE_OR_VIEW_NOT_FOUND", "UNRESOLVED_COLUMN", "DELTA_FAILED_TO_MERGE_FIELDS", "CAST_INVALID_INPUT",
     "DATATYPE_MISMATCH", "PKIX path building failed", "UnknownHostException",
+    # A schema change under the write (Delta): the same write fails until someone resolves it.
+    "DELTA_SCHEMA_CHANGE",
     # Oracle, PostgreSQL, MySQL: a refused login, a missing object, a missing privilege.
     "ORA-01017", "ORA-00942", "ORA-01031", "ORA-28000", "ORA-01045", "password authentication failed",
     "does not exist", "doesn't exist", "Access denied for user", "Unknown database", "Unknown column",
@@ -62,7 +66,9 @@ _PERMANENT_TYPES = (ValueError, KeyError, TypeError)
 _TRANSIENT = (
     "FAILED_JDBC.CONNECTION", "Connection reset", "Broken pipe", "SocketTimeoutException", "Read timed out",
     "connect timed out", "The TCP/IP connection to the host", "The connection is closed", "forcibly closed",
-    "ORA-03113", "ORA-03114", "ORA-03135", "ORA-12170", "ORA-12541", "Communications link failure",
+    "ORA-03113", "ORA-03114", "ORA-03135", "ORA-12170", "ORA-12541",
+    # Oracle listener: the service's instances are not up yet, or all are blocking new connections.
+    "ORA-12514", "ORA-12528", "Communications link failure",
     "too many clients", "Too many connections",
     # Unity Catalog throttling a remote_query read (a UC connection): "TEMPORARILY_UNAVAILABLE: Too many requests".
     "TEMPORARILY_UNAVAILABLE", "Too many requests", "REQUEST_LIMIT_EXCEEDED",
@@ -75,10 +81,16 @@ _SQLSERVER_FETCH_ABORTED = re.compile(
     r"SQLServerException(?:\[[^\]]*\])?: An error occurred during the current command \(Done status 0\)")
 _CODE = re.compile(r"\bcode=(\d+)")
 # SQLSTATE classes: 08 connection exception, 53300 too many connections, 57P01/57P03 server shutting
-# down or starting (transient); 28 invalid authorization, 42 syntax or access rule, 3D unknown
-# database (permanent).
-_SQLSTATE_TRANSIENT = re.compile(r"(?:SQLSTATE:?\s*|state=)(?:08[0-9A-Z]{3}|53300|57P01|57P03)\b")
-_SQLSTATE_PERMANENT = re.compile(r"(?:SQLSTATE:?\s*|state=)(?:28|42|3D)[0-9A-Z]{3}\b")
+# down or starting, 40001 serialization failure and 40P01 deadlock, 57014 a cancelled query (transient);
+# 22 bad data, 28 invalid authorization, 42 syntax or access rule, 3D unknown database (permanent).
+_SQLSTATE_TRANSIENT = re.compile(
+    r"(?:SQLSTATE:?\s*|state=)(?:08[0-9A-Z]{3}|53300|57P01|57P03|57014|40001|40P01)\b")
+_SQLSTATE_PERMANENT = re.compile(r"(?:SQLSTATE:?\s*|state=)(?:22|28|42|3D)[0-9A-Z]{3}\b")
+# Spark's schema-compatibility error classes (INCOMPATIBLE_DATA_FOR_TABLE and its kin): a write that
+# doesn't fit the table's schema fails the same way again.
+_PERMANENT_CLASS = re.compile(r"\bINCOMPATIBLE_[A-Z_]+")
+# SQL Server's deadlock victim (1205) and PostgreSQL's "deadlock detected" have the word in their text.
+_DEADLOCK = re.compile(r"deadlock", re.IGNORECASE)
 _ERROR_CLASS = re.compile(r"\[([A-Z][A-Z0-9_]*(?:\.[A-Z0-9_]+)*)\]")
 
 
@@ -149,19 +161,20 @@ def _call(obj, method: str):
 
 
 def classify(exc: BaseException) -> str:
-    """'transient' when retrying the table could succeed, else 'permanent' (also for anything not
-    recognised). Rules that rule a retry out win over the transient ones."""
+    """'transient' when retrying the table could succeed, 'permanent' when it can't, and 'unknown' for
+    an error no rule recognises (retried once, then failed). Rules that rule a retry out win over the
+    transient ones."""
     text = error_text(exc)
     codes = {int(c) for c in _CODE.findall(text)}
     if (any(m in text for m in _NEVER) or any(m in text for m in _PERMANENT) or codes & _PERMANENT_CODES
-            or _SQLSTATE_PERMANENT.search(text)):
+            or _SQLSTATE_PERMANENT.search(text) or _PERMANENT_CLASS.search(text)):
         return PERMANENT
     if any(isinstance(e, _PERMANENT_TYPES) for e in _chain(exc)):
         return PERMANENT
     if (any(m in text for m in _TRANSIENT) or codes & _TRANSIENT_CODES or _SQLSTATE_TRANSIENT.search(text)
-            or _SQLSERVER_FETCH_ABORTED.search(text)):
+            or _SQLSERVER_FETCH_ABORTED.search(text) or _DEADLOCK.search(text)):
         return TRANSIENT
-    return PERMANENT
+    return UNKNOWN
 
 
 def error_class(exc: BaseException) -> str:
@@ -227,11 +240,12 @@ class RetryPolicy:
 
     def claim(self, cfg: dict, exc: BaseException, attempt: int) -> Optional[float]:
         """Seconds to wait before retrying ``cfg`` after ``exc`` failed attempt ``attempt`` (0-based), or
-        None: fail now (permanent, out of attempts, budget spent, or the source stopped)."""
+        None: fail now (permanent, unknown after its one retry, out of attempts, budget spent, or the
+        source stopped)."""
         if self.retries == 0:
             return None
         try:
-            transient = classify(exc) == TRANSIENT
+            verdict = classify(exc)
             source = self.source_of(cfg)
         except Exception:                 # can't judge it: fail it, as without retries
             return None
@@ -239,7 +253,9 @@ class RetryPolicy:
         with self._lock:
             if attempt > 0:
                 self._retry_over(key, ok=False)      # the retry granted for it failed
-            if not transient or attempt >= self.retries or source in self._stopped:
+            if verdict == PERMANENT or attempt >= self.retries or source in self._stopped:
+                return None
+            if verdict == UNKNOWN and attempt > 0:   # an unrecognised error gets one retry, no more
                 return None
             if self._left <= 0:
                 self._exhausted = True

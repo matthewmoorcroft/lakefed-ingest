@@ -199,7 +199,7 @@ secret). See `README.md`, `docs/deploy.md`, `docs/monitoring.md`, `docs/lakebase
 | File | Purpose |
 |---|---|
 | `src/lakefed_ingest/ct_engine.py` | Source ops (Spark JDBC, or `remote_query` through a UC connection): CT versions, detection, read + MERGE / append, seed, sink DDL, batched appends (`append_batch`) |
-| `src/lakefed_ingest/table_retry.py` | Table retries: classify transient vs permanent errors (deny rules win, unknown = permanent), equal-jitter backoff, per-run budget and per-source stop (`RetryPolicy`), the worker wrapper (`with_retries`); the next attempt comes from `planner.retry_plan` |
+| `src/lakefed_ingest/table_retry.py` | Table retries: classify transient, permanent or unknown errors (deny rules win; unknown gets one retry, then fails), equal-jitter backoff, per-run budget and per-source stop (`RetryPolicy`), the worker wrapper (`with_retries`); the next attempt comes from `planner.retry_plan` |
 | `src/lakefed_ingest/batch_append.py` | Batched appends (append mode, consolidated sinks): plan batches by (sink, kind), write with bisect on failure, bulk checkpoints + telemetry; per-table fallback |
 | `src/lakefed_ingest/source_adapters.py` | Per-engine dialect (`src_type`): JDBC URL/driver/options, quoting, literals, select/size/bounds SQL |
 | `src/lakefed_ingest/load_strategies.py` | Per-`load_type` strategy, position encoding, `supported()` matrix (+ placeholder pairs); cdc placeholder |
