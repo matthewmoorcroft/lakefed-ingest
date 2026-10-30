@@ -118,3 +118,16 @@ def test_the_check_shares_a_cycle_out_by_its_changes_unless_told_one_run_per_gro
     assert "launcher.cycle_requests(summary[\"per_collection\"], group_size" in code
     job = (NOTEBOOK.parents[2] / "resources" / "lakefed_ingest_check.yml").read_text()
     assert 'runs_by: "{{job.parameters.runs_by}}"' in job and '- name: runs_by\n          default: "changes"' in job
+
+
+def test_a_cycle_is_sized_by_the_jobs_own_tables_per_group_when_it_has_one():
+    notebook = json.loads((NOTEBOOK.parent / "check_launch.ipynb").read_text())
+    code = "\n".join(c["source"] if isinstance(c["source"], str) else "".join(c["source"]) for c in notebook["cells"])
+    assert "store.schedule_tables_per_group(int(schedule_id)) if schedule_id else None" in code
+    assert ss.schedule_tables_per_group_sql().count("%s") == 1
+    cursor = _Cursor()
+    cursor.execute = lambda sql, params=(): setattr(cursor, "rows", [(20_000,)])
+    assert _store(cursor).schedule_tables_per_group(7) == 20_000
+    cursor.execute = lambda sql, params=(): setattr(cursor, "rows", [])
+    cursor.fetchone = lambda: (cursor.rows or [None])[0]
+    assert _store(cursor).schedule_tables_per_group(7) is None

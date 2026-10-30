@@ -918,6 +918,13 @@ def enabled_collections_sql() -> str:
     return f"select distinct task_collection from {CONTROL_TABLE} where task_enabled order by task_collection"
 
 
+def schedule_tables_per_group_sql() -> str:
+    """An operations-app ingestion job's tables per group (its options), or no row when it has none. Param: schedule
+    id."""
+    return (f"select (options ->> 'tables_per_group')::bigint from {SCHEMA}.schedule "
+            "where id = %s and options ? 'tables_per_group'")
+
+
 def schedule_collections_sql() -> str:
     """The groups of one operations-app ingestion job (schedule) that is not deleted: its members not removed, in
     name order. Param: schedule id."""
@@ -1409,6 +1416,13 @@ class StateStore:
         with self._cursor() as cur:
             cur.execute(enabled_collections_sql())
             return [row[0] for row in cur.fetchall()]
+
+    def schedule_tables_per_group(self, schedule_id: int) -> Optional[int]:
+        """The job's tables per group, the size a cycle's runs are shared out by; None when it has none."""
+        with self._cursor() as cur:
+            cur.execute(schedule_tables_per_group_sql(), (int(schedule_id),))
+            row = cur.fetchone()
+            return int(row[0]) if row and row[0] else None
 
     def schedule_collections(self, schedule_id: int) -> list:
         """The groups of an operations-app ingestion job, as the check job reads them when started with the
