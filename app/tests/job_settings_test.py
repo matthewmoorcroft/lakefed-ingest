@@ -131,12 +131,16 @@ def test_each_new_database_gets_every_table_of_the_job_with_its_settings_filled_
     assert order["task_collection"] == "cust_c01"           # the server's existing group
 
 
-def test_a_new_server_gets_its_own_groups_by_a_stable_hash_of_the_database_name():
+def test_a_new_server_gets_its_own_groups_its_databases_spread_evenly():
     entries = [{"line": i, "server": "sql_02", "database": f"db_9{i:02d}", "enabled": True} for i in range(20)]
     plan = js.plan_databases(FLEET, entries, job_name="Customer", groups_per_server=4)
     groups = {r["task_collection"] for r in plan["new"]}
-    assert groups <= {"customer_sql_02_c01", "customer_sql_02_c02", "customer_sql_02_c03", "customer_sql_02_c04"}
-    assert len(groups) > 1 and plan["new_groups"] == sorted(groups)
+    assert groups == {"customer_sql_02_c01", "customer_sql_02_c02", "customer_sql_02_c03", "customer_sql_02_c04"}
+    assert plan["new_groups"] == sorted(groups)
+    per_group = {}
+    for r in plan["new"]:
+        per_group.setdefault(r["task_collection"], set()).add(r["src_database"])
+    assert sorted(len(databases) for databases in per_group.values()) == [5, 5, 5, 5]
     again = js.plan_databases(FLEET, entries[:5], job_name="Customer", groups_per_server=4)
     first = {r["src_database"]: r["task_collection"] for r in plan["new"]}
     assert all(first[r["src_database"]] == r["task_collection"] for r in again["new"])
@@ -209,3 +213,15 @@ def test_an_identity_column_whose_values_follow_no_template_is_named_so_the_page
     # The same names in another order collapse to one entry, which is still a set of names, not a column.
     assert js.differing_identity_columns({"mixed": {"a, b": 100}}, 100) == []
     assert js.differing_identity_columns({"value": {"a": "{database}"}}, 100) == []
+
+
+def test_a_new_database_on_a_server_of_the_job_joins_its_lightest_group():
+    fleet = FLEET + [row(11, database="db_000201", task_collection="cust_c02"),
+                     row(12, database="db_000201", table="Invoice", task_collection="cust_c02")]
+    # cust_c01 has 5 tables, cust_c02 2: the new database's 3 tables go to cust_c02, the next database's to cust_c01
+    # (now 5 against 5, the first by name).
+    entries = [{"line": 2, "server": "sql_01", "database": "db_000301", "enabled": True},
+               {"line": 3, "server": "sql_01", "database": "db_000302", "enabled": True}]
+    plan = js.plan_databases(fleet, entries, job_name="Customer", groups_per_server=1)
+    placed = {r["src_database"]: r["task_collection"] for r in plan["new"]}
+    assert placed == {"db_000301": "cust_c02", "db_000302": "cust_c01"}

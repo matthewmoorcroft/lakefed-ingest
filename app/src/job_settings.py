@@ -10,6 +10,7 @@ import re
 from collections import Counter
 from typing import Dict, List, Optional
 
+import placement
 import queries as q
 
 TAGS = ("{server}", "{database}", "{schema}", "{table}")
@@ -304,8 +305,8 @@ def plan_databases(job_rows: List[dict], entries: List[dict], job_name: str, gro
     """What adding these databases does to a job: {new: control rows to insert, enable / disable: row ids,
     new_groups, errors}. A new database gets every table of the job, each copied from the table's first row (load
     type, key, columns, write mode) and given the job's target names, client_id and identity columns, filled for
-    it. It joins its server's groups by a stable hash of its name, or, on a server new to the job, one of
-    groups_per_server new groups. A database already in the job is left, its tables enabled or disabled as the
+    it. It joins its server's group with the fewest tables, or, on a server new to the job, one of groups_per_server
+    new groups, the server's new databases spread evenly over them. A database already in the job is left, its tables enabled or disabled as the
     file says; with full_list, the job's databases missing from the file are disabled, never deleted."""
     out = {"new": [], "enable": [], "disable": [], "new_groups": [], "errors": []}
     if not job_rows:
@@ -323,12 +324,22 @@ def plan_databases(job_rows: List[dict], entries: List[dict], job_name: str, gro
     by_database: Dict[tuple, List[dict]] = {}
     servers: Dict[str, dict] = {}
     groups: Dict[str, set] = {}
+    loads: Dict[str, Dict[str, int]] = {}
     for r in sorted(job_rows, key=lambda r: r["id"]):
         server = server_of(r).lower()
         models.setdefault((str(r["src_schema"]).lower(), str(r["src_table"]).lower()), r)
         by_database.setdefault((server, str(r["src_database"] or "").lower()), []).append(r)
         servers.setdefault(server, r)
         groups.setdefault(server, set()).add(r["task_collection"])
+        loads.setdefault(server, {}).setdefault(r["task_collection"], 0)
+        loads[server][r["task_collection"]] += 1
+    lightest = placement.Lightest(loads)
+    # A server new to the job: its new databases, each taking the job's tables, spread evenly over its new groups.
+    src_type = str(next(iter(models.values())).get("src_type") or "sqlserver").lower()
+    new_entries = [(_server_key(e["server"], src_type), e["database"]) for e in entries]
+    new_entries = [(server, database) for server, database in new_entries if server not in groups]
+    new_spread = placement.server_placements(((server, database, len(models)) for server, database in new_entries),
+                                             {server: groups_per_server for server, _ in new_entries})
     known = set(by_database)
     listed: Dict[tuple, bool] = {}
     secret_templates: Dict[str, Optional[str]] = {}
@@ -364,13 +375,12 @@ def plan_databases(job_rows: List[dict], entries: List[dict], job_name: str, gro
                                          "pattern; add this database by Import CSV, with its secret")
                     continue
                 reach["secret_key"] = render(secrets, {**source, "src_database": e["database"]})
-            names = sorted(groups[key[0]])
-            group = names[_bucket(e["database"], len(names))]
+            group = lightest.place(key[0], e["database"], len(models))
         else:
             reach = {"src_connection": e["server"], "use_remote_query": True, "src_host": None, "src_port": None,
                      "secret_key": None}
-            group = (f"{q.identifier(job_name)}_{q.identifier(e['server'])}_"
-                     f"c{_bucket(e['database'], groups_per_server) + 1:02d}")
+            index = new_spread.get(key[0], {}).get(str(e["database"]).lower(), 0)
+            group = f"{q.identifier(job_name)}_{q.identifier(e['server'])}_c{index + 1:02d}"
             new_groups.add(group)
         planned = []
         for model in models.values():

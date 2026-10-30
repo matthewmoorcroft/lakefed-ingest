@@ -2655,6 +2655,14 @@ def selected_servers_sql(kind: str) -> str:
             f"from ({source_rows_sql(kind)}) r where {_SELECTED} group by r.server order by r.server")
 
 
+def selected_databases_sql(kind: str) -> str:
+    """A selection's databases with the tables each takes, for spreading them evenly over the job's groups
+    (placement.even): one row per database, (server, src_database, tables), in key order. Params: as selected_servers_sql."""
+    return (f"select r.server, lower(r.src_database) as src_database, count(*) as tables "
+            f"from ({source_rows_sql(kind)}) r where {_SELECTED} group by r.server, lower(r.src_database) "
+            f"order by r.server, lower(r.src_database)")
+
+
 def insert_job_selection_sql(n: int) -> str:
     """n parts of what a job was made from, in one statement. Params: each part's JOB_SELECTION_COLUMNS in turn."""
     one = "(" + ", ".join(["%s"] * len(JOB_SELECTION_COLUMNS)) + ")"

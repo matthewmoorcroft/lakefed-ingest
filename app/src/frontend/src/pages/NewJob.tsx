@@ -51,7 +51,7 @@ export default function NewJob() {
   const [run, setRun] = useState<Row>({ cadence_minutes: 60, start: "00:00", timezone: "Europe/London", paused: true, notify_emails: "" });
   const [params, setParams] = useState<Record<string, string>>({});
   const [variant, setVariant] = useState<string | null>(null);
-  const [groupsPerServer, setGroupsPerServer] = useState(4);
+  const [groupsPerServer, setGroupsPerServer] = useState<number | null>(null);
   const [importing, setImporting] = useState(false);
   const [discovering, setDiscovering] = useState(false);
   // The job's own cluster, as in Edit's Job cluster: at the Databricks job's values unless changed here.
@@ -186,14 +186,16 @@ export default function NewJob() {
       </Section>
 
       <details className="card advanced">
-        <summary><b>Advanced configuration</b> <span className="muted">compute and tuning, at the defaults we tested: {groupsPerServer} groups per
-          server, runs through the {jobVariant === "check" ? "check job" : "Databricks job"}, {clusterSummary(clusterInfo.data, cluster)};
+        <summary><b>Advanced configuration</b> <span className="muted">compute and tuning, at the defaults we tested: {groupsPerServer ? `${groupsPerServer} groups per server` : "groups by tables"},
+          runs through the {jobVariant === "check" ? "check job" : "Databricks job"}, {clusterSummary(clusterInfo.data, cluster)};
           {" "}{paramsSummary(params) || "every key at its default"}</span></summary>
         <h3>Compute</h3>
         <div className="form-grid">
-          <label>Groups per server<input type="number" min={1} max={64} value={groupsPerServer}
-            onChange={(e) => setGroupsPerServer(Number(e.target.value) || 1)} />
-            <span className="help">Each server's databases are split between this many groups, which run side by side.</span></label>
+          <label>Groups per server<input type="number" min={1} max={64} value={groupsPerServer ?? ""} placeholder="by tables"
+            onChange={(e) => setGroupsPerServer(e.target.value.trim() ? Math.min(64, Math.max(1, Math.round(Number(e.target.value)) || 1)) : null)} />
+            <span className="help">Blank: one group for about every 12,500 of a server's tables, a small remainder joining the
+              others (100,200 tables make 8). A number: that many groups for each server. Either way each database goes whole
+              to the group with the fewest tables, so the groups come out about even; the preview shows each server's groups.</span></label>
           {variants.length > 1 && <label>Runs start<select value={jobVariant} onChange={(e) => setVariant(e.target.value)}>
             {variants.map((v) => <option key={v} value={v}>{v === "check" ? "through the check job: only databases with changes" : "the Databricks job for every group"}</option>)}</select></label>}
         </div>

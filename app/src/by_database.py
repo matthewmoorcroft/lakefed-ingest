@@ -2,14 +2,14 @@
 read in, the units a selection takes, and the plan of one database. Pure: the endpoints and the background task read
 Lakebase and write each database's own transaction (main.py)."""
 import contextlib
-import math
 import time
 from typing import Callable, Dict, Iterator, List, Optional, Tuple
 
 import new_job as nj
+import placement
 
 # A group of a big job takes about this many tables, so a server with 5.3 million tables gets about 425 groups.
-TABLES_PER_GROUP = 12_500
+TABLES_PER_GROUP = placement.TABLES_PER_GROUP
 # Databases are read this many at a time, each page starting after the key of the last one read.
 DATABASE_PAGE = 500
 # A transaction of a big job writes its databases up to about this many tables together. A database is never split
@@ -61,13 +61,24 @@ class Stages:
 
 
 def groups_for_tables(tables: int) -> int:
-    """How many groups a server's tables take: one per TABLES_PER_GROUP tables, at least one."""
-    return max(1, math.ceil(int(tables) / TABLES_PER_GROUP))
+    """How many groups a server's tables take by default: one per TABLES_PER_GROUP tables, no group for a remainder of
+    a tenth of a group or less, at least one (placement.groups_for_tables)."""
+    return placement.groups_for_tables(tables)
 
 
-def groups_by_server(servers: List[dict]) -> Dict[str, int]:
-    """{server: its groups} for a selection's servers (queries.selected_servers_sql rows)."""
-    return {s["server"]: groups_for_tables(s["tables"]) for s in servers}
+def groups_by_server(servers: List[dict], groups_per_server: Optional[int] = None) -> Dict[str, int]:
+    """{server: its groups} for a selection's servers (queries.selected_servers_sql rows): the job's own number when
+    Advanced configuration sets one, else the default for each server's tables."""
+    return {s["server"]: int(groups_per_server) if groups_per_server else groups_for_tables(s["tables"]) for s in servers}
+
+
+def group_of_placement(job_name: str, placements: Dict[str, Dict[str, int]]) -> Callable[[str, str], str]:
+    """Where a new job's database goes, from its even placement (placement.server_placements over the selection's
+    databases): its server's group with that index."""
+    def group_of(server: str, database: str) -> str:
+        index = placements.get(server, {}).get(str(database or "").lower(), 0)
+        return f"{nj.q.identifier(job_name)}_{nj.q.identifier(server)}_c{index + 1:02d}"
+    return group_of
 
 
 def database_pages(page: Callable[[Tuple[str, str, str]], List[dict]]) -> Iterator[dict]:
@@ -180,7 +191,7 @@ def transactions_of(checked: List[Checked]) -> Iterator[List[Checked]]:
 
 def plan_database(job_name: str, given: dict, rows: List[dict], columns: List[str], groups: Dict[str, int],
                   taken: set, own: set, group_of: Optional[Callable[[str, str], str]] = None,
-                  have: Optional[set] = None) -> dict:
+                  have: Optional[set] = None, join=None) -> dict:
     """The plan of one database's rows (each {server, src_database, src_schema, src_table, line, fields}), made as
     new_job.plan makes a file's: its lines, groups and errors. groups is {server: its groups} (groups_by_server) and
     taken the groups other jobs use; the job's own groups (own) are not taken. A new job places its databases by
@@ -188,19 +199,20 @@ def plan_database(job_name: str, given: dict, rows: List[dict], columns: List[st
     the uploaded file, or None for a discovery."""
     text = nj.csv_of(columns, [row["fields"] for row in rows])
     if group_of is None:
-        group_of = lambda server, database: nj.group_name(job_name, server, database, groups.get(server, nj.DEFAULT_GROUPS_PER_SERVER))
-    plan = nj.plan(job_name, text, given, taken_groups=set(taken) - set(own), group_of=group_of, have=have)
+        group_of = lambda server, database: nj.group_name(job_name, server, database, groups.get(server, 1))
+    plan = nj.plan(job_name, text, given, taken_groups=set(taken) - set(own), group_of=group_of, have=have, join=join)
     for line, row in zip(plan["lines"], rows):
         line["line"] = row.get("line") or None
     return plan
 
 
-def summary_of(job_name: str, servers: List[dict], default_load_type: str = "ct") -> dict:
+def summary_of(job_name: str, servers: List[dict], default_load_type: str = "ct",
+               groups_of: Optional[Dict[str, int]] = None) -> dict:
     """What a big job's preview shows before Create, from the selection's servers (queries.selected_servers_sql): each
     server's databases, tables, tables by load type (a line that sets none takes the job's default_load_type) and group
     names, and the totals: the same fields per server as new_job.summary. Nothing is checked yet: checked is False, and
     by_database is True, so the page says the lines are read when the write runs."""
-    groups_of = groups_by_server(servers)
+    groups_of = groups_of or groups_by_server(servers)
     out_servers = []
     for s in sorted(servers, key=lambda s: s["server"]):
         names = nj.group_names(job_name, s["server"], groups_of[s["server"]])

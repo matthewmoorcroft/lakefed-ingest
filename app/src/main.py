@@ -39,6 +39,7 @@ import jobs
 import by_database
 import lakebase as db
 import new_job as nj
+import placement
 import queries as q
 import rediscovery
 import rollup
@@ -2154,7 +2155,8 @@ class _TablesFrom(BaseModel):
 
 class JobTablesRequest(_TablesFrom):
     load_type: str = "ct"
-    groups_per_server: int = nj.DEFAULT_GROUPS_PER_SERVER
+    # Blank: each server's default for its tables (placement.groups_for_tables); a number: that many per server.
+    groups_per_server: Optional[int] = Field(None, ge=1, le=nj.MAX_GROUPS_PER_SERVER)
     dry_run: bool = True
     request_id: Optional[str] = Field(None, max_length=80)
 
@@ -3403,7 +3405,8 @@ class NewJobRequest(_TablesFrom):
     # Blank in a preview, which shows the tables whatever the name; Create refuses a blank name ("name the job").
     name: str = Field(default="", max_length=80)
     settings: dict = {}
-    groups_per_server: int = nj.DEFAULT_GROUPS_PER_SERVER
+    # Blank: each server's default for its tables (placement.groups_for_tables); a number: that many per server.
+    groups_per_server: Optional[int] = Field(None, ge=1, le=nj.MAX_GROUPS_PER_SERVER)
     run: NewJobRun = NewJobRun()
     dry_run: bool = True
     # Made when the page opens the Create, so a retry of the same Create finds the task the first one made.
@@ -3525,7 +3528,7 @@ def _create_by_database(body: NewJobRequest, request: Request, selection: Select
     servers = db.query(q.selected_servers_sql(kind), (param, *rest))
     if not servers:
         errors.append("the selection takes no tables")
-    groups_of = by_database.groups_by_server(servers)
+    groups_of = by_database.groups_by_server(servers, body.groups_per_server)
     all_groups = [g for s in servers for g in nj.group_names(name or PREVIEW_NAME, s["server"], groups_of[s["server"]])]
     timezone_ = sch.timezone_for(run.cadence_minutes, run.timezone)
     if not errors and name:     # the schedule's checks (its name and groups free) wait for the name
@@ -3533,7 +3536,7 @@ def _create_by_database(body: NewJobRequest, request: Request, selection: Select
                                all_groups, jobs.schedule_variants())
     if errors:
         raise HTTPException(422, {"errors": errors})
-    summary = by_database.summary_of(name or PREVIEW_NAME, servers, settings["load_type"])
+    summary = by_database.summary_of(name or PREVIEW_NAME, servers, settings["load_type"], groups_of)
     if body.dry_run:
         return {"summary": summary, "settings": settings, "created": False, "target_missing": _target_missing(settings),
                 "name_missing": not name}
@@ -3552,9 +3555,13 @@ def _create_by_database(body: NewJobRequest, request: Request, selection: Select
     def units():
         return _units_of(kind, param, selection)
 
+    sizes = db.query(q.selected_databases_sql(kind), (param, *rest))
+    group_of = by_database.group_of_placement(name, placement.server_placements(
+        ((r["server"], r["src_database"], r["tables"]) for r in sizes), groups_of))
+
     def plan_of(rows, own, stages):
         with stages.timed("plan"):
-            return by_database.plan_database(name, body.settings, rows, columns, groups_of, taken, own)
+            return by_database.plan_database(name, body.settings, rows, columns, groups_of, taken, own, group_of=group_of)
 
     def read_of(chunk, stages):
         with stages.timed("read"):
@@ -3652,11 +3659,21 @@ def _add_by_database(job_id: int, body: "JobTablesRequest", request: Request, ki
     servers = db.query(q.selected_servers_sql(kind), (param, *rest))
     databases_total = sum(s["databases"] for s in servers)
     parts = _selection_parts(selection, [s["server"] for s in servers] if selection.whole_server else [])
+    # A database the job has keeps its group, a new one on a server the job has joins that server's lightest group, and
+    # a server new to the job gets its own groups, its databases spread evenly over them.
+    new_servers = by_database.groups_by_server([s for s in servers if not inputs["join"].knows(s["server"])],
+                                               body.groups_per_server)
+    sizes = db.query(q.selected_databases_sql(kind), (param, *rest)) if new_servers else []
+    spread = by_database.group_of_placement(job["name"], placement.server_placements(
+        ((r["server"], r["src_database"], r["tables"]) for r in sizes if r["server"] in new_servers), new_servers))
+
+    def group_of(server, database):
+        return inputs["group_of"](server, database) or (spread(server, database) if server in new_servers else None)
 
     def plan_of(rows, stages):
         with stages.timed("plan"):
             return by_database.plan_database(job["name"], given, rows, columns, {}, taken, set(groups),
-                                             group_of=inputs["group_of"], have=inputs["have"])
+                                             group_of=group_of, have=inputs["have"], join=inputs["join"])
 
     def read_of(chunk, stages):
         with stages.timed("read"):
@@ -4366,7 +4383,7 @@ def _rediscover(sid: int, report=lambda **fields: None) -> dict:
             if not picked["add"]:
                 return outcome, []
             plan = nj.plan_for_job(job["name"], nj.csv_of(nj.DISCOVERY_COLUMNS, [r["fields"] for r in picked["add"]]),
-                                   "ct", job_rows, nj.DEFAULT_GROUPS_PER_SERVER, taken)
+                                   "ct", job_rows, None, taken)
             if plan["errors"]:
                 raise HTTPException(422, {"errors": plan["errors"]})
             written = _write_planned_tables(cur, job, plan, user, batch, skip_taken=True)

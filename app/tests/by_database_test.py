@@ -29,8 +29,31 @@ COLUMNS = ["src_connection", "src_database", "src_schema", "src_table", "select_
 def test_groups_are_sized_by_tables_not_four_per_server():
     assert bd.groups_for_tables(22_000 * 240) == 423          # the 5.3 million tables of one server: about 425
     assert bd.groups_for_tables(bd.TABLES_PER_GROUP) == 1
-    assert bd.groups_for_tables(bd.TABLES_PER_GROUP + 1) == 2
     assert bd.groups_for_tables(0) == 1
+
+
+def test_a_small_remainder_makes_no_group_of_its_own():
+    assert bd.groups_for_tables(100_200) == 8                 # not 9 for the last 200 tables
+    assert bd.groups_for_tables(bd.TABLES_PER_GROUP + 1_250) == 1
+    assert bd.groups_for_tables(bd.TABLES_PER_GROUP + 1_251) == 2
+
+
+def test_the_jobs_own_number_of_groups_wins_over_the_default():
+    servers = [{"server": "sql_a", "tables": 100_200}, {"server": "sql_b", "tables": 10}]
+    assert bd.groups_by_server(servers) == {"sql_a": 8, "sql_b": 1}
+    assert bd.groups_by_server(servers, 3) == {"sql_a": 3, "sql_b": 3}
+
+
+def test_a_selections_databases_spread_evenly_over_its_groups():
+    import placement
+    rows = [("sql_a", f"eng_{d:03d}", tables) for d, tables in enumerate((900, 500, 400, 300, 200, 100, 100), 1)]
+    placements = placement.server_placements(rows, {"sql_a": 2})
+    group_of = bd.group_of_placement("Big job", placements)
+    loads = {}
+    for _, database, tables in rows:
+        group = group_of("sql_a", database.upper())             # case-blind, as the rows' names are
+        loads[group] = loads.get(group, 0) + tables
+    assert sorted(loads) == ["big_job_sql_a_c01", "big_job_sql_a_c02"] and sorted(loads.values()) == [1200, 1300]
 
 
 def test_the_summary_names_every_group_of_each_server_before_anything_is_read():
@@ -355,6 +378,9 @@ def _big_client(monkeypatch):
                 entry["databases"] += 1
                 entry["tables"] += len(names)
             return list(servers.values())
+        if sql == q.selected_databases_sql("upload"):
+            return [{"server": server, "src_database": database.lower(), "tables": len(names)}
+                    for (server, database), names in sorted(source.databases.items())]
         if sql == q.source_databases_after_sql("upload"):
             return source.keys_after(tuple(params[2:5]), params[1], params[5])
         if sql == q.database_rows_chunk_sql("upload"):
@@ -407,10 +433,26 @@ def _without_seconds(progress: dict) -> dict:
     return {key: value for key, value in progress.items() if key != "seconds"}
 
 
-def _create(client, request_id="big-1", dry_run=False):
+def _create(client, request_id="big-1", dry_run=False, groups_per_server=None):
     return client.post("/api/ingestion-jobs", json={"name": "Big job", "settings": FAN_IN, "dry_run": dry_run,
-                                                    "request_id": request_id,
+                                                    "request_id": request_id, "groups_per_server": groups_per_server,
                                                     "source": {"upload_id": "u1", "whole_server": True}})
+
+
+def test_a_big_create_spreads_its_databases_evenly_over_the_groups_advanced_sets(big):
+    r = _create(big, groups_per_server=3)
+    assert r.status_code == 202
+    big.tasks.run()
+    per_group = {}
+    for row in big.store.controls:
+        per_group.setdefault(row["task_collection"], set()).add(row["src_database"].lower())
+    assert sorted(per_group) == ["big_job_sql_a_c01", "big_job_sql_a_c02", "big_job_sql_a_c03"]
+    assert [len(databases) for databases in per_group.values()] == [10, 10, 10]    # 30 databases of 5 tables
+
+
+def test_a_big_create_takes_one_group_by_default_for_a_few_tables(big):
+    big.tasks.run() if _create(big).status_code == 202 else None
+    assert {row["task_collection"] for row in big.store.controls} == {"big_job_sql_a_c01"}
 
 
 def test_a_big_create_is_a_task_that_writes_its_databases_in_transactions(big):

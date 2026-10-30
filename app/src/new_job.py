@@ -12,6 +12,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 import config_import as ci
 import job_settings as js
+import placement
 import queries as q
 
 LOAD_TYPES = ("ct", "cursor", "full")
@@ -52,6 +53,38 @@ def settings_of(given: dict) -> dict:
             out[name] = DEFAULTS[name]      # given_errors reports it, and nothing is written while it does
     out["identity"] = {str(k).strip(): str(v).strip() for k, v in (out.get("identity") or {}).items() if str(k).strip()}
     return out
+
+
+def _placer(job_name: str, lines: List[dict], groups_per_server: Optional[int],
+            group_of: Optional[Callable[[str, str], Optional[str]]],
+            join: Optional[placement.Lightest] = None) -> Callable[[str, str], str]:
+    """Where each line's database goes: its group if the job has it already (group_of); the lightest group of its server
+    if the job has that server (join); else an even placement over its server's new groups, by the tables the file
+    gives each database."""
+    known = group_of or (lambda server, database: None)
+    sizes: Dict[tuple, int] = {}
+    for line in lines:
+        row = dict(line["row"])
+        row["use_remote_query"] = bool(row.get("src_connection")) and not row.get("src_host")
+        server, database = js.server_of(row), str(row.get("src_database") or "")
+        if known(server, database) is None and not (join and join.knows(server)):
+            sizes[(server, database.lower())] = sizes.get((server, database.lower()), 0) + 1
+    per_server: Dict[str, int] = {}
+    for (server, _), tables in sizes.items():
+        per_server[server] = per_server.get(server, 0) + tables
+    groups = {server: int(groups_per_server) if groups_per_server else placement.groups_for_tables(tables)
+              for server, tables in per_server.items()}
+    placements = placement.server_placements(((s, d, n) for (s, d), n in sizes.items()), groups)
+
+    def place(server: str, database: str) -> str:
+        existing = known(server, database)
+        if existing is not None:
+            return existing
+        if join and join.knows(server):
+            return join.place(server, database)
+        index = placements.get(server, {}).get(database.lower(), 0)
+        return f"{q.identifier(job_name)}_{q.identifier(server)}_c{index + 1:02d}"
+    return place
 
 
 def group_name(job_name: str, server: str, database: str, groups_per_server: int) -> str:
@@ -100,21 +133,22 @@ def _line_load_types(text: str):
     return out.getvalue(), {n: t for n, t in types.items() if t}
 
 
-def plan(job_name: str, text: str, given: dict, groups_per_server: int = DEFAULT_GROUPS_PER_SERVER,
+def plan(job_name: str, text: str, given: dict, groups_per_server: Optional[int] = None,
          taken_groups: Optional[set] = None, group_of: Optional[Callable[[str, str], str]] = None,
-         have: Optional[set] = None, require_target: bool = True) -> dict:
+         have: Optional[set] = None, require_target: bool = True, join: Optional[placement.Lightest] = None) -> dict:
     """What creating the job writes: {"errors": problems with the file or the settings (nothing is written while there
     are any), "lines": one per CSV line with its control row, status (valid, invalid, or in_job for a table the job
     already has) and errors, "groups": the groups its lines go to, "settings": the job's settings}. taken_groups are
-    names other jobs or tables already use; group_of(server, database) places a database (by default a new job's
-    groups); have holds the (target, client_id) pairs a job already writes."""
+    names other jobs or tables already use; group_of(server, database) is the group of a database an existing job has
+    (None for any other), and join places a new database on one of that job's servers (its lightest group). Every other database is spread evenly over its server's new groups by tables
+    (placement): groups_per_server of them, or by default as many as the server's tables in the file need. have holds
+    the (target, client_id) pairs a job already writes."""
     settings = settings_of(given)
-    group_of = group_of or (lambda server, database: group_name(job_name, server, database, groups_per_server))
     out = {"errors": given_errors(given) + setting_errors(settings, require_target), "lines": [], "groups": [],
            "settings": settings}
     if not str(job_name or "").strip():
         out["errors"].insert(0, "name the job")
-    if group_of is None and not 1 <= int(groups_per_server or 0) <= MAX_GROUPS_PER_SERVER:
+    if groups_per_server is not None and not 1 <= int(groups_per_server) <= MAX_GROUPS_PER_SERVER:
         out["errors"].append(f"groups per server must be from 1 to {MAX_GROUPS_PER_SERVER}")
     if out["errors"]:
         return out
@@ -128,6 +162,7 @@ def plan(job_name: str, text: str, given: dict, groups_per_server: int = DEFAULT
     if read["errors"]:
         out["errors"] = read["errors"]
         return out
+    place = _placer(job_name, read["lines"], groups_per_server, group_of, join)
     seen: Dict[tuple, int] = {}
     groups = set()
     for line in read["lines"]:
@@ -143,7 +178,7 @@ def plan(job_name: str, text: str, given: dict, groups_per_server: int = DEFAULT
             if row["load_type"] not in LOAD_TYPES:
                 problems.append(f"load_type must be one of {', '.join(LOAD_TYPES)}")
         server = js.server_of(row)
-        row["task_collection"] = group_of(server, row.get("src_database") or "")
+        row["task_collection"] = place(server, row.get("src_database") or "")
         row["write_mode"] = _write_mode(row["load_type"], settings)
         for key, _ in js.TARGET_SETTINGS:
             row[key] = js.render(settings[key], row, target=True, lowercase=bool(settings["lowercase"]))
@@ -181,7 +216,7 @@ _JOB_SETTINGS = ("fan_in", "write_mode_changes", "write_mode_full", "sink_catalo
                  "client_id", "identity", "freshness_sla_minutes")
 
 
-def job_inputs(job_name: str, job_rows: List[dict], groups_per_server: int = DEFAULT_GROUPS_PER_SERVER) -> dict:
+def job_inputs(job_name: str, job_rows: List[dict], groups_per_server: Optional[int] = None) -> dict:
     """What a job's own rows say about the tables added to it: {"errors": the job's settings differ between its tables
     (nothing is planned while there are any), "given": the settings each table takes, "group_of": where a database
     goes (a database the job has keeps its group, a new one joins its server's groups, a new server gets new groups),
@@ -190,31 +225,29 @@ def job_inputs(job_name: str, job_rows: List[dict], groups_per_server: int = DEF
     mixed = [name for name in _JOB_SETTINGS if "mixed" in read.get(name, {})]
     if mixed:
         return {"errors": [f"the job's {name.replace('_', ' ')} differs between its tables: set it in Edit first"
-                           for name in mixed], "given": {}, "group_of": None, "have": set(), "known": set()}
+                           for name in mixed], "given": {}, "group_of": None, "join": None, "have": set(), "known": set()}
     given = {name: read[name]["value"] for name in _JOB_SETTINGS if read.get(name, {}).get("value") is not None}
     database_groups: Dict[tuple, str] = {}
     server_groups: Dict[str, set] = {}
+    tables_by_group: Dict[str, Dict[str, int]] = {}
     for r in job_rows:
         server = js.server_of(r)
         database_groups.setdefault((server, str(r.get("src_database") or "").lower()), r["task_collection"])
         server_groups.setdefault(server, set()).add(r["task_collection"])
+        loads = tables_by_group.setdefault(server, {})
+        loads[r["task_collection"]] = loads.get(r["task_collection"], 0) + 1
 
-    def group_of(server: str, database: str) -> str:
-        if (server, database.lower()) in database_groups:
-            return database_groups[(server, database.lower())]
-        if server in server_groups:
-            names = sorted(server_groups[server])
-            return names[js._bucket(database, len(names))]
-        return group_name(job_name, server, database, groups_per_server)
+    def group_of(server: str, database: str) -> Optional[str]:
+        return database_groups.get((server, database.lower()))
 
     have = {(".".join(str(r.get(k) or "").lower() for k, _ in js.TARGET_SETTINGS), str(r.get("client_id") or ""))
             for r in job_rows}
-    return {"errors": [], "given": given, "group_of": group_of, "have": have,
+    return {"errors": [], "given": given, "group_of": group_of, "join": placement.Lightest(tables_by_group), "have": have,
             "known": {g for gs in server_groups.values() for g in gs}}
 
 
 def plan_for_job(job_name: str, text: str, load_type: str, job_rows: List[dict],
-                 groups_per_server: int = DEFAULT_GROUPS_PER_SERVER, taken_groups: Optional[set] = None) -> dict:
+                 groups_per_server: Optional[int] = None, taken_groups: Optional[set] = None) -> dict:
     """What importing a CSV of tables into an existing job writes, as plan() does for a new one, plus "new_groups".
     Each table takes the job's settings. A database already in the job keeps its group; a new database on one of the
     job's servers joins one of that server's groups by a stable hash of its name, as Add databases does; a new server
@@ -225,7 +258,7 @@ def plan_for_job(job_name: str, text: str, load_type: str, job_rows: List[dict],
     given = {**inputs["given"], "load_type": load_type}
     known = inputs["known"]
     out = plan(job_name, text, given, groups_per_server, (taken_groups or set()) - known, inputs["group_of"],
-               inputs["have"])
+               inputs["have"], join=inputs["join"])
     out["new_groups"] = sorted(set(out["groups"]) - known)
     return out
 

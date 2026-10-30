@@ -41,11 +41,11 @@ VALIDATION_CASES = {
 VALIDATION_EXPECTED = {
     "clean": {
         "errors": [],
-        "groups": ['job_sql_a_c01', 'job_sql_a_c03'],
+        "groups": ['job_sql_a_c01', 'job_sql_a_c02'],
         "lines": [
             (2, 'eng_001.gen.t0001', 'valid',
              [],
-             'job_sql_a_c03', 'main.engagements.t0001'),
+             'job_sql_a_c02', 'main.engagements.t0001'),
             (3, 'eng_002.gen.t0001', 'valid',
              [],
              'job_sql_a_c01', 'main.engagements.t0001'),
@@ -56,31 +56,41 @@ VALIDATION_EXPECTED = {
     },
     "fan_in_problems": {
         "errors": [],
-        "groups": ['job_host1_1433_c02', 'job_sql_a_c01', 'job_sql_a_c02', 'job_sql_a_c03'],
+        "groups": ['job_host1_1433_c01', 'job_sql_a_c01', 'job_sql_a_c02', 'job_sql_a_c03', 'job_sql_a_c04'],
         "lines": [
             (2, 'eng_001.gen.t1', 'invalid',
-             ["select_list must list explicit columns (* isn't supported)"],
-             'job_sql_a_c03', 'main.engagements.t1'),
+             [
+                 "select_list must list explicit columns (* isn't supported)",
+             ],
+             'job_sql_a_c01', 'main.engagements.t1'),
             (3, 'eng_002.gen.', 'invalid',
              [
                  'src_table is required',
                  'client_id may only use letters, digits and _ . : - (1-128 characters)',
              ],
-             'job_sql_a_c01', 'main.engagements.t'),
+             'job_sql_a_c02', 'main.engagements.t'),
             (4, 'eng_003.gen.t3', 'invalid',
-             ['primary_key is required for load_type ct'],
+             [
+                 'primary_key is required for load_type ct',
+             ],
              'job_sql_a_c03', 'main.engagements.t3'),
             (5, 'eng_004.gen.t5', 'invalid',
-             ['give the UC connection or the host, not both', 'secret_key is required'],
-             'job_host1_1433_c02', 'main.engagements.t5'),
+             [
+                 'give the UC connection or the host, not both',
+                 'secret_key is required',
+             ],
+             'job_host1_1433_c01', 'main.engagements.t5'),
             (6, 'eng_004.gen.t5', 'invalid',
-             ['line 5 already writes c.s.t5_eng_004', 'line 5 already writes main.engagements.t5 for eng_004'],
-             'job_sql_a_c02', 'main.engagements.t5'),
+             [
+                 'line 5 already writes c.s.t5_eng_004',
+                 'line 5 already writes main.engagements.t5 for eng_004',
+             ],
+             'job_sql_a_c04', 'main.engagements.t5'),
         ],
     },
     "no_fan_in_problems": {
         "errors": [],
-        "groups": ['job_sql_a_c01', 'job_sql_a_c02', 'job_sql_a_c03'],
+        "groups": ['job_sql_a_c01', 'job_sql_a_c02', 'job_sql_a_c03', 'job_sql_a_c04'],
         "lines": [
             (2, 'eng_001.gen.t1', 'invalid',
              [
@@ -89,27 +99,35 @@ VALIDATION_EXPECTED = {
                  'load_type must be one of ct, cursor, full',
                  'client_id must be blank: this job has no fan-in',
              ],
-             'job_sql_a_c03', 'main.s.eng_001_t1'),
+             'job_sql_a_c01', 'main.s.eng_001_t1'),
             (3, 'eng_002.gen.t2', 'valid',
              [],
-             'job_sql_a_c01', 'main.s.eng_002_t2'),
+             'job_sql_a_c02', 'main.s.eng_002_t2'),
             (4, 'eng_003.gen.t3', 'invalid',
-             ['cursor_column is required for load_type cursor'],
+             [
+                 'cursor_column is required for load_type cursor',
+             ],
              'job_sql_a_c03', 'main.s.eng_003_t3'),
             (5, 'eng_004.gen.t4', 'invalid',
-             ['this line has more cells than the header has columns'],
-             'job_sql_a_c02', 'main.s.eng_004_t4'),
+             [
+                 'this line has more cells than the header has columns',
+             ],
+             'job_sql_a_c04', 'main.s.eng_004_t4'),
         ],
     },
     "taken_group": {
         "errors": [],
-        "groups": ['job_sql_a_c01', 'job_sql_a_c03'],
+        "groups": ['job_sql_a_c01', 'job_sql_a_c02'],
         "lines": [
             (2, 'eng_001.gen.t1', 'invalid',
-             ['group job_sql_a_c03 is already in use: give the job another name'],
-             'job_sql_a_c03', 'main.s.eng_001_t1'),
+             [
+                 'group job_sql_a_c02 is already in use: give the job another name',
+             ],
+             'job_sql_a_c02', 'main.s.eng_001_t1'),
             (3, 'eng_002.gen.t2', 'invalid',
-             ['group job_sql_a_c01 is already in use: give the job another name'],
+             [
+                 'group job_sql_a_c01 is already in use: give the job another name',
+             ],
              'job_sql_a_c01', 'main.s.eng_002_t2'),
             (4, 'eng_002.gen.t2', 'invalid',
              [
@@ -168,9 +186,27 @@ def test_import_csv_keeps_its_own_cap_of_5000_lines():
     assert read["errors"] == ["more than 5,000 lines: at most 5,000 in one import"]
 
 
-def test_the_same_database_always_joins_the_same_group():
-    first = nj.plan("Job", CSV, FAN_IN, 4)["lines"][0]["group"]
-    assert first == nj.group_name("Job", "sql_a", "eng_001", 4) == nj.plan("Job", CSV, FAN_IN, 4)["lines"][0]["group"]
+def test_the_same_file_always_places_its_databases_the_same_way():
+    first = [line["group"] for line in nj.plan("Job", CSV, FAN_IN, 4)["lines"]]
+    assert first == [line["group"] for line in nj.plan("Job", CSV, FAN_IN, 4)["lines"]]
+
+
+def test_a_files_databases_are_spread_evenly_by_tables_and_never_split():
+    text = HEAD + "".join(f'sql_a,eng_{d:03d},gen,t{t:04d},"id",id\n' for d, tables in ((1, 6), (2, 3), (3, 3), (4, 2), (5, 2))
+                          for t in range(1, tables + 1))
+    plan = nj.plan("Job", text, FAN_IN, 2)
+    groups = {}
+    for line in plan["lines"]:
+        groups.setdefault(line["row"]["src_database"], set()).add(line["group"])
+    assert all(len(g) == 1 for g in groups.values())         # a database is never split
+    tables = {}
+    for line in plan["lines"]:
+        tables[line["group"]] = tables.get(line["group"], 0) + 1
+    assert sorted(tables.values()) == [8, 8]                 # 16 tables in two even groups
+
+
+def test_by_default_a_file_takes_one_group_per_server_for_a_few_tables():
+    assert nj.plan("Job", CSV, FAN_IN)["groups"] == ["job_sql_a_c01"]
 
 
 def test_without_fan_in_two_databases_cannot_write_one_table():
@@ -210,7 +246,7 @@ def test_a_line_naming_both_a_connection_and_a_host_or_neither_is_invalid():
 
 
 def test_a_group_already_in_use_refuses_the_line():
-    taken = {nj.group_name("Job", "sql_a", "eng_001", 4)}
+    taken = {nj.plan("Job", CSV, FAN_IN, 4)["lines"][0]["group"]}
     line = nj.plan("Job", CSV, FAN_IN, 4, taken)["lines"][0]
     assert line["status"] == "invalid" and "already in use" in line["errors"][-1]
 
