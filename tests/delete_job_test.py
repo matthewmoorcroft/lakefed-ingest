@@ -1,4 +1,5 @@
 """Deleting an app job's tables (delete_job): which groups go, the run locks, what is deleted and kept, the targets."""
+import contextlib
 import re
 
 import pytest
@@ -51,6 +52,14 @@ class FakeCursor:
             self._result = [(self.selection is not None,)]
         elif sql == dj.delete_selection_sql():
             self.rowcount = (self.selection or {}).get(params[0], 0)
+        elif sql == dj.expired_jobs_sql():
+            self._answer(["id", "name", "drop_targets"], [s for s in self.schedules if _expired(s)])
+        elif sql == dj.expired_check_sql():
+            self._result = [(s["drop_targets"],) for s in self.schedules if s["id"] == params[0] and _expired(s)]
+        elif sql == dj.finished_sql():
+            for s in self.schedules:
+                if s["id"] == params[0]:
+                    s["finished"] = True
         elif sql.startswith("delete from"):
             table = re.match(r"delete from lakefed_ingest\.(\w+)", sql).group(1)
             self.rowcount = {"control": sum(r["task_collection"] in params[0] for r in self.control)}.get(table, 2)
@@ -64,8 +73,13 @@ class FakeCursor:
         return self._result[0]
 
 
-def schedule(sid, deleted=True, name=None):
-    return {"id": sid, "name": name or f"Job {sid}", "deleted_at": "2026-10-29" if deleted else None}
+def schedule(sid, deleted=True, name=None, expired=False, drop_targets=False, finished=False):
+    return {"id": sid, "name": name or f"Job {sid}", "deleted_at": "2026-10-29" if deleted else None,
+            "expired": expired, "drop_targets": drop_targets, "finished": finished}
+
+
+def _expired(job):
+    return job["expired"] and not job["finished"]
 
 
 def member(sid, group, removed=False):
@@ -171,7 +185,7 @@ def test_what_the_job_was_made_from_goes_with_it_where_the_database_keeps_it():
     result = dj.delete_rows(cur, 7)
     assert result["deleted"]["job_selection"] == 3
     assert [p for sql, p in cur.executed if sql == dj.delete_selection_sql()] == [(7,)]
-    assert statements(cur)[-1] == dj.delete_selection_sql()          # in the same transaction, after the groups' rows
+    assert statements(cur)[-2:] == [dj.delete_selection_sql(), dj.finished_sql()]    # in the same transaction, last
     # A job with no groups left still forgets it; a database below version 9 has nothing to forget.
     cur = FakeCursor([schedule(7)], [], [], selection={7: 1})
     assert dj.delete_rows(cur, 7)["deleted"] == {"job_selection": 1}
@@ -341,3 +355,111 @@ def test_ids_already_gone_are_reported_as_missing_and_nothing_else_goes():
     result = dj.delete_table_rows(cur, 1, [10, 999])
     assert result["missing"] == [999] and result["control_ids"] == [10]
     assert [r["id"] for r in cur.control] == [11, 12, 20]
+
+
+def test_a_purge_marks_the_job_finished_in_the_same_transaction_as_its_rows():
+    cur = FakeCursor([schedule(7)], [member(7, "g1", removed=True)], [row("g1", "a")])
+    dj.delete_rows(cur, 7)
+    assert statements(cur)[-1] == dj.finished_sql()
+    assert cur.schedules[0]["finished"] and [p for sql, p in cur.executed if sql == dj.finished_sql()] == [(7,)]
+
+
+def test_a_job_with_no_groups_left_is_still_marked_finished():
+    cur = FakeCursor([schedule(7)], [], [])
+    dj.delete_rows(cur, 7)
+    assert cur.schedules[0]["finished"] and statements(cur)[-1] == dj.finished_sql()
+
+
+def test_a_refused_purge_marks_nothing_finished():
+    cur = FakeCursor([schedule(7)], [member(7, "g1", removed=True)], [row("g1", "a")], locked={"lakefed_ingest:g1"})
+    with pytest.raises(dj.RunGoing):
+        dj.delete_rows(cur, 7)
+    assert not cur.schedules[0]["finished"] and dj.finished_sql() not in statements(cur)
+
+
+def test_the_finished_mark_is_the_flag_the_app_reads_and_the_job_is_locked_while_it_is_read():
+    sql = dj.finished_sql()
+    assert "'{delete_finished}'" in sql and "'true'::jsonb" in sql and sql.endswith("where id = %s")
+    assert dj.schedule_sql().endswith("for update") and "for update" in dj.expired_check_sql()
+
+
+def test_the_expired_jobs_are_the_deleted_ones_past_retention_and_not_finished():
+    sql = dj.expired_jobs_sql()
+    assert "deleted_at <= now() - make_interval(days => %s)" in sql
+    assert "not coalesce((options ->> 'delete_finished')::boolean, false)" in sql and "delete_drop_targets" in sql
+    cur = FakeCursor([schedule(7, expired=True, drop_targets=True), schedule(8),
+                      schedule(9, expired=True, finished=True)], [], [])
+    assert dj.expired_jobs(cur, 7) == [{"id": 7, "name": "Job 7", "drop_targets": True}]
+    assert cur.executed[-1] == (sql, (7,))
+
+
+def test_a_job_whose_retention_has_not_run_out_is_not_purged():
+    cur = FakeCursor([schedule(7)], [member(7, "g1", removed=True)], [row("g1", "a")])
+    assert dj.delete_expired(cur, 7, 7) is None
+    assert not any(s.startswith("delete") or s == dj.finished_sql() for s in statements(cur))
+
+
+def test_an_expired_job_is_purged_and_says_whether_it_asked_for_its_tables():
+    cur = FakeCursor([schedule(7, expired=True, drop_targets=True)], [member(7, "g1", removed=True)],
+                     [row("g1", "a")])
+    result = dj.delete_expired(cur, 7, 7)
+    assert result["groups"] == ["g1"] and result["drop_targets"] is True
+    assert result["targets"]["drop"] == ["`main`.`sales`.`a`"] and cur.schedules[0]["finished"]
+    assert [p for sql, p in cur.executed if sql == dj.expired_check_sql()] == [(7, 7)]
+    cur = FakeCursor([schedule(7, expired=True)], [member(7, "g1", removed=True)], [row("g1", "a")])
+    assert dj.delete_expired(cur, 7, 7)["drop_targets"] is False
+
+
+def _dropper(log, failing=()):
+    def drop(tables):
+        log.extend(tables)
+        return {table: "denied" for table in tables if table in failing}
+    return drop
+
+
+def test_the_daily_purge_with_nothing_expired_purges_nothing():
+    cur = FakeCursor([schedule(7)], [member(7, "g1", removed=True)], [row("g1", "a")])
+    log = []
+    assert dj.purge_expired(lambda: contextlib.nullcontext(cur), 7, _dropper(log)) == {
+        "listed": 0, "purged": [], "waiting": [], "failed": {}}
+    assert log == []
+
+
+def test_a_job_that_is_loading_waits_for_the_next_daily_run_and_the_others_go_on():
+    schedules = [schedule(7, expired=True), schedule(8, expired=True, drop_targets=True)]
+    cur = FakeCursor(schedules, [member(7, "g1", removed=True), member(8, "g2", removed=True)],
+                     [row("g1", "a"), row("g2", "b")], locked={"lakefed_ingest:g1"})
+    log = []
+    purged = dj.purge_expired(lambda: contextlib.nullcontext(cur), 7, _dropper(log))
+    assert purged["listed"] == 2 and purged["failed"] == {}
+    assert [entry["job"] for entry in purged["waiting"]] == ["Job 7"] and "g1" in purged["waiting"][0]["reason"]
+    assert [entry["job"] for entry in purged["purged"]] == ["Job 8"] and purged["purged"][0]["dropped"] == 1
+    assert log == ["`main`.`sales`.`b`"] and not schedules[0]["finished"] and schedules[1]["finished"]
+
+
+def test_a_target_table_that_will_not_drop_is_named_and_the_rest_of_the_purge_goes_on():
+    schedules = [schedule(7, expired=True, drop_targets=True), schedule(8, expired=True, drop_targets=True)]
+    cur = FakeCursor(schedules, [member(7, "g1", removed=True), member(8, "g2", removed=True)],
+                     [row("g1", "a"), row("g2", "b")])
+    log = []
+    purged = dj.purge_expired(lambda: contextlib.nullcontext(cur), 7,
+                              _dropper(log, failing={"`main`.`sales`.`a`"}))
+    assert purged["failed"] == {"`main`.`sales`.`a`": "denied"}
+    assert [entry["job"] for entry in purged["purged"]] == ["Job 7", "Job 8"]
+    assert purged["purged"][0]["drop_failed"] == 1 and purged["purged"][0]["dropped"] == 0
+    assert purged["purged"][1]["dropped"] == 1 and all(s["finished"] for s in schedules)
+
+
+def test_a_job_restored_after_the_list_was_read_is_skipped():
+    cur = FakeCursor([schedule(7, expired=True)], [member(7, "g1", removed=True)], [row("g1", "a")])
+    opened = []
+
+    @contextlib.contextmanager
+    def transaction():
+        if opened:
+            cur.schedules[0]["expired"] = False       # a Restore committed between the list and the purge
+        opened.append(True)
+        yield cur
+
+    purged = dj.purge_expired(transaction, 7, _dropper([]))
+    assert purged["listed"] == 1 and purged["purged"] == [] and not cur.schedules[0]["finished"]

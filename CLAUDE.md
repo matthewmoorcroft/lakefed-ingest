@@ -116,7 +116,7 @@ secret). See `README.md`, `docs/deploy.md`, `docs/monitoring.md`, `docs/lakebase
   `db_instance`, `db_name`.
   The tuning parameters' defaults are bundle variables of the same name (`databricks.yml`).
 - `lakefed_ingest_check` → `check_launch.ipynb` (serverless): checks a group of collections
-  (`task_collections`, blank = every collection with enabled rows; or `schedule_id`, an app job's groups read
+  (`task_collections`, blank = every collection with enabled rows except those only a deleted job holds; or `schedule_id`, an app job's groups read
   from Lakebase; `initial_check.run_check`, each collection's errors apart; its source queries count under
   `max_queries_per_source`, `initial_check.SourceCap`), stamps
   unchanged databases, records each collection's databases with work in `check_work`, starts
@@ -139,8 +139,11 @@ secret). See `README.md`, `docs/deploy.md`, `docs/monitoring.md`, `docs/lakebase
   changed (`cluster_copies.py`); records the copy in `options.ingest_copy_job_id`. The check job takes the job to
   start as its `ingest_job_id` job parameter.
 - `lakefed_ingest_delete_job` → `delete_job.ipynb` (serverless, runs as the deployer, queued, one at a time):
-  finishes an app job's Delete (`delete_job.py`). The app marks the job deleted and starts it with `schedule_id` and
-  `drop_targets`. In one transaction, under each group's run lock (a run of any group refuses the lot), it deletes
+  purges an app job's groups (`delete_job.py`). The app marks a job deleted and keeps it for
+  `deleted_job_retention_days` (Restore brings it back); Delete now starts this job with `schedule_id` and
+  `drop_targets`, and the daily run (03:00, its defaults: `purge_expired` with `retention_days`) purges every deleted job whose retention has run out
+  (`expired_jobs_sql`, `purge_expired`, each job in its own transaction). The purge sets `options.delete_finished`,
+  which the app reads as purged. In one transaction, under each group's run lock (a run of any group refuses the lot), it deletes
   the groups no other live job holds: their control, checkpoint, reseed_queue, database_check, check_work and rollup
   rows, and the job's job_selection rows (what it was chosen from; skipped below schema version 9).
   Run history (ingest_run, ingest_event) and control_change stay. With `drop_targets`, after the commit, it drops

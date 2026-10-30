@@ -1,10 +1,15 @@
 """Deleting an operations-app job's tables (run by delete_job.ipynb, job lakefed_ingest_delete_job).
 
-The app has no DELETE privilege on the Lakebase tables, so when a job is deleted in the app its groups' tables would
-stay behind, as groups in no job. This job runs as the deployer (the state database's owner) and removes them:
+The app has no DELETE privilege on the Lakebase tables, so a deleted job's groups' rows can only be removed here. The
+app marks a job deleted and keeps it for the retention period (the bundle variable deleted_job_retention_days), so a
+Restore can bring it back. This job runs as the deployer (the state database's owner) and purges it:
 
 - **Which groups:** the deleted job's members that no other live job holds (a group is in one job, but a removed
   member could have joined another job since).
+- **When:** a job's delete run (its id given) purges it at once, from the app's Delete now. The daily run purges
+  every deleted job whose retention has run out (purge_expired), each in its own transaction.
+- **Finished:** the purge sets the job's options.delete_finished in the same transaction as the rows, so the app
+  lists it as purged and refuses a Restore.
 - **What goes, in one transaction under each group's run lock:** the groups' control rows and what is keyed by them
   (checkpoint, reseed_queue) or by the group (database_check, check_work, and the monitoring rollups
   rollup_database and rollup_group). A run of any of the groups refuses the
@@ -40,8 +45,33 @@ SCHEMA = "lakefed_ingest"
 
 
 def schedule_sql() -> str:
-    """The job, deleted or not. Param: schedule id."""
-    return f"select id, name, deleted_at from {SCHEMA}.schedule where id = %s"
+    """The job, deleted or not, locked for this transaction: a Restore of it waits for the purge, then finds it purged.
+    Param: schedule id."""
+    return f"select id, name, deleted_at from {SCHEMA}.schedule where id = %s for update"
+
+
+def expired_jobs_sql() -> str:
+    """The deleted jobs whose retention has run out and whose delete hasn't finished, oldest first: their id, name and
+    whether they asked for their target tables to go. Param: retention days."""
+    return (f"select id, name, coalesce((options ->> 'delete_drop_targets')::boolean, false) as drop_targets "
+            f"from {SCHEMA}.schedule where deleted_at is not null and deleted_at <= now() - make_interval(days => %s) "
+            f"and not coalesce((options ->> 'delete_finished')::boolean, false) order by deleted_at, id")
+
+
+def expired_check_sql() -> str:
+    """One deleted job's row when its retention has run out and its delete hasn't finished, locked for this
+    transaction (a Restore waits for it), with whether it asked for its target tables to go. Params: schedule id,
+    retention days."""
+    return (f"select coalesce((options ->> 'delete_drop_targets')::boolean, false) from {SCHEMA}.schedule "
+            f"where id = %s and deleted_at is not null and deleted_at <= now() - make_interval(days => %s) "
+            f"and not coalesce((options ->> 'delete_finished')::boolean, false) for update")
+
+
+def finished_sql() -> str:
+    """Mark a deleted job's delete finished: its groups' rows are gone, so the app lists it as purged. Param: schedule
+    id."""
+    return (f"update {SCHEMA}.schedule set options = jsonb_set(coalesce(options, '{{}}'::jsonb), "
+            f"'{{delete_finished}}', 'true'::jsonb) where id = %s")
 
 
 def groups_sql() -> str:
@@ -141,20 +171,20 @@ def delete_rows(cur, schedule_id: int) -> dict:
         raise ValueError(f"ingestion job {job['name']} ({schedule_id}) isn't deleted: delete it in the app first")
     cur.execute(groups_sql(), (int(schedule_id), int(schedule_id)))
     groups = [r["task_collection"] for r in _rows(cur)]
-    if not groups:
-        return {"job": job["name"], "groups": [], "deleted": _forget_selection(cur, schedule_id),
-                "targets": {"drop": [], "kept": []}}
-    for group in groups:
-        cur.execute(lock_sql(), (collection_lock_key(group),))
-        if not cur.fetchone()[0]:
-            raise RunGoing(f"a run of group {group} is loading: nothing was deleted; run the delete again once it ends")
-    cur.execute(targets_sql(), (groups, groups))
-    targets = plan_targets(_rows(cur))
-    deleted = {}
-    for table, sql in DELETES:
-        cur.execute(sql, (groups,))
-        deleted[table] = cur.rowcount
+    deleted, targets = {}, {"drop": [], "kept": []}
+    if groups:
+        for group in groups:
+            cur.execute(lock_sql(), (collection_lock_key(group),))
+            if not cur.fetchone()[0]:
+                raise RunGoing(f"a run of group {group} is loading: nothing was deleted; "
+                               "run the delete again once it ends")
+        cur.execute(targets_sql(), (groups, groups))
+        targets = plan_targets(_rows(cur))
+        for table, sql in DELETES:
+            cur.execute(sql, (groups,))
+            deleted[table] = cur.rowcount
     deleted.update(_forget_selection(cur, schedule_id))
+    cur.execute(finished_sql(), (int(schedule_id),))
     return {"job": job["name"], "groups": groups, "deleted": deleted, "targets": targets}
 
 
@@ -229,6 +259,51 @@ def delete_table_rows(cur, schedule_id: int, control_ids) -> dict:
     kept = list(dict.fromkeys(sink_fqn(r) for r in rows))
     return {"job": job["name"], "groups": groups, "control_ids": live, "missing": missing, "deleted": deleted,
             "databases": len(databases), "targets": {"drop": [], "kept": kept}}
+
+
+def expired_jobs(cur, retention_days: int) -> List[dict]:
+    """Inside the caller's transaction: the deleted jobs whose retention has run out, as {"id", "name",
+    "drop_targets"} rows (see expired_jobs_sql)."""
+    cur.execute(expired_jobs_sql(), (int(retention_days),))
+    return _rows(cur)
+
+
+def delete_expired(cur, schedule_id: int, retention_days: int) -> Optional[dict]:
+    """Inside the caller's transaction: delete_rows for one deleted job whose retention has run out, with its
+    ``drop_targets`` choice added. Returns None when it has no longer (a Restore, or its purge, came first): nothing
+    is deleted then. Raises RunGoing as delete_rows does."""
+    cur.execute(expired_check_sql(), (int(schedule_id), int(retention_days)))
+    found = cur.fetchall()
+    if not found:
+        return None
+    result = delete_rows(cur, schedule_id)
+    result["drop_targets"] = bool(found[0][0])
+    return result
+
+
+def purge_expired(transaction, retention_days: int, drop_tables) -> dict:
+    """Purge every deleted job whose retention has run out, each in its own transaction, so one job's run going
+    doesn't hold up the others (a job whose group is loading waits for the next daily run). ``transaction()`` opens
+    one transaction and yields its cursor; ``drop_tables(tables)`` drops them after the commit and returns
+    {table: error} for the ones it couldn't. A job's target tables are dropped only if it asked for them.
+    Returns {"listed", "purged": [summary per job], "waiting": [{"job", "reason"}], "failed": {table: error}}."""
+    with transaction() as cur:
+        listed = expired_jobs(cur, retention_days)
+    purged, waiting, failed = [], [], {}
+    for job in listed:
+        try:
+            with transaction() as cur:
+                result = delete_expired(cur, job["id"], retention_days)
+        except RunGoing as error:
+            waiting.append({"job": job["name"], "reason": str(error)})
+            continue
+        if result is None:
+            continue
+        to_drop = result["targets"]["drop"] if result["drop_targets"] else []
+        drop_failed = drop_tables(to_drop) if to_drop else {}
+        failed.update(drop_failed)
+        purged.append(summary(result, [t for t in to_drop if t not in drop_failed], drop_failed))
+    return {"listed": len(listed), "purged": purged, "waiting": waiting, "failed": failed}
 
 
 DRAFT_TTL_S = 2 * 3600

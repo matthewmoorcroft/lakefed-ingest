@@ -1,13 +1,12 @@
 """The check: which source databases of a group of collections need an ingest.
 
-``check_launch.ipynb`` runs this first, on serverless, over one group of collections (a schedule's
-members, or every collection with enabled rows). For each database it asks the same questions a
-sweep's planning asks (``planner``): has any table never been loaded, is any append pending or reseed
-due, and did the change tracking version move past the checkpoints (then, did any of our tables
-change). A database with nothing to do gets its check stamp (``planner.unchanged_writes``) and no
-ingest. The others are their collection's work list: the check job records it (``check_work``) and
-starts that collection's run for those databases only (``launcher.py``). A quiet cycle starts no
-ingest cluster.
+``check_launch.ipynb`` runs this first, on serverless, over one group of collections (a schedule's members, or every
+collection with enabled rows except those only a deleted job holds). For each database it asks the same questions a
+sweep's planning asks (``planner``): has any table never been loaded, is any append pending or reseed due, and did the
+change tracking version move past the checkpoints (then, did any of our tables change). A database with nothing to do
+gets its check stamp (``planner.unchanged_writes``) and no ingest. The others are their collection's work list: the
+check job records it (``check_work``) and starts that collection's run for those databases only (``launcher.py``). A
+quiet cycle starts no ingest cluster.
 
 ``check_collection`` is pure (no Spark, no Lakebase): the notebook passes the source queries in, as
 ``detect_one``. ``run_check`` takes the Lakebase calls as objects, so it is tested with fakes.

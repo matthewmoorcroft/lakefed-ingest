@@ -35,6 +35,9 @@ variables:
   lakebase_database:
     description: Postgres database on the Lakebase instance.
     default: lakefed_ingest
+  deleted_job_retention_days:
+    description: Days a deleted operations-app job is kept, so it can be restored, before the delete job purges it. The app's DELETED_JOB_RETENTION_DAYS (app/databricks.yml) must have the same value.
+    default: 7
   lakebase_catalog:
     description: Unity Catalog catalog the Lakebase database is registered as (for DBSQL monitoring).
     default: lakefed_ingest_lakebase

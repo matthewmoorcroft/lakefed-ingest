@@ -1496,6 +1496,20 @@ def test_a_check_without_a_group_takes_every_collection_with_an_enabled_row():
     assert "where task_enabled" in ss.enabled_collections_sql() and "order by" in ss.enabled_collections_sql()
 
 
+def test_a_check_without_a_group_leaves_out_the_groups_only_a_deleted_job_holds():
+    sql = ss.enabled_collections_sql()
+    assert f"task_collection not in ({ss.deleted_only_collections_sql()})" in sql
+    deleted_only = ss.deleted_only_collections_sql()
+    assert "ds.deleted_at is not null" in deleted_only and "s.deleted_at is null" in deleted_only
+    assert "m.removed_at is null" in deleted_only and "not exists" in deleted_only
+
+
+def test_the_deleted_only_groups_are_read_on_their_own():
+    conn = FakeConn(fetch=[("g2",)])
+    assert ss.StateStore(conn).deleted_only_collections() == ["g2"]
+    assert conn.calls == [(ss.deleted_only_collections_sql(), None)]
+
+
 def test_the_check_reads_an_ingestion_jobs_groups_by_its_id_and_none_of_a_deleted_one():
     sql = ss.schedule_collections_sql()
     assert "m.schedule_id = %s" in sql and "m.removed_at is null" in sql and "s.deleted_at is null" in sql

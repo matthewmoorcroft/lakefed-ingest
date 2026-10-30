@@ -921,9 +921,23 @@ class RollupQueue:
             raise
 
 
+def deleted_only_collections_sql() -> str:
+    """The groups only deleted operations-app jobs hold: a member of a deleted job and no member of a live one (a
+    removed member counts as none). Their control rows wait for the delete job, or a Restore, so no check takes
+    them. In name order."""
+    return (f"select distinct d.task_collection from {SCHEMA}.schedule_member d "
+            f"join {SCHEMA}.schedule ds on ds.id = d.schedule_id where ds.deleted_at is not null "
+            f"and not exists (select 1 from {SCHEMA}.schedule_member m "
+            f"join {SCHEMA}.schedule s on s.id = m.schedule_id "
+            f"where m.task_collection = d.task_collection and m.removed_at is null and s.deleted_at is null) "
+            f"order by d.task_collection")
+
+
 def enabled_collections_sql() -> str:
-    """The collections with at least one enabled control row, in name order."""
-    return f"select distinct task_collection from {CONTROL_TABLE} where task_enabled order by task_collection"
+    """The collections with at least one enabled control row, except those only deleted operations-app jobs hold, in
+    name order."""
+    return (f"select distinct task_collection from {CONTROL_TABLE} where task_enabled "
+            f"and task_collection not in ({deleted_only_collections_sql()}) order by task_collection")
 
 
 def schedule_tables_per_group_sql() -> str:
@@ -1469,7 +1483,8 @@ class StateStore:
         return {(r[0], r[1]): {"version": int(r[2]), "checked_at": r[3]} for r in rows}
 
     def enabled_collections(self) -> list:
-        """The collections with at least one enabled control row (a check over every collection)."""
+        """The collections with at least one enabled control row (a check over every collection), not those only
+        a deleted operations-app job holds."""
         with self._cursor() as cur:
             cur.execute(enabled_collections_sql())
             return [row[0] for row in cur.fetchall()]
@@ -1480,6 +1495,12 @@ class StateStore:
             cur.execute(schedule_tables_per_group_sql(), (int(schedule_id),))
             row = cur.fetchone()
             return int(row[0]) if row and row[0] else None
+
+    def deleted_only_collections(self) -> list:
+        """The groups only deleted operations-app jobs hold: a check named by hand leaves them out."""
+        with self._cursor() as cur:
+            cur.execute(deleted_only_collections_sql())
+            return [row[0] for row in cur.fetchall()]
 
     def schedule_collections(self, schedule_id: int) -> list:
         """The groups of an operations-app ingestion job, as the check job reads them when started with the

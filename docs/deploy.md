@@ -117,7 +117,9 @@ The one-time and ad hoc jobs shouldn't wait several minutes for a job cluster to
   the SQL warehouse.
 - **Ingestion** runs on job clusters with the source network path (scheduled, recurring work).
 - **The operations app's helper jobs**, `lakefed_ingest_cluster_copies` and `lakefed_ingest_delete_job`, run on
-  serverless as the deployer. The delete job finishes an app job's Delete: it deletes the job's groups' rows in
+  serverless as the deployer. The delete job purges an app job's groups: a Delete keeps the job for
+  `deleted_job_retention_days` (default 7, the same value as the app's `DELETED_JOB_RETENTION_DAYS`, so set both alike),
+  then the daily run purges it, or Delete now purges it at once. The purge deletes the job's groups' rows in
   Lakebase (it owns the state database; the app has no `DELETE` privilege) and, when asked, drops the target tables
   only those groups write, so the deployer needs to be able to drop those tables (`MANAGE` or ownership in Unity
   Catalog). Deploy this bundle before the app, which looks both jobs up by name.

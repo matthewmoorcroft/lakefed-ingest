@@ -366,7 +366,8 @@ Written by the operations app (see "Schedules" in `app/README.md`); the ingestio
   `table_remove`, each Remove request by control id with its delete job run; `table_exclude`, the tables a removal
   took out, which re-discovery and whole-database Add tables leave out until Add tables names them again),
   who created it and when, and
-  `deleted_at` (soft delete).
+  `deleted_at` (soft delete: the job is kept for `deleted_job_retention_days`, then purged; the purge's delete job sets
+  `options.delete_finished`, and a job with it is no longer restorable).
 - **`schedule_member`:** one row per (schedule, collection): `offset_minutes` (start offset within the
   cadence: the schedule's start time plus the member's stagger), `job_id` (the wrapper job the app created), `synced_at`, `sync_error`, and `removed_at`
   (soft remove; the next sync deletes the wrapper job).
@@ -419,9 +420,10 @@ matching `filter`; `database`: a whole database; `tables`: the `tables` named, a
 `src_database`, `source_kind` (`discovery` or `upload`) and `source_id`, `created_by`, `created_at`. A later
 re-discovery reads it: a whole server takes its new databases, a whole database its new tables, chosen tables
 nothing more (see Re-discovery in [app/README.md](../app/README.md)). Tables given as CSV lines in the request body
-record nothing here. A job's Delete removes its rows:
-the delete job (`lakefed_ingest_delete_job`) deletes them in the transaction that deletes the job's groups. A Remove
-of one table of a live job does the same for that table alone (see below).
+record nothing here. A job's purge removes its rows:
+the delete job (`lakefed_ingest_delete_job`) deletes them in the transaction that deletes the job's groups, once the
+job's retention has run out or at Delete now. A Remove of one table of a live job does the same for that table alone
+(see below).
 
 Telemetry tables grow with every run. To keep long-term history cheaply, snapshot them to Delta
 (see [monitoring.md](monitoring.md)) and prune old rows from Lakebase.
@@ -486,10 +488,11 @@ before versions were recorded) counts as version 0.
 Neither the ingestion job nor the operations app deletes configuration or history (a re-run
 discovery replaces only its own `discovered_table` rows), and the app has no `DELETE` privilege.
 The exceptions are the app's removals, both run by the `lakefed_ingest_delete_job` job as the deployer
-(`src/lakefed_ingest/delete_job.py`). An app job's Delete deletes that job's groups' control rows and their state, and,
-when asked, the target tables only they write. A Remove of one table of a live job (the Failing tables list) deletes
-that table's control row, checkpoint and reseed_queue rows, recounts the rollups of its database and group, and keeps
-its target table and the job's other tables. Run history and `control_change` stay in both.
+(`src/lakefed_ingest/delete_job.py`). An app job's purge, which runs when its Delete is made final (Delete now) or on the
+daily run once its retention has run out, deletes that job's groups' control rows and their state and, when asked, the
+target tables only they write; a Delete alone deletes no rows. A Remove of one table of a live job (the Failing tables
+list) deletes that table's control row, checkpoint and reseed_queue rows, recounts the rollups of its database and group,
+and keeps its target table and the job's other tables. Run history and `control_change` stay in both.
 
 **To stop ingesting a table,** disable it: `task_enabled = false`, or **Disable** in the app. Runs skip
 it from then on; it's reversible and logged. Turn it back on with **Enabled** on the job's Edit page.
