@@ -3,7 +3,6 @@ import { Link } from "react-router-dom";
 import { api, type Row } from "../api";
 import { Badge, ErrorBox, Menu, Notice, PageHead, Section, fmtTime, readAt, statusName, usePageStamp } from "../components";
 import { usePermissions } from "../permissions";
-import SchemaSetup from "./SchemaSetup";
 
 // Schedules: when each ingestion job runs, as set in its Edit view (When it runs), one row per job and no groups, as
 // the Databricks Jobs list shows them. Run history is on Runs. A schedule is changed in the job's Edit view.
@@ -65,7 +64,6 @@ export default function Schedules() {
           </table></div>
         )}
       </Section>
-      <SchemaSetup />
     </>
   );
 }

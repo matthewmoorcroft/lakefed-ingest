@@ -473,16 +473,18 @@ def test_the_permissions_answer_lists_what_the_user_may_not_do_on_each_job_group
     sid = api.post("/api/schedules", json=BODY).json()["id"]
     monkeypatch.setattr(main.jobs, "SETUP_JOB_ID", "556")
     monkeypatch.setattr(main.jobs, "DISCOVER_JOB_ID", None)
-    monkeypatch.setattr(main.jobs, "user_job_permission",
-                        lambda job_id, user: "CAN_MANAGE_RUN" if str(job_id) == "555" else "CAN_VIEW")
+    asked = []
+    monkeypatch.setattr(main.jobs, "user_job_permission", lambda job_id, user: asked.append(str(job_id)) or (
+        "CAN_MANAGE_RUN" if str(job_id) == "555" else "CAN_VIEW"))
     answer = api.get("/api/permissions").json()
     assert answer["jobs"][str(sid)] == {"run": None, "change": CHANGE_REFUSAL,
                                         "delete": CHANGE_REFUSAL.replace("changing the job or its tables", "deleting")}
     assert set(answer["groups"]) == {"c1", "c2"}
-    assert answer["run"]["setup"] == "starting a run needs Can Manage Run on the Databricks job 556; you have Can View"
-    assert answer["run"]["discovery"] == "no discovery job is configured"
+    assert answer["run"] == {"ingestion": "no ingestion job is configured",
+                             "discovery": "no discovery job is configured"}
     assert answer["new_running_job"]["default"] is None
-    assert api.post("/api/jobs/setup/run").status_code == 403
+    # The app starts the setup job itself (schema_upgrade), so it never reads the setup job's access list.
+    assert "556" not in asked and api.post("/api/jobs/setup/run").status_code in (404, 405)
 
 
 def test_a_job_records_who_created_it_and_who_last_changed_it_and_a_sent_name_is_ignored(api, monkeypatch):

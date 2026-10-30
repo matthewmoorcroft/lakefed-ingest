@@ -2047,6 +2047,26 @@ def export_reads_jdbc_sql() -> str:
 EXPORT_PAGE = 5000
 
 
+def schema_version_table_sql() -> str:
+    """Whether the schema_version table exists (null when it doesn't), for the app's schema upgrade check."""
+    return f"select to_regclass('{SCHEMA}.schema_version')::text as to_regclass"
+
+
+def schema_version_sql() -> str:
+    """The newest schema version applied to the database, 0 when none (state_store's own read)."""
+    return f"select coalesce(max(version), 0) as version from {SCHEMA}.schema_version"
+
+
+def try_session_lock_sql() -> str:
+    """A session advisory lock on two int keys, taken only if free. Params: the two keys."""
+    return "select pg_try_advisory_lock(%s, %s)"
+
+
+def session_unlock_sql() -> str:
+    """Release a session advisory lock taken with try_session_lock_sql. Params: the two keys."""
+    return "select pg_advisory_unlock(%s, %s)"
+
+
 def export_page_sql() -> str:
     """One page of an export: the enabled control rows of some groups after a control id, by id (keyset paging, so a
     200,000-table export never holds more than a page). Params: the groups (text[]), the last id read, the page size."""

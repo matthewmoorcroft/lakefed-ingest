@@ -238,3 +238,45 @@ def test_manages_export_reads_as_the_apps_role(client, monkeypatch):
     lines = exported.text.splitlines()
     assert lines[0].startswith("ingestion_job,src_connection,src_database,") and len(lines) == 5
     assert {line.split(",")[0] for line in lines[1:]} == {"Role"}
+
+
+def test_the_schema_upgrade_reads_the_version_and_takes_its_lock_as_the_apps_role(client, monkeypatch):
+    import schema_upgrade
+    started = []
+
+    def run_now(job_id):
+        started.append(job_id)
+        return 41
+    # The schema is applied here without recording a version, as a database with no schema reads: left alone.
+    nothing = schema_upgrade.check(main.db.connect, "16", lambda job_id: [], run_now)
+    assert (nothing["state"], nothing["database"], started) == ("missing", 0, [])
+    behind = schema_upgrade.SCHEMA_VERSION - 1
+    client.sql("insert into lakefed_ingest.schema_version (version) values (%s) returning version", (behind,))
+    with main.db.connect() as conn:
+        assert schema_upgrade.database_version(conn) == behind
+    other = main.db.connect()
+    try:
+        assert other.execute("select pg_try_advisory_lock(%s, %s)", schema_upgrade.UPGRADE_LOCK).fetchone()[0]
+        held = schema_upgrade.check(main.db.connect, "16", lambda job_id: [], run_now)
+        assert (held["state"], started) == ("busy", []), held
+        other.execute("select pg_advisory_unlock(%s, %s)", schema_upgrade.UPGRADE_LOCK)
+        first = schema_upgrade.check(main.db.connect, "16", lambda job_id: [], run_now)
+        assert (first["state"], first["database"], first["run_id"], first["error"]) == ("started", behind, 41, None)
+        again = schema_upgrade.check(main.db.connect, "16", lambda job_id: [{"run_id": 41, "url": "https://h/run/41"}],
+                                     run_now)
+        assert (again["state"], started) == ("running", ["16"]), again
+        assert other.execute("select pg_try_advisory_lock(%s, %s)", schema_upgrade.UPGRADE_LOCK).fetchone()[0], (
+            "the check lets its lock go")
+    finally:
+        other.close()
+    assert client.sql("select action, field, old_value, new_value from lakefed_ingest.control_change "
+                      "where action = 'schema_upgrade'") == [("schema_upgrade", "schema_version", str(behind),
+                                                              str(schema_upgrade.SCHEMA_VERSION))]
+    monkeypatch.setattr(main.jobs, "APP_NAME", "lakefed-ops")
+    monkeypatch.setattr(main.jobs, "user_app_permission", lambda user: "CAN_MANAGE")
+    monkeypatch.setattr(main.jobs, "app_deployment", lambda: {})
+    monkeypatch.setattr(main.jobs, "SETUP_JOB_ID", "16")
+    monkeypatch.setattr(main.run_poller, "runs_of", lambda job_id, active_only, limit: [{"run_id": 41, "url": "u"}])
+    schema = client.get("/api/manage/version").json()["schema"]
+    assert (schema["database"], schema["app"], schema["run"], schema["error"]) == (
+        behind, schema_upgrade.SCHEMA_VERSION, {"run_id": 41, "url": "u"}, None)

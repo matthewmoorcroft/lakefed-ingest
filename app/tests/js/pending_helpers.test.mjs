@@ -2,7 +2,7 @@
 // strips the types in pending.ts as it loads it). frontend_pending_test.py runs this file from pytest.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { changeInProgress, connectionFailure, connectionNextBlock, connectionNextLabel, deleteNotice, longWait, readsDone, waitLine, isUnconfirmed, requestWriteNotice, runButton, runTimeoutNotice, rediscoveryBusy, rediscoveryButton, rediscoveryNotice, saveNotice, setupRunBlocks, setupRunNotice, syncFailureLines }
+import { changeInProgress, connectionFailure, connectionNextBlock, connectionNextLabel, deleteNotice, longWait, readsDone, waitLine, isUnconfirmed, requestWriteNotice, runButton, runTimeoutNotice, rediscoveryBusy, rediscoveryButton, rediscoveryNotice, saveNotice, syncFailureLines }
   from "../../src/frontend/src/pending.ts";
 
 const IDLE = { phase: "idle", timed_out: false, run_url: null, blocked: null, refused: null };
@@ -173,61 +173,6 @@ test("a dropped connection is not confirmed either", () => {
   assert.equal(isUnconfirmed(null), false);
 });
 
-const NO_START = { starting: false, error: null };
-const SETUP_LINK = "https://h/run/41";
-
-test("Run setup job is off from the moment it is pressed until Databricks reports the run ended", () => {
-  assert.equal(setupRunBlocks(undefined, true), true);
-  assert.equal(setupRunBlocks({ state: "pending", url: SETUP_LINK }, false), true);
-  assert.equal(setupRunBlocks({ state: "timeout", reason: "still listed as running" }, false), true);
-  assert.equal(setupRunBlocks({ state: "succeeded" }, false), false);
-  assert.equal(setupRunBlocks({ state: "failed", reason: "no" }, false), false);
-  assert.equal(setupRunBlocks(null, false), false);
-});
-
-test("a setup run that is starting shows pending, with no end state", () => {
-  const notice = setupRunNotice(undefined, { starting: true, error: null });
-  assert.equal(notice.tone, "info");
-  assert.match(notice.text, /Starting the setup job/);
-});
-
-test("a setup run Databricks still lists as going shows pending", () => {
-  const notice = setupRunNotice({ state: "pending", url: SETUP_LINK }, NO_START);
-  assert.deepEqual(notice, { tone: "info", text: "Setup job running" });
-});
-
-test("a setup run that ended with success shows succeeded", () => {
-  assert.deepEqual(setupRunNotice({ state: "succeeded" }, NO_START), { tone: "ok", text: "Setup job succeeded" });
-});
-
-test("a setup run that failed shows failed with Databricks' message", () => {
-  const notice = setupRunNotice({ state: "failed", reason: "schema migration lock timed out" }, NO_START);
-  assert.deepEqual(notice, { tone: "bad", text: "Setup job failed: schema migration lock timed out." });
-});
-
-test("a setup run past its limit shows a timeout that is not done, and keeps the button off", () => {
-  const reason = "Databricks has not reported it ended after 30 minutes: it is still listed as running";
-  const notice = setupRunNotice({ state: "timeout", reason }, NO_START);
-  assert.equal(notice.tone, "warn");
-  assert.match(notice.text, /^Setup job not confirmed: Databricks has not reported it ended after 30 minutes/);
-  assert.match(notice.text, /Run setup job stays off until Databricks reports it ended\.$/);
-  assert.equal(setupRunBlocks({ state: "timeout", reason }, false), true);
-});
-
-test("a setup start that did not answer is not confirmed, not failed", () => {
-  const notice = setupRunNotice(undefined, { starting: false, error: Object.assign(new Error("gateway"), { status: 504 }) });
-  assert.equal(notice.tone, "warn");
-  assert.match(notice.text, /may have started/);
-});
-
-test("a setup start the server refused shows failed to start with its message", () => {
-  const notice = setupRunNotice(undefined, { starting: false, error: new Error("the setup job is not configured") });
-  assert.deepEqual(notice, { tone: "bad", text: "Setup job did not start: the setup job is not configured." });
-});
-
-test("with nothing started here there is nothing to say", () => {
-  assert.equal(setupRunNotice(undefined, NO_START), null);
-});
 
 const SAVED = "Saved: 2 tables changed.";
 

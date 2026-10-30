@@ -1,11 +1,14 @@
 # The operations app and its one-time grant job.
 #
 # The app runs as its own service principal, with the least privilege its checks allow:
-#   - ingestion, check, setup and discovery jobs: CAN_MANAGE through app resources, so the app can read their
-#     access lists: every action that runs, changes or deletes a job follows the signed-in user's own permission
-#     on these jobs (jobs.user_job_permission). Reading an access list needs CAN_MANAGE, so this is more than the
+#   - ingestion, check and discovery jobs: CAN_MANAGE through app resources, so the app can read their access
+#     lists: every action that runs, changes or deletes a job follows the signed-in user's own permission on these
+#     jobs (jobs.user_job_permission). Reading an access list needs CAN_MANAGE, so this is more than the
 #     CAN_MANAGE_RUN that starting runs needs, and would let the app edit or delete these jobs: it never does
 #     (app/README.md, Security model);
+#   - setup job: CAN_MANAGE_RUN, to start it when the app finds the state database behind (schema_upgrade.py) and
+#     to read its runs. No user starts it through the app, so its access list is never read; the run executes as
+#     the job's run-as identity, the deployer, who owns the schema;
 #   - cluster copies job: CAN_MANAGE_RUN, to start it when an app job's own cluster changes. It runs as the
 #     deployer and makes the copies of the ingestion job (each gives the app CAN_MANAGE on it);
 #   - the discovery warehouse below: CAN_USE through an app resource, to run discovery's catalog queries through the
@@ -54,7 +57,7 @@ resources:
           description: The lakefed_ingest_setup schema job.
           job:
             id: ${var.setup_job_id}
-            permission: CAN_MANAGE
+            permission: CAN_MANAGE_RUN
         - name: discover-job
           description: The lakefed_ingest_discover table discovery job (bulk import).
           job:

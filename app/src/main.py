@@ -45,6 +45,7 @@ import rediscovery
 import rollup
 import run_poller
 import schedules as sch
+import schema_upgrade
 import source_catalog
 import warehouse
 import warehouse_reads
@@ -54,9 +55,13 @@ import warehouse_reads
 async def _lifespan(_app: FastAPI):
     """The app's background work while it runs: the run poller, which keeps the databricks_run table current (every
     instance runs one, and only the one holding the poller's lock polls; RUN_POLLER=0 turns it off on this instance),
-    and the re-discovery scheduler (REDISCOVERY_TICK_S; 0 leaves it off)."""
+    the re-discovery scheduler (REDISCOVERY_TICK_S; 0 leaves it off), and the schema upgrade check, once, which starts
+    the setup job when the state database is behind (schema_upgrade; SCHEMA_UPGRADE=0 turns it off)."""
     if os.environ.get("RUN_POLLER", "1") != "0":
         run_poller.POLLER.start(on_change=_forget_shared_reads)
+    if os.environ.get("SCHEMA_UPGRADE", "1") != "0":
+        schema_upgrade.start(db.connect, jobs.SETUP_JOB_ID, lambda job_id: jobs.runs(job_id, active_only=True, limit=1),
+                             lambda job_id: jobs.run_now(job_id, {}))
     if REDISCOVERY_TICK_S > 0:
         threading.Thread(target=_rediscovery_scheduler, daemon=True, name="lakefed-app-rediscovery").start()
     yield
@@ -1385,8 +1390,7 @@ def permissions(request: Request):
                 groups.setdefault(m["task_collection"],
                                   f"these tables are in the ingestion job {s['name']}: {by_job[s['id']]['change']}")
     bundle = {name: (_databricks_job_refusals(job_id, user)["run"] if job_id else f"no {name} job is configured")
-              for name, job_id in (("ingestion", jobs.INGEST_JOB_ID), ("setup", jobs.SETUP_JOB_ID),
-                                   ("discovery", jobs.DISCOVER_JOB_ID))}
+              for name, job_id in (("ingestion", jobs.INGEST_JOB_ID), ("discovery", jobs.DISCOVER_JOB_ID))}
     return {"jobs": {str(sid): refusals for sid, refusals in by_job.items()}, "groups": groups, "run": bundle,
             "new_running_job": {variant: _permission_refusals({"job_variant": variant}, user)["run"]
                                 for variant in jobs.schedule_variants()},
@@ -1520,7 +1524,7 @@ def _databricks_job_refusals(job_id, user: str) -> dict:
 
 
 def _manage_refusal(user: str) -> Optional[str]:
-    """Why the user may not manage the app (Manage: the setup job, the Databricks jobs, the export), or None. It is the
+    """Why the user may not manage the app (Manage: its version, the export, the Databricks jobs), or None. It is the
     app's own Databricks permission, Can Manage on the app (workspace admins have it), not one of the app's."""
     if not (user or "").strip():
         return NO_IDENTITY
@@ -2839,40 +2843,6 @@ def cancel_run(run_id: int, request: Request):
     return {"cancelled": run_id}
 
 
-@app.post("/api/jobs/setup/run")
-def run_setup(request: Request):
-    _refuse(_manage_refusal(_user(request)))
-    _refuse_run_of(_require(jobs.SETUP_JOB_ID, "setup"), request)
-    return {"run_id": jobs.run_now(_require(jobs.SETUP_JOB_ID, "setup"), {})}
-
-
-# Where Databricks has not reported a setup run ended by this long after its start, the page says so, and it is not done.
-SETUP_LIMIT_S = 30 * 60
-
-
-@app.get("/api/jobs/setup/runs/active")
-def setup_run_active():
-    """The setup run Databricks lists going, if any (the run poller's table), so a page opened during a run keeps its
-    button off. Its outcome is read from GET /api/jobs/setup/runs/{run_id}."""
-    runs = run_poller.runs_of(_require(jobs.SETUP_JOB_ID, "setup"), active_only=True, limit=1)
-    return {"run_id": int(runs[0]["run_id"]) if runs else None}
-
-
-@app.get("/api/jobs/setup/runs/{run_id}")
-def setup_run(run_id: int):
-    """A setup run's outcome for the Schema setup section: pending while Databricks lists it going (the run poller's
-    table), a timeout past SETUP_LIMIT_S, then succeeded, or failed with Databricks' message. Only the setup job's runs."""
-    try:
-        state = run_poller.run_state_of(run_id)
-    except Exception as e:
-        if jobs.is_not_found(e):
-            raise HTTPException(404, f"setup run {run_id} not found")
-        raise
-    if str(state.get("job_id")) != str(_require(jobs.SETUP_JOB_ID, "setup")):
-        raise HTTPException(404, f"setup run {run_id} not found")
-    return {"run_id": int(run_id), "outcome": action_states.run_outcome(state, datetime.now(timezone.utc), SETUP_LIMIT_S)}
-
-
 # ---- Manage: the app's own Databricks jobs and the export, for those who manage the app -----------------------------
 MANAGE_JOBS = (("Ingestion", "INGEST_JOB_ID"), ("Check", "CHECK_JOB_ID"), ("Discovery", "DISCOVER_JOB_ID"),
                ("Cluster copies", "CLUSTER_COPIES_JOB_ID"), ("Delete", "DELETE_JOB_ID"),
@@ -2905,7 +2875,26 @@ def manage_version(request: Request):
         deployment, error = jobs.app_deployment(), None
     except Exception as e:
         deployment, error = {}, str(e).split(". ")[0]
-    return {"app": jobs.APP_NAME, "version": jobs.APP_VERSION, "deployment": deployment, "error": error}
+    return {"app": jobs.APP_NAME, "version": jobs.APP_VERSION, "deployment": deployment, "error": error,
+            "schema": _schema_state()}
+
+
+def _schema_state() -> dict:
+    """The state database's schema version against the one this code expects, the last upgrade check's outcome
+    (schema_upgrade.LAST), and the setup job's run going, if any, while the setup job upgrades it."""
+    out = {"database": None, "app": schema_upgrade.SCHEMA_VERSION, "check": dict(schema_upgrade.LAST), "run": None,
+           "error": None}
+    try:
+        exists = db.query(q.schema_version_table_sql())[0]["to_regclass"] is not None
+        out["database"] = int(db.query(q.schema_version_sql())[0]["version"]) if exists else 0
+    except Exception as e:
+        out["error"] = f"can't read the state database's schema version: {str(e).split('. ')[0]}"
+    try:
+        going = run_poller.runs_of(jobs.SETUP_JOB_ID, active_only=True, limit=1) if jobs.SETUP_JOB_ID else []
+        out["run"] = {"run_id": going[0]["run_id"], "url": going[0].get("url")} if going else None
+    except Exception as e:
+        out["error"] = out["error"] or f"can't read the setup job's runs: {str(e).split('. ')[0]}"
+    return out
 
 
 @app.get("/api/manage/export.csv")
@@ -2940,7 +2929,7 @@ def manage_export(request: Request, jobs_: str = Query("", alias="jobs")):
 
 
 def _bundle_job_ids() -> list:
-    return [*jobs.ingest_variants().values(), jobs.CHECK_JOB_ID, jobs.SETUP_JOB_ID, jobs.DISCOVER_JOB_ID]
+    return [*jobs.ingest_variants().values(), jobs.CHECK_JOB_ID, jobs.DISCOVER_JOB_ID]
 
 
 # ---- bulk import --------------------------------------------------------------------------------

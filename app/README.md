@@ -15,7 +15,7 @@ root doesn't depend on it, and everything the app does can also be done with SQL
 | **Schedules** | Run collections at a cadence (see [Schedules](#schedules)): create, edit, pause, resume and delete schedules; each member's next run, wrapper job, last run, p95 run time, skipped triggers, and warnings for overruns and SLAs a schedule can't meet |
 | **Tables** | Browse control rows with their checkpoint (phase, status, freshness lag, SLA). Filter by collection, text, or failing / SLA breached / no SLA / seeding / disabled. Select one row to **edit** it (every field, plus its change history), or several to **bulk edit** (e.g. move to another collection, or switch to reads through a UC connection), **enable**, **disable** or **force a reseed**. Changing `write_mode` needs a new sink in the same edit (an append sink and a merge sink can't share a table) |
 | **Databricks jobs** | Under Schedules and jobs: the Databricks ingestion job's active and recent runs (with the ingestion job that started each); **cancel** a run |
-| **Manage** | Only for those with Can Manage on the app itself (see [Security model](#security-model)): the app's version (the commit it was deployed from, and its active deployment) and state database; **Export as CSV** of one, several or every ingestion job's enabled tables, in the columns Create from one CSV reads, with an `ingestion_job` column naming each line's job (streamed a page at a time, so a 200,000-table export works; one job's lines import as a new ingestion job, and an import refuses a file of several jobs); and the Databricks jobs the app runs, each linked |
+| **Manage** | Only for those with Can Manage on the app itself (see [Security model](#security-model)): the app's version (the commit it was deployed from, and its active deployment) and the state database's schema version against the app's (see Schema upgrades, under Deploy); **Export as CSV** of one, several or every ingestion job's enabled tables, in the columns Create from one CSV reads, with an `ingestion_job` column naming each line's job (streamed a page at a time, so a 200,000-table export works; one job's lines import as a new ingestion job, and an import refuses a file of several jobs); and the Databricks jobs the app runs, each linked |
 | **Changes** | The change log: every add, register, edit, enable / disable and reseed made in the app, with who, what and when |
 | **Add table** | A form that adds one control row, checked before insert (the database constraints are the backstop): a JDBC source (host and secret) or a UC connection (`use_remote_query`), `write_mode`, `client_attrs` and `jdbc_options` |
 | **Bulk import** | Discover a server's tables (the `lakefed_ingest_discover` job, catalog metadata only), review the recommended settings in an editable grid, set shared fields once (collection, sink catalog / schema / table templates, `client_id` template, freshness SLA), and register the selection. Tables at or above a size threshold (default 1 GB) get a partitioned seed; tables already registered start unticked; duplicates are skipped |
@@ -267,11 +267,12 @@ Databricks Apps builds the frontend at deploy time (`npm install`, then `npm run
 
 The app runs as its own service principal (created with the app):
 
-- **Jobs:** `CAN_MANAGE` on the ingestion, check, setup and discovery jobs, through app resources, so it can
-  read their access lists. This is a trade-off for the per-user checks below: starting runs needs only
-  `CAN_MANAGE_RUN`, but the Permissions API returns a job's access list only to those who manage it, so the
-  service principal could also edit or delete these jobs. The app never edits or deletes them. The cluster copies
-  and delete jobs need only `CAN_MANAGE_RUN`: the app starts them and reads their runs.
+- **Jobs:** `CAN_MANAGE` on the ingestion, check and discovery jobs, through app resources, so it can read their
+  access lists. This is a trade-off for the per-user checks below: starting runs needs only `CAN_MANAGE_RUN`, but
+  the Permissions API returns a job's access list only to those who manage it, so the service principal could also
+  edit or delete these jobs. The app never edits or deletes them. The setup, cluster copies and delete jobs need
+  only `CAN_MANAGE_RUN`: the app starts them and reads their runs, and each run executes as the job's run-as
+  identity, the deployer. No user starts the setup job through the app, so its access list is never read.
 - **Lakebase:** granted by the `lakefed_ingest_app_grants` job:
   - `CAN_USE` on the instance (to mint its own short-lived credential);
   - a Postgres role;
@@ -306,11 +307,11 @@ The app runs as its own service principal (created with the app):
   so a grant to `data-eng` counts for a member of `team-x` inside it. A lookup that fails or passes those caps
   keeps the groups found so far: it can refuse something Databricks would allow, never the reverse.
 
-  Manage and its endpoints (`/api/manage/...`, and starting the setup job) need `CAN_MANAGE` on the app itself (its
+  Manage and its endpoints (`/api/manage/...`) need `CAN_MANAGE` on the app itself (its
   Databricks permission; workspace admins have it). The service principal reads the app's access list through the
   Permissions API: where it isn't allowed that read, only workspace admins see Manage, and the refusal says why.
 
-  Running the setup or discovery job, or cancelling a run, needs `CAN_MANAGE_RUN` on that job. Groups in no
+  Running the discovery job, or cancelling a run, needs `CAN_MANAGE_RUN` on that job. Groups in no
   ingestion job, and new paused jobs, are open to everyone with `CAN_USE` on the app. The server checks every
   call, and the pages show a refused button disabled with the reason. Permissions are read again after 20
   seconds.
@@ -346,6 +347,13 @@ Prerequisites: the ingestion bundle is deployed and its setup job has run (Lakeb
 
 Re-run the grant job if the app is recreated (new service principal). Default privileges cover
 tables the same owner adds later, so schema upgrades don't need it.
+
+**Schema upgrades.** When the app starts and finds the state database behind the schema version its code expects
+(`schema_upgrade.SCHEMA_VERSION`), it starts the setup job once, under an advisory lock and only if no setup run is
+going, and logs it in the change log (`schema_upgrade`). Manage shows the database's version against the app's, and
+**Upgrading the state database** with the run's link while it runs. The next ingestion or check run also migrates a
+database behind, as before. A first install, with no schema at all, is left to the deploy steps: the grant job and
+the app's own Postgres role need the schema to exist first. `SCHEMA_UPGRADE=0` turns the check off.
 
 The grant job defaults to serverless jobs compute (it only calls the workspace APIs and Lakebase). If
 the workspace doesn't have serverless jobs, run it on an existing all-purpose cluster in your target

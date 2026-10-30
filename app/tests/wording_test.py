@@ -69,7 +69,7 @@ def test_the_nav_says_schedules_and_its_page_shows_only_the_schedules():
     assert '["/schedules", "Schedules"]' in app and '["/jobs", "Jobs"]' not in app
     assert '<Route path="/schedules-and-jobs" element={<Navigate to="/schedules" replace />} />' in app
     page = (FRONTEND / "pages" / "Schedules.tsx").read_text()
-    assert '<PageHead title="Schedules"' in page and "<SchemaSetup />" in page
+    assert '<PageHead title="Schedules"' in page and "<SchemaSetup />" not in page
     for gone in ("The Databricks jobs the app runs them with", "Active runs", "Recent runs", "<Jobs"):
         assert gone not in page, gone
     assert not (FRONTEND / "pages" / "Jobs.tsx").exists()

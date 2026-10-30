@@ -8,7 +8,7 @@ type Refusal = string | null;
 export interface Permissions {
   jobs: Record<string, { run: Refusal; change: Refusal; delete: Refusal }>;
   groups: Record<string, string>;
-  run: { ingestion: Refusal; setup: Refusal; discovery: Refusal };
+  run: { ingestion: Refusal; discovery: Refusal };
   new_running_job: Record<string, Refusal>;
   /** Why the user may not manage the app (Can Manage on the app), or null when they may: Manage shows only then. */
   manage: Refusal;

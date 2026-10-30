@@ -118,12 +118,10 @@ def test_every_manage_endpoint_refuses_those_who_dont_manage_the_app(monkeypatch
     monkeypatch.setattr(main.jobs, "APP_NAME", "lakefed-ops")
     monkeypatch.setattr(main.jobs, "user_app_permission", lambda user: "CAN_USE")
     monkeypatch.setattr(main.db, "query", lambda *a: pytest.fail("read Lakebase"))
-    monkeypatch.setattr(main.jobs, "run_now", lambda *a: pytest.fail("started the setup job"))
     client = TestClient(main.app, headers=USER)
     for path in ("/api/manage/jobs", "/api/manage/version", "/api/manage/export.csv", "/api/manage/export.csv?jobs=7"):
         r = client.get(path)
         assert r.status_code == 403 and "Can Manage on the app lakefed-ops" in r.json()["detail"], path
-    assert client.post("/api/jobs/setup/run").status_code == 403
 
 
 def test_the_jobs_list_names_each_databricks_job_with_its_link(monkeypatch, manager):
@@ -148,11 +146,12 @@ def test_the_jobs_list_names_each_databricks_job_with_its_link(monkeypatch, mana
 
 def test_the_version_is_what_the_deploy_passed_and_the_apps_active_deployment(monkeypatch, manager):
     monkeypatch.setattr(main.jobs, "APP_VERSION", "0123456789abcdef")
+    monkeypatch.setattr(main, "_schema_state", lambda: {"database": 13, "app": 13})
     monkeypatch.setattr(main.jobs, "app_deployment", lambda: {"id": "d1", "created": "2026-10-30T11:00:00Z",
                                                               "creator": "deployer@example.com"})
     client = TestClient(main.app, headers=USER)
     assert client.get("/api/manage/version").json() == {
-        "app": "lakefed-ops", "version": "0123456789abcdef", "error": None,
+        "app": "lakefed-ops", "version": "0123456789abcdef", "error": None, "schema": {"database": 13, "app": 13},
         "deployment": {"id": "d1", "created": "2026-10-30T11:00:00Z", "creator": "deployer@example.com"}}
 
     def refused():

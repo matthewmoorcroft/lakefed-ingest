@@ -1,6 +1,7 @@
 """The app never shares a Lakebase connection between threads or requests: every query, statement and transaction
 opens its own (lakebase.connect), so one transaction's rollback can never take another's work and transactions never
-nest. The run poller's lock connection is the one long-lived connection, and only the poller's thread uses it. The
+nest. The run poller's lock connection is the one long-lived connection, and only the poller's thread uses it; the
+schema upgrade check (schema_upgrade.check) holds its lock on a connection it is handed, in its own thread, once. The
 connections are fakes here."""
 import pathlib
 import re
