@@ -91,7 +91,7 @@ export default function NewJob() {
       name: name.trim(), source: chosen?.source, ...(tablesPerGroup ? { tables_per_group: tablesPerGroup } : {}), dry_run: dryRun,
       request_id: requestId,
       settings: { ...w, load_type: loadType, freshness_sla_minutes: w.freshness_sla_minutes === "" ? null : Number(w.freshness_sla_minutes),
-                  identity: Object.fromEntries(identity.filter(([n]) => n.trim()).map(([n, t]) => [n.trim(), t.trim()])) },
+                  identity: Object.fromEntries(identity.filter(([n, t]) => n.trim() && t.trim()).map(([n, t]) => [n.trim(), t.trim()])) },
       run: { cadence_minutes: cadence, timezone: cadence <= 60 ? "UTC" : run.timezone || "Europe/London", paused: run.paused,
              notify_emails: run.notify_emails || null, job_variant: jobVariant,
              options: { ...(cadence > 60 ? { start_minute: (h || 0) * 60 + (m || 0) } : {}), ...(own ? { cluster: own } : {}) },

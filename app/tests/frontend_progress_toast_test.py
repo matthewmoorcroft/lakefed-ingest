@@ -43,3 +43,11 @@ def test_an_action_that_worked_is_a_toast_and_errors_stay_notices():
     assert 'toast("Groups changed")' in EDIT and "<StatusLine line={saveLine} />" in EDIT
     for page in ("Tables", "ImportCsv", "AddTable", "BulkImport", "JobEdit", "IngestionJob"):
         assert 'Notice tone="ok"' not in (PAGES / f"{page}.tsx").read_text(), page
+
+
+def test_a_new_identity_column_starts_empty_and_is_saved_only_with_a_name_and_a_value():
+    form = (PAGES / "jobForm.tsx").read_text()
+    assert 'setIdentity([...identity, ["", ""]])' in form and 'placeholder="{database}"' not in form
+    assert "<th>Column<Required /></th><th>Value<Required />" in form
+    assert "identity.filter(([n, t]) => n.trim() && t.trim())" in NEW_JOB
+    assert "[...typed, ...identity].filter(([n, t]) => n.trim() && t.trim())" in EDIT

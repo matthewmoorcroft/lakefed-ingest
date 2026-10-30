@@ -365,7 +365,7 @@ export default function JobEdit() {
     if (String(w.freshness_sla_minutes ?? "") !== String(value(s.freshness_sla_minutes) ?? ""))
       out.freshness_sla_minutes = w.freshness_sla_minutes === "" ? null : Number(w.freshness_sla_minutes);
     const typed = Object.entries(differing).filter(([, t]) => t.trim());
-    const ident = Object.fromEntries([...typed, ...identity].filter(([n]) => n.trim()).map(([n, t]) => [n.trim(), t.trim()]));
+    const ident = Object.fromEntries([...typed, ...identity].filter(([n, t]) => n.trim() && t.trim()).map(([n, t]) => [n.trim(), t.trim()]));
     if (typed.length || JSON.stringify(ident) !== JSON.stringify(value(s.identity) ?? {})) out.identity = ident;
     return out;
   };

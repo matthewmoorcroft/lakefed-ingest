@@ -56,7 +56,7 @@ export function IdentityFields({ w, setW, identity, setIdentity, differing = {},
   return (
     <>
       <table className="data identity">
-        <thead><tr><th>Column</th><th>Value<Info label="About identity values">Valid tags: <span className="mono">{TAGS}</span>,
+        <thead><tr><th>Column<Required /></th><th>Value<Required /><Info label="About identity values">Valid tags: <span className="mono">{TAGS}</span>,
           for example <span className="mono">{"{server}/{database}"}</span>. A column added later is empty for rows loaded before
           it.</Info></th><th></th></tr></thead>
         <tbody>
@@ -76,13 +76,13 @@ export function IdentityFields({ w, setW, identity, setIdentity, differing = {},
           {identity.map(([name, template], i) => (
             <tr key={i}>
               <td><input className="mono" value={name} placeholder="column name" aria-label="Identity column name" onChange={(e) => setIdentity(identity.map((x, j) => (j === i ? [e.target.value, x[1]] : x)))} /></td>
-              <td><input className="mono" value={template} placeholder="{database}" aria-label="Identity column value" onChange={(e) => setIdentity(identity.map((x, j) => (j === i ? [x[0], e.target.value] : x)))} /></td>
+              <td><input className="mono" value={template} placeholder="e.g. {server}" aria-label="Identity column value" onChange={(e) => setIdentity(identity.map((x, j) => (j === i ? [x[0], e.target.value] : x)))} /></td>
               <td><button className="ghost" onClick={() => setIdentity(identity.filter((_, j) => j !== i))}>Remove</button></td>
             </tr>
           ))}
         </tbody>
       </table>
-      <div className="toolbar"><button className="ghost" onClick={() => setIdentity([...identity, ["", "{database}"]])}>Add a column</button></div>
+      <div className="toolbar"><button className="ghost" onClick={() => setIdentity([...identity, ["", ""]])}>Add a column</button></div>
     </>
   );
 }
