@@ -140,7 +140,8 @@ def split_sql_statements(ddl: str) -> List[str]:
 #   11 = discovery.listing (how a discovery listed its databases, for a later re-discovery)
 #   12 = app_task.progress (a by-database write's progress)
 #   13 = rollup_database, rollup_group (the monitoring rollups) and an index on control by group and database
-SCHEMA_VERSION = 13
+#   14 = ingest_event.error_kind and error_class (how a failed attempt was classified, for the failing-tables list)
+SCHEMA_VERSION = 14
 # Advisory lock that serializes migrations (the setup job and ingestion runs of any collection): two
 # int keys, so it can't collide with a collection's one-key lock whatever the collection is named,
 # and a class of its own (not SOURCE_LOCK_CLASS).
@@ -664,7 +665,7 @@ def record_event_finish_sql() -> str:
         "finished_at = now(), "
         "duration_ms = (extract(epoch from (now() - started_at)) * 1000)::bigint, "
         "status = %s, stage = %s, rows_read = %s, rows_merged = %s, "
-        "position_from = %s, position_to = %s, error = %s, "
+        "position_from = %s, position_to = %s, error = %s, error_kind = %s, error_class = %s, "
         "action = coalesce(%s, action), pool = coalesce(%s, pool), retry_count = coalesce(%s, retry_count) "
         "where id = %s"
     )
@@ -1524,17 +1525,19 @@ class StateStore:
 
     def record_event_finish(self, event_id, status, stage=None, rows_read=None, rows_merged=None,
                             position_from=None, position_to=None, error=None,
-                            action=None, pool=None, retry_count=None) -> None:
+                            action=None, pool=None, retry_count=None, error_kind=None, error_class=None) -> None:
         """Finalize an ingest_event row; on 'ok' also stamp checkpoint.last_success_at.
         Positions are stored as text. ``action`` (optional) corrects the provisional action set at
         start (e.g. 'reseed'); ``pool`` (optional) records the FAIR pool(s) the table's units ran in;
         ``retry_count`` (optional) the table's earlier attempts in this run. Status 'retried' is an
-        attempt that failed and is tried again."""
+        attempt that failed and is tried again. ``error_kind`` and ``error_class`` say how a failure was
+        classified (table_retry.classify, table_retry.error_class)."""
         with self._cursor() as cur:
             cur.execute(record_event_finish_sql(), (
                 status, stage, rows_read, rows_merged, position_text(position_from),
                 position_text(position_to),
-                (error[:2000] if isinstance(error, str) else error), action, pool, retry_count, int(event_id),
+                (error[:2000] if isinstance(error, str) else error), error_kind, error_class,
+                action, pool, retry_count, int(event_id),
             ))
             if status == "ok":
                 cur.execute(touch_last_success_sql(), (int(event_id),))

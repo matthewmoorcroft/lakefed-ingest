@@ -154,3 +154,14 @@ def test_a_check_and_a_run_of_one_collection_go_at_once_on_different_databases(s
     held = check.try_lock_databases([ss.database_lock_key("g1", "srv", n) for n in ("a", "b")])
     assert held == {ss.database_lock_key("g1", "srv", "b")}           # the check leaves the run's database out
     assert whole.try_lock_collection("g1") is False
+
+
+def test_a_failed_attempt_records_how_it_was_classified(conn):
+    """The classification columns exist once the schema applies, and record_event_finish writes them."""
+    conn.execute("insert into lakefed_ingest.ingest_event (run_id, task_collection, control_id, src_table, status) "
+                 "values (1, 'c', 10, 't10', 'running')")
+    event_id = conn.execute("select id from lakefed_ingest.ingest_event").fetchone()[0]
+    ss.StateStore(conn).record_event_finish(event_id, "failed", stage="read", error="x", error_kind="transient",
+                                            error_class="FAILED_JDBC.CONNECTION")
+    assert conn.execute("select error_kind, error_class from lakefed_ingest.ingest_event where id = %s",
+                        (event_id,)).fetchone() == ("transient", "FAILED_JDBC.CONNECTION")

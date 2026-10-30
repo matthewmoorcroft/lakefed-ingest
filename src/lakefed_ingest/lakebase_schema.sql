@@ -383,6 +383,10 @@ alter table lakefed_ingest.ingest_event alter column position_from type text usi
 alter table lakefed_ingest.ingest_event alter column position_to type text using position_to::text;
 -- Phase 'cdc' was renamed 'incremental' (see checkpoint above); keep history consistent.
 update lakefed_ingest.ingest_event set phase = 'incremental' where phase = 'cdc';
+-- How a failed attempt was classified (table_retry.classify: permanent | transient | unknown) and the error class it
+-- was classified by (its Spark error class, else its exception type). The operations app's failing-tables list reads them.
+alter table lakefed_ingest.ingest_event add column if not exists error_kind text;
+alter table lakefed_ingest.ingest_event add column if not exists error_class text;
 
 create index if not exists ingest_event_run_idx
     on lakefed_ingest.ingest_event (run_id);
