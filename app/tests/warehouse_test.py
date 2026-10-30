@@ -76,6 +76,12 @@ def test_a_statement_is_sent_to_the_configured_warehouse_and_waits_briefly_then_
     assert answer == {"statement_id": "s1", "state": "PENDING", "rows": None, "error": None}
 
 
+def test_a_statement_sent_with_no_wait_answers_at_once(workspace):
+    client = workspace(_Statements([_answer(StatementState.PENDING)]))
+    warehouse.start("SELECT 1", [], wait_s=0)
+    assert client.statement_execution.sent[0]["wait_timeout"] == "0s"
+
+
 def test_a_finished_statement_gives_its_rows_by_column_name_across_every_chunk(workspace):
     client = workspace(_Statements([_answer(StatementState.SUCCEEDED, rows=[["db_a"], ["db_b"]], chunks=3)],
                                    chunks={1: ([["db_c"]], 2), 2: ([["db_d"]], None)}))

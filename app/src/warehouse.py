@@ -34,15 +34,15 @@ def remote_query_statement(connection: str, database: str, query: str):
             [{"name": "conn", "value": connection}, {"name": "db", "value": database}, {"name": "q", "value": query}])
 
 
-def start(statement: str, parameters: List[dict]) -> dict:
-    """Send a statement to the warehouse and wait up to START_WAIT_S for it: {statement_id, state, rows, error}, rows
-    by column name once it has SUCCEEDED."""
+def start(statement: str, parameters: List[dict], wait_s: int = START_WAIT_S) -> dict:
+    """Send a statement to the warehouse and wait up to wait_s for it: {statement_id, state, rows, error}, rows by
+    column name once it has SUCCEEDED. With wait_s 0 it answers at once, and the statement carries on there."""
     from databricks.sdk.service.sql import (Disposition, ExecuteStatementRequestOnWaitTimeout, Format,
                                             StatementParameterListItem)
     if not configured():
         raise NotConfigured("no SQL warehouse is set for discovery (the app's WAREHOUSE_ID)")
     answer = workspace().statement_execution.execute_statement(
-        statement=statement, warehouse_id=WAREHOUSE_ID, wait_timeout=f"{START_WAIT_S}s",
+        statement=statement, warehouse_id=WAREHOUSE_ID, wait_timeout=f"{wait_s}s",
         on_wait_timeout=ExecuteStatementRequestOnWaitTimeout.CONTINUE, disposition=Disposition.INLINE,
         format=Format.JSON_ARRAY,
         parameters=[StatementParameterListItem(name=p["name"], value=p["value"]) for p in parameters])

@@ -103,7 +103,7 @@ def advance(store, warehouse, kind: str, discovery_id: str, connection: str, fir
     for database in store.claim(kind, discovery_id, list(first), max(0, IN_FLIGHT - still), CLAIM_S):
         statement, parameters = statement_for(kind, connection, database)
         try:
-            answer = warehouse.start(statement, parameters)
+            answer = warehouse.start(statement, parameters, wait_s=0)    # sent together; the next step collects them
         except Exception as e:
             store.clear(kind, discovery_id, database)
             return {**store.progress(kind, discovery_id), "error": first_line(str(e)), "warehouse": ""}

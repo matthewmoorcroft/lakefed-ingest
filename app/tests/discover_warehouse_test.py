@@ -26,7 +26,7 @@ class _Warehouse:
     def remote_query_statement(self, connection, database, query):
         return warehouse.remote_query_statement(connection, database, query)
 
-    def start(self, statement, parameters):
+    def start(self, statement, parameters, wait_s=None):
         self.sent.append((statement, parameters))
         return self._next()
 

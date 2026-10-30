@@ -40,7 +40,7 @@ class _Warehouse:
     def __init__(self, databases):
         self.databases, self.answers, self.ids = databases, {}, itertools.count(1)
 
-    def start(self, statement, parameters):
+    def start(self, statement, parameters, wait_s=None):
         query = " ".join(str(p.get("value") if isinstance(p, dict) else p) for p in parameters) + statement
         if "sys.databases" in query:
             rows = [{"name": name} for name in self.databases]

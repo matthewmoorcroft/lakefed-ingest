@@ -58,11 +58,12 @@ class _Warehouse:
     ENDED = warehouse.ENDED
 
     def __init__(self, answers, state="RUNNING"):
-        self.answers, self.state, self.started_for, self.statements = answers, state, [], {}
+        self.answers, self.state, self.started_for, self.statements, self.waits = answers, state, [], {}, []
 
-    def start(self, statement, parameters):
+    def start(self, statement, parameters, wait_s=None):
         database = {p["name"]: p["value"] for p in parameters}["db"]
         self.started_for.append(database)
+        self.waits.append(wait_s)
         self.statements[f"s-{database}"] = (database, statement)
         return {"statement_id": f"s-{database}", "state": "PENDING", "rows": None, "error": None}
 
@@ -158,13 +159,15 @@ def test_a_read_never_keeps_more_than_its_share_of_statements_going():
     for _ in range(5):
         wr.advance(store, fake, wr.READ, "d9", "sql_a")
     assert len(fake.started_for) == wr.IN_FLIGHT and len(store.in_flight(wr.READ, "d9")) == wr.IN_FLIGHT
+    # Sent together, none waited for: one step starts them all, and the next collects the ones that ended.
+    assert fake.waits == [0] * wr.IN_FLIGHT
 
 
 def test_a_statement_that_fails_to_start_frees_its_database_and_says_why():
     store = _Store(["eng_001"], wr.READ)
 
     class Broken(_Warehouse):
-        def start(self, statement, parameters):
+        def start(self, statement, parameters, wait_s=None):
             raise RuntimeError("the warehouse was deleted\nmore")
     step = wr.advance(store, Broken({}), wr.READ, "d9", "sql_a")
     assert step["error"] == "the warehouse was deleted" and step["pending"] == 1
