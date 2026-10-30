@@ -343,7 +343,9 @@ Written by the operations app (see "Schedules" in `app/README.md`); the ingestio
   180, 240, 360, 720 or 1440), `timezone`, `parameters` (ingestion job parameters, JSON), `job_variant`,
   `stagger`, `paused`, `notify_emails`, `options` (JSON, null = none: `start_minute`, a set start time in
   minutes after local midnight for daily and every 2 to 12 hours schedules; `rediscover_hour`, the UTC hour of the
-  job's daily re-discovery, absent when off; `rediscovery`, the last re-discovery's record, written by the app),
+  job's daily re-discovery, absent when off; `rediscovery`, the last re-discovery's record, written by the app;
+  `table_remove`, each Remove request by control id with its delete job run; `table_exclude`, the tables a removal
+  took out, which re-discovery and whole-database Add tables leave out until Add tables names them again),
   who created it and when, and
   `deleted_at` (soft delete).
 - **`schedule_member`:** one row per (schedule, collection): `offset_minutes` (start offset within the
