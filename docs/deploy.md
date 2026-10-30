@@ -206,6 +206,20 @@ Either way the migration needs the schema's owner: the deployer, unless the jobs
 identity. From an early deploy, it renames the `ct_checkpoint` / `sweep_run` tables and their
 CT-specific columns to the generic `checkpoint` / `ingest_run` names in place (data kept).
 
+**Large telemetry tables:** the schema-14 upgrade builds `ingest_event_control_started_idx` on `ingest_event`
+inside the migration transaction, which holds that table's lock for the whole build (see
+[lakebase_schema.md](lakebase_schema.md#locks-and-waiting)). On a deployment with a large `ingest_event`, build
+it first, as the schema's owner and outside any transaction, so the migration skips it:
+
+```sql
+create index concurrently if not exists ingest_event_control_started_idx
+    on lakefed_ingest.ingest_event (control_id, started_at);
+```
+
+Check that it is valid: `select indisvalid from pg_index where indexrelid = 'lakefed_ingest.ingest_event_control_started_idx'::regclass;`
+must return `true`. A concurrent build that fails leaves an invalid index under the same name, which the migration
+would skip, so drop it (`drop index concurrently lakefed_ingest.ingest_event_control_started_idx;`) and build it again.
+
 **Scheduling:** the ingestion job's schedule (paused by default) can't pass parameters, so it only ingests
 the default `task_collection`. For per-collection cadence, use the operations app's schedules (a wrapper
 job per collection), or the check job, `lakefed_ingest_check`: it checks a group of collections on

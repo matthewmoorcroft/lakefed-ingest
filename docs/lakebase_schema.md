@@ -293,6 +293,15 @@ collection's other events. Like every migration they are built in the upgrade's 
 the telemetry tables' write lock while it builds them: on a database with years of history, run
 `lakefed_ingest_setup` at a quiet time rather than leave the upgrade to the next ingestion run.
 
+The operations app's failing-tables read (schema version 14) looks up each table's last `ok` event and its
+failures by control row and time, so it has `ingest_event_control_started_idx` on `(control_id, started_at)`. It is
+not partial, so the `ok` and the `failed` lookups both use it. The migration builds it with a plain
+`create index if not exists` inside the upgrade transaction, which by then already holds `ingest_event`'s
+`ACCESS EXCLUSIVE` lock (the schema-14 `add column` statements take it, and it is kept to the commit; see
+[Locks and waiting](#locks-and-waiting)). The build therefore holds that lock for its whole run, and reads of
+`ingest_event` wait with it. On a large `ingest_event`, build the index first with `create index concurrently`
+(see [deploy.md](deploy.md)): the migration then skips it.
+
 ## `control_change` — change log
 
 Written by the operations app in the same transaction as each change. Columns:
@@ -517,6 +526,11 @@ on `control` (the largest table) that holds an `ACCESS EXCLUSIVE` lock for the s
 from the catalog or written as `NOT VALID` plus a later `VALIDATE`, an upgrade that touches the `control` or
 `checkpoint` constraints should run between ingestion runs, not during them.
 
-Upgrades that only add columns, tables or indexes are safe while runs are going. A version that renames,
+Upgrades that only add columns, tables or indexes wait for running loads at their first lock (3 s, retried),
+then keep the lock to the commit. A column added to `ingest_event` (schema 14) takes that table's
+`ACCESS EXCLUSIVE` lock, so an index built after it in the same transaction, such as
+`ingest_event_control_started_idx`, holds the lock for the build's whole length. A plain build is a
+single scan of the table, and its time grows with the table's rows; it has not been measured on a stable
+deployment. Pre-create the index on a large table (see [deploy.md](deploy.md)). Otherwise, a version that renames,
 or adds a constraint to a table the ingestion job writes, can fail tables of a run still on the old code
 (they're redone by the next run): for those, pause schedules or deploy between runs.
