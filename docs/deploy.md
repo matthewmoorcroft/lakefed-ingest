@@ -136,12 +136,12 @@ The one-time and ad hoc jobs shouldn't wait several minutes for a job cluster to
   logins. This assumes the ingestion jobs run as that same deployer, so they can read the logins; deploy the app bundle
   as the user who runs the ingestion jobs, and check the jobs' run-as identity on your deployment. The audit log records
   each write with the value redacted (checked 30 Oct 2026). See the app's README, "JDBC connections entered by hand".
-- **The check** (`lakefed_ingest_check`) runs on serverless and reads every source database it checks, so
-  serverless compute needs a network path to the sources, not only to Lakebase: for example private
+- **The check** (`lakefed_ingest_check`) runs on serverless by default and reads every source database it checks,
+  so serverless compute needs a network path to the sources, not only to Lakebase: for example private
   endpoints through a network connectivity configuration (NCC), or source firewall rules that allow the
-  serverless egress. Check this before choosing the check variant: a source that only a job cluster can
-  reach can't be checked, and its group should use the default variant. A job-cluster option for the check
-  is not built yet.
+  serverless egress. A source that only a job cluster can reach is checked on a classic job cluster or an
+  existing cluster instead, see [Compute for the check](#compute-for-the-check). Without either, its group
+  should use the default variant.
 
 If the workspace doesn't have serverless jobs (or serverless can't reach Lakebase there), run setup
 on an all-purpose cluster instead, such as the utility cluster. It's a one-time or ad hoc job, often
@@ -167,6 +167,158 @@ targets:
 
 The job keeps its (now unused) environment definition; the task runs on the cluster. The job's run-as
 identity needs permission to attach to the cluster, and the cluster must reach Lakebase on port 5432.
+
+### Compute for the check
+
+The check job (`lakefed_ingest_check`) runs on serverless by default. Its one task uses the job
+environment `lakebase_client`, which installs `psycopg[binary]` and `databricks-sdk==0.145.0`. The default
+needs no setting. A classic job cluster or an existing cluster is set by a target override, below.
+
+**Why a variable can't switch this.** A task takes one compute reference: `environment_key` (serverless),
+`job_cluster_key` (an entry in the job's `job_clusters`), or `existing_cluster_id`. A task can't have two.
+Each choice sets one field and clears the others, and YAML has no conditionals. A bundle variable fills one
+string, and the schema (`databricks bundle schema`) types these fields as plain strings, so a variable
+could only stand in for one field, not clear the rest. How the CLI treats an empty `job_cluster_key` or
+`existing_cluster_id` is not confirmed, so each alternative is a target override. The setup job's
+override under [Compute for the setup and discovery jobs](#compute-for-the-setup-and-discovery-jobs) uses
+the same pattern (`environment_key: ""`).
+
+**Classic job cluster.** The check runs on a job cluster sized by the bundle's own compute variables
+(`node_type_id`, `driver_node_type_id`, `num_workers`). Put this in your target in `databricks.yml`:
+
+```yaml
+targets:
+  dev:                                          # your target
+    resources:
+      jobs:
+        lakefed_ingest_check:
+          job_clusters:
+            - job_cluster_key: check_cluster
+              new_cluster:
+                spark_version: 18.x-scala2.13   # the ingestion job's runtime; it is hard-coded there, no variable
+                data_security_mode: SINGLE_USER
+                node_type_id: ${var.node_type_id}
+                driver_node_type_id: ${var.driver_node_type_id}
+                num_workers: ${var.num_workers}
+                custom_tags:
+                  project: lakefed_ingest
+          tasks:
+            - task_key: check
+              environment_key: ""               # clears the serverless environment
+              job_cluster_key: check_cluster
+              libraries:                        # the packages the serverless environment installs
+                - pypi:
+                    package: "psycopg[binary]"
+                - pypi:
+                    package: "databricks-sdk==0.145.0"
+```
+
+- The cluster needs Databricks Runtime 18.3 or later for `remote_query` (per the
+  [remote_query docs](https://learn.microsoft.com/en-us/azure/databricks/query-federation/remote-queries)).
+  Check the runtime `18.x` resolves to in your workspace.
+- `SINGLE_USER` mode: the identity the job runs as needs `MANAGE` as well as `USE CONNECTION` on each
+  connection the check reads through (the same `remote_query` page says single-user clusters need `MANAGE`).
+- The cluster reaches Lakebase on port 5432 through the workspace IP access list or Private Link (step 3,
+  item 1), and it needs a network path to each source, in place of the serverless NCC or firewall rules.
+- The job keeps its environment definition, which this task no longer uses.
+
+**Existing cluster.** An all-purpose cluster you already run. Only the cluster ID is set; no variable is needed:
+
+```yaml
+targets:
+  dev:                                          # your target
+    resources:
+      jobs:
+        lakefed_ingest_check:
+          tasks:
+            - task_key: check
+              environment_key: ""               # clears the serverless environment
+              existing_cluster_id: "<cluster-id>"
+              libraries:
+                - pypi:
+                    package: "psycopg[binary]"
+                - pypi:
+                    package: "databricks-sdk==0.145.0"
+```
+
+- It must be a classic cluster on Databricks Runtime 18.3 or later, in the same network position as the
+  classic option above (Lakebase on 5432, a path to each source).
+- The job's run-as identity needs permission to attach to the cluster, as for the setup job.
+
+### The app's SQL warehouse
+
+The operations app runs its discovery SQL (the connection test, database lists, and table reads through
+`remote_query`) on one SQL warehouse. The app gets its ID as `WAREHOUSE_ID`, from the app resource
+`discovery-warehouse` in `app/resources/lakefed_ingest_app.yml`. Only `app/src/warehouse.py` reads it, from the
+environment, so no app code holds a warehouse ID.
+
+By default that resource is the bundle's own warehouse, `lakefed_ingest discovery`: Pro, serverless, sized by
+`discovery_warehouse_size`, `discovery_warehouse_max_clusters` and `discovery_warehouse_auto_stop_mins` in
+`app/databricks.yml`. It auto-stops when idle.
+
+To use a customer's warehouse instead, it must be Pro or serverless, on version 2025.35 or above. The
+[remote_query docs](https://learn.microsoft.com/en-us/azure/databricks/query-federation/remote-queries) say
+"SQL warehouses must be Pro or Serverless and use version 2025.35 or above" (the AWS page is
+[query-federation/remote-queries](https://docs.databricks.com/aws/en/query-federation/remote-queries)).
+(The Runtime 18.3 requirement applies to clusters, not to SQL warehouses.)
+
+**Why a variable can't switch this.** The app resource takes one warehouse ID, and the default is the ID of a
+warehouse the bundle creates. YAML has no conditionals. The override below changes the `discovery-warehouse`
+resource in a target of `app/databricks.yml`. It repeats every app resource, because whether a target replaces a
+list or merges it is not confirmed. Run `databricks bundle plan` and confirm no app resource is removed.
+
+```yaml
+# app/databricks.yml
+targets:
+  dev:                                           # your target
+    resources:
+      apps:
+        lakefed_ingest_app:
+          resources:
+            - name: ingest-job
+              description: The lakefed_ingest ingestion job.
+              job:
+                id: ${var.ingest_job_id}
+                permission: CAN_MANAGE
+            - name: setup-job
+              description: The lakefed_ingest_setup schema job.
+              job:
+                id: ${var.setup_job_id}
+                permission: CAN_MANAGE_RUN
+            - name: discover-job
+              description: The lakefed_ingest_discover table discovery job (bulk import).
+              job:
+                id: ${var.discover_job_id}
+                permission: CAN_MANAGE
+            - name: check-job
+              description: The lakefed_ingest_check job, started by schedules of the check variant.
+              job:
+                id: ${var.check_job_id}
+                permission: CAN_MANAGE
+            - name: cluster-copies-job
+              description: The lakefed_ingest_cluster_copies job, started when an app job's own cluster changes.
+              job:
+                id: ${var.cluster_copies_job_id}
+                permission: CAN_MANAGE_RUN
+            - name: delete-job
+              description: The lakefed_ingest_delete_job job, started when an app job is deleted.
+              job:
+                id: ${var.delete_job_id}
+                permission: CAN_MANAGE_RUN
+            - name: discovery-warehouse
+              description: The SQL warehouse discovery runs on.
+              sql_warehouse:
+                id: "<customer-warehouse-id>"         # Pro or serverless, version 2025.35 or above
+                permission: CAN_USE
+```
+
+- The bundle's own warehouse is still defined and created. This override doesn't remove it, and it stays idle
+  while nothing uses it. Whether a target can drop it is not confirmed.
+- The app's service principal gets `CAN_USE` through the resource. What the deploying user needs to bind a
+  customer's warehouse is not confirmed; check it at deploy.
+- Discovery reads the sources through `remote_query` on whichever warehouse is set, so that warehouse needs a
+  network path to each source. For a customer's warehouse, that is its own network setup, not the bundle's
+  serverless network connectivity.
 
 ## 3. Steps outside the bundle
 

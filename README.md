@@ -481,7 +481,7 @@ snapshot of every table that gained the column). New sinks get
 | Lakebase instance, database, UC catalog | Bundle resources in `resources/lakefed_ingest_setup.yml` (created on deploy, or adopt existing ones with `bundle deployment bind`) |
 | Schema + migrations | `lakefed_ingest_setup` job on a new deployment (idempotent); after an upgrade, the first ingestion run migrates the schema itself |
 | Serverless jobs compute (default for setup) | The `lakefed_ingest_setup` job (and the operations app's grant job) default to serverless: they only talk to Lakebase, so they don't wait for a cluster. Without serverless, point them at an all-purpose cluster ([docs/deploy.md](docs/deploy.md#compute-for-the-setup-and-discovery-jobs)). Discovery reads the sources, so it runs on the bundle's single-node all-purpose `lakefed_ingest utility` cluster, which stays up between runs (auto-terminates after an hour). Ingestion runs on job clusters |
-| Serverless network path to the sources (check variant) | The check job, `lakefed_ingest_check`, reads the source databases from serverless compute, so serverless needs a network path to every source it checks (for example private endpoints through a network connectivity configuration, or source firewall rules), not only to Lakebase. Without one, use the default variant for those groups ([docs/deploy.md](docs/deploy.md#compute-for-the-setup-and-discovery-jobs)) |
+| Serverless network path to the sources (check variant) | The check job, `lakefed_ingest_check`, reads the source databases from serverless compute, so serverless needs a network path to every source it checks (for example private endpoints through a network connectivity configuration, or source firewall rules), not only to Lakebase. Without one, run the check on a classic job cluster or an existing cluster, or use the default variant for those groups ([docs/deploy.md](docs/deploy.md#compute-for-the-check)) |
 | Lakebase auth | SDK-minted OAuth token at runtime; the run identity must be a Postgres role on the instance |
 | Cluster → Lakebase network path (port 5432) | Workspace IP access list must allow cluster egress, or use Private Link. Verify first. |
 | Per-database source credentials | One JSON secret `{"user","password"}` per source database, named by `control.secret_key`, in the `secret_scope` (may be Azure Key Vault-backed); or, for rows with `use_remote_query`, a UC connection on which the job's identity has `USE CONNECTION` and `MANAGE`. The operations app's JDBC connections name a scope and key the same way ([app/README.md](app/README.md#jdbc-connections-entered-by-hand)) |
@@ -542,6 +542,17 @@ starts it with its members instead.
 script to run once per SQL Server database. It reports table sizes, CT settings, and how many
 tables and rows change per time bucket — the inputs for choosing collections, `parallelism`, and
 cluster size.
+
+## Compute options
+
+- **The check** (`lakefed_ingest_check`) runs on serverless by default. A classic job cluster or an existing
+  cluster can run it instead. The check reads the sources itself, so whichever compute it uses needs a network
+  path to each source.
+- **The operations app's SQL warehouse** is the bundle's own serverless Pro warehouse by default. A customer's
+  Pro or serverless warehouse (version 2025.35 or above) can replace it.
+- No bundle variable switches either one: a task has one compute reference, and YAML has no conditionals. Each
+  alternative is a ready target override in [docs/deploy.md](docs/deploy.md#compute-for-the-check) and
+  [docs/deploy.md](docs/deploy.md#the-apps-sql-warehouse).
 
 ## Tests
 
