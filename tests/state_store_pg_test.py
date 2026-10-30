@@ -52,3 +52,83 @@ def test_a_run_closes_its_collections_abandoned_runs_and_their_open_events(conn)
     assert events["t10"] == ("failed", f"{ss.ABANDONED_RUN_REASON}; closed by run 2")
     assert events["t11"] == ("failed", f"timed out | {ss.ABANDONED_RUN_REASON}; closed by run 2")
     assert events["t12"] == ("ok", None)
+
+
+@pytest.fixture
+def sessions():
+    """A throwaway database with the Lakebase schema, and a way to open more sessions on it, as runs are."""
+    psycopg = pytest.importorskip("psycopg")
+    name = f"lakefed_test_{uuid.uuid4().hex[:8]}"
+    admin = psycopg.connect(URI, autocommit=True)
+    admin.execute(f"create database {name}")
+    target = psycopg.conninfo.make_conninfo(URI, dbname=name)
+    opened = []
+
+    def session():
+        opened.append(psycopg.connect(target, autocommit=True))
+        return opened[-1]
+    try:
+        for statement in ss.split_sql_statements(SCHEMA.read_text()):
+            session().execute(statement)
+        yield session
+    finally:
+        for c in opened:
+            c.close()
+        admin.execute(f"drop database {name}")
+        admin.close()
+
+
+def test_work_list_runs_share_a_collection_and_anything_needing_it_alone_is_refused(sessions):
+    first, second, edit = (ss.StateStore(sessions()) for _ in range(3))
+    assert first.try_lock_collection_shared("g1") and second.try_lock_collection_shared("g1")
+    assert edit.try_lock_collection("g1") is False                       # a whole run, the check
+    xact = sessions()
+    assert xact.execute("select pg_try_advisory_xact_lock(hashtextextended(%s, 0))",
+                        (ss.collection_lock_key("g1"),)).fetchone()[0] is False      # the app's edits and Delete
+    first.unlock_collection_shared("g1")
+    second.unlock_collection_shared("g1")
+    assert edit.try_lock_collection("g1") is True
+    assert first.try_lock_collection_shared("g1") is False               # and the other way round
+
+
+def test_two_runs_given_one_database_take_it_once_and_the_second_skips_it(sessions):
+    first, second = ss.StateStore(sessions()), ss.StateStore(sessions())
+    keys = [ss.database_lock_key("g1", "srv", name) for name in ("db1", "db2")]
+    assert first.try_lock_databases(keys) == set(keys)
+    assert second.try_lock_databases(keys + [ss.database_lock_key("g1", "srv", "db3")]) == \
+        {ss.database_lock_key("g1", "srv", "db3")}
+    first.unlock_databases(keys)
+    assert second.try_lock_databases(keys) == set(keys)
+
+
+def test_a_run_closes_abandoned_runs_only_when_no_other_run_holds_the_collection(sessions):
+    first, second = ss.StateStore(sessions()), ss.StateStore(sessions())
+    assert first.try_lock_collection_shared("g1") and second.try_lock_collection_shared("g1")
+    assert first.alone_on_collection("g1") is False
+    second.unlock_collection_shared("g1")
+    assert first.alone_on_collection("g1") is True
+    assert second.try_lock_collection_shared("g1") is True               # the exclusive try was let go at once
+
+
+def test_two_runs_recounting_one_group_at_once_leave_it_exact(sessions):
+    """Each run writes its own database's rows and recounts the group; the second recount waits for the first to
+    commit, so the group counts both databases."""
+    import threading
+    setup = sessions()
+    setup.execute("insert into lakefed_ingest.control (task_collection, src_host, src_database, src_schema, src_table, "
+                  "sink_catalog, sink_schema, sink_table, primary_key, select_list) values "
+                  "('g1', 'host-a', 'db1', 'dbo', 't', 'main', 's', 'db1_t', 'id', 'id'), "
+                  "('g1', 'host-a', 'db2', 'dbo', 't', 'main', 's', 'db2_t', 'id', 'id')")
+    stores = [ss.StateStore(sessions()) for _ in range(2)]
+    barrier = threading.Barrier(2)
+
+    def recount(store, database):
+        barrier.wait()
+        store.rewrite_rollups("g1", [database])
+    threads = [threading.Thread(target=recount, args=(s, d)) for s, d in zip(stores, ("db1", "db2"))]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(30)
+    assert setup.execute("select databases, tables from lakefed_ingest.rollup_group where task_collection = 'g1'"
+                         ).fetchone() == (2, 2)

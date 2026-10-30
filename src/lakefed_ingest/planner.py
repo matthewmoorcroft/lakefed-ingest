@@ -25,7 +25,7 @@ from __future__ import annotations
 
 from collections import Counter
 from datetime import datetime, timezone
-from typing import Optional, Callable, Dict, List, Tuple
+from typing import Optional, Callable, Dict, Iterable, List, Tuple
 
 import ct_engine
 import cursor_engine
@@ -137,6 +137,20 @@ def locked_run_status(work_id: str) -> str:
     """How a run that finds its collection locked by another sweep ends. A run with a work list was started
     for databases that only it would ingest, so it fails; a run without one is a plain skip."""
     return "failed" if str(work_id or "").strip() else "skipped"
+
+
+def work_database_keys(task_collection: str, work: Iterable[tuple]) -> Dict[str, tuple]:
+    """{lock key: (source, src_database)} for a work list's databases (``state_store.database_lock_key``)."""
+    return {ss.database_lock_key(task_collection, source, database): (source, database)
+            for source, database in sorted({(str(s), str(d)) for s, d in work})}
+
+
+def work_after_locks(work: Iterable[tuple], keys: Dict[str, tuple], held: set) -> Tuple[set, List[tuple]]:
+    """A work-list run's databases once it has tried their locks: (the ones it keeps, the ones another run holds).
+    A database another run holds (two overlapping checks gave it to both) is skipped, not failed: the run that holds
+    it ingests it, and if not, the next cycle's check finds it again (it was never stamped)."""
+    kept = {keys[key] for key in held if key in keys}
+    return {tuple(item) for item in work if tuple(item) in kept}, sorted(set(keys.values()) - kept)
 
 
 def sink_checked_configs(configs: List[dict]) -> List[dict]:

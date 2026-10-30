@@ -1009,6 +1009,54 @@ def unlock_collection_sql() -> str:
     return "select pg_advisory_unlock(hashtextextended(%s, 0))"
 
 
+# A run given a work list (by the check) holds its collection's lock SHARED, on the same key, plus one exclusive lock
+# per database it was given, so runs of one collection on different databases go at once, and two runs never take
+# one database. Everything that needs the collection to itself (a run without a work list, the check, the app's
+# edits and Delete, which try the same key exclusively) is refused while any of them holds it, and the other way
+# round: a work-list run can't start while one of those holds it.
+DATABASE_LOCK_NAMESPACE = "lakefed_ingest.database:"
+
+
+def database_lock_key(task_collection: str, source: str, src_database: str) -> str:
+    """The key of one database's run lock within a collection (the grain of a check stamp)."""
+    return f"{DATABASE_LOCK_NAMESPACE}{task_collection}|{source}|{src_database}"
+
+
+def try_lock_collection_shared_sql() -> str:
+    """Non-blocking: true iff this session now holds the collection's lock shared."""
+    return "select pg_try_advisory_lock_shared(hashtextextended(%s, 0))"
+
+
+def unlock_collection_shared_sql() -> str:
+    return "select pg_advisory_unlock_shared(hashtextextended(%s, 0))"
+
+
+def try_lock_databases_sql() -> str:
+    """Non-blocking, one statement: each database lock key with whether this session now holds it. Param: keys
+    (text[])."""
+    return ("select k, pg_try_advisory_lock(hashtextextended(k, 0)) "
+            "from unnest(%s::text[]) with ordinality as u(k, n) order by n")
+
+
+def unlock_databases_sql() -> str:
+    """Param: keys (text[])."""
+    return "select pg_advisory_unlock(hashtextextended(k, 0)) from unnest(%s::text[]) as u(k)"
+
+
+# The group rollup is recounted from its database rows by each run that changed them. Two runs of one group may
+# commit at once, and each recount reads the database rows as they were before the other committed, so the later
+# write could leave the group one database stale. A transaction lock on the group's key, taken before the recount,
+# makes the second wait for the first and then read its rows.
+ROLLUP_LOCK_NAMESPACE = "lakefed_ingest.rollup:"
+
+
+def rollup_group_lock_sql() -> str:
+    """Wait for, and hold until commit, the recount locks of some groups, in order. Param: task_collection per group
+    (text[])."""
+    return ("select pg_advisory_xact_lock(hashtextextended(%s || g, 0)) "
+            "from (select distinct g from unnest(%s::text[]) as u(g) order by g) as ordered")
+
+
 # Per-source query caps (job parameter max_queries_per_source): every run holds a session-level SHARED
 # advisory lock per source it reads, on its collection-lock connection, so the holders of a source's
 # lock are the runs reading it now, and a run that stops leaves the count with its session. The lock
@@ -1404,6 +1452,7 @@ class StateStore:
             for at in range(0, len(names), ROLLUP_CHUNK):
                 chunk = names[at:at + ROLLUP_CHUNK]
                 cur.execute(rollup_database_rewrite_sql(), ([task_collection] * len(chunk), chunk))
+            cur.execute(rollup_group_lock_sql(), (ROLLUP_LOCK_NAMESPACE, [task_collection]))
             cur.execute(rollup_group_rewrite_sql(), ([task_collection],))
 
     def record_ct_begin_version(self, cfg: dict, begin_version) -> None:
@@ -1514,6 +1563,40 @@ class StateStore:
     def unlock_collection(self, task_collection: str) -> None:
         with self._cursor() as cur:
             cur.execute(unlock_collection_sql(), (collection_lock_key(task_collection),))
+
+    def try_lock_collection_shared(self, task_collection: str) -> bool:
+        """True iff this connection now holds the collection's lock shared (non-blocking): a work-list run's."""
+        with self._cursor() as cur:
+            cur.execute(try_lock_collection_shared_sql(), (collection_lock_key(task_collection),))
+            return bool(cur.fetchone()[0])
+
+    def unlock_collection_shared(self, task_collection: str) -> None:
+        with self._cursor() as cur:
+            cur.execute(unlock_collection_shared_sql(), (collection_lock_key(task_collection),))
+
+    def try_lock_databases(self, keys) -> set:
+        """Try each database lock key (non-blocking); returns the keys this connection now holds."""
+        keys = list(dict.fromkeys(keys))
+        if not keys:
+            return set()
+        with self._cursor() as cur:
+            cur.execute(try_lock_databases_sql(), (keys,))
+            return {key for key, taken in cur.fetchall() if taken}
+
+    def unlock_databases(self, keys) -> None:
+        keys = list(dict.fromkeys(keys))
+        if keys:
+            with self._cursor() as cur:
+                cur.execute(unlock_databases_sql(), (keys,))
+
+    def alone_on_collection(self, task_collection: str) -> bool:
+        """For a run holding the collection's lock shared: whether no other session holds it, so the collection's
+        other open runs are dead and may be closed. It tries the lock exclusively (its own shared hold doesn't
+        conflict with itself) and lets go at once if it got it."""
+        if not self.try_lock_collection(task_collection):
+            return False
+        self.unlock_collection(task_collection)
+        return True
 
     def join_sources(self, sources) -> dict:
         """Hold a shared lock per source until this connection closes (see ``SOURCE_LOCK_CLASS``);

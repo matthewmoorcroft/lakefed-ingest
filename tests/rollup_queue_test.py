@@ -118,11 +118,13 @@ def test_rewrite_rollups_recomputes_databases_in_chunks_then_the_group_in_one_tr
     store, cursor = _recording_store()
     names = [f"db{i:03d}" for i in range(450)]
     store.rewrite_rollups("c1", names)
-    assert [sql for sql, _ in cursor.calls] == [RECOMPUTE_DATABASES] * 3 + [ss.rollup_group_rewrite_sql()]
+    # The group's recount lock comes right before its recount, in the same transaction (two runs of one group).
+    assert [sql for sql, _ in cursor.calls] == [RECOMPUTE_DATABASES] * 3 + [ss.rollup_group_lock_sql(),
+                                                                           ss.rollup_group_rewrite_sql()]
     assert [params for _, params in cursor.calls[:3]] == [
         (["c1"] * 200, names[:200]), (["c1"] * 200, names[200:400]), (["c1"] * 50, names[400:])]
-    assert cursor.calls[3][1] == (["c1"],)
-    assert cursor.events[0] == "begin" and cursor.events[-1] == "commit" and cursor.events.count("execute") == 4
+    assert cursor.calls[3][1] == (ss.ROLLUP_LOCK_NAMESPACE, ["c1"]) and cursor.calls[4][1] == (["c1"],)
+    assert cursor.events[0] == "begin" and cursor.events[-1] == "commit" and cursor.events.count("execute") == 5
 
 
 def test_rewrite_rollups_names_each_database_once_with_a_blank_for_none():

@@ -151,7 +151,12 @@ secret). See `README.md`, `docs/deploy.md`, `docs/monitoring.md`, `docs/lakebase
 
 ### Run flow (`ingest.ipynb`)
 1. Per-collection Lakebase advisory lock (duplicate run exits `skipped`; a duplicate with a `work_id` fails,
-   since its databases would not be ingested).
+   since its databases would not be ingested). A run with a `work_id` holds it shared plus an exclusive lock per
+   database of its list (`state_store.database_lock_key`), so runs of one collection on different databases go at
+   once; a database another run holds is skipped (left to it, never stamped), and a list wholly held elsewhere ends
+   `skipped`. A run without one, the check, the app's edits and Delete need it exclusively and are refused meanwhile.
+   A shared holder closes abandoned runs only when no other session holds the lock (`alone_on_collection`); the
+   group rollup recount takes a transaction lock first (`rollup_group_lock_sql`), so two runs can't leave it stale.
 2. Plan (`planner.py`, pure): unsupported (`src_type`, `load_type`) pair → fail per table (stage
    `plan`); `full` → reload; `cursor` → `cursor_seed` / schema_reseed / `cursor` (per-table high
    watermark, `cursor_engine`); CT tables → seed / schema_reseed / detection candidate; group by
