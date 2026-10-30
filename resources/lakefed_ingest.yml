@@ -158,7 +158,7 @@ resources:
         # Retries in the whole run; once spent, failures fail at once (as with retries off).
         - name: table_retry_budget
           default: ${var.table_retry_budget}
-        # On: a run with failed tables ends as failed, so the failure email fires.
+        # Accepted for older jobs; a run with failed tables always ends as failed (ingest.ipynb).
         - name: fail_on_table_errors
           default: ${var.fail_on_table_errors}
         # Spark session settings for this run, a JSON object of setting -> value (blank keeps the

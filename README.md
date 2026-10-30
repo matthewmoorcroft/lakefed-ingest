@@ -346,10 +346,12 @@ driver first.
 
 A table that fails with a transient source error is tried again in the same run, up to `table_retries`
 more times (job parameter, default `2`; `0` turns it off and the table waits for the next run): a
-refused or dropped connection, a timeout, Azure SQL throttling, or Unity Catalog throttling a
-`remote_query` read ("TEMPORARILY_UNAVAILABLE: Too many requests") (`table_retry.py`). Errors that would fail again
-(a missing table, a denied permission, a schema error, a failed login when Spark passes on its cause)
-and errors it doesn't recognise fail at once, as without retries.
+refused or dropped connection, a timeout, a deadlock, a cancelled query (SQLSTATE 57014), an Oracle listener
+error (ORA-12514, ORA-12528), Azure SQL throttling, or Unity Catalog throttling a `remote_query` read
+("TEMPORARILY_UNAVAILABLE: Too many requests") (`table_retry.py`). Errors that would fail again (a missing table,
+a denied permission, a schema error, bad data (SQLSTATE class 22), a schema change under the write
+(`DELTA_SCHEMA_CHANGE`, `INCOMPATIBLE_*`), a failed login when Spark passes on its cause) fail at once, as without
+retries. An error it doesn't recognise gets one retry in the run, then fails.
 
 - **Pauses** double with each attempt, with jitter: 5 to 10 s, then 10 to 20 s, up to 2 minutes
   (environment variables `LAKEFED_TABLE_RETRY_BASE_S`, default `10`, and `LAKEFED_TABLE_RETRY_MAX_S`,
@@ -367,10 +369,10 @@ and errors it doesn't recognise fail at once, as without retries.
   then `ok` or `failed`, with `retry_count`. The run's `detail` has the totals (`table_retries`). See
   [monitoring.md](docs/monitoring.md).
 
-A run with a table still failed at its end is a failed run: it ends as failed after it has recorded the failures in
-Lakebase, so the job's failure email and any run alerts fire, and the next run tries the tables again. The job
-parameter `fail_on_table_errors` (default `true`) gives this today; the operations app has no setting for it and never
-sends it, and an app job that stored a value earlier keeps it.
+A run whose tables failed ends as failed, after recording them, so its job's failure email and any run alerts fire.
+A table that recovers on its retry is not a failure. The run's error text names the first five failing tables
+with their errors and links the run's page. The `fail_on_table_errors` parameter no longer changes this; it is
+still accepted so that older jobs load.
 
 ### Large estates
 
