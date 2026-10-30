@@ -32,6 +32,11 @@ export type Access = "open" | "closed" | "unknown";
 export const accessOf = (row: { open?: boolean | null } | undefined): Access =>
   row?.open === true ? "open" : row?.open === false ? "closed" : "unknown";
 
+/** The databases of these that may be read: every one but those the login can't open, which nothing reads (their
+ *  rows are greyed out, their chevron is off and a whole-database choice leaves them out). */
+export const readable = (names: string[], seen: Record<string, { open?: boolean | null } | undefined>): string[] =>
+  names.filter((name) => accessOf(seen[name]) !== "closed");
+
 /** The whole server's part of a choice: the databases its filter keeps, less those the login can't open; their
  *  tables as counted so far, and how many of them aren't checked yet. */
 export type ServerCount = { matched: number; closed: number; unknown: number; tables: number };

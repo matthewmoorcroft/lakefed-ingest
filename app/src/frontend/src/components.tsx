@@ -692,12 +692,13 @@ export function Chevron({ open }: { open: boolean }) {
 
 /** A row that opens to show what is under it: the chevron and the row's name in one button, so the whole name is the
  * hit area and Enter or Space opens it, with aria-expanded as the Databricks UI sets it. With no children it is the
- * chevron alone, for a row whose name is a link; give it a label then. */
-export function Twisty({ open, onToggle, label, children }: { open: boolean; onToggle: () => void; label?: string;
-                        children?: ReactNode }) {
+ * chevron alone, for a row whose name is a link; give it a label then. closed: why the row can't open (its button is
+ * off and its hover says so). */
+export function Twisty({ open, onToggle, label, closed, children }: { open: boolean; onToggle: () => void; label?: string;
+                        closed?: string; children?: ReactNode }) {
   return (
-    <button type="button" className={`twisty${children ? " named" : ""}`} aria-expanded={open} aria-label={label}
-      title={label} onClick={onToggle}>
+    <button type="button" className={`twisty${children ? " named" : ""}`} aria-expanded={closed ? undefined : open}
+      aria-label={label} title={closed ?? label} disabled={!!closed} onClick={closed ? undefined : onToggle}>
       <Chevron open={open} />{children}
     </button>
   );

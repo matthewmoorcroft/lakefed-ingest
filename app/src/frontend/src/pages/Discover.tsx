@@ -4,7 +4,7 @@ import { api, qs, type Row } from "../api";
 import { ErrorBox, Modal, Notice, OutLink, Pager, Tag, Tip, fmtInt, plural, Twisty } from "../components";
 import { useSettings } from "../App";
 import { DatabaseTables } from "./SourcePick";
-import { accessOf, countsText, likeContaining, selectionCounts, serverRowPick, underFilter, type Pick, type ServerCount } from "./pickState";
+import { accessOf, countsText, likeContaining, readable, selectionCounts, serverRowPick, underFilter, type Pick, type ServerCount } from "./pickState";
 import { connectionNextBlock, discoveryWait, readsProgress, warehouseReadsState, warehouseRunState, waitingSince, type RunWait } from "../pending";
 
 // Add tables, Discover on a source: as Lakeflow Connect's Connection and Source steps. Step 1 is the Unity Catalog
@@ -268,6 +268,11 @@ function Step2({ connection, discoveryId, checksOn, typedNames, picks, setPicks,
   useEffect(() => {
     const rows: Row[] = listing.data?.databases ?? [];
     if (rows.length) setSeen((now) => ({ ...now, ...Object.fromEntries(rows.map((r) => [r.src_database, r])) }));
+    // A database found closed after it was picked leaves the choice, so nothing reads it.
+    const shut = rows.filter((r) => accessOf(r) === "closed").map((r) => String(r.src_database));
+    if (shut.some((d) => picks[d] !== undefined)) {
+      setPicks((now) => Object.fromEntries(Object.entries(now).filter(([d]) => !shut.includes(d))));
+    }
   }, [listing.data]);
   const closed = (d: string) => accessOf(seen[d]) === "closed";
   // Through the SQL warehouse, every listed database is checked: the page shown first, then the rest while this step is
@@ -339,6 +344,7 @@ function Step2({ connection, discoveryId, checksOn, typedNames, picks, setPicks,
   };
   const openDatabase = async (d: string) => {
     if (open === d) return setOpen(null);
+    if (!readable([d], seen).length) return;
     setOpen(d);
     if (read[d]) return;
     setReading(d); setError(null);
@@ -388,7 +394,8 @@ function Step2({ connection, discoveryId, checksOn, typedNames, picks, setPicks,
             <Fragment key={d}>
               <tr className={`l2${closed(d) ? " closed" : ""}`}><td className="name" style={{ paddingLeft: 30 }}>
                 <TriBox pick={pickOf(d)} label={`The whole database ${d}`} onClick={() => !covered(d) && setAll([d], pickOf(d) === "all" ? "none" : "all")} />{" "}
-                <Twisty open={open === d} onToggle={() => openDatabase(d)}>{d}</Twisty></td>
+                <Twisty open={open === d} onToggle={() => openDatabase(d)}
+                  closed={closed(d) ? `${d} can't be opened: ${String(seen[d]?.why ?? "the connection's login can't open this database")}` : undefined}>{d}</Twisty></td>
                 <td className="num">{reading === d ? "reading…" : ""}</td>
                 <td className="muted">{closed(d) ? <Tip text={String(seen[d]?.why ?? "the connection's login can't open this database")} focusable>
                   can't open: hover for why</Tip>
