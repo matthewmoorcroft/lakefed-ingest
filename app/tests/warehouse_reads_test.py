@@ -96,7 +96,7 @@ def test_a_check_opens_each_database_and_counts_its_tables_the_page_shown_first(
     store = _Store([f"db{i:02d}" for i in range(20)], wr.CHECK)
     fake = _Warehouse({f"db{i:02d}": [_ok([{"tables": str(i)}])] for i in range(20)})
     first = wr.advance(store, fake, wr.CHECK, "d1", "sql_a", first=["db19", "db18"])
-    assert fake.started_for[:2] == ["db18", "db19"] and len(fake.started_for) == wr.IN_FLIGHT
+    assert fake.started_for[:2] == ["db18", "db19"] and len(fake.started_for) == wr.IN_FLIGHT[wr.CHECK]
     assert first["state"] == "RUNNING" and first["pending"] == 20 and first["warehouse"] == "RUNNING"
     _, statement = fake.statements["s-db18"]
     assert statement == "SELECT * FROM remote_query(:conn, database => :db, query => :q)"
@@ -158,9 +158,14 @@ def test_a_read_never_keeps_more_than_its_share_of_statements_going():
     fake = _Warehouse({f"db{i:03d}": [{"state": "RUNNING", "rows": None, "error": None}] for i in range(100)})
     for _ in range(5):
         wr.advance(store, fake, wr.READ, "d9", "sql_a")
-    assert len(fake.started_for) == wr.IN_FLIGHT and len(store.in_flight(wr.READ, "d9")) == wr.IN_FLIGHT
+    cap = wr.IN_FLIGHT[wr.READ]
+    assert len(fake.started_for) == cap and len(store.in_flight(wr.READ, "d9")) == cap
     # Sent together, none waited for: one step starts them all, and the next collects the ones that ended.
-    assert fake.waits == [0] * wr.IN_FLIGHT
+    assert fake.waits == [0] * wr.IN_FLIGHT[wr.READ]
+
+
+def test_a_background_read_keeps_to_8_and_leaves_room_for_the_check_of_the_page_shown():
+    assert wr.IN_FLIGHT == {wr.CHECK: 16, wr.READ: 8}
 
 
 def test_a_statement_that_fails_to_start_frees_its_database_and_says_why():

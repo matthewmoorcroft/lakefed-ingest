@@ -4536,7 +4536,7 @@ REDISCOVERY_TICK_S = float(os.environ.get("REDISCOVERY_TICK_S", "300"))   # 0 tu
 REDISCOVERY_POLL_S = float(os.environ.get("REDISCOVERY_POLL_S", "30"))
 REDISCOVERY_MAX_WAIT_S = float(os.environ.get("REDISCOVERY_MAX_WAIT_S", str(6 * 3600)))
 # How often re-discovery takes a step of its warehouse reads: short, since each step starts only as many statements as
-# have ended (warehouse_reads.IN_FLIGHT going at once).
+# have ended (warehouse_reads.IN_FLIGHT going at once, by kind).
 REDISCOVERY_WAREHOUSE_POLL_S = float(os.environ.get("REDISCOVERY_WAREHOUSE_POLL_S", "2"))
 REDISCOVERY_USER = "re-discovery"
 

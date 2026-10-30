@@ -2,9 +2,9 @@
 (and how many tables it has), and the tables of the databases chosen.
 
 Each database is one statement through the connection (remote_query). The statements are kept going a few at a time
-(IN_FLIGHT), and each step of the work (advance) does what one request can: it reads the statements still going,
-saves what ended, and starts more. The page calls it every second or two while it waits, and re-discovery calls it in
-a loop, so no request waits long and no thread has to stay alive between them.
+(IN_FLIGHT, per kind), and each step of the work (advance) does what one request can: it reads the statements still
+going, saves what ended, and starts more. The page calls it every second or two while it waits, and re-discovery calls
+it in a loop, so no request waits long and no thread has to stay alive between them.
 
 Where each database stands is kept on its discovery row in Lakebase (discovery.listing, a JSON object): the statement
 going for it, when a request claimed it, and for a check whether the login can open it and why not. A request claims
@@ -18,12 +18,14 @@ from typing import Iterable, List, Optional
 
 import source_catalog
 
-# Statements kept going at once for one discovery. The bundle's warehouse is 2X-Small with up to 2 clusters, and a
-# serverless warehouse takes about 10 statements at once per cluster before it queues them.
-IN_FLIGHT = 16
 CLAIM_S = 60
 # The two kinds of work: a check of a listed database (status 'listed'), and a read of a chosen one (status 'running').
 CHECK, READ = "check", "read"
+# Statements kept going at once for one discovery, by kind. The bundle's warehouse is 2X-Small with up to 2 clusters,
+# and a serverless warehouse takes about 10 statements at once per cluster before it queues them. A read goes on in
+# the background while the person fills in the form, so it keeps to 8 and leaves room for what they wait on: the
+# connection test's listing (one statement, sent straight to the warehouse) and the check of the page shown.
+IN_FLIGHT = {CHECK: 16, READ: 8}
 # How a database is checked: opening it is the test, and the count says how many tables choosing it takes.
 ACCESS_SQL = "SELECT COUNT(*) AS tables FROM sys.tables WHERE is_ms_shipped = 0"
 TABLE_COLUMNS = ("discovery_id", "src_database", "src_schema", "src_table", "row_count", "size_mb", "ct_enabled",
@@ -100,7 +102,7 @@ def advance(store, warehouse, kind: str, discovery_id: str, connection: str, fir
             store.finish_read(discovery_id, database, None, first_line(answer.get("error")) or
                               f"the read ended {answer['state']}")
     still = len(store.in_flight(kind, discovery_id))
-    for database in store.claim(kind, discovery_id, list(first), max(0, IN_FLIGHT - still), CLAIM_S):
+    for database in store.claim(kind, discovery_id, list(first), max(0, IN_FLIGHT[kind] - still), CLAIM_S):
         statement, parameters = statement_for(kind, connection, database)
         try:
             answer = warehouse.start(statement, parameters, wait_s=0)    # sent together; the next step collects them
