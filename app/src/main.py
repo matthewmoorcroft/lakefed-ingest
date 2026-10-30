@@ -2958,13 +2958,14 @@ class WarehouseReadStore:
         db.execute(q.warehouse_check_done_sql(), (ok, why, tables, discovery_id, database))
 
     def finish_read(self, discovery_id: str, database: str, rows: Optional[List[tuple]], error: Optional[str]) -> None:
-        """A database's tables replaced and its row finished, in one transaction; or its row failed with why."""
+        """A database's tables saved and its row finished, in one transaction; or its row failed with why. No delete
+        first: the app has no DELETE on Lakebase (grant_app_access), and each read has a discovery id of its own, so
+        there is nothing to replace; a second answer for the same database inserts nothing (on conflict)."""
         if rows is None:
             db.execute(q.warehouse_read_done_sql(), ("failed", None, error, discovery_id, database))
             return
         columns = warehouse_reads.TABLE_COLUMNS
         with db.transaction() as cur:
-            cur.execute(q.delete_discovered_tables_sql(), (discovery_id, database))
             for at in range(0, len(rows), q.CONTROL_BATCH):
                 chunk = rows[at:at + q.CONTROL_BATCH]
                 cur.execute(q.insert_discovered_tables_sql(columns, len(chunk)), tuple(v for row in chunk for v in row))

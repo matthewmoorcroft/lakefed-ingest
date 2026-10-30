@@ -37,3 +37,40 @@ def test_the_listing_page_shows_each_databases_check_and_the_totals_count_them()
     assert "(listing ->> 'open')::boolean as open" in q.discovery_listing_sql()
     assert "listing ->> 'why' as why" in q.discovery_listing_sql()
     assert "as closed" in q.discovery_totals_sql() and "as tables" in q.discovery_totals_sql()
+
+
+def test_a_read_saves_its_tables_without_a_delete(monkeypatch):
+    """The app has no DELETE on Lakebase (grant_app_access gives select, insert and update), so a statement with one
+    fails there for every database, even when no row matches; the tables' owner, as the Postgres tests run, never
+    sees it."""
+    import contextlib
+    import pytest
+    pytest.importorskip("fastapi")
+    import main
+    sent = []
+
+    class Cursor:
+        def execute(self, sql, params=()):
+            sent.append(sql)
+
+    monkeypatch.setattr(main.db, "transaction", contextlib.contextmanager(lambda: (yield Cursor())))
+    row = tuple(None for _ in wr.TABLE_COLUMNS)
+    main.WarehouseReadStore().finish_read("d1", "eng_001", [row, row], None)
+    assert sent and not any("delete" in sql.lower() for sql in sent)
+
+
+def test_no_statement_of_the_app_deletes_rows():
+    """Every string in the app's code that reads as SQL: none deletes (the app's role can't)."""
+    import io
+    import re
+    import tokenize
+    from pathlib import Path
+    found = []
+    for path in sorted((Path(__file__).resolve().parents[1] / "src").glob("*.py")):
+        for token in tokenize.generate_tokens(io.StringIO(path.read_text()).readline):
+            # From Python 3.12 an f-string's text is its own token (FSTRING_MIDDLE), not a STRING.
+            text = token.type in (tokenize.STRING, getattr(tokenize, "FSTRING_MIDDLE", tokenize.STRING))
+            if text and re.search(r"\bdelete\s+from\b", token.string, re.I) \
+                    and not token.string.lstrip("rbfuRBFU").startswith(('"""', "'''")):
+                found.append(f"{path.name}:{token.start[0]}")
+    assert found == [], f"a DELETE statement in the app, which has no DELETE privilege: {found}"

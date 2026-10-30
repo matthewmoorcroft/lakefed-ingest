@@ -1477,11 +1477,6 @@ def warehouse_read_done_sql() -> str:
             f"where discovery_id = %s and src_database = %s and status = 'running'")
 
 
-def delete_discovered_tables_sql() -> str:
-    """Params: discovery_id, src_database."""
-    return f"delete from {SCHEMA}.discovered_table where discovery_id = %s and src_database = %s"
-
-
 def insert_discovered_tables_sql(columns, count: int) -> str:
     """Insert ``count`` discovered_table rows of the given columns."""
     one_row = "(" + ", ".join(["%s"] * len(columns)) + ")"

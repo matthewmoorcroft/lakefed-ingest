@@ -147,7 +147,6 @@ def test_a_read_of_named_databases_saves_each_ones_tables_once_and_finishes_once
                "excluded_cols": None, "pk_cols": "id", "pk_unreadable": "0", "pk_first_type": "int",
                "rowversion_col": None, "identity_col": None, "identity_type": None}
     found = wr.table_rows(did, "eng_001", [summary, {**summary, "tbl": "lines"}])
-    pg.execute(q.delete_discovered_tables_sql(), (did, "eng_001"))
     insert = q.insert_discovered_tables_sql(wr.TABLE_COLUMNS, len(found))
     pg.execute(insert, tuple(v for row in found for v in row))
     pg.execute(insert, tuple(v for row in found for v in row))
@@ -164,5 +163,5 @@ def test_a_read_of_named_databases_saves_each_ones_tables_once_and_finishes_once
     assert _row(pg, did, "eng_002")["error"] == "Login failed"
     assert _rows(pg, q.warehouse_progress_sql(wr.READ), (did,)) == \
         [{"databases": 2, "pending": 0, "done": 1, "failed": 1, "tables": 2}]
-    pg.execute(q.delete_discovered_tables_sql(), (did, "eng_001"))
+    pg.execute("delete from lakefed_ingest.discovered_table where discovery_id = %s", (did,))      # the test's own tidy-up
     assert _rows(pg, "select count(*) as n from lakefed_ingest.discovered_table where discovery_id = %s", (did,)) == [{"n": 0}]
