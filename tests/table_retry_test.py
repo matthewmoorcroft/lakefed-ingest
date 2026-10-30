@@ -332,6 +332,36 @@ def test_once_the_budget_is_spent_failures_fail_at_once():
     assert (summary["retries"], summary["budget_left"], summary["budget_exhausted"]) == (2, 0, True)
 
 
+# ---- 4b. a budget of 0: no retries at all -----------------------------------------------------------------
+
+def test_the_default_budget_is_zero_so_no_table_is_retried_until_a_job_raises_it():
+    assert tr.DEFAULT_BUDGET == 0 and tr.RetryPolicy().budget == 0 and tr.RetryPolicy(retries=2).budget == 0
+
+
+def test_with_a_budget_of_zero_a_transient_failure_fails_at_once_and_is_not_reported_as_spent():
+    sink, policy, sleeps = _Sink(faults={1: ["before"]}), _policy(retries=2, budget=0), []
+    worker = _Worker(sink, policy)
+    assert _run(worker, policy, [_plan(1)], sleeps)[0][0] == "failed"
+    assert worker.events == [(1, "failed", "seed", 0)] and sleeps == []
+    assert policy.summary() == {"retries": 0, "recovered": 0, "failed_after_retry": 0, "budget": 0, "budget_left": 0,
+                                "budget_exhausted": False, "sources_stopped": [], "by_class": {}}
+
+
+def test_with_a_budget_of_zero_an_unknown_failure_fails_at_once_without_its_one_retry():
+    sink = _Sink(faults={1: ["before"]}, error="something nobody has seen before")
+    policy, sleeps = _policy(budget=0), []
+    worker = _Worker(sink, policy)
+    assert _run(worker, policy, [_plan(1)], sleeps)[0][0] == "failed"
+    assert worker.events == [(1, "failed", "seed", 0)] and sleeps == []
+
+
+def test_claim_with_a_budget_of_zero_grants_no_retry_whatever_the_error():
+    policy, cfg = _policy(retries=3, budget=0), _cfg(1)
+    assert policy.claim(cfg, _spark_error(), 0) is None
+    assert policy.claim(cfg, RuntimeError("something nobody has seen before"), 0) is None
+    assert policy.summary()["retries"] == 0 and policy.summary()["budget_exhausted"] is False
+
+
 # ---- 5. a source that keeps failing stops retrying ---------------------------------------------------------
 
 def test_a_source_stops_retrying_after_its_failed_retries_and_others_carry_on():

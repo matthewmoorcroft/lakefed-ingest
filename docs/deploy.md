@@ -31,7 +31,8 @@ targets:
       # append_batch_size: "16"
       # max_seeds_per_run: "10000"
       # max_queries_per_source: "64"         # see README "Concurrency"
-      # table_retries: "0"                    # off; the default "2" retries transient errors (README "Table retries")
+      # table_retry_budget: "20"              # retries per run; the default "0" retries no table (README "Table retries")
+      # table_retries: "2"                    # attempts per table; used only while table_retry_budget is above 0
 ```
 
 The default compute needs ~32 cores; a subscription with a small vCPU quota must use smaller nodes

@@ -1,6 +1,8 @@
 """Table retries: a table whose load fails with a transient source error (a refused or dropped
 connection, a timeout, Azure SQL throttling) is tried again in the same run after a pause, instead
-of waiting for the next run. Job parameter ``table_retries`` (default 2) sets the attempts; 0 turns it off.
+of waiting for the next run. Job parameter ``table_retry_budget`` (default 0) is how many retries the
+run may grant: at 0 no table is retried, and a failing table fails at once. ``table_retries`` (default 2)
+sets the attempts per table, and 0 turns them off.
 
 * ``classify`` (pure): "transient", "permanent" or "unknown". The rules that rule a retry out are
   checked first and win. An error no rule recognises is "unknown": it gets one retry within the run's
@@ -37,7 +39,7 @@ import ct_engine
 PER_SOURCE = int(os.environ.get("LAKEFED_TABLE_RETRY_PER_SOURCE", "5"))
 BASE_S = float(os.environ.get("LAKEFED_TABLE_RETRY_BASE_S", "10"))
 MAX_S = float(os.environ.get("LAKEFED_TABLE_RETRY_MAX_S", "120"))
-DEFAULT_BUDGET = 20
+DEFAULT_BUDGET = 0
 
 TRANSIENT, PERMANENT, UNKNOWN = "transient", "permanent", "unknown"
 
@@ -204,10 +206,11 @@ def backoff_delay(attempt: int, base: float = None, cap: float = None, rand=rand
 
 
 class RetryPolicy:
-    """One run's retry limits. ``retries`` 0 turns retries off.
+    """One run's retry limits. ``retries`` 0 turns retries off, and so does a ``budget`` of 0.
 
     * ``retries``: extra attempts per table.
-    * ``budget``: retries in the whole run; once spent, failures fail at once.
+    * ``budget``: retries in the whole run; once spent, failures fail at once. The default is 0: no table is
+      retried until a job raises it.
     * ``per_source``: failed retries on one source server (``ct_engine.source_key``) before that
       source stops retrying for the rest of the run. Retries that succeed don't count, so a blip that
       fails many of a server's tables at once is retried in full. An outage that fails them all at
@@ -242,7 +245,8 @@ class RetryPolicy:
         """Seconds to wait before retrying ``cfg`` after ``exc`` failed attempt ``attempt`` (0-based), or
         None: fail now (permanent, unknown after its one retry, out of attempts, budget spent, or the
         source stopped)."""
-        if self.retries == 0:
+        # A zero budget is retries off: nothing is granted, so nothing is reported as spent.
+        if self.retries == 0 or self.budget == 0:
             return None
         try:
             verdict = classify(exc)

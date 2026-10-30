@@ -30,8 +30,8 @@ are inserted, finished, when the batch ends, with `pool` = `batch<size>` and no 
 don't appear among the in-flight tables. A `verify` stage is a run checking the sink for an append
 an earlier run left pending, or a retry checking for the rows of the attempt that failed.
 
-With `table_retries` set (README "Table retries"), an attempt that fails with a transient source error
-and is tried again finishes as `retried`, with its stage and error, and the table gets another row for
+With `table_retries` set and the run's `table_retry_budget` above 0 (its default is 0, so nothing is retried:
+README "Table retries"), an attempt that fails with a transient source error and is tried again finishes as `retried`, with its stage and error, and the table gets another row for
 its next attempt; `retry_count` numbers them (0, 1, ...). Only a final failure is `failed`, so the
 failure query below lists tables that are still failing.
 
@@ -156,7 +156,8 @@ counted in `batch_rows`).
 
 Table retries: the run's `detail.table_retries` holds `retries` (granted), `recovered` (tables that
 succeeded on a retry), `failed_after_retry`, `budget` and `budget_left`, `budget_exhausted`,
-`sources_stopped` and `by_class` (retries per error class). The retried attempts of a run:
+`sources_stopped` and `by_class` (retries per error class). At a budget of 0 nothing is retried, and
+`budget_exhausted` stays `false`, since no budget was spent. The retried attempts of a run:
 ```sql
 SELECT src_database, src_schema, src_table, retry_count, stage, left(error, 200) AS error, finished_at
 FROM lakefed_ingest_lakebase.lakefed_ingest.ingest_event

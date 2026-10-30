@@ -344,19 +344,26 @@ driver first.
 
 ### Table retries
 
-A table that fails with a transient source error is tried again in the same run, up to `table_retries`
-more times (job parameter, default `2`; `0` turns it off and the table waits for the next run): a
-refused or dropped connection, a timeout, a deadlock, a cancelled query (SQLSTATE 57014), an Oracle listener
-error (ORA-12514, ORA-12528), Azure SQL throttling, or Unity Catalog throttling a `remote_query` read
+By default no table is retried. The run's retry budget, `table_retry_budget`, defaults to `0`, so a table
+that fails ends its run as failed, whatever the error. A job raises the budget in the app's Advanced
+configuration (Tuning: Table retry budget), and only then do its tables get retried.
+
+With the budget above `0`, a table that fails with a transient source error is tried again in the same run,
+up to `table_retries` more times (job parameter, default `2`; `0` turns it off and the table waits for the next
+run): a refused or dropped connection, a timeout, a deadlock, a cancelled query (SQLSTATE 57014), an Oracle
+listener error (ORA-12514, ORA-12528), Azure SQL throttling, or Unity Catalog throttling a `remote_query` read
 ("TEMPORARILY_UNAVAILABLE: Too many requests") (`table_retry.py`). Errors that would fail again (a missing table,
 a denied permission, a schema error, bad data (SQLSTATE class 22), a schema change under the write
 (`DELTA_SCHEMA_CHANGE`, `INCOMPATIBLE_*`), a failed login when Spark passes on its cause) fail at once, as without
 retries. An error it doesn't recognise gets one retry in the run, then fails.
 
+With the budget at `0`, nothing is retried: a transient error fails at once, and so does an unrecognised one,
+since its one retry comes out of the budget. `table_retries` only applies when the budget is above `0`.
+
 - **Pauses** double with each attempt, with jitter: 5 to 10 s, then 10 to 20 s, up to 2 minutes
   (environment variables `LAKEFED_TABLE_RETRY_BASE_S`, default `10`, and `LAKEFED_TABLE_RETRY_MAX_S`,
   default `120`). A waiting table holds no `parallelism` slot.
-- **Limits:** `table_retry_budget` (default `20`) retries in the whole run, and a source server stops
+- **Limits:** `table_retry_budget` (default `0`, which retries nothing) retries in the whole run, and a source server stops
   retrying for the rest of the run after 5 failed retries (`LAKEFED_TABLE_RETRY_PER_SOURCE`); retries
   that succeed don't count, so a short blip is retried in full. An outage that fails a server's tables
   all at once gets at most the budget's retries before any of them fails. Either way a source outage
