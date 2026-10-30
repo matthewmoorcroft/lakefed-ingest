@@ -1535,7 +1535,15 @@ def warehouse_named_rows_sql(count: int) -> str:
 # read's own discovery rows, marked in listing: draft, draft_by and touched_at (the last time a page or a Create asked
 # about it, kept on its first row), then discarded when the page is cancelled or left. Create (or Add tables) takes
 # the mark off in its own transaction and names the job; the delete job purges discarded drafts and those nobody has
-# asked about for DRAFT_TTL_S (main.py), since the app has no DELETE.
+# asked about for run_poller.DRAFT_TTL_S, since the app has no DELETE.
+
+
+def drafts_to_purge_sql() -> str:
+    """Whether any draft is due for the delete job's purge (delete_job.purgeable_drafts_sql's rule): discarded, or not
+    asked about for the time limit. Param: seconds."""
+    return (f"select discovery_id from {SCHEMA}.discovery where listing ? 'draft' group by discovery_id "
+            f"having bool_or(listing ? 'discarded') or coalesce(max((listing ->> 'touched_at')::timestamptz), "
+            f"max(started_at)) < now() - make_interval(secs => %s) limit 1")
 
 
 def draft_of_sql() -> str:

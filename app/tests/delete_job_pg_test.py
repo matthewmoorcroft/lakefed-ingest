@@ -96,3 +96,30 @@ def test_a_run_holding_a_groups_lock_refuses_the_delete_and_the_deletion_is_list
     pg.execute(q.set_schedule_flag_sql(), (["delete_finished"], True, sid))
     listed = pg.execute(q.deletions_sql(), (10,)).fetchall()
     assert [(r[0], r[2]["delete_drop_targets"]) for r in listed] == [(sid, True)]
+
+
+def _draft_rows(conn, did, marks, started="now()"):
+    conn.execute("insert into lakefed_ingest.discovery (discovery_id, src_database, status, listing, started_at) values "
+                 f"(%s, 'eng_001', 'ok', %s::jsonb, {started}), (%s, 'eng_002', 'ok', %s::jsonb, {started})",
+                 (did, marks, did, marks))
+    conn.execute("insert into lakefed_ingest.discovered_table (discovery_id, src_database, src_schema, src_table) values "
+                 "(%s, 'eng_001', 'dbo', 't1'), (%s, 'eng_002', 'dbo', 't1')", (did, did))
+
+
+def test_the_purge_takes_discarded_and_left_drafts_and_never_one_a_job_took(pg):
+    import delete_job
+    import queries as q
+    old = "now() - interval '3 hours'"
+    _draft_rows(pg, "discarded", '{"draft": true, "touched_at": "2026-10-30T00:00:00+00:00", "discarded": "x"}')
+    _draft_rows(pg, "left", '{"draft": true}', started=old)
+    _draft_rows(pg, "fresh", '{"draft": true}')
+    _draft_rows(pg, "taken", '{"job_id": 7}', started=old)
+    assert pg.execute(q.drafts_to_purge_sql(), (7200,)).fetchall()      # the app sees one is due
+    with pg.cursor() as cur, pg.transaction():
+        purged = delete_job.purge_drafts(cur, 7200)
+    assert purged == {"drafts": 2, "databases": 4, "tables": 4}
+    left = pg.execute("select distinct discovery_id from lakefed_ingest.discovery order by 1").fetchall()
+    assert [d for (d,) in left] == ["fresh", "taken"]
+    tables = pg.execute("select distinct discovery_id from lakefed_ingest.discovered_table order by 1").fetchall()
+    assert [d for (d,) in tables] == ["fresh", "taken"]
+    assert pg.execute(q.drafts_to_purge_sql(), (7200,)).fetchall() == []

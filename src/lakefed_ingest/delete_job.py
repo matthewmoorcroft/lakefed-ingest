@@ -16,6 +16,10 @@ stay behind, as groups in no job. This job runs as the deployer (the state datab
   changes can still be read after it is gone; their rows keep the group and control id of rows that no longer exist.
 - **Target tables, when asked:** after the commit, the tables only these groups write; one another job's rows also
   write is kept and named. A schema is never dropped.
+- **Drafts (purge_drafts):** the app reads a choice's tables as they are chosen, into discovery rows marked draft,
+  before the job exists. A draft discarded (the page was cancelled or left) or that nobody has asked about for
+  draft_ttl_s is purged: its discovery and discovered_table rows. A draft a Create or an Add took has no mark, so it
+  is never purged. The app starts this mode at most hourly, and only when there is a draft to purge.
 
 Pure (no Spark, no Lakebase): the notebook passes a cursor and runs the drops; tested with fakes.
 """
@@ -147,6 +151,46 @@ def delete_rows(cur, schedule_id: int) -> dict:
         deleted[table] = cur.rowcount
     deleted.update(_forget_selection(cur, schedule_id))
     return {"job": job["name"], "groups": groups, "deleted": deleted, "targets": targets}
+
+
+DRAFT_TTL_S = 2 * 3600
+
+
+def purgeable_drafts_sql() -> str:
+    """The drafts to purge: discarded, or not asked about (touched_at on their first row, else when they started) for
+    the time limit. Param: seconds."""
+    return (f"select discovery_id from {SCHEMA}.discovery where listing ? 'draft' group by discovery_id "
+            f"having bool_or(listing ? 'discarded') or coalesce(max((listing ->> 'touched_at')::timestamptz), "
+            f"max(started_at)) < now() - make_interval(secs => %s)")
+
+
+def purge_discovery_sql() -> str:
+    """Delete these drafts' discovery rows, those still marked draft. Param: discovery ids (text[])."""
+    return (f"delete from {SCHEMA}.discovery where discovery_id = any(%s) and listing ? 'draft' "
+            f"returning discovery_id")
+
+
+def purge_tables_sql() -> str:
+    """Delete the tables read for these drafts. Param: discovery ids (text[])."""
+    return f"delete from {SCHEMA}.discovered_table where discovery_id = any(%s)"
+
+
+def purge_drafts(cur, ttl_s: int = DRAFT_TTL_S) -> dict:
+    """Inside the caller's transaction: purge the drafts discarded or not asked about for ``ttl_s``. Their discovery
+    rows go first, each only while still marked draft (a Create taking it meanwhile holds its rows until it commits,
+    and takes the mark off), then the tables of the drafts whose rows went. Returns the counts."""
+    cur.execute(purgeable_drafts_sql(), (int(ttl_s),))
+    ids = [row[0] for row in cur.fetchall()]
+    if not ids:
+        return {"drafts": 0, "databases": 0, "tables": 0}
+    cur.execute(purge_discovery_sql(), (ids,))
+    gone = sorted({row[0] for row in cur.fetchall()})
+    databases = cur.rowcount
+    tables = 0
+    if gone:
+        cur.execute(purge_tables_sql(), (gone,))
+        tables = cur.rowcount
+    return {"drafts": len(gone), "databases": databases, "tables": tables}
 
 
 # Names a summary or a failure lists; the rest are counted, so a job of many thousands of tables stays readable.

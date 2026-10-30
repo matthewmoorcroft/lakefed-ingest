@@ -294,3 +294,24 @@ def test_a_closure_records_the_reason_and_a_run_still_going_is_not_closed():
     assert rp.closure(missing, (NOW - timedelta(hours=1)).isoformat(), 1, NOW) is None
     reason = rp.closure(missing, (NOW - timedelta(days=2)).isoformat(), 1, NOW)["reason"]
     assert reason.startswith("its Databricks run no")
+
+
+def test_the_drafts_purge_is_asked_for_at_most_hourly_and_only_when_a_draft_is_due(monkeypatch):
+    asked, started = [], []
+    due = [[{"discovery_id": "d1"}], []]
+    monkeypatch.setattr(jobs, "DELETE_JOB_ID", "9")
+    monkeypatch.setattr(rp.db, "query", lambda sql, params=(): asked.append((sql, params)) or due.pop(0))
+    monkeypatch.setattr(jobs, "start_draft_purge", started.append)
+    assert rp.purge_drafts_if_due(None, 100.0) == 100.0 and started == [rp.DRAFT_TTL_S]
+    assert rp.purge_drafts_if_due(100.0, 100.0 + rp.PURGE_EVERY_S - 1) == 100.0 and len(asked) == 1
+    assert rp.purge_drafts_if_due(100.0, 100.0 + rp.PURGE_EVERY_S) == 100.0 + rp.PURGE_EVERY_S
+    assert asked == [(q.drafts_to_purge_sql(), (rp.DRAFT_TTL_S,))] * 2 and len(started) == 1     # none due: no run
+    monkeypatch.setattr(jobs, "DELETE_JOB_ID", None)
+    assert rp.purge_drafts_if_due(None, 0.0) is None and len(asked) == 2
+
+
+def test_the_purge_run_takes_the_drafts_mode_and_its_time_limit(monkeypatch):
+    sent = []
+    monkeypatch.setattr(jobs, "DELETE_JOB_ID", "9")
+    monkeypatch.setattr(jobs, "run_now", lambda job_id, parameters: sent.append((job_id, parameters)) or 5)
+    assert jobs.start_draft_purge(7200) == 5 and sent == [("9", {"purge_drafts": "true", "draft_ttl_s": "7200"})]

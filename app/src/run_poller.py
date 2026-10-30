@@ -20,6 +20,7 @@ Until the table exists (the schema has not been migrated), the readers below fal
 from __future__ import annotations
 
 import json
+import os
 import threading
 import time
 from datetime import datetime, timedelta, timezone
@@ -30,6 +31,10 @@ import lakebase as db
 import queries as q
 
 POLL_S = 15
+# The delete job purges the drafts of choices no job took (discarded, or not asked about for DRAFT_TTL_S): the poller
+# asks for it at most every PURGE_EVERY_S, and only when there is one, so a quiet app starts no run.
+PURGE_EVERY_S = 3600
+DRAFT_TTL_S = int(os.environ.get("DRAFT_TTL_S", str(2 * 3600)))
 # The poller's own advisory lock (its own class, so no collection's or schedule's lock can have the same key).
 POLLER_LOCK = (0x6C667072, 0)
 ACTIVE_STATES = ("QUEUED", "PENDING", "RUNNING", "TERMINATING", "BLOCKED", "WAITING_FOR_RETRY")
@@ -203,6 +208,16 @@ def tracked_jobs() -> Dict[int, tuple]:
     return out
 
 
+def purge_drafts_if_due(last: Optional[float], now_s: float) -> Optional[float]:
+    """Start the delete job's drafts purge when an hour has gone since the last look and a draft is due. Returns when
+    it last looked (``now_s`` when it did, else ``last``)."""
+    if not jobs.DELETE_JOB_ID or (last is not None and now_s - last < PURGE_EVERY_S):
+        return last
+    if db.query(q.drafts_to_purge_sql(), (DRAFT_TTL_S,)):
+        jobs.start_draft_purge(DRAFT_TTL_S)
+    return now_s
+
+
 class Poller:
     """One poller per process. ``start`` runs it in a daemon thread; ``wake`` polls at once."""
 
@@ -211,6 +226,7 @@ class Poller:
         self._lead_conn = None
         self._seeded = False
         self._on_change: Optional[Callable[[], None]] = None
+        self._purge_looked: Optional[float] = None
         self.last_error: Optional[str] = None
 
     def start(self, on_change: Callable[[], None]) -> None:
@@ -225,6 +241,7 @@ class Poller:
             try:
                 if table_ready() and self._leads():
                     self.poll_once(datetime.now(timezone.utc))
+                    self._purge_looked = purge_drafts_if_due(self._purge_looked, time.monotonic())
                 self.last_error = None
             except Exception as e:
                 self.last_error = str(e).split(". ")[0][:300]

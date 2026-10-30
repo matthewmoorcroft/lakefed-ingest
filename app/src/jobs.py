@@ -252,6 +252,11 @@ def start_cluster_copies(schedule_id) -> int:
     return run_now(CLUSTER_COPIES_JOB_ID, {"schedule_id": str(int(schedule_id)), "app_service_principal": APP_PRINCIPAL or ""})
 
 
+def start_draft_purge(ttl_s: int) -> int:
+    """Start the delete job's drafts mode: the tables read for choices no job took, discarded or left for ttl_s, go."""
+    return run_now(DELETE_JOB_ID, {"purge_drafts": "true", "draft_ttl_s": str(int(ttl_s))})
+
+
 def start_delete_job(schedule_id, drop_targets: bool) -> int:
     """Start the delete job for one deleted app job: its groups' rows go, and its target tables too when asked."""
     return run_now(DELETE_JOB_ID, {"schedule_id": str(int(schedule_id)), "drop_targets": "true" if drop_targets else "false"})

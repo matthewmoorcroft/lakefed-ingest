@@ -220,3 +220,5 @@ def test_a_discarded_draft_reads_no_more_and_cant_be_created_from_as_the_apps_ro
                                                     "databases": [{"server": "sql_a", "database": "eng_001"}]}})
     assert made.status_code == 422 and "discarded" in made.text, made.text
     assert client.sql("select count(*) from lakefed_ingest.control") == [(0,)]
+    import queries as q
+    assert main.db.query(q.drafts_to_purge_sql(), (7200,)) == [{"discovery_id": did}]    # the poller's look, as the app

@@ -178,3 +178,46 @@ def test_what_the_job_was_made_from_goes_with_it_where_the_database_keeps_it():
     cur = FakeCursor([schedule(7)], [member(7, "g1", removed=True)], [row("g1", "a")])
     assert "job_selection" not in dj.delete_rows(cur, 7)["deleted"]
     assert dj.delete_selection_sql() not in statements(cur)
+
+
+class PurgeCursor:
+    """The delete job's purge statements over drafts in memory: {discovery_id: {"databases": [...], "tables": n,
+    "draft": still marked}}."""
+
+    def __init__(self, purgeable, drafts):
+        self.purgeable, self.drafts, self.executed, self.rowcount, self._result = purgeable, drafts, [], -1, []
+
+    def execute(self, sql, params=()):
+        self.executed.append(sql)
+        if sql == dj.purgeable_drafts_sql():
+            self._result = [(i,) for i in self.purgeable]
+        elif sql == dj.purge_discovery_sql():
+            gone = [i for i in params[0] if self.drafts[i]["draft"]]
+            self._result = [(i,) for i in gone for _ in self.drafts[i]["databases"]]
+            self.rowcount = len(self._result)
+        elif sql == dj.purge_tables_sql():
+            self.rowcount = sum(self.drafts[i]["tables"] for i in params[0])
+        else:
+            raise AssertionError(sql)
+
+    def fetchall(self):
+        return self._result
+
+
+def test_the_purge_deletes_the_drafts_discarded_or_left_and_their_tables():
+    drafts = {"d1": {"databases": ["a", "b"], "tables": 30, "draft": True},
+              "d2": {"databases": ["c"], "tables": 5, "draft": False}}      # a Create took it meanwhile: kept
+    cur = PurgeCursor(["d1", "d2"], drafts)
+    assert dj.purge_drafts(cur, 3600) == {"drafts": 1, "databases": 2, "tables": 30}
+    assert cur.executed == [dj.purgeable_drafts_sql(), dj.purge_discovery_sql(), dj.purge_tables_sql()]
+
+
+def test_a_purge_with_nothing_to_purge_deletes_nothing():
+    cur = PurgeCursor([], {})
+    assert dj.purge_drafts(cur) == {"drafts": 0, "databases": 0, "tables": 0}
+    assert cur.executed == [dj.purgeable_drafts_sql()]
+
+
+def test_the_purge_takes_only_marked_drafts():
+    assert "listing ? 'draft'" in dj.purgeable_drafts_sql() and "listing ? 'draft'" in dj.purge_discovery_sql()
+    assert "bool_or(listing ? 'discarded')" in dj.purgeable_drafts_sql()

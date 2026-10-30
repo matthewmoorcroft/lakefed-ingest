@@ -3013,7 +3013,8 @@ def warehouse_reads_step(discovery_id: str, connection: str):
 @app.post("/api/discoveries/{discovery_id}/discard")
 def discard_draft(discovery_id: str):
     """Discard a draft (the page was cancelled or left before Create): nothing more is read for it, the statements
-    still going are cancelled, and the delete job purges its rows within DRAFT_TTL_S (the app has no DELETE). A draft
+    still going are cancelled, and the delete job purges its rows within the hour (run_poller.purge_drafts_if_due; the
+    app has no DELETE). A draft
     a Create or an Add has taken is not a draft any more, so this changes nothing then. Sent by navigator.sendBeacon
     too, so it takes no body."""
     going = [r["statement_id"] for r in db.query(q.draft_discard_sql(), (discovery_id,)) if r.get("statement_id")]
@@ -3024,10 +3025,6 @@ def discard_draft(discovery_id: str):
             logging.getLogger(__name__).info("could not cancel statement %s of draft %s: %s", statement_id, discovery_id,
                                              str(e)[:200])
     return {"discovery_id": discovery_id, "cancelled": len(going)}
-
-
-# A draft nobody has asked about for this long counts as discarded, and the delete job purges it.
-DRAFT_TTL_S = int(os.environ.get("DRAFT_TTL_S", str(2 * 3600)))
 
 
 def _draft_reading(selection: "Selection", advance: bool = True) -> Optional[dict]:
