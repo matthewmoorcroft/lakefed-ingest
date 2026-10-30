@@ -27,21 +27,23 @@ COLUMNS = ["src_connection", "src_database", "src_schema", "src_table", "select_
 # ---- the big job's pure parts --------------------------------------------------------------------------------------
 
 def test_groups_are_sized_by_tables_not_four_per_server():
-    assert bd.groups_for_tables(22_000 * 240) == 423          # the 5.3 million tables of one server: about 425
+    assert bd.groups_for_tables(22_000 * 240) == 528          # the 5.3 million tables of one server, 10,000 a group
     assert bd.groups_for_tables(bd.TABLES_PER_GROUP) == 1
     assert bd.groups_for_tables(0) == 1
 
 
 def test_a_small_remainder_makes_no_group_of_its_own():
-    assert bd.groups_for_tables(100_200) == 8                 # not 9 for the last 200 tables
-    assert bd.groups_for_tables(bd.TABLES_PER_GROUP + 1_250) == 1
-    assert bd.groups_for_tables(bd.TABLES_PER_GROUP + 1_251) == 2
+    assert bd.groups_for_tables(100_200) == 10                # not 11 for the last 200 tables
+    assert bd.groups_for_tables(bd.TABLES_PER_GROUP + 1_000) == 1
+    assert bd.groups_for_tables(bd.TABLES_PER_GROUP + 1_001) == 2
 
 
 def test_the_jobs_own_number_of_groups_wins_over_the_default():
     servers = [{"server": "sql_a", "tables": 100_200}, {"server": "sql_b", "tables": 10}]
-    assert bd.groups_by_server(servers) == {"sql_a": 8, "sql_b": 1}
+    assert bd.groups_by_server(servers) == {"sql_a": 10, "sql_b": 1}
     assert bd.groups_by_server(servers, 3) == {"sql_a": 3, "sql_b": 3}
+    import placement
+    assert bd.groups_by_server(servers, placement.TablesPerGroup(50_000)) == {"sql_a": 2, "sql_b": 1}
 
 
 def test_a_selections_databases_spread_evenly_over_its_groups():
@@ -59,7 +61,7 @@ def test_a_selections_databases_spread_evenly_over_its_groups():
 def test_the_summary_names_every_group_of_each_server_before_anything_is_read():
     summary = bd.summary_of("Big job", [{"server": "sql_a", "databases": 22_000, "tables": 22_000 * 240}])
     assert summary["by_database"] is True and summary["checked"] is False
-    assert len(summary["groups"]) == 423 and summary["groups"][0] == "big_job_sql_a_c01"
+    assert len(summary["groups"]) == 528 and summary["groups"][0] == "big_job_sql_a_c01"
     assert summary["tables"] == 5_280_000 and summary["databases"] == 22_000
 
 

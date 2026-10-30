@@ -1,12 +1,14 @@
-"""Which group each database of a job goes to. A server gets the number of groups the job sets, or by default one for
-about every TABLES_PER_GROUP of its tables, with no group of its own for a small remainder. Its databases are spread
+"""Which group each database of a job goes to. A server gets one group for about every tables-per-group of its tables
+(the job's own, or TABLES_PER_GROUP), with no group of its own for a small remainder, or a number of groups an older
+caller sets. Its databases are spread
 so each group has about the same number of tables: the biggest first, each into the group with the fewest tables so
 far. A database is never split: all its tables are in one group. Databases added to a job later each join their
 server's group with the fewest tables at that time, and nothing already placed moves. Pure, so it is tested without a
 database."""
-from typing import Dict, Iterable, List, Optional, Tuple
+from dataclasses import dataclass
+from typing import Dict, Iterable, List, Optional, Tuple, Union
 
-TABLES_PER_GROUP = 12_500
+TABLES_PER_GROUP = 10_000
 # A remainder of up to this share of a group joins the other groups instead of making a group of its own: 100,200
 # tables make 8 groups, not 9.
 REMAINDER_SHARE = 0.1
@@ -17,6 +19,33 @@ def groups_for_tables(tables: int, per_group: int = TABLES_PER_GROUP) -> int:
     of a group adding one more, and at least one."""
     whole, remainder = divmod(max(0, int(tables)), per_group)
     return max(1, whole + (1 if remainder > per_group * REMAINDER_SHARE else 0))
+
+
+@dataclass(frozen=True)
+class TablesPerGroup:
+    """A job's group size: each server gets one group for about this many of its tables (groups_for_tables)."""
+    tables: int
+
+
+# How many groups a server gets: a number per server (an older caller's groups_per_server), a TablesPerGroup, or None
+# for the default size.
+Groups = Union[int, TablesPerGroup, None]
+
+
+def group_count(tables: int, groups: Groups = None) -> int:
+    """A server's number of groups for its tables under ``groups``."""
+    if isinstance(groups, TablesPerGroup):
+        return groups_for_tables(tables, groups.tables)
+    return int(groups) if groups else groups_for_tables(tables)
+
+
+def sizing(groups_per_server: Optional[int], tables_per_group: Optional[int], job_tables_per_group=None) -> Groups:
+    """What a request's grouping is: a number of groups it names, else the tables per group it names, else the job's
+    own (kept in its options), else None (the default size)."""
+    if groups_per_server:
+        return int(groups_per_server)
+    size = tables_per_group or job_tables_per_group
+    return TablesPerGroup(int(size)) if size else None
 
 
 def even(databases: Iterable[Tuple[str, int]], groups: int) -> Dict[str, int]:

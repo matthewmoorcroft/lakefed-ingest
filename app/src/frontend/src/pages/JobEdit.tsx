@@ -655,7 +655,7 @@ function Groups({ jobId, locked }: { jobId: string; locked: Locked }) {
       <div className="form-grid">
         <label>Groups per server<input type="number" min={1} max={64} value={value} placeholder="by tables"
           onChange={(e) => { setValue(e.target.value); setPreview(null); }} />
-          <span className="help">Blank: one group for about every 12,500 of a server's tables, a small remainder joining
+          <span className="help">Blank: one group for about every 10,000 of a server's tables, a small remainder joining
             the others (100,200 tables make 8).</span></label>
       </div>
       <button className="ghost" onClick={look} disabled={!!locked} title={locked ?? undefined}>Preview the groups</button>

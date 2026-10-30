@@ -218,7 +218,7 @@ export default function NewJob() {
         <div className="form-grid">
           <label>Groups per server<input type="number" min={1} max={64} value={groupsPerServer ?? ""} placeholder="by tables"
             onChange={(e) => setGroupsPerServer(e.target.value.trim() ? Math.min(64, Math.max(1, Math.round(Number(e.target.value)) || 1)) : null)} />
-            <span className="help">Blank: one group for about every 12,500 of a server's tables, a small remainder joining the
+            <span className="help">Blank: one group for about every 10,000 of a server's tables, a small remainder joining the
               others (100,200 tables make 8). A number: that many groups for each server. Either way each database goes whole
               to the group with the fewest tables, so the groups come out about even; the preview shows each server's groups.</span></label>
           {variants.length > 1 && <label>Runs start<select value={jobVariant} onChange={(e) => setVariant(e.target.value)}>

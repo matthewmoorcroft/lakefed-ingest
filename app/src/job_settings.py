@@ -338,8 +338,12 @@ def plan_databases(job_rows: List[dict], entries: List[dict], job_name: str, gro
     src_type = str(next(iter(models.values())).get("src_type") or "sqlserver").lower()
     new_entries = [(_server_key(e["server"], src_type), e["database"]) for e in entries]
     new_entries = [(server, database) for server, database in new_entries if server not in groups]
+    new_tables: Dict[str, int] = {}
+    for server, _ in new_entries:
+        new_tables[server] = new_tables.get(server, 0) + len(models)
     new_spread = placement.server_placements(((server, database, len(models)) for server, database in new_entries),
-                                             {server: groups_per_server for server, _ in new_entries})
+                                             {server: placement.group_count(tables, groups_per_server)
+                                              for server, tables in new_tables.items()})
     known = set(by_database)
     listed: Dict[tuple, bool] = {}
     secret_templates: Dict[str, Optional[str]] = {}

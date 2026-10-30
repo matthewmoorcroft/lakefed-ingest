@@ -4,9 +4,20 @@ import placement
 
 
 def test_the_default_number_of_groups_leaves_out_a_small_remainder():
-    assert placement.groups_for_tables(100_200) == 8
-    assert placement.groups_for_tables(12_500 * 8 + 1_251) == 9
-    assert [placement.groups_for_tables(n) for n in (0, 1, 12_500, 13_750, 13_751)] == [1, 1, 1, 1, 2]
+    assert placement.groups_for_tables(100_200) == 10
+    assert placement.groups_for_tables(10_000 * 8 + 1_001) == 9
+    assert [placement.groups_for_tables(n) for n in (0, 1, 10_000, 11_000, 11_001)] == [1, 1, 1, 1, 2]
+
+
+def test_a_jobs_tables_per_group_sizes_its_groups_and_a_number_of_groups_still_wins():
+    assert placement.group_count(100_200) == 10
+    assert placement.group_count(100_200, placement.TablesPerGroup(25_000)) == 4
+    assert placement.group_count(100_200, 3) == 3
+    assert placement.sizing(None, None) is None
+    assert placement.sizing(None, 5_000) == placement.TablesPerGroup(5_000)
+    assert placement.sizing(None, None, 20_000) == placement.TablesPerGroup(20_000)      # the job's own
+    assert placement.sizing(None, 5_000, 20_000) == placement.TablesPerGroup(5_000)     # the request's wins
+    assert placement.sizing(2, 5_000, 20_000) == 2                                      # an older caller's number
 
 
 def test_databases_are_spread_biggest_first_into_the_lightest_group():

@@ -125,10 +125,10 @@ class _Lakebase:
         return _Connection(self)
 
 
-def _regroup_client(monkeypatch, asked, stub_run_check=True):
+def _regroup_client(monkeypatch, asked, stub_run_check=True, tables=10):
     """The app over a fake Lakebase holding one job of 12 databases in 2 groups, with the workspace guard on (conftest):
     only the calls stubbed here may reach Databricks, so any other one on the regroup path fails the test."""
-    rows = _rows([1] * 6 + [2] * 6, [10] * 12, job="re")
+    rows = _rows([1] * 6 + [2] * 6, [tables] * 12, job="re")
     job = {"id": 7, "name": "re", "cadence_minutes": 60, "stagger": False, "job_variant": "check"}
     members = [{"id": n, "schedule_id": 7, "task_collection": f"re_sql_a_c0{n}", "removed_at": None, "job_id": None,
                 "offset_minutes": 0} for n in (1, 2)]
@@ -166,3 +166,30 @@ def test_an_unstubbed_run_check_on_the_regroup_path_fails_at_the_workspace_guard
     client, _ = _regroup_client(monkeypatch, [], stub_run_check=False)
     with pytest.raises(RuntimeError, match="never reach a Databricks workspace"):
         client.post("/api/ingestion-jobs/7/groups", json={"groups_per_server": 3})
+
+
+def test_a_new_tables_per_group_regroups_by_size_and_is_kept_on_the_job(monkeypatch):
+    plan = main._regroup_plan("job", _rows([1] * 6 + [2] * 6, [10] * 12), main.placement.TablesPerGroup(40))
+    assert plan["summary"]["servers"][0]["groups_after"] == 3      # 120 tables, 40 a group
+    asked = []
+    client, store = _regroup_client(monkeypatch, asked, tables=100)
+    for size, moved in ((400, True), (1_000, False)):      # 1,200 tables: 3 groups at 400, the same 2 at 1,000
+        store.statements.clear()
+        done = client.post("/api/ingestion-jobs/7/groups", json={"tables_per_group": size, "dry_run": False,
+                                                                "request_id": f"regroup-size-{size}"})
+        assert done.status_code == 200, done.text
+        assert (main.q.move_controls_sql() in store.statements) is moved
+        assert main.q.set_schedule_option_sql() in store.statements   # the job keeps its new size either way
+
+
+def test_a_job_keeps_the_tables_per_group_create_names_and_its_later_adds_use_it():
+    body = main.NewJobRequest(name="n", csv="x", tables_per_group=20_000)
+    assert main._create_options(body)[main.TABLES_PER_GROUP_OPTION] == 20_000
+    assert main._create_options(main.NewJobRequest(name="n", csv="x")) == {}
+    tables = main.JobTablesRequest(csv="x")
+    job = {"options": {main.TABLES_PER_GROUP_OPTION: 20_000}}
+    assert main._sizing(tables, job) == main.placement.TablesPerGroup(20_000)
+    assert main._sizing(main.JobTablesRequest(csv="x", tables_per_group=500), job) == main.placement.TablesPerGroup(500)
+    assert main._sizing(tables, {"options": {}}) is None
+    # A request can't set it through the run's options: only Create's field and a regroup do.
+    assert main.TABLES_PER_GROUP_OPTION in main.MANAGED_OPTIONS

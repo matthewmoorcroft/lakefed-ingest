@@ -72,8 +72,7 @@ def _placer(job_name: str, lines: List[dict], groups_per_server: Optional[int],
     per_server: Dict[str, int] = {}
     for (server, _), tables in sizes.items():
         per_server[server] = per_server.get(server, 0) + tables
-    groups = {server: int(groups_per_server) if groups_per_server else placement.groups_for_tables(tables)
-              for server, tables in per_server.items()}
+    groups = {server: placement.group_count(tables, groups_per_server) for server, tables in per_server.items()}
     placements = placement.server_placements(((s, d, n) for (s, d), n in sizes.items()), groups)
 
     def place(server: str, database: str) -> str:
@@ -148,7 +147,7 @@ def plan(job_name: str, text: str, given: dict, groups_per_server: Optional[int]
            "settings": settings}
     if not str(job_name or "").strip():
         out["errors"].insert(0, "name the job")
-    if groups_per_server is not None and not 1 <= int(groups_per_server) <= MAX_GROUPS_PER_SERVER:
+    if isinstance(groups_per_server, int) and not 1 <= groups_per_server <= MAX_GROUPS_PER_SERVER:
         out["errors"].append(f"groups per server must be from 1 to {MAX_GROUPS_PER_SERVER}")
     if out["errors"]:
         return out

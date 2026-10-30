@@ -66,10 +66,10 @@ def groups_for_tables(tables: int) -> int:
     return placement.groups_for_tables(tables)
 
 
-def groups_by_server(servers: List[dict], groups_per_server: Optional[int] = None) -> Dict[str, int]:
-    """{server: its groups} for a selection's servers (queries.selected_servers_sql rows): the job's own number when
-    Advanced configuration sets one, else the default for each server's tables."""
-    return {s["server"]: int(groups_per_server) if groups_per_server else groups_for_tables(s["tables"]) for s in servers}
+def groups_by_server(servers: List[dict], groups_per_server: placement.Groups = None) -> Dict[str, int]:
+    """{server: its groups} for a selection's servers (queries.selected_servers_sql rows), under the job's grouping
+    (placement.group_count: its tables per group, or a number of groups an older caller sets)."""
+    return {s["server"]: placement.group_count(s["tables"], groups_per_server) for s in servers}
 
 
 def group_of_placement(job_name: str, placements: Dict[str, Dict[str, int]]) -> Callable[[str, str], str]:

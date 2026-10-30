@@ -2048,7 +2048,9 @@ class JobDatabasesRequest(BaseModel):
     csv: Optional[str] = None
     columns: dict = {"server": "server", "database": "database", "enabled": "enabled"}
     databases: Optional[List[dict]] = None
-    groups_per_server: int = Field(1, ge=1, le=64)
+    groups_per_server: Optional[int] = Field(None, ge=1, le=64)
+    # The job's group size: each server gets one group for about this many of its tables (placement.TablesPerGroup).
+    tables_per_group: Optional[int] = Field(None, ge=100, le=1_000_000)
     full_list: bool = False
     dry_run: bool = True
     request_id: Optional[str] = Field(None, max_length=80)
@@ -2082,7 +2084,7 @@ def add_job_databases(job_id: int, body: JobDatabasesRequest, request: Request):
     job = _load_schedule(job_id)[0]
 
     def planned(rows):
-        plan = js.plan_databases(rows, entries, job["name"], body.groups_per_server, body.full_list)
+        plan = js.plan_databases(rows, entries, job["name"], _sizing(body, job), body.full_list)
         if plan["errors"]:
             raise HTTPException(422, {"errors": plan["errors"]})
         summary = {"databases": len(entries), "new_tables": len(plan["new"]), "enable": len(plan["enable"]),
@@ -2134,6 +2136,8 @@ def add_job_databases(job_id: int, body: JobDatabasesRequest, request: Request):
 class JobGroupsRequest(BaseModel):
     # Blank: each server's default for its tables (placement.groups_for_tables); a number: that many per server.
     groups_per_server: Optional[int] = Field(None, ge=1, le=nj.MAX_GROUPS_PER_SERVER)
+    # The job's group size: each server gets one group for about this many of its tables (placement.TablesPerGroup).
+    tables_per_group: Optional[int] = Field(None, ge=100, le=1_000_000)
     dry_run: bool = True
     request_id: Optional[str] = Field(None, max_length=80)
 
@@ -2153,7 +2157,7 @@ def _regroup_plan(job_name: str, rows: List[dict], groups_per_server: Optional[i
         databases = by_server[server]
         now = sorted({group for group, _ in databases.values()})
         tables = sum(n for _, n in databases.values())
-        count = int(groups_per_server) if groups_per_server else placement.groups_for_tables(tables)
+        count = placement.group_count(tables, groups_per_server)
         line = {"server": server, "databases": len(databases), "tables": tables, "groups_before": len(now),
                 "groups_after": count, "databases_moving": 0, "tables_moving": 0}
         if count != len(now):
@@ -2205,13 +2209,15 @@ def regroup_job(job_id: int, body: JobGroupsRequest, request: Request):
     job, members = _load_schedule(job_id)
     groups = _job_groups(job_id)
     plan = _regroup_plan(job["name"], db.query(q.groups_control_rows_sql(), (groups,)) if groups else [],
-                         body.groups_per_server)
+                         _sizing(body))
     blocker = _regroup_blocker(job, members)
     if body.dry_run:
         return {"summary": plan["summary"], "blocked": blocker}
     if blocker:
         raise HTTPException(409, blocker)
     if plan["summary"]["unchanged"]:
+        if body.tables_per_group:      # nothing moves, but the job keeps its new size for what's added later
+            db.execute(q.set_schedule_option_sql(), ([TABLES_PER_GROUP_OPTION], int(body.tables_per_group), job_id))
         return {"summary": {**plan["summary"], "applied": True}, "blocked": None}
     _refuse_job_tables(job, groups + plan["new"], request)
     batch = uuid.uuid4().hex[:12]
@@ -2220,7 +2226,7 @@ def regroup_job(job_id: int, body: JobGroupsRequest, request: Request):
         with _write() as cur:
             groups = _lock_job(cur, job_id)
             rows = db.fetch(cur, q.groups_control_rows_sql(for_update=True), (groups,)) if groups else []
-            plan = _regroup_plan(job["name"], rows, body.groups_per_server)
+            plan = _regroup_plan(job["name"], rows, _sizing(body))
             _lock_collections_together(cur, groups + plan["new"])
             by_target: Dict[str, List[int]] = {}
             stamps: Dict[Tuple[str, str], set] = {}
@@ -2247,6 +2253,8 @@ def regroup_job(job_id: int, body: JobGroupsRequest, request: Request):
                                    sch.start_minute(job))
                 for group in plan["new"]:
                     cur.execute(q.insert_member_sql(), (job_id, group, offs[group]))
+            if body.tables_per_group:      # the job's new size, for its Add tables and regroups after this one
+                cur.execute(q.set_schedule_option_sql(), ([TABLES_PER_GROUP_OPTION], int(body.tables_per_group), job_id))
             _touch(cur, user, [job_id])
             result = {"summary": {**plan["summary"], "applied": True}, "blocked": None}
             _task_written(cur, task_id, result, job_id, len(plan["moves"]))
@@ -2284,6 +2292,8 @@ class JobTablesRequest(_TablesFrom):
     load_type: str = "ct"
     # Blank: each server's default for its tables (placement.groups_for_tables); a number: that many per server.
     groups_per_server: Optional[int] = Field(None, ge=1, le=nj.MAX_GROUPS_PER_SERVER)
+    # The job's group size: each server gets one group for about this many of its tables (placement.TablesPerGroup).
+    tables_per_group: Optional[int] = Field(None, ge=100, le=1_000_000)
     dry_run: bool = True
     request_id: Optional[str] = Field(None, max_length=80)
 
@@ -2350,7 +2360,7 @@ def _add_job_tables(job_id: int, body: "JobTablesRequest", request: Request, inl
         return {"summary": None, "applied": False, "discovering": True, "databases": selected["databases"]}
 
     def planned(rows):
-        plan = _file_lines(nj.plan_for_job(job["name"], text, body.load_type, rows, body.groups_per_server, taken),
+        plan = _file_lines(nj.plan_for_job(job["name"], text, body.load_type, rows, _sizing(body, job), taken),
                            selected)
         if plan["errors"]:
             raise HTTPException(422, {"errors": plan["errors"]})
@@ -3395,8 +3405,10 @@ def _validate_schedule(body: ScheduleBody):
 
 # Options only the app's own steps write: who last changed the job, the copies job's copy and the app's run
 # applying it, and a deleted job's delete job run and whether it drops the target tables. A request's values for them are ignored, and the stored ones kept.
+# A job's tables per group, set at Create or by a regroup that names one.
+TABLES_PER_GROUP_OPTION = "tables_per_group"
 MANAGED_OPTIONS = ("updated_by", sch.COPY_OPTION, "cluster_copy_run_id", "delete_run_id", "delete_drop_targets",
-                   rediscovery.RECORD)
+                   rediscovery.RECORD, TABLES_PER_GROUP_OPTION)
 
 
 def _requested_options(body: "ScheduleBody") -> dict:
@@ -3611,6 +3623,8 @@ class NewJobRequest(_TablesFrom):
     settings: dict = {}
     # Blank: each server's default for its tables (placement.groups_for_tables); a number: that many per server.
     groups_per_server: Optional[int] = Field(None, ge=1, le=nj.MAX_GROUPS_PER_SERVER)
+    # The job's group size: each server gets one group for about this many of its tables (placement.TablesPerGroup).
+    tables_per_group: Optional[int] = Field(None, ge=100, le=1_000_000)
     run: NewJobRun = NewJobRun()
     dry_run: bool = True
     # Made when the page opens the Create, so a retry of the same Create finds the task the first one made.
@@ -3734,7 +3748,7 @@ def _create_by_database(body: NewJobRequest, request: Request, selection: Select
     servers = db.query(q.selected_servers_sql(kind), (param, *rest))
     if not servers:
         errors.append("the selection takes no tables")
-    groups_of = by_database.groups_by_server(servers, body.groups_per_server)
+    groups_of = by_database.groups_by_server(servers, _sizing(body))
     all_groups = [g for s in servers for g in nj.group_names(name or PREVIEW_NAME, s["server"], groups_of[s["server"]])]
     timezone_ = sch.timezone_for(run.cadence_minutes, run.timezone)
     if not errors and name:     # the schedule's checks (its name and groups free) wait for the name
@@ -3748,7 +3762,7 @@ def _create_by_database(body: NewJobRequest, request: Request, selection: Select
                 "name_missing": not name}
     if not run.paused:     # anyone may set up a job, but one that runs needs the right to run what it starts
         _refuse(_permission_refusals({"job_variant": run.job_variant}, user)["run"])
-    options = {k: v for k, v in (run.options or {}).items() if k not in MANAGED_OPTIONS}
+    options = _create_options(body)
     _refuse_unknown_node_types(sch.own_cluster({"options": options}))
     offs = sch.offsets(all_groups, run.cadence_minutes, run.stagger,
                        sch.start_minute({"options": options, "cadence_minutes": run.cadence_minutes}))
@@ -3870,7 +3884,7 @@ def _add_by_database(job_id: int, body: "JobTablesRequest", request: Request, ki
     # A database the job has keeps its group, a new one on a server the job has joins that server's lightest group, and
     # a server new to the job gets its own groups, its databases spread evenly over them.
     new_servers = by_database.groups_by_server([s for s in servers if not inputs["join"].knows(s["server"])],
-                                               body.groups_per_server)
+                                               _sizing(body, job))
     sizes = db.query(q.selected_databases_sql(kind), (param, *rest)) if new_servers else []
     spread = by_database.group_of_placement(job["name"], placement.server_placements(
         ((r["server"], r["src_database"], r["tables"]) for r in sizes if r["server"] in new_servers), new_servers))
@@ -3996,7 +4010,7 @@ def _create_now(body: NewJobRequest, request: Request, inline=None):
         progress, task_id = inline
         return _create_job(body, request, inline=True, progress=progress, task_id=task_id)
     user = _user(request)
-    create_options = {k: v for k, v in (body.run.options or {}).items() if k not in MANAGED_OPTIONS}
+    create_options = _create_options(body)
 
     def after_create(result):
         return _created(result, user, create_options)
@@ -4004,6 +4018,21 @@ def _create_now(body: NewJobRequest, request: Request, inline=None):
     if (made := _made_already(body, after_create)) is not None:
         return made
     return _create_job(body, request)
+
+
+def _create_options(body: "NewJobRequest") -> dict:
+    """A new job's options: the run's, less those only the app's own steps write, with the job's tables per group when
+    Create names one (Add tables and a regroup later read it back, _sizing)."""
+    options = {k: v for k, v in (body.run.options or {}).items() if k not in MANAGED_OPTIONS}
+    if body.tables_per_group:
+        options[TABLES_PER_GROUP_OPTION] = int(body.tables_per_group)
+    return options
+
+
+def _sizing(body, job: Optional[dict] = None) -> placement.Groups:
+    """A request's grouping (placement.sizing): its groups per server, else its tables per group, else the job's."""
+    stored = sch.options_of(job).get(TABLES_PER_GROUP_OPTION) if job else None
+    return placement.sizing(getattr(body, "groups_per_server", None), getattr(body, "tables_per_group", None), stored)
 
 
 # The name a preview groups the tables under while the job has none yet: the groups are named from the job's name.
@@ -4019,7 +4048,7 @@ def _create_job(body: NewJobRequest, request: Request, inline: bool = False, pro
     """The Create itself. A file with database-only lines is first discovered by name in a background task
     (_create_after_discovery), which runs this again with inline=True, so the write happens in that task."""
     user = _user(request)
-    create_options = {k: v for k, v in (body.run.options or {}).items() if k not in MANAGED_OPTIONS}
+    create_options = _create_options(body)
     if not inline and body.source is not None and not body.dry_run and _has_database_lines(body.source):
         if not body.run.paused:
             _refuse(_permission_refusals({"job_variant": body.run.job_variant}, user)["run"])
@@ -4039,7 +4068,7 @@ def _create_job(body: NewJobRequest, request: Request, inline: bool = False, pro
     def planned():
         # A preview with no name yet groups the tables under PREVIEW_NAME and checks no group against the taken ones.
         unnamed_preview = body.dry_run and not name
-        plan = _file_lines(nj.plan(PREVIEW_NAME if unnamed_preview else name, text, body.settings, body.groups_per_server,
+        plan = _file_lines(nj.plan(PREVIEW_NAME if unnamed_preview else name, text, body.settings, _sizing(body),
                                    set() if unnamed_preview else taken, require_target=not body.dry_run), selected)
         errors = list(plan["errors"])
         if not errors and plan["groups"] and not unnamed_preview:
