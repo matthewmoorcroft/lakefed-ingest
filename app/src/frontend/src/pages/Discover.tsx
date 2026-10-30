@@ -278,8 +278,8 @@ function Step2({ connection, discoveryId, checksOn, typedNames, picks, setPicks,
     }
   }, [listing.data]);
   const closed = (d: string) => accessOf(seen[d]) === "closed";
-  // Through the SQL warehouse, every listed database is checked: the page shown first, then the rest while this step is
-  // open. The answers stay on the listing in Lakebase, so a database is checked once.
+  // Through the SQL warehouse, the databases the page shows are checked, and only those: another page or filter checks
+  // its own. The answers stay on the listing in Lakebase, so a database is checked once.
   const qc = useQueryClient();
   const [checking, setChecking] = useState(false);
   const shownKey = shown.join("\n");
@@ -295,7 +295,7 @@ function Step2({ connection, discoveryId, checksOn, typedNames, picks, setPicks,
           if (stopped) return;
           await qc.invalidateQueries({ queryKey: ["discovery-listing", discoveryId] });
           if (step.error) throw new Error(String(step.error));
-          if (!step.pending) return;
+          if (!Number(step.pending_shown ?? step.pending)) return;
           await wait(1500);
           if (stopped) return;
         }

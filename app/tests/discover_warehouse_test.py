@@ -206,12 +206,16 @@ def test_reading_the_whole_server_through_the_warehouse_needs_its_listing(client
     assert answer.status_code == 422 and "listing_id" in answer.json()["detail"]
 
 
-def test_the_page_checks_access_with_the_databases_it_shows_first(client, monkeypatch):
+def test_the_page_checks_access_for_the_databases_it_shows_and_hears_how_many_of_them_are_left(client, monkeypatch):
     client.use([_answer("SUCCEEDED", rows=[])])
-    calls = _advance_recorded(monkeypatch, {"databases": 2, "pending": 0, "open": 1, "closed": 1, "tables": 5,
-                                            "state": "SUCCEEDED", "warehouse": "RUNNING"})
+    calls = _advance_recorded(monkeypatch, {"databases": 2, "pending": 1, "open": 1, "closed": 0, "tables": 5,
+                                            "state": "RUNNING", "warehouse": "RUNNING"})
+    asked = []
+    monkeypatch.setattr(main.db, "query", lambda sql, params=(): asked.append((sql, params)) or [{"unchecked": 0}])
     body = client.post("/api/discoveries/abc123/access?connection=sql_a", json={"first": ["eng_001"]}).json()
-    assert body["closed"] == 1 and calls == [("check", "abc123", "sql_a", ["eng_001"])]
+    assert body["pending"] == 1 and body["pending_shown"] == 0           # the rest of the server isn't the page's
+    assert calls == [("check", "abc123", "sql_a", ["eng_001"])]
+    assert asked == [(q.warehouse_unchecked_sql(), ("abc123", ["eng_001"]))]
     assert client.post("/api/discoveries/abc123/access?connection=sql_other", json={}).status_code == 404
 
 

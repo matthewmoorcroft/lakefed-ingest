@@ -26,6 +26,13 @@ def test_a_check_works_on_listed_databases_not_checked_yet_and_a_read_on_running
     assert "for update skip locked" in q.warehouse_claim_sql(wr.READ)
 
 
+def test_a_check_takes_only_the_page_shown_and_a_read_takes_it_first():
+    check, read = q.warehouse_claim_sql(wr.CHECK), q.warehouse_claim_sql(wr.READ)
+    assert "and src_database = any(%s::text[]) order by src_database limit %s" in check
+    assert "order by (src_database = any(%s::text[])) desc, src_database limit %s" in read
+    assert _marks(q.warehouse_unchecked_sql()) == 2 and "src_database = any(%s::text[])" in q.warehouse_unchecked_sql()
+
+
 def test_a_second_answer_for_a_database_changes_nothing():
     assert q.warehouse_read_done_sql().endswith("and status = 'running'")
     assert q.warehouse_check_done_sql().endswith("and status = 'listed'")

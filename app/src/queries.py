@@ -1436,17 +1436,28 @@ def warehouse_in_flight_sql(kind: str) -> str:
 
 
 def warehouse_claim_sql(kind: str) -> str:
-    """Claim up to a number of a discovery's databases with no statement yet (the names asked for first, then by
-    name), skipping those another request holds or claimed less than a while ago. Params: discovery_id, the age in
-    seconds after which a claim with no statement is free again, the names first (text[]), limit."""
+    """Claim up to a number of a discovery's databases with no statement yet, skipping those another request holds or
+    claimed less than a while ago. A check claims only the names asked for (the page shown): the login's access is
+    checked for what the page lists, never the whole server. A read claims the names asked for first, then by name.
+    Params: discovery_id, the age in seconds after which a claim with no statement is free again, the names (text[]),
+    limit."""
+    names = ("and src_database = any(%s::text[]) order by src_database" if kind == "check"
+             else "order by (src_database = any(%s::text[])) desc, src_database")
     return (f"update {SCHEMA}.discovery d set listing = coalesce(d.listing, '{{}}'::jsonb) "
             f"|| jsonb_build_object('claimed_at', now()::text) "
             f"from (select discovery_id, src_database from {SCHEMA}.discovery "
             f"      where discovery_id = %s and {WAREHOUSE_WORK[kind]} and not (coalesce(listing, '{{}}'::jsonb) ? 'statement_id') "
             f"      and (listing ->> 'claimed_at' is null "
             f"           or (listing ->> 'claimed_at')::timestamptz < now() - make_interval(secs => %s)) "
-            f"      order by (src_database = any(%s::text[])) desc, src_database limit %s for update skip locked) c "
+            f"      {names} limit %s for update skip locked) c "
             f"where d.discovery_id = c.discovery_id and d.src_database = c.src_database returning d.src_database")
+
+
+def warehouse_unchecked_sql() -> str:
+    """How many of the names asked for are listed and not checked yet: the page's checks still to come. Params:
+    discovery_id, the names (text[])."""
+    return (f"select count(*) as unchecked from {SCHEMA}.discovery where discovery_id = %s and {WAREHOUSE_WORK['check']} "
+            f"and src_database = any(%s::text[])")
 
 
 def warehouse_started_sql() -> str:

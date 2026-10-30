@@ -2983,11 +2983,14 @@ class AccessCheckRequest(BaseModel):
 
 @app.post("/api/discoveries/{discovery_id}/access")
 def check_access(discovery_id: str, body: AccessCheckRequest, connection: str):
-    """One step of checking whether the connection's login can open each listed database (warehouse_reads.advance):
-    the page asks while some aren't checked yet, the databases it shows first. The answers are on the listing."""
+    """One step of checking whether the connection's login can open the databases the page shows
+    (warehouse_reads.advance): only those, so a server of 22,000 databases is checked a page at a time as it is
+    looked at. The page asks while some of them aren't checked yet (pending_shown). The answers are on the listing."""
     _require_connection(connection)
-    return warehouse_reads.advance(WarehouseReadStore(), warehouse, warehouse_reads.CHECK, discovery_id, connection,
+    step = warehouse_reads.advance(WarehouseReadStore(), warehouse, warehouse_reads.CHECK, discovery_id, connection,
                                    body.first)
+    unchecked = db.query(q.warehouse_unchecked_sql(), (discovery_id, list(body.first)))[0]["unchecked"]
+    return {**step, "pending_shown": int(unchecked or 0)}
 
 
 @app.get("/api/discoveries/{discovery_id}/reads")

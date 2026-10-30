@@ -133,7 +133,7 @@ service principal.
 | Step | What runs on the warehouse |
 |---|---|
 | The connection test (Next on the connection step) | one statement in master listing the server's online user databases (`source_catalog.DATABASES_SQL`); the filter works on the next step. A failed test shows its codes beside Next (Databricks' error class, SQL Server's error number, the SQLSTATE: `source_catalog.error_codes`), the source's message and what to do; Next moves on only once it passes |
-| The database list | one statement per database (`warehouse_reads.ACCESS_SQL`): opening it is the check, and it counts its tables. The page shown is checked first, then the rest while the step is open. A database the login can't open is greyed out, can't be ticked, and says why on hover; ticking the whole server takes only the others and says how many it left out |
+| The database list | one statement per database (`warehouse_reads.ACCESS_SQL`): opening it is the check, and it counts its tables. Only the page shown is checked (another page or filter checks its own), so a server of 22,000 databases is never checked as a whole. A database the login can't open is greyed out, can't be ticked, and says why on hover; ticking the whole server leaves out the ones found so and says how many, and one on a page not looked at fails in the read with the server's reason, named before anything is added |
 | Reading the chosen tables | one statement per database (`source_catalog.TABLE_SUMMARY_SQL`, one row per user table), saved to `discovered_table` with the same recommendations as the discovery job |
 
 At most 16 statements of one discovery are going at once (`warehouse_reads.IN_FLIGHT`). Each request the page makes

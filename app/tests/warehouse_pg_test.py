@@ -17,6 +17,8 @@ URI = os.environ.get("LAKEFED_APP_TEST_PG")
 pytestmark = pytest.mark.skipif(not URI, reason="LAKEFED_APP_TEST_PG not set")
 REPO = Path(__file__).resolve().parents[2]
 LISTING = json.dumps({"via": "warehouse"})
+# The page shown, for a check: it claims only the names the page lists.
+ALL = ["eng_001", "eng_002", "eng_003"]
 
 
 @pytest.fixture(scope="module")
@@ -70,32 +72,42 @@ def test_a_listing_is_saved_once_with_how_it_was_listed(pg):
     assert all(r["finished_at"] is not None for r in rows)
 
 
-def test_a_check_claims_the_names_asked_for_first_then_by_name_and_never_one_claimed_twice(pg):
+def test_a_check_claims_only_the_names_asked_for_and_never_one_claimed_twice(pg):
     did = _listed(pg, [f"eng_00{i}" for i in range(1, 6)])
+    page = ["eng_002", "eng_004", "eng_005"]
     # RETURNING keeps no order, so the claims are compared as sets.
-    assert sorted(_claim(pg, wr.CHECK, did, first=["eng_004"], limit=2)) == ["eng_001", "eng_004"]
-    assert sorted(_claim(pg, wr.CHECK, did)) == ["eng_002", "eng_003", "eng_005"]
-    assert _claim(pg, wr.CHECK, did) == []
+    assert sorted(_claim(pg, wr.CHECK, did, first=page, limit=2)) == ["eng_002", "eng_004"]
+    assert _claim(pg, wr.CHECK, did, first=page) == ["eng_005"]
+    assert _claim(pg, wr.CHECK, did, first=page) == [] and _claim(pg, wr.CHECK, did) == []
+    assert _rows(pg, q.warehouse_unchecked_sql(), (did, page)) == [{"unchecked": 3}]    # claimed, not answered yet
     # A claim with no statement after the age given is free again (the app stopped between claiming and starting).
-    assert len(_claim(pg, wr.CHECK, did, age_s=0)) == 5
+    assert len(_claim(pg, wr.CHECK, did, first=[f"eng_00{i}" for i in range(1, 6)], age_s=0)) == 5
+
+
+def test_a_read_claims_the_names_asked_for_first_then_the_rest(pg):
+    did = uuid.uuid4().hex[:12]
+    pg.execute(q.warehouse_named_rows_sql(3), (did, "sql_a", "eng_001", "op", did, "sql_a", "eng_002", "op",
+                                               did, "sql_a", "eng_003", "op"))
+    assert sorted(_claim(pg, wr.READ, did, first=["eng_003"], limit=2)) == ["eng_001", "eng_003"]
+    assert _claim(pg, wr.READ, did) == ["eng_002"]
 
 
 def test_a_started_statement_is_in_flight_until_cleared_then_claimed_again(pg):
     did = _listed(pg, ["eng_001", "eng_002"])
-    _claim(pg, wr.CHECK, did)
+    _claim(pg, wr.CHECK, did, first=ALL)
     pg.execute(q.warehouse_started_sql(), ("s-1", did, "eng_001"))
     assert [(r["src_database"], r["statement_id"]) for r in _rows(pg, q.warehouse_in_flight_sql(wr.CHECK), (did,))] == \
         [("eng_001", "s-1")]
-    assert _claim(pg, wr.CHECK, did, age_s=0) == ["eng_002"], "a database with a statement going is not claimed"
+    assert _claim(pg, wr.CHECK, did, first=ALL, age_s=0) == ["eng_002"], "a database with a statement going is not claimed"
     pg.execute(q.warehouse_clear_sql(), (did, "eng_001"))
     assert _rows(pg, q.warehouse_in_flight_sql(wr.CHECK), (did,)) == []
     assert "claimed_at" not in _row(pg, did, "eng_001")["listing"]
-    assert _claim(pg, wr.CHECK, did) == ["eng_001"]
+    assert _claim(pg, wr.CHECK, did, first=ALL) == ["eng_001"]
 
 
 def test_a_checks_answer_marks_the_database_open_or_closed_and_the_progress_counts_them(pg):
     did = _listed(pg, ["eng_001", "eng_002", "eng_003"])
-    _claim(pg, wr.CHECK, did)
+    _claim(pg, wr.CHECK, did, first=ALL)
     pg.execute(q.warehouse_started_sql(), ("s-1", did, "eng_001"))
     pg.execute(q.warehouse_check_done_sql(), (True, None, 1000, did, "eng_001"))
     pg.execute(q.warehouse_check_done_sql(), (False, "no access", None, did, "eng_002"))
@@ -105,7 +117,7 @@ def test_a_checks_answer_marks_the_database_open_or_closed_and_the_progress_coun
     assert _rows(pg, q.warehouse_progress_sql(wr.CHECK), (did,)) == \
         [{"databases": 3, "pending": 1, "open": 1, "closed": 1, "tables": 1000}]
     assert _rows(pg, q.warehouse_in_flight_sql(wr.CHECK), (did,)) == []
-    assert _claim(pg, wr.CHECK, did, age_s=0) == ["eng_003"], "a checked database is not checked again"
+    assert _claim(pg, wr.CHECK, did, first=ALL, age_s=0) == ["eng_003"], "a checked database is not checked again"
 
 
 def test_the_listing_page_and_its_totals_show_each_check_under_a_filter(pg):
