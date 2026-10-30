@@ -132,7 +132,10 @@ secret). See `README.md`, `docs/deploy.md`, `docs/monitoring.md`, `docs/lakebase
   the groups no other live job holds: their control, checkpoint, reseed_queue, database_check, check_work and rollup
   rows, and the job's job_selection rows (what it was chosen from; skipped below schema version 9).
   Run history (ingest_run, ingest_event) and control_change stay. With `drop_targets`, after the commit, it drops
-  (`DROP TABLE IF EXISTS`) only the target tables no other group's rows write, never a schema.
+  (`DROP TABLE IF EXISTS`) only the target tables no other group's rows write, never a schema. With `purge_drafts`
+  (no `schedule_id`) it purges instead the app's drafts no job took (`delete_job.purge_drafts`: discovery rows marked
+  `draft` in `listing`, discarded or not asked about for `draft_ttl_s`, and their discovered_table rows); the app's
+  run poller starts it at most hourly, only when one is due.
 - `lakefed_ingest_discover` → `discover_tables.ipynb`: table discovery for bulk onboarding (params
   `discovery_id`, `spec` JSON, `discover_workers` (databases read at once, default 32, capped by
   `max_queries_per_source`)); writes `discovery` / `discovered_table` in one transaction per database. Runs on the

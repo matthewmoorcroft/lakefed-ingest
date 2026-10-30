@@ -111,6 +111,9 @@ which runs as the deployer:
   the reason and **Run again** on the job page (with the same tick box);
 - **Deleted jobs** on Ingestion jobs is history only: the finished deletes.
 
+The same job purges New job's drafts (below) with `purge_drafts`: the app's poller starts it at most once an hour,
+and only when a draft is due.
+
 **Run now and Cancel run.** Neither shows an end state before Databricks confirms it. **Run now** reads **Starting…**
 until the poller records a run going, and **Cancel run** reads **Cancelling…** until every run of the job has ended.
 Both read the `databricks_run` table the poller keeps, with no timer on the page. After 15 minutes without a start, or
@@ -144,6 +147,23 @@ databases it starts, so two pages or app instances never start the same one twic
 The step's top line counts the choice: databases chosen of those listed and their tables (counting while some aren't
 checked yet); the same numbers end the step's last line and the job's Chosen summary.
 
+**New job reads the tables as they are chosen (drafts).** Ticking a whole database, or the whole server under its
+filter, starts the read of its tables at once, while the rest of the job is filled in. The read is a draft: its rows
+are the read's own `discovery` and `discovered_table` rows, marked `draft` in `listing`, and nothing of the job
+(control, checkpoint, schedule, rollups) is written before Create.
+- **Add the tables chosen** doesn't wait: the reads go on from New job's page, whose preview counts what is read so
+  far and says how far the read is (asked every 2 seconds while a database is left).
+- **Create** is enabled throughout. Pressed early, it waits for the rest of the read in a background task (its
+  progress shows "reading the chosen databases' tables first"), then writes. A database that couldn't be read stops it
+  by name before anything is written; one the whole server's read couldn't open is left out and counted.
+- Create's transaction takes the draft: the mark comes off and the job is named on its rows.
+- **Cancel**, leaving the page, or choosing the tables again before Create discards the draft
+  (`POST /api/discoveries/{id}/discard`, by `sendBeacon` as the page closes): nothing more is read and its statements
+  still going are cancelled. A draft nobody has asked about for two hours (`DRAFT_TTL_S`) counts as discarded.
+- The app has no DELETE, so the delete job purges discarded drafts (`purge_drafts`; see Deleting a job). Nothing is
+  kept for a job that wasn't created, once the next purge has run.
+- Edit's Add tables reads the same way but still waits at Add, as before.
+
 **The warehouse.** Serverless, PRO, set by three bundle variables: `discovery_warehouse_size` (default `2X-Small`),
 `discovery_warehouse_max_clusters` (default 2: it scales out by clusters when statements queue, not by size) and
 `discovery_warehouse_auto_stop_mins` (default 5). A serverless warehouse starts in a few seconds. 2X-Small is 4 DBUs an
@@ -151,10 +171,10 @@ hour per cluster while it runs: at a list price of about 0.70 USD per serverless
 5.60 USD with both clusters; it stops after 5 idle minutes, so it costs only while someone chooses tables. Your
 contract's price may differ. The app gets `CAN_USE` on it as an app resource (`WAREHOUSE_ID`).
 
-**At a whole server's size** (estimates): a check takes about a second, so 22,000 databases at 16 at once take about
-20 to 25 minutes in the background, about 2.50 USD of warehouse time with both clusters running; the page shown is checked first, so the list
-is usable at once. A read of 1,000 tables is about 2 to 5 seconds per database, about 1 to 2 hours for 22,000 at 16 at
-once. Without a warehouse set (`WAREHOUSE_ID` empty), Discover runs the discovery job as before.
+**At a whole server's size** (estimates): a check takes about a second, and only the page shown (100 databases) is
+checked, about 7 seconds at 16 at once whatever the server's size. A read of 1,000 tables is about 2 to 5 seconds per
+database, about 1 to 2 hours for 22,000 at 16 at once; in New job it starts at the choice, so Create waits only for
+what is left when it is pressed. Without a warehouse set (`WAREHOUSE_ID` empty), Discover runs the discovery job as before.
 
 **What stays on the discovery job:** listing an Azure SQL server's databases through Azure (it takes a service
 credential only Databricks compute holds; the tables are then read through the warehouse), and sources read by host
