@@ -82,8 +82,8 @@ variables:
     description: Table retries in the whole run; once spent, failures fail at once.
     default: "20"
   fail_on_table_errors:
-    description: End a run as failed when any of its tables failed, so the job's failure email fires ("false" = the run succeeds and the failures are recorded).
-    default: "false"
+    description: End a run as failed when any of its tables is still failed at its end (a table that recovers on a retry is not a failure), so the job's failure email fires ("false" = the run succeeds and the failures are recorded).
+    default: "true"
   spark_conf:
     description: Spark session settings for a run, a JSON object of setting to value (a string, number or boolean; blank keeps the cluster's). Code generation off saves compiling every append's plan (+26% tables per second on one cluster in the sweep).
     default: '{"spark.sql.codegen.wholeStage": "false"}'
