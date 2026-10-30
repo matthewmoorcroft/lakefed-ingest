@@ -404,6 +404,10 @@ create index if not exists ingest_event_failed_time_idx
 create index if not exists ingest_event_first_load_idx
     on lakefed_ingest.ingest_event (task_collection, control_id, finished_at)
     where status = 'ok' and action in ('seed', 'reseed', 'full');
+-- The failing-tables read looks up one table's last ok event and its failures by control_id and started_at. Not partial,
+-- so the ok lookup (status = 'ok') and the failures lookup (status = 'failed') both use it.
+create index if not exists ingest_event_control_started_idx
+    on lakefed_ingest.ingest_event (control_id, started_at);
 
 -- NOTE: the two-level controller/batching was removed — one run ingests a whole task_collection in
 -- one task (see ingest.ipynb), so there is no `task_batch` table. A `task_batch` left over from an

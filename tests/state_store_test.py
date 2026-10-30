@@ -615,7 +615,7 @@ SCHEMA_FINGERPRINTS = {
     11: "557b634c85d1a753d82c7e0ca145209f3b56e1a957d833ad38469e0c97f65999",
     12: "3c4da8d33b1512088b091acb8548088962d3220648a7d497ff4378c043f269f8",
     13: "02ab6eceb01e8c75509c88f496d08f187e6cbf746cc0019f3477977968854cc0",
-    14: "14a95d34d6d617fd3d3d7a4fbbaeb87f0d03e1e6389322ad7b02b4166178a5b1",
+    14: "f125d8ae5701120edba627816947a339119e6d8d6d1c4690632b975e52f6ddf7",
 }
 
 
@@ -630,6 +630,15 @@ def test_schema_version_is_bumped_with_every_ddl_change():
 def test_schema_fingerprint_ignores_comments_and_whitespace():
     assert ss.schema_fingerprint("create table a (x int); -- note\n") == ss.schema_fingerprint("create  table a\n(x int);")
     assert ss.schema_fingerprint("create table a (x int);") != ss.schema_fingerprint("create table a (x bigint);")
+
+
+def test_the_failing_tables_index_is_a_plain_non_partial_index_on_control_and_started_at():
+    statements = [" ".join(s.split()) for s in ss.split_sql_statements(_DDL)]
+    index_statements = [s for s in statements if "ingest_event_control_started_idx" in s]
+    assert index_statements == [
+        "create index if not exists ingest_event_control_started_idx "
+        "on lakefed_ingest.ingest_event (control_id, started_at)"
+    ]
 
 
 def test_ddl_creates_the_schema_version_table_and_runs_in_a_transaction():
