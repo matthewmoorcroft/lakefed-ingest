@@ -111,9 +111,10 @@ resources:
           default: ""
         # How a cycle's runs are made: "changes" shares the changed databases out over as many runs as their
         # changed tables over the job's group size need, each database whole on one run (a group with a first
-        # load keeps a run of its own); "group" starts one run per group with work, as before.
+        # load keeps a run of its own); "group" starts one run per group with work, as before, and is the default
+        # until the lab proof of "changes" passes (the proof sets runs_by on each run it starts).
         - name: runs_by
-          default: "changes"
+          default: "group"
         # The check waits for the ingest runs it started and fails when one failed. timeout_s bounds that wait in
         # seconds (0: no limit): the runs still going then are cancelled and the check fails. While it waits the
         # check's serverless compute is idle, so this bound is also the most a cycle's wait can cost.

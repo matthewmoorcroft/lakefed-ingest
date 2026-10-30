@@ -113,11 +113,11 @@ def test_a_run_of_a_share_runs_each_collection_as_a_part_of_its_own_and_a_part_s
 def test_the_check_shares_a_cycle_out_by_its_changes_unless_told_one_run_per_group():
     notebook = json.loads((NOTEBOOK.parent / "check_launch.ipynb").read_text())
     code = "\n".join(c["source"] if isinstance(c["source"], str) else "".join(c["source"]) for c in notebook["cells"])
-    assert 'runs_by = widget("runs_by", "changes")' in code
+    assert 'runs_by = widget("runs_by", "group")' in code
     assert 'hold_work_locks=runs_by == "group", share_locks=runs_by == "changes"' in code
     assert "launcher.cycle_requests(summary[\"per_collection\"], group_size" in code
     job = (NOTEBOOK.parents[2] / "resources" / "lakefed_ingest_check.yml").read_text()
-    assert 'runs_by: "{{job.parameters.runs_by}}"' in job and '- name: runs_by\n          default: "changes"' in job
+    assert 'runs_by: "{{job.parameters.runs_by}}"' in job and '- name: runs_by\n          default: "group"' in job
 
 
 def test_a_cycle_is_sized_by_the_jobs_own_tables_per_group_when_it_has_one():

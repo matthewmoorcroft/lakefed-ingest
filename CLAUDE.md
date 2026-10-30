@@ -125,9 +125,9 @@ secret). See `README.md`, `docs/deploy.md`, `docs/monitoring.md`, `docs/lakebase
   fails; a run that failed or was skipped fails the check, so the wrapper's failure email fires). Locks are let go
   when each run starts, so the wait holds none. No For each. Its own schedule
   (paused) is the fallback cadence; an app schedule in group mode starts it with its members.
-  With `runs_by` `changes` (the default; `group` keeps one run per collection with work) the cycle is shared out
-  by its changes (`initial_check.plan_cycle`, `launcher.cycle_requests`): each database's tables with work
-  (`check_collection`'s `weights`), as many runs as those tables over the job's group size (its tables over its
+  With `runs_by` `changes` (`group`, the default until its lab proof, keeps one run per collection with work)
+  the cycle is shared out by its changes (`initial_check.plan_cycle`, `launcher.cycle_requests`): each database's
+  tables with work (`check_collection`'s `weights`), as many runs as those tables over the job's group size (its tables over its
   groups, `group_size_of`), each database whole on one run, a collection with a first load on a run of its own.
   The check then holds each collection shared and each database it checks exclusively (`share_locks`), leaving out
   the databases a run still holds; a database a run going was given waits for it (`deferred`). A run spanning
