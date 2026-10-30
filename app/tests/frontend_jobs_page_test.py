@@ -113,3 +113,9 @@ def test_the_menu_is_one_flat_list():
 def test_the_tables_page_filters_and_shows_the_ingestion_job():
     tables = (PAGES / "Tables.tsx").read_text()
     assert 'ingestion_job: { headerName: "Ingestion job" }' in tables and 'params.get("job")' in tables
+
+
+def test_the_table_failure_email_box_keeps_only_a_choice_away_from_the_jobs_default():
+    assert 'const failDefault = defaults?.fail_on_table_errors || "true";' in FORM
+    assert 'fail_on_table_errors: String(on) === failDefault ? "" : String(on)' in FORM
+    assert "Also email when tables fail in a run" in FORM

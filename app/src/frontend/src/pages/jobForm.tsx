@@ -91,8 +91,11 @@ export function IdentityFields({ w, setW, identity, setIdentity, differing = {},
 export function RunFields({ run, setRun, params, setParams, cadences = CADENCES, defaults }: { run: Row; setRun: (r: Row) => void;
                            params: Record<string, string>; setParams: (p: Record<string, string>) => void; cadences?: number[];
                            defaults?: Record<string, string> }) {
-  // Blank follows the ingestion job's default (on); unticking keeps "false" for this job.
-  const failOnTables = (params.fail_on_table_errors || defaults?.fail_on_table_errors || "true") === "true";
+  // Blank follows the ingestion job's default (on once the bundle sets it); only a choice away from it is kept.
+  const failDefault = defaults?.fail_on_table_errors || "true";
+  const failOnTables = (params.fail_on_table_errors || failDefault) === "true";
+  const setFailOnTables = (on: boolean) =>
+    setParams({ ...params, fail_on_table_errors: String(on) === failDefault ? "" : String(on) });
   const atSetTimes = Number(run.cadence_minutes) > 60;
   return (
     <div className="form-grid">
@@ -108,7 +111,7 @@ export function RunFields({ run, setRun, params, setParams, cadences = CADENCES,
       <label className="wide emails">Emails when a run fails<input value={run.notify_emails} placeholder="a@example.com, b@example.com"
         onChange={(e) => setRun({ ...run, notify_emails: e.target.value })} /></label>
       <label className="checkbox wide"><input type="checkbox" checked={failOnTables}
-        onChange={(e) => setParams({ ...params, fail_on_table_errors: e.target.checked ? "" : "false" })} />
+        onChange={(e) => setFailOnTables(e.target.checked)} />
         Also email when tables fail in a run</label>
     </div>
   );
