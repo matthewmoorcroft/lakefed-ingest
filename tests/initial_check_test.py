@@ -1,5 +1,6 @@
 """The check: which databases of a group of collections need an ingest, and the work list of each."""
 import json
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 
 import ct_engine
@@ -140,7 +141,7 @@ class _Store:
     def __init__(self, configs, checkpoints, held=()):
         self.configs, self.checkpoints, self.held = configs, checkpoints, set(held)
         self.runs, self.finished, self.advanced, self.stamped, self.unlocked = [], {}, [], {}, []
-        self.closed, self.work_ids = [], []
+        self.closed, self.work_ids, self.rolled = [], [], {}
         self.alive = True
 
     def mixed_sinks(self):
@@ -172,6 +173,9 @@ class _Store:
     def stamp_databases(self, collection, stamps, run_id):
         self.stamped[collection] = [s[1] for s in stamps]
 
+    def rewrite_rollups(self, collection, src_databases):
+        self.rolled.setdefault(collection, set()).update(src_databases)
+
     def finish_run(self, run_id, **kw):
         self.finished[run_id] = kw
 
@@ -181,6 +185,15 @@ class _Store:
 
     def is_alive(self):
         return self.alive
+
+
+def test_the_check_recomputes_the_rollups_of_the_databases_it_stamped():
+    configs = [_cfg(1, "quiet", "a", "c1"), _cfg(2, "quiet", "b", "c1"),
+               _cfg(3, "new", "a", "c2"), _cfg(4, "old", "a", "c2")]
+    store = _Store(configs, _recorded(configs, {1: _cp(10), 2: _cp(10), 4: _cp(10)}))
+    ic.run_check(store, store, ["c1", "c2"], _detector({"quiet": 10, "old": 10}),
+                 existing_sinks_of=_sinks, job_run_id="77", cluster_id="serverless", parallelism=4)
+    assert store.rolled == {"c1": {"quiet"}, "c2": {"old"}}
 
 
 def test_the_check_stamps_the_quiet_databases_and_lists_each_collections_work():
@@ -214,14 +227,83 @@ def test_the_check_releases_a_collections_lock_when_its_check_fails():
 
     configs = [_cfg(1, "quiet", "a", "c1")]
     store = _Store(configs, _recorded(configs, {1: _cp(10)}))
-    try:
-        ic.run_check(store, store, ["c1"], broken, existing_sinks_of=_sinks)
-        raise AssertionError("the check should fail")
-    except RuntimeError as e:
-        assert "source unreachable" in str(e)
-    assert store.unlocked == ["c1"]
+    summary = ic.run_check(store, store, ["c1"], broken, existing_sinks_of=_sinks)
+    assert summary["failed"] == [{"collection": "c1", "error": "RuntimeError: source unreachable"}]
+    assert summary["per_collection"] == [] and store.unlocked == ["c1"]
     assert store.finished[1]["status"] == "failed" and "source unreachable" in store.finished[1]["detail"]
     assert store.closed == [("c1", 1)]
+    assert "c1: RuntimeError: source unreachable" in ic.failure_message(summary["failed"])
+
+
+def test_one_collection_whose_check_fails_does_not_stop_the_others():
+    def detect(members):
+        if members[0][0]["src_database"] == "bad":
+            raise ValueError("malformed control row")
+        return _detector({"quiet": 10})(members)
+
+    configs = [_cfg(1, "bad", "a", "c1"), _cfg(2, "quiet", "a", "c2"), _cfg(3, "new", "a", "c3")]
+    store = _Store(configs, _recorded(configs, {1: _cp(10), 2: _cp(10)}))
+    summary = ic.run_check(store, store, ["c1", "c2", "c3"], detect, existing_sinks_of=_sinks)
+    assert [f["collection"] for f in summary["failed"]] == ["c1"]
+    assert [(r["collection"], r["work"]) for r in summary["per_collection"]] == [("c2", []), ("c3", [[SOURCE, "new"]])]
+    assert store.stamped["c2"] == ["quiet"] and sorted(store.unlocked) == ["c1", "c2", "c3"]
+
+
+def test_a_collection_with_work_keeps_its_lock_until_its_run_is_started():
+    configs = [_cfg(1, "quiet", "a", "c1"), _cfg(2, "new", "a", "c2")]
+    store = _Store(configs, _recorded(configs, {1: _cp(10)}))
+    summary = ic.run_check(store, store, ["c1", "c2"], _detector({"quiet": 10}), existing_sinks_of=_sinks,
+                           hold_work_locks=True)
+    # c2 has work: its lock stays held, so a second check of c2 meanwhile finds it busy and starts nothing.
+    assert summary["held"] == ["c2"] and store.unlocked == ["c1"]
+    store.held.add("c2")
+    again = ic.run_check(store, store, ["c2"], _detector({}), existing_sinks_of=_sinks, hold_work_locks=True)
+    assert again["busy"] == ["c2"] and again["per_collection"] == []
+    ic.release_locks(store, summary["held"])
+    assert store.unlocked == ["c1", "c2"]
+
+
+def test_the_checks_source_queries_take_their_share_of_the_per_server_cap():
+    import threading
+    import time as clock
+
+    joined, in_flight, most = [], [0], [0]
+    mu = threading.Lock()
+
+    def detect(members):
+        with mu:
+            in_flight[0] += 1
+            most[0] = max(most[0], in_flight[0])
+        clock.sleep(0.02)
+        with mu:
+            in_flight[0] -= 1
+        return _detector({c["src_database"]: 10 for c, _ in members})(members)
+
+    # Two sessions read the server (an ingest run and this check): a cap of 4 gives the check 2 at a time.
+    cap = ic.SourceCap(4, join=lambda sources: joined.extend(sources) or {s: 11 for s in sources},
+                       runs=lambda keys: {11: 2}, source_of=lambda cfg: "connection:sql_a")
+    configs = [_cfg(i, f"db{i}", "a", "c1") for i in range(1, 9)]
+    store = _Store(configs, _recorded(configs, {i: _cp(10) for i in range(1, 9)}))
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        summary = ic.run_check(store, store, ["c1"], detect, existing_sinks_of=_sinks, map_fn=pool.map,
+                               source_cap=cap)
+    assert joined == ["connection:sql_a"] and cap.limiter.limit("connection:sql_a") == 2
+    assert most[0] == 2 and summary["unchanged_databases"] == 8
+
+
+def test_without_a_cap_the_check_leaves_detection_as_it_is():
+    cap = ic.SourceCap(0, join=None, runs=None, source_of=None)
+    detect = _detector({})
+    assert cap.wrap([], detect) is detect
+
+
+def test_when_the_sessions_cant_be_counted_the_check_takes_the_whole_cap():
+    def refuse(keys):
+        raise RuntimeError("pg_locks unavailable")
+
+    cap = ic.SourceCap(6, join=lambda sources: {s: 1 for s in sources}, runs=refuse, source_of=lambda cfg: "host:h:1433")
+    cap.wrap([_cfg(1, "db1", "a")], _detector({}))
+    assert cap.limiter.limit("host:h:1433") == 6
 
 
 def test_a_check_closes_the_runs_a_dead_sweep_left_open_once_it_holds_the_lock():
@@ -235,12 +317,9 @@ def test_a_check_whose_lock_connection_dropped_writes_nothing_and_fails():
     configs = [_cfg(1, "quiet", "a", "c1")]
     store = _Store(configs, _recorded(configs, {1: _cp(10)}))
     store.alive = False                       # the session lock went with the dropped connection
-    try:
-        ic.run_check(store, store, ["c1"], _detector({"quiet": 10}), existing_sinks_of=_sinks)
-        raise AssertionError("a check that lost its lock must fail")
-    except RuntimeError as e:
-        assert "lock" in str(e)
-    assert store.advanced == [] and store.stamped == {}
+    summary = ic.run_check(store, store, ["c1"], _detector({"quiet": 10}), existing_sinks_of=_sinks)
+    assert [f["collection"] for f in summary["failed"]] == ["c1"] and "lock" in summary["failed"][0]["error"]
+    assert summary["per_collection"] == [] and store.advanced == [] and store.stamped == {}
     assert store.finished[1]["status"] == "failed" and store.unlocked == ["c1"]
 
 
@@ -258,11 +337,8 @@ def test_a_failed_unlock_is_reported_and_does_not_hide_the_check_result():
     def broken(members):
         raise RuntimeError("source unreachable")
 
-    try:
-        ic.run_check(store, store, ["c1"], broken, existing_sinks_of=_sinks)
-        raise AssertionError("the check should fail")
-    except RuntimeError as e:
-        assert "source unreachable" in str(e)
+    summary = ic.run_check(store, store, ["c1"], broken, existing_sinks_of=_sinks)
+    assert "source unreachable" in summary["failed"][0]["error"]
 
 
 def test_a_failing_close_of_abandoned_runs_does_not_stop_the_check():
@@ -275,3 +351,78 @@ def test_a_failing_close_of_abandoned_runs_does_not_stop_the_check():
     store.close_abandoned_runs = broken_close
     summary = ic.run_check(store, store, ["c1"], _detector({"quiet": 10}), existing_sinks_of=_sinks)
     assert summary["per_collection"][0]["work"] == [] and store.finished[1]["status"] == "completed"
+
+
+def test_a_database_check_stamp_names_the_check_run_that_wrote_it():
+    configs = [_cfg(1, "quiet", "a", "c1")]
+    store = _Store(configs, _recorded(configs, {1: _cp(10)}))
+    stamped_by = []
+    store.stamp_databases = lambda collection, stamps, run_id: stamped_by.append(run_id)
+    ic.run_check(store, store, ["c1"], _detector({"quiet": 10}), existing_sinks_of=_sinks)
+    assert stamped_by == [1]        # the check's own ingest_run row, so database_check.run_id is filled in
+
+
+def test_weights_count_the_changed_tables_and_the_first_loads_of_each_database():
+    configs = [_cfg(1, "busy", "a"), _cfg(2, "busy", "b"), _cfg(3, "busy", "c"),
+               _cfg(4, "new", "a"), _cfg(5, "new", "b"),
+               _cfg(6, "forced", "a"), _cfg(7, "forced", "b"), _cfg(8, "quiet", "a")]
+    cps = _recorded(configs, {1: _cp(20), 2: _cp(20), 3: _cp(20), 6: _cp(5), 7: _cp(5), 8: _cp(10)})
+    detect = _detector({"busy": 21, "quiet": 10, "forced": 5}, changed={1, 3})
+    result = ic.check_collection(configs, cps, detect, existing_sinks=_sinks(configs), force={"forced"}, now=NOW)
+    # busy: 2 of its 3 tables changed; new: both never loaded; forced: sent whole, every table counts.
+    assert result["weights"] == [[SOURCE, "busy", 2, 0], [SOURCE, "forced", 2, 0], [SOURCE, "new", 2, 2]]
+
+
+def _work(collection, *databases):
+    """A collection's check result with these (database, changed tables[, first loads]) as its work."""
+    return {"collection": collection,
+            "weights": [[SOURCE, name, tables, rest[0] if rest else 0] for name, tables, *rest in databases]}
+
+
+def _placed(runs):
+    return [tuple(d) for run in runs for d in run["databases"]]
+
+
+def test_changes_in_one_group_are_shared_over_as_many_runs_as_their_tables_need():
+    work = [_work("g1", *[(f"db{i:02d}", 250) for i in range(12)])]           # 3,000 changed tables, one group
+    runs = ic.plan_cycle(work, group_size=1000)
+    assert [run["tables"] for run in runs] == [1000, 1000, 1000]
+    assert all(run["collections"] == ["g1"] and not run["first_loads"] for run in runs)
+    placed = _placed(runs)
+    assert len(placed) == 12 and len(set(placed)) == 12                       # each database whole, on one run
+
+
+def test_small_changes_in_many_groups_share_one_run():
+    work = [_work(f"g{n}", (f"db{n}", 5)) for n in range(1, 9)]
+    runs = ic.plan_cycle(work, group_size=12500)
+    assert len(runs) == 1 and runs[0]["tables"] == 40
+    assert runs[0]["collections"] == [f"g{n}" for n in range(1, 9)]
+
+
+def test_a_group_with_a_first_load_keeps_a_run_of_its_own():
+    work = [_work("g1", ("new_db", 1000, 1000), ("db_b", 3)), _work("g2", ("db_c", 4)), _work("g3", ("db_d", 2))]
+    runs = ic.plan_cycle(work, group_size=1000)
+    assert runs[0] == {"databases": [["g1", SOURCE, "new_db"], ["g1", SOURCE, "db_b"]], "collections": ["g1"],
+                       "tables": 1003, "first_loads": True}
+    assert runs[1:] == [{"databases": [["g2", SOURCE, "db_c"], ["g3", SOURCE, "db_d"]], "collections": ["g2", "g3"],
+                         "tables": 6, "first_loads": False}]
+
+
+def test_a_database_bigger_than_a_share_runs_alone_so_a_cycle_can_take_one_run_more():
+    work = [_work("g1", ("huge", 1500), ("a", 200), ("b", 200), ("c", 100))]     # 2,000 tables: two runs by size
+    runs = ic.plan_cycle(work, group_size=1000)
+    assert [[d[2] for d in run["databases"]] for run in runs] == [["huge"], ["a", "b", "c"]]
+    work = [_work("g1", ("huge", 1800), ("big", 1100), ("a", 50), ("b", 50))]      # 3,000 tables, share 1,000
+    runs = ic.plan_cycle(work, group_size=1000)
+    assert [[d[2] for d in run["databases"]] for run in runs] == [["huge"], ["big"], ["a", "b"]]
+
+
+def test_the_same_work_always_makes_the_same_runs():
+    work = [_work("g2", ("x", 7), ("y", 7)), _work("g1", ("z", 7), ("w", 7))]
+    assert ic.plan_cycle(work, 14) == ic.plan_cycle(list(reversed(work)), 14)
+    assert ic.plan_cycle([], 14) == [] and ic.plan_cycle([_work("g1")], 14) == []
+
+
+def test_a_jobs_group_size_is_its_tables_over_its_groups():
+    assert ic.group_size_of({"g1": 12500, "g2": 12400, "g3": 100}) == 8334
+    assert ic.group_size_of({}) == 1 and ic.group_size_of({"g1": 0}) == 1

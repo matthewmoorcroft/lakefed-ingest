@@ -349,6 +349,8 @@ create index if not exists ingest_run_collection_idx
 -- launch share its launch id, so the app shows them as one job run. Null for runs started otherwise.
 alter table lakefed_ingest.ingest_run add column if not exists work_id text;
 create index if not exists ingest_run_work_idx on lakefed_ingest.ingest_run (work_id);
+-- Every group's runs by time (the app's Runs page across groups, a window's batched appends).
+create index if not exists ingest_run_started_idx on lakefed_ingest.ingest_run (started_at);
 
 -- One row per (run, table): per-table telemetry for a run.
 create table if not exists lakefed_ingest.ingest_event (
@@ -389,6 +391,15 @@ create index if not exists ingest_event_failed_idx
     where status = 'failed';
 create index if not exists ingest_event_collection_idx
     on lakefed_ingest.ingest_event (task_collection, finished_at);
+-- Recent failures across every group by time (the app's errors and failed tables).
+create index if not exists ingest_event_failed_time_idx
+    on lakefed_ingest.ingest_event (started_at)
+    where status = 'failed';
+-- Each table's latest first load (seed, reseed or full), whatever its age: the rows a database's tables hold,
+-- read without passing over the group's other events.
+create index if not exists ingest_event_first_load_idx
+    on lakefed_ingest.ingest_event (task_collection, control_id, finished_at)
+    where status = 'ok' and action in ('seed', 'reseed', 'full');
 
 -- NOTE: the two-level controller/batching was removed — one run ingests a whole task_collection in
 -- one task (see ingest.ipynb), so there is no `task_batch` table. A `task_batch` left over from an
@@ -415,6 +426,12 @@ create table if not exists lakefed_ingest.discovery (
     finished_at   timestamptz,
     constraint discovery_pk primary key (discovery_id, src_database)
 );
+-- A discovery through a Unity Catalog connection (remote_query) names it instead of a host and secret. A discovery
+-- of the 'list' kind only lists the server's databases (status 'listed', no tables), as Test connection does.
+alter table lakefed_ingest.discovery add column if not exists src_connection text;
+-- How the discovery listed its databases (the LIKE pattern, the Azure resource, the host's secret template), so a
+-- later re-discovery of a job's selection reads the same way. Null for a discovery made before this column.
+alter table lakefed_ingest.discovery add column if not exists listing jsonb;
 
 create table if not exists lakefed_ingest.discovered_table (
     discovery_id          text        not null,
@@ -482,6 +499,9 @@ create table if not exists lakefed_ingest.schedule (
 );
 create unique index if not exists schedule_name_uq
     on lakefed_ingest.schedule (lower(name)) where deleted_at is null;
+-- Schedule options the app sets, as a JSON object (null = none): start_minute, a set start time for daily
+-- and every 2 to 12 hours schedules, in minutes after local midnight.
+alter table lakefed_ingest.schedule add column if not exists options jsonb;
 alter table lakefed_ingest.schedule drop constraint if exists valid_schedule_cadence;
 alter table lakefed_ingest.schedule add constraint valid_schedule_cadence check (
     cadence_minutes in (5, 10, 15, 20, 30, 60, 120, 180, 240, 360, 720, 1440)
@@ -503,3 +523,146 @@ create unique index if not exists schedule_member_uq
     on lakefed_ingest.schedule_member (schedule_id, task_collection) where removed_at is null;
 create index if not exists schedule_member_collection_idx
     on lakefed_ingest.schedule_member (task_collection);
+
+-- A long write the operations app runs off the request: a large New ingestion job, Add tables or a databases file.
+-- The request records it and answers at once; a background thread in the app writes it in one transaction and moves
+-- done and heartbeat_at as it goes; the page reads it. A request sent again with the same request_id finds the same
+-- task, so a retry never writes twice. A task whose heartbeat stops (the app restarted) reads as failed, and its
+-- transaction was rolled back with it.
+create table if not exists lakefed_ingest.app_task (
+    id            bigserial   primary key,
+    kind          text        not null,                    -- create, tables or databases
+    request_id    text        not null,
+    job_id        bigint,                                  -- the ingestion job (schedule id), once known
+    status        text        not null default 'running',  -- running, succeeded or failed
+    done          int         not null default 0,          -- tables written so far
+    total         int         not null default 0,
+    result        jsonb,                                   -- what the request would have answered
+    error         text,
+    created_by    text,
+    created_at    timestamptz not null default now(),
+    heartbeat_at  timestamptz not null default now(),
+    finished_at   timestamptz
+);
+create unique index if not exists app_task_request_uq on lakefed_ingest.app_task (request_id);
+create index if not exists app_task_job_idx on lakefed_ingest.app_task (job_id, created_at);
+-- A by-database write's progress (stage, databases written of how many, tables written), committed with each database.
+alter table lakefed_ingest.app_task add column if not exists progress jsonb;
+
+-- A CSV of tables uploaded to the operations app for New ingestion job or Add tables: the file is posted once and
+-- kept here, one row per line, so the pages show its servers and databases from Lakebase and page its tables, and
+-- Create names the upload and what of it to take instead of sending the file again. A line's own problems (no
+-- database, schema or table, no connection or host) are found on upload; the job's settings are checked on Create.
+create table if not exists lakefed_ingest.table_upload (
+    upload_id     text        primary key,
+    file_name     text,
+    uploaded_by   text,
+    uploaded_at   timestamptz not null default now(),
+    columns       text[]      not null,                    -- the file's header
+    lines         int         not null default 0,
+    tables        int         not null default 0,          -- lines that can be taken (status ok)
+    invalid       int         not null default 0
+);
+create table if not exists lakefed_ingest.table_upload_line (
+    upload_id     text        not null,
+    line          int         not null,                    -- the file's line number (the header is line 1)
+    server        text,                                    -- its UC connection, or host:port
+    src_database  text,
+    src_schema    text,
+    src_table     text,
+    load_type     text,                                    -- the file's own, if it gives one
+    fields        jsonb       not null,                    -- the line as read: {column: value}
+    status        text        not null,                    -- ok or invalid
+    errors        text[],
+    constraint table_upload_line_pk primary key (upload_id, line)
+);
+create index if not exists table_upload_line_database_idx
+    on lakefed_ingest.table_upload_line (upload_id, server, src_database);
+
+-- What an ingestion job was made from, part by part, as chosen in New or Add tables: a whole server (with the database
+-- filter it was chosen under), a whole database, or some of a database's tables. A later re-discovery reads it: a whole
+-- server takes its new databases, a whole database its new tables, chosen tables nothing more.
+create table if not exists lakefed_ingest.job_selection (
+    id            bigserial   primary key,
+    job_id        bigint      not null,                    -- schedule.id
+    scope         text        not null,                    -- server, database or tables
+    server        text        not null,
+    src_database  text,                                    -- null for a whole server
+    tables        text[],                                  -- schema.table, for scope tables
+    filter        text,                                    -- the database filter a whole server was chosen under
+    source_kind   text        not null,                    -- discovery or upload
+    source_id     text,
+    created_by    text,
+    created_at    timestamptz not null default now()
+);
+create index if not exists job_selection_job_idx on lakefed_ingest.job_selection (job_id);
+
+-- The Databricks runs the operations app tracks (app/src/run_poller.py): the ingestion job and its variants, the
+-- check job, the cluster copies, the app's wrapper jobs, and its setup, discovery and delete jobs. One row per run,
+-- written by the app's poller only when a run's state changes. The app has no DELETE, so rows are never removed:
+-- prune old ones as the owner, like ingest_run.
+create table if not exists lakefed_ingest.databricks_run (
+    run_id           bigint      primary key,                  -- the Databricks run id
+    job_id           bigint      not null,                     -- the Databricks job the run belongs to
+    kind             text        not null check (kind in ('wrapper', 'check', 'group', 'setup', 'discover', 'delete', 'copies')),
+    schedule_id      bigint,                                   -- wrapper and check runs: their schedule
+    task_collection  text,                                     -- group runs: the collection they ingest
+    trigger          text,                                     -- PERIODIC, RUN_JOB_TASK, ONE_TIME, ...
+    parameters       jsonb       not null default '{}'::jsonb, -- the run's job parameters
+    life_cycle_state text        not null,                     -- QUEUED ... TERMINATED, SKIPPED, INTERNAL_ERROR, NOT_FOUND
+    result_state     text,
+    state_message    text,
+    run_page_url     text,
+    started_at       timestamptz,
+    ended_at         timestamptz,
+    seen_at          timestamptz not null default now()        -- when the poller last saw this state change
+);
+create index if not exists databricks_run_job_started_idx
+    on lakefed_ingest.databricks_run (job_id, started_at desc);
+
+-- Monitoring rollups (the operations app's pages read these, not a scan of control). One row per database and
+-- ingestion group, rewritten from the database's own rows as its work ends (state_store.StateStore.rewrite_rollups)
+-- and by the app's edits, in the same transaction. A database with no rows left is zeroed, not deleted, and the
+-- delete job removes a deleted group's rows. `earliest_due_at` is when the first loaded table with a freshness target
+-- falls due (its last success or creation, plus the target); a database is late once that time has passed.
+create table if not exists lakefed_ingest.rollup_database (
+    task_collection       text        not null,
+    src_database          text        not null,         -- '' when the control row has none
+    server                text        not null,         -- the server key (queries.SERVER); '' when none
+    src_connection        text        not null,         -- '' when none
+    src_host              text        not null,         -- '' when none
+    instance_label        text        not null,         -- source_instance_group; '' when none
+    tables                int         not null,         -- enabled tables
+    no_sla_tables         int         not null,         -- enabled tables without a freshness target
+    failing               int         not null,         -- enabled tables whose checkpoint failed
+    first_load            int         not null,         -- enabled tables waiting for a first load
+    loaded                int         not null,         -- enabled tables neither failing nor waiting
+    control_rows          int         not null,         -- control rows in the grain, enabled or not; 0 once none
+    oldest_success_at     timestamptz,
+    newest_success_at     timestamptz,
+    newest_any_success_at timestamptz,                  -- over every row, enabled or not (a connection's databases)
+    earliest_due_at       timestamptz,
+    updated_at            timestamptz not null default now(),
+    constraint rollup_database_pk primary key (task_collection, src_database, server, src_connection, src_host,
+                                               instance_label)
+);
+create index if not exists rollup_database_due_idx
+    on lakefed_ingest.rollup_database (task_collection, earliest_due_at);
+
+create table if not exists lakefed_ingest.rollup_group (
+    task_collection       text        primary key,
+    tables                int         not null,
+    no_sla_tables         int         not null,
+    failing               int         not null,
+    first_load            int         not null,
+    loaded                int         not null,
+    databases             int         not null,         -- databases with an enabled table
+    servers               int         not null,
+    oldest_success_at     timestamptz,
+    newest_success_at     timestamptz,
+    updated_at            timestamptz not null default now()
+);
+
+-- A rollup rewrite reads one database's control rows by (collection, database name) instead of the whole collection.
+create index if not exists control_collection_database_idx
+    on lakefed_ingest.control (task_collection, (coalesce(src_database, '')));

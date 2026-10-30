@@ -4,7 +4,7 @@ The ingestion job ingests a whole task_collection inside **one** job task (threa
 pools), so there is no per-table task in the Jobs UI to watch. Visibility is re-created by writing
 per-table telemetry to **Lakebase**. The Lakebase database is already
 registered as a Unity Catalog catalog (`lakefed_ingest_lakebase`, via the `database_catalogs` resource
-in `lakefed_ingest_setup.yml`), so you query the telemetry **directly from DBSQL** — no sync job,
+in `lakefed_ingest_setup.yml`), so you query the telemetry **directly from DBSQL**, with no sync job,
 no copy. Writes go to Lakebase (point writes from the ingestion run); reads go through UC federation.
 
 ## Tables (Lakebase, UC path `lakefed_ingest_lakebase.lakefed_ingest`)
@@ -20,11 +20,11 @@ queries below.
 | `database_check` | per (collection, source database) | stamped when the whole database is unchanged, in place of each table's `last_success_at` |
 
 `ingest_event` carries `action` (seed/increment/reseed/full), `stage` (plan/detect/ensure_sink/read/
-seed/merge/load/checkpoint — pinpoints *where* a failure happened; `plan` = the row's
-`src_type`/`load_type` pair isn't supported), `status`, `duration_ms`, `rows_read`/`rows_merged`,
-`position_from`/`position_to` (checkpoint positions as text — the CT version for `ct`; NULL for
+seed/merge/load/checkpoint). It pinpoints *where* a failure happened; `plan` means the row's
+`src_type`/`load_type` pair isn't supported; `status`, `duration_ms`, `rows_read`/`rows_merged`,
+`position_from`/`position_to` (checkpoint positions as text, the CT version for `ct`; NULL for
 `full`), `pool`, and `error`. One row is INSERTed at start
-(status `running`) and UPDATEd at finish — concurrent workers touch distinct rows, so there is no
+(status `running`) and UPDATEd at finish; concurrent workers touch distinct rows, so there is no
 write contention. Tables in a batched append (`append_batch_size` > 1) are the exception: their rows
 are inserted, finished, when the batch ends, with `pool` = `batch<size>` and no row counts, so they
 don't appear among the in-flight tables. A `verify` stage is a run checking the sink for an append
@@ -39,7 +39,14 @@ A run that ends without finishing (cancelled, or its cluster went away) can't cl
 next run of the same collection holds the collection's lock, so it closes them at launch: the dead
 run's `ingest_run` row and its `running` events become `failed`, with the run's `detail` naming the
 run that closed it (`closed_by_run`). So does the last `retried` event of a table that was waiting for
-its retry, keeping its error with the reason added. Until then the dead run still reads `running`.
+its retry, keeping its error with the reason added. Until then the dead run still reads `running`,
+unless the operations app is running: its run poller, every 15 seconds, asks the Jobs API about each
+one's Databricks run (`job_run_id`) and closes those that have ended (terminated, skipped or an internal error;
+one the API no longer has, once it began a day ago) the same way, with `closed_by_app` and the reason in
+`detail`. A run still going in Databricks, or one whose state can't be read, is left as it is, and the app never
+cancels anything on its own. Cancel run on an ingestion job's page cancels the job's wrapper, check and group
+runs, and closes the records of those it cancelled. The page shows Cancelling… until every one of those runs has ended
+in Databricks (as the poller records it), and Run now stays off until then.
 
 Table and column reference: [lakebase_schema.md](lakebase_schema.md).
 
@@ -102,16 +109,33 @@ FROM t ORDER BY last_success_at NULLS FIRST;
 
 Freshness SLA breaches. The SLA is per table, in `control.freshness_sla_minutes` (NULL = no SLA). An
 enabled table breaches it when its last success, or its creation if it has never succeeded, is older
-than the SLA. The operations app applies the same rule, so an alert on this query (trigger when it
-returns rows) matches what the app shows:
+than the SLA. Its last success counts its database's check stamp, as in the query above: a quiet
+database checked and found unchanged stamps the database, not each table. The operations app applies
+the same rule (`queries.SLA_BREACHED`), so an alert on this query (trigger when it returns rows) matches
+what the app shows:
 ```sql
-SELECT c.task_collection, c.src_database, c.src_schema, c.src_table, c.freshness_sla_minutes,
-       cp.last_success_at,
-       timestampdiff(MINUTE, coalesce(cp.last_success_at, c.created_at), current_timestamp()) AS lag_minutes
-FROM lakefed_ingest_lakebase.lakefed_ingest.control c
-LEFT JOIN lakefed_ingest_lakebase.lakefed_ingest.checkpoint cp ON cp.control_id = c.id
-WHERE c.task_enabled AND c.freshness_sla_minutes IS NOT NULL
-  AND timestampdiff(MINUTE, coalesce(cp.last_success_at, c.created_at), current_timestamp()) > c.freshness_sla_minutes
+WITH t AS (
+  SELECT c.task_collection, c.src_database, c.src_schema, c.src_table, c.freshness_sla_minutes, c.created_at,
+         greatest(cp.last_success_at,
+                  CASE WHEN cp.strategy = 'ct' AND cp.phase = 'incremental'
+                        AND CAST(cp.position AS BIGINT) >= dc.checked_version THEN dc.checked_at END) AS last_success_at
+  FROM lakefed_ingest_lakebase.lakefed_ingest.control c
+  LEFT JOIN lakefed_ingest_lakebase.lakefed_ingest.checkpoint cp ON cp.control_id = c.id
+  LEFT JOIN lakefed_ingest_lakebase.lakefed_ingest.database_check dc
+    ON dc.task_collection = c.task_collection AND dc.src_database = c.src_database
+   AND dc.source = concat_ws('|', lower(coalesce(nullif(c.src_host, ''), nullif(c.src_connection, ''), '')),
+                             coalesce(nullif(c.src_port, 0),
+                                      CASE WHEN nullif(c.src_host, '') IS NULL
+                                                AND nullif(c.src_connection, '') IS NOT NULL THEN 0
+                                           ELSE CASE coalesce(nullif(lower(trim(c.src_type)), ''), 'sqlserver')
+                                                  WHEN 'sqlserver' THEN 1433 WHEN 'oracle' THEN 1521
+                                                  WHEN 'postgresql' THEN 5432 WHEN 'mysql' THEN 3306
+                                                  ELSE 0 END END),
+                             coalesce(nullif(c.secret_key, ''), nullif(c.src_connection, ''), '')))
+  WHERE c.task_enabled AND c.freshness_sla_minutes IS NOT NULL)
+SELECT *, timestampdiff(MINUTE, coalesce(last_success_at, created_at), current_timestamp()) AS lag_minutes
+FROM t
+WHERE timestampdiff(MINUTE, coalesce(last_success_at, created_at), current_timestamp()) > freshness_sla_minutes
 ORDER BY lag_minutes DESC;
 ```
 
@@ -181,7 +205,7 @@ HAVING coalesce(max(r.started_at), TIMESTAMP '1970-01-01') < current_timestamp()
 ## Optional: durable history beyond the OLTP store
 
 Lakebase is the live store; if you want run history retained in Delta (e.g. for long-term
-analysis or to offload the OLTP instance), run **one scheduled statement** — no notebook or job
+analysis or to offload the OLTP instance), run **one scheduled statement**, with no notebook or job
 needed. Simplest is a periodic snapshot (parameterize `<catalog>.<schema>`):
 
 ```sql
@@ -198,7 +222,7 @@ WHEN NOT MATCHED THEN INSERT *;
 ```
 
 Schedule either as a DBSQL query (or a one-statement task) at whatever cadence durable history
-needs. This is optional — the UC-federated reads above work without it.
+needs. This is optional: the UC-federated reads above work without it.
 
 ## The operations app
 

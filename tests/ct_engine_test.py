@@ -534,6 +534,46 @@ def test_ensure_sink_table_is_noop_when_sink_exists(monkeypatch):
     assert spark.statements == []
 
 
+def test_a_missing_target_schema_is_made_once_per_run_before_its_first_table(monkeypatch):
+    monkeypatch.setattr(ce, "_read", lambda sp, cfg, q, **kw: _DF(sp, q))
+    ce.forget_sinks()
+    spark = _FakeSpark()
+    spark.catalog.tableExists = lambda name: False
+    cfg = {"src_schema": "dbo", "src_table": "t", "select_list": "id, v", "sink_catalog": "main",
+           "sink_schema": "lakefed_100k", "sink_table": "t0001"}
+    ce.ensure_sink_table(spark, cfg, ce.sink_fqn(cfg))
+    ce.ensure_sink_table(spark, dict(cfg, sink_table="t0002"), ce.sink_fqn(dict(cfg, sink_table="t0002")))
+    schemas = [x for x in spark.statements if x.startswith("CREATE SCHEMA")]
+    assert schemas == ["CREATE SCHEMA IF NOT EXISTS `main`.`lakefed_100k` COMMENT 'Target of lakefed ingestion jobs'"]
+    assert spark.statements.index(schemas[0]) < next(i for i, x in enumerate(spark.statements) if x.startswith("CREATE TABLE"))
+    ce.forget_sinks()                                              # a new run asks again
+    ce.ensure_sink_table(spark, dict(cfg, sink_table="t0003"), ce.sink_fqn(dict(cfg, sink_table="t0003")))
+    assert len([x for x in spark.statements if x.startswith("CREATE SCHEMA")]) == 2
+
+
+def test_a_target_schema_the_run_cant_make_names_the_grant_it_needs(monkeypatch):
+    ce.forget_sinks()
+    spark = _FakeSpark()
+    spark.catalog.tableExists = lambda name: False
+    def refuse(stmt):
+        raise Exception("[PERMISSION_DENIED] User does not have CREATE SCHEMA on Catalog 'main'.\nmore")
+    spark.sql = refuse
+    cfg = {"src_schema": "dbo", "src_table": "t", "select_list": "id", "sink_catalog": "main", "sink_schema": "s",
+           "sink_table": "t"}
+    with pytest.raises(RuntimeError) as refused:
+        ce.ensure_sink_table(spark, cfg, ce.sink_fqn(cfg))
+    assert "USE CATALOG and CREATE SCHEMA on `main`" in str(refused.value) and "PERMISSION_DENIED" in str(refused.value)
+
+
+def test_an_existing_target_table_makes_no_schema(monkeypatch):
+    ce.forget_sinks()
+    spark = _FakeSpark()
+    spark.catalog.tableExists = lambda name: True
+    ce.ensure_sink_table(spark, {"src_schema": "dbo", "src_table": "t", "select_list": "id", "sink_catalog": "main",
+                                 "sink_schema": "s", "sink_table": "t"}, "`main`.`s`.`t`")
+    assert spark.statements == []
+
+
 # ---- skip-no-change: detection builders ---------------------------------------------------
 
 def test_quoting_doubles_closing_bracket_and_quote():

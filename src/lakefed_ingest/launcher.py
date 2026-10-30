@@ -38,7 +38,7 @@ OK_OUTCOMES = ("succeeded", "started", "already_running", "deferred")
 RUN_PARAMETERS = (
     "db_instance", "db_name", "parallelism", "secret_scope", "trust_server_certificate", "snapshot_isolation",
     "reseed_on_new_columns", "append_batch_size", "max_seeds_per_run", "freshness_interval_s", "detection_chunk",
-    "max_queries_per_source", "table_retries", "table_retry_budget", "spark_conf",
+    "max_queries_per_source", "table_retries", "table_retry_budget", "fail_on_table_errors", "spark_conf",
 )
 
 
@@ -129,6 +129,7 @@ def capacity(max_concurrent_runs: int, active: int, queue_enabled: bool = False)
 def launch(jobs, job_id: int, requests: List[dict], *, launch_id: str = "", max_running: int = 0,
            wait: bool = False, confirm_s: float = 30, poll_s: float = 30, timeout_s: float = 0,
            already_running: Dict[str, Optional[frozenset]] = None, room: Optional[int] = None,
+           on_settled: Optional[Callable[[str], None]] = None,
            sleep: Callable[[float], None] = time.sleep, clock: Callable[[], float] = time.monotonic) -> dict:
     """Start the requested runs, then confirm they started, or, with ``wait``, wait until all have ended.
 
@@ -147,6 +148,10 @@ def launch(jobs, job_id: int, requests: List[dict], *, launch_id: str = "", max_
       out; if the step itself is stopped while it waits, the runs it started that are still going are
       cancelled, then the error is raised again.
 
+    ``on_settled(collection)`` is called once nothing more will be started for a collection: right after its start
+    call, whatever it returned, or at once when it won't be started. The check releases that collection's lock
+    there, held since its check so that no second check could start a run for it meanwhile.
+
     Returns ``{runs: [{collection, databases, run_id, outcome, state_message, url, poll_errors}], counts,
     seconds}``; ``failures`` lists the runs that need attention.
     """
@@ -155,6 +160,11 @@ def launch(jobs, job_id: int, requests: List[dict], *, launch_id: str = "", max_
              "state_message": "", "url": None, "poll_errors": 0, "request": r} for r in requests]
     pending = []
     already_running = already_running or {}
+
+    def settled(entry):
+        if on_settled:
+            on_settled(entry["collection"])
+
     for entry in runs:
         if entry["collection"] in already_running:
             covered = already_running[entry["collection"]]
@@ -169,6 +179,8 @@ def launch(jobs, job_id: int, requests: List[dict], *, launch_id: str = "", max_
             entry["state_message"] = "the ingestion job is at its maximum concurrent runs; the next cycle starts it"
         else:
             pending.append(entry)
+            continue
+        settled(entry)
     going: Dict[int, dict] = {}
     polled = set()          # run ids whose state a poll has read
 
@@ -179,7 +191,10 @@ def launch(jobs, job_id: int, requests: List[dict], *, launch_id: str = "", max_
         except Exception as e:
             entry["outcome"], entry["state_message"] = "start_failed", str(e)[:500]
             return
-        going[entry["run_id"]] = entry
+        else:
+            going[entry["run_id"]] = entry
+        finally:
+            settled(entry)
 
     def poll():
         for run_id, entry in list(going.items()):
@@ -285,7 +300,10 @@ class SdkJobs:
         self.w.jobs.cancel_run(int(run_id))     # not waited for: the step goes on cancelling the others
 
     def active_runs(self, job_id: int) -> List[dict]:
-        return [{"run_id": r.run_id, "job_parameters": {p.name: p.value for p in (r.job_parameters or [])}}
+        """The job's runs going now, each with the parameters it runs with: a parameter the run wasn't given
+        has its default (a run of the job's own schedule ingests its default task_collection)."""
+        return [{"run_id": r.run_id, "job_parameters": {p.name: p.value if p.value is not None else p.default
+                                                        for p in (r.job_parameters or [])}}
                 for r in self.w.jobs.list_runs(job_id=int(job_id), active_only=True)]
 
     def max_concurrent_runs(self, job_id: int) -> int:

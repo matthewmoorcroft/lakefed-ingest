@@ -714,11 +714,36 @@ def check_sink_mode(cfg: dict, sink_fqn: str, sink_columns: List[str]) -> None:
 # The sinks checked so far in this run, and their columns: ensure_sink_table asks Unity Catalog about
 # each sink once per run instead of once per batch. Each run starts with forget_sinks().
 _known_sinks: dict = {}
+_known_schemas: set = set()
+
+# A target schema the first run can't make: it is made as the identity the ingestion job runs as, which needs these.
+SCHEMA_CREATE_MSG = ("can't create the target schema {schema}: the identity this job runs as needs USE CATALOG and "
+                     "CREATE SCHEMA on {catalog} (or the schema made beforehand, with USE SCHEMA and CREATE TABLE "
+                     "on it). {error}")
 
 
 def forget_sinks() -> None:
     """Start a run: the next ``ensure_sink_table`` of every sink asks the catalog again."""
     _known_sinks.clear()
+    _known_schemas.clear()
+
+
+def ensure_sink_schema(spark, cfg: dict) -> None:
+    """Create the row's target schema if it doesn't exist, as Lakeflow Connect's pipeline creation makes a new
+    destination schema: a job set up in the app may name a schema nobody made yet. It is made once per run, owned
+    by the identity the job runs as. A row without a catalog and schema (a test, a two-part name) is left alone."""
+    if not cfg.get("sink_catalog") or not cfg.get("sink_schema"):
+        return
+    catalog = quote_delta_ident(cfg["sink_catalog"])
+    schema = f"{catalog}.{quote_delta_ident(cfg['sink_schema'])}"
+    if schema in _known_schemas:
+        return
+    try:
+        spark.sql(f"CREATE SCHEMA IF NOT EXISTS {schema} COMMENT 'Target of lakefed ingestion jobs'")
+    except Exception as e:
+        raise RuntimeError(SCHEMA_CREATE_MSG.format(schema=schema, catalog=catalog,
+                                                    error=str(e).strip().split("\n")[0][:300])) from e
+    _known_schemas.add(schema)
 
 
 def ensure_sink_table(spark, cfg: dict, sink_fqn: str, slots=None) -> None:
@@ -737,6 +762,8 @@ def ensure_sink_table(spark, cfg: dict, sink_fqn: str, slots=None) -> None:
         check_sink_mode(cfg, sink_fqn, known)
         return
     if not spark.catalog.tableExists(sink_fqn):
+        ensure_sink_schema(spark, cfg)
+
         def create():
             with _unit(slots, cfg):
                 if spark.catalog.tableExists(sink_fqn):      # another client created it meanwhile

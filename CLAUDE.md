@@ -80,15 +80,25 @@ secret). See `README.md`, `docs/deploy.md`, `docs/monitoring.md`, `docs/lakebase
   (default catalog `lakefed_ingest_lakebase`) for DBSQL monitoring.
 - `schedule`, `schedule_member` — written by the operations app (cadence, members, wrapper `job_id`);
   soft deletes (`deleted_at`, `removed_at`): the app has no DELETE privilege.
+- `app_task` (a large write the app runs in a background thread: progress, heartbeat, a unique `request_id`),
+  `table_upload` / `table_upload_line` (a CSV posted once, a row per line) and `job_selection` (what a job was chosen
+  from: a whole server with its filter, a whole database, or tables), written by the operations app (version 9).
+- `rollup_database`, `rollup_group`: the monitoring rollups: one row per database (per server, connection, host and
+  instance label) and one per ingestion group, rewritten in the same transaction as the rows they count (the engine
+  after each database's work, the app after its own edits). The pages read them, so counts are never scanned from
+  control; a grain with no control row left is zeroed (`control_rows = 0`), not deleted. See `docs/lakebase_schema.md`.
 - DDL is applied by `StateStore.migrate` (from `apply_lakebase_schema.ipynb`, and from `ingest.ipynb`
   when `schema_version` is behind `state_store.SCHEMA_VERSION`, so upgrades are deploy-only): one
-  transaction, split on `;` — no `DO $$` blocks, no `CREATE INDEX CONCURRENTLY`. Migrations must be
+  transaction, split on `;`, no `DO $$` blocks, no `CREATE INDEX CONCURRENTLY`. Migrations must be
   idempotent (`if not exists`, `drop constraint if exists`). Renames (no IF EXISTS form in Postgres) go
   in `state_store.RENAMES`; only the pending ones run, before the DDL. Every DDL or RENAMES change
-  bumps `SCHEMA_VERSION` (`tests/state_store_test.py` pins its fingerprint). Every upgrade re-applies the whole
-  file from any earlier version, so statements must be idempotent and additive; `ddl_problems` in the same test
+  bumps `SCHEMA_VERSION` (`tests/state_store_test.py` pins its fingerprint). An upgrade re-reads the whole
+  file from any earlier version and skips statements the catalog shows are already in place (`pg_catalog`;
+  backfills use `UPDATE_PROBES`); constraint re-declarations always run. `ddl_problems` in the same test
   checks the forms, and statements that change existing columns or rows need a `REVIEWED_NON_ADDITIVE` entry
-  (docs/lakebase_schema.md, "Changing the schema").
+  (docs/lakebase_schema.md, "Changing the schema"). Each attempt waits 3 s for locks (`lock_timeout`) and
+  retries up to 10 times; a run whose migration can't get the locks exits with `migration_waiting` and
+  ingests nothing.
 
 ### Jobs (`resources/`)
 - `lakefed_ingest` → task `ingest` → `ingest.ipynb`: one run ingests a `task_collection`. Parameters:
@@ -101,20 +111,40 @@ secret). See `README.md`, `docs/deploy.md`, `docs/monitoring.md`, `docs/lakebase
   (cap per source across runs, 0 = none: each run takes cap / runs reading the source, counted from
   shared advisory locks; `parallel.SourceLimiter`), `table_retries` (extra attempts per table after a
   transient source error, 0 = off; `table_retry.py`), `table_retry_budget` (retries per run),
+  `fail_on_table_errors` (a run with failed tables ends as failed, so its failure email fires),
   `db_instance`, `db_name`.
   The tuning parameters' defaults are bundle variables of the same name (`databricks.yml`).
 - `lakefed_ingest_check` → `check_launch.ipynb` (serverless): checks a group of collections
-  (`task_collections`, blank = every collection with enabled rows; `initial_check.run_check`), stamps
+  (`task_collections`, blank = every collection with enabled rows; or `schedule_id`, an app job's groups read
+  from Lakebase; `initial_check.run_check`, each collection's errors apart; its source queries count under
+  `max_queries_per_source`, `initial_check.SourceCap`), stamps
   unchanged databases, records each collection's databases with work in `check_work`, starts
   `lakefed_ingest` once per collection with work by run-now (`work_id`; `launcher.py`), watches the
   runs for `confirm_s` (a run Databricks skips fails the check) and ends. No For each. Its own schedule
   (paused) is the fallback cadence; an app schedule in group mode starts it with its members.
+- `lakefed_ingest_cluster_copies` → `cluster_copies.ipynb` (serverless, runs as the deployer): one copy of
+  `lakefed_ingest` per app schedule with its own cluster (`options.cluster`), only the cluster's types and workers
+  changed (`cluster_copies.py`); records the copy in `options.ingest_copy_job_id`. The check job takes the job to
+  start as its `ingest_job_id` job parameter.
+- `lakefed_ingest_delete_job` → `delete_job.ipynb` (serverless, runs as the deployer, queued, one at a time):
+  finishes an app job's Delete (`delete_job.py`). The app marks the job deleted and starts it with `schedule_id` and
+  `drop_targets`. In one transaction, under each group's run lock (a run of any group refuses the lot), it deletes
+  the groups no other live job holds: their control, checkpoint, reseed_queue, database_check, check_work and rollup
+  rows, and the job's job_selection rows (what it was chosen from; skipped below schema version 9).
+  Run history (ingest_run, ingest_event) and control_change stay. With `drop_targets`, after the commit, it drops
+  (`DROP TABLE IF EXISTS`) only the target tables no other group's rows write, never a schema. With `purge_drafts`
+  (no `schedule_id`) it purges instead the app's drafts no job took (`delete_job.purge_drafts`: discovery rows marked
+  `draft` in `listing`, discarded or not asked about for `draft_ttl_s`, and their discovered_table rows); the app's
+  run poller starts it at most hourly, only when one is due.
 - `lakefed_ingest_discover` → `discover_tables.ipynb`: table discovery for bulk onboarding (params
-  `discovery_id`, `spec` JSON); writes `discovery` / `discovered_table`. Runs on the bundle's
-  single-node all-purpose cluster `lakefed_ingest utility` (`resources.clusters.lakefed_ingest_utility`,
+  `discovery_id`, `spec` JSON, `discover_workers` (databases read at once, default 32, capped by
+  `max_queries_per_source`)); writes `discovery` / `discovered_table` in one transaction per database. Runs on the
+  bundle's single-node all-purpose cluster `lakefed_ingest utility` (`resources.clusters.lakefed_ingest_utility`,
   auto-terminates after 60 min) so repeated runs skip cluster start; transient connection errors
   (paused sources) retry with backoff (`discovery.CONNECT_RETRIES`).
-- Setup and the app's grant job run on serverless (job `environments`); ingestion on job clusters.
+- Setup and the app's grant job run on serverless (job `environments`); ingestion on job clusters. The check job
+  also runs on serverless and reads the sources, so serverless needs a network path to them (NCC private
+  endpoints or firewall rules); a source only a job cluster reaches belongs in a default-variant schedule.
 - `lakefed_ingest_setup` → `apply_lakebase_schema.ipynb`; plus bundle resources for the Lakebase
   instance, its UC catalog, and the secret scope (`database_instances.lakebase`,
   `database_catalogs.lakebase_catalog`, `secret_scopes.secret_scope`).
@@ -146,7 +176,7 @@ secret). See `README.md`, `docs/deploy.md`, `docs/monitoring.md`, `docs/lakebase
    is no position to protect). A `pending` route (run stopped before the advance) checks the sink
    for that run's rows (`append_committed`) before anything else, unless the row now points at
    another source, sink or key, or its sink is gone: then it reseeds (`enqueue_reseed` clears the pending append).
-   With `table_retries` > 0, a transient source failure is retried in the run (`table_retry.with_retries`;
+   With `table_retries` > 0 (default 2), a transient source failure is retried in the run (`table_retry.with_retries`;
    the next attempt from `planner.retry_plan` on the fresh checkpoint). An append-mode retry goes to
    `pending`, or carries `verify_run_id` (stage `verify`): rows of this run in the sink → finish the
    checkpoint (`recovered`), never append again.
@@ -166,6 +196,7 @@ secret). See `README.md`, `docs/deploy.md`, `docs/monitoring.md`, `docs/lakebase
 | `src/lakefed_ingest/parallel.py` | Thread pool, FAIR pools, `WorkSlots` budget, `SourceLimiter` (per-source permits) |
 | `src/lakefed_ingest/partitions.py` | Partitioned-seed planning |
 | `src/lakefed_ingest/discovery.py` | Table discovery for bulk onboarding (catalog queries + recommended control-row settings); run by `discover_tables.ipynb` / job `lakefed_ingest_discover` |
+| `src/lakefed_ingest/delete_job.py` | A deleted app job's groups: which go, the run locks, the row deletes, which target tables are dropped and which kept (pure; run by `delete_job.ipynb`) |
 | `src/lakefed_ingest/state_store.py` | Lakebase accessor (psycopg, SDK-minted OAuth token) + pure helpers |
 | `tests/conftest.py` | Puts `src/lakefed_ingest` on `sys.path` |
 | `tests/synthetic/` | Synthetic SQL Server DB generator, change generator, reconcile |

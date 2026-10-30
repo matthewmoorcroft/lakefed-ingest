@@ -215,6 +215,11 @@ def _policy(retries=2, budget=20, per_source=5):
                   "(Done status 16)."), tr.PERMANENT),
     (RuntimeError("com.microsoft.sqlserver.jdbc.SQLServerException: Invalid object name 'gen.h0800'. "
                   "An error occurred during the current command (Done status 0)."), tr.PERMANENT),  # deny wins
+    # Unity Catalog throttling a remote_query read (a 100,000-table lab load, 29 Oct: lfc_eng_065.gen.t0936)
+    (RuntimeError("[UC_SERVER_UNCAUGHT_EXCEPTION] Unity Catalog error: TEMPORARILY_UNAVAILABLE: Too many requests. "
+                  "Please retry later. SQLSTATE: XXKUC"), tr.TRANSIENT),
+    (RuntimeError("REQUEST_LIMIT_EXCEEDED: the rate limit for this API has been exceeded"), tr.TRANSIENT),
+    (RuntimeError("[TABLE_OR_VIEW_NOT_FOUND] gen.t0936 TEMPORARILY_UNAVAILABLE"), tr.PERMANENT),     # deny wins
 ])
 def test_classify_retries_transient_source_errors_only(error, expected):
     assert tr.classify(error) == expected

@@ -31,7 +31,7 @@ targets:
       # append_batch_size: "16"
       # max_seeds_per_run: "10000"
       # max_queries_per_source: "64"         # see README "Concurrency"
-      # table_retries: "2"                    # see README "Table retries"
+      # table_retries: "0"                    # off; the default "2" retries transient errors (README "Table retries")
 ```
 
 The default compute needs ~32 cores; a subscription with a small vCPU quota must use smaller nodes
@@ -107,7 +107,25 @@ The one-time and ad hoc jobs shouldn't wait several minutes for a job cluster to
   without use. Deploying creates it, and Databricks starts a new cluster on creation. To use a cluster
   you already have, override the task's `existing_cluster_id` in your target. A source that is paused
   or resuming (Azure SQL serverless) is retried three times, with pauses doubling from 15-30 s.
+  With the operations app, Discover on a source runs on the app bundle's small serverless SQL warehouse
+  instead (`lakefed_ingest discovery`, 2X-Small, up to 2 clusters, stopping after 5 idle minutes: bundle variables
+  `discovery_warehouse_size`, `discovery_warehouse_max_clusters`, `discovery_warehouse_auto_stop_mins`), through the
+  Unity Catalog connection, so the test, the database list and the table reads answer in seconds; the warehouse
+  needs the same network path to the sources (serverless network connectivity). The discovery job stays for listing
+  through Azure and for sources read by host and password. See [app/README.md](../app/README.md), Discovery through
+  the SQL warehouse.
 - **Ingestion** runs on job clusters with the source network path (scheduled, recurring work).
+- **The operations app's helper jobs**, `lakefed_ingest_cluster_copies` and `lakefed_ingest_delete_job`, run on
+  serverless as the deployer. The delete job finishes an app job's Delete: it deletes the job's groups' rows in
+  Lakebase (it owns the state database; the app has no `DELETE` privilege) and, when asked, drops the target tables
+  only those groups write, so the deployer needs to be able to drop those tables (`MANAGE` or ownership in Unity
+  Catalog). Deploy this bundle before the app, which looks both jobs up by name.
+- **The check** (`lakefed_ingest_check`) runs on serverless and reads every source database it checks, so
+  serverless compute needs a network path to the sources, not only to Lakebase: for example private
+  endpoints through a network connectivity configuration (NCC), or source firewall rules that allow the
+  serverless egress. Check this before choosing the check variant: a source that only a job cluster can
+  reach can't be checked, and its group should use the default variant. A job-cluster option for the check
+  is not built yet.
 
 If the workspace doesn't have serverless jobs (or serverless can't reach Lakebase there), run setup
 on an all-purpose cluster instead, such as the utility cluster. It's a one-time or ad hoc job, often
@@ -194,7 +212,7 @@ job per collection), or the check job, `lakefed_ingest_check`: it checks a group
 serverless and starts the ingestion job only for those with work. Its own schedule (paused) checks every
 collection; a schedule of the app's `check` variant starts it with that schedule's members. It reads the
 sources like the ingest does, so serverless needs the same network path to them (a UC connection, or
-serverless network connectivity to the servers).
+serverless network connectivity to the servers; see [Compute](#compute-for-the-setup-and-discovery-jobs)).
 
 ## Schema changes
 

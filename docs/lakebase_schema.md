@@ -19,6 +19,7 @@ as `lakefed_ingest_lakebase.lakefed_ingest.<table>` (see [monitoring.md](monitor
 | `control_change` | **Audit.** Every change the operations app makes to control rows | The operations app |
 | `discovery`, `discovered_table` | **Onboarding.** Tables found by the discovery job, with recommended control-row settings | The discovery job |
 | `schedule`, `schedule_member` | **Scheduling.** Cadences for running collections, and the wrapper job per (schedule, collection) | The operations app |
+| `databricks_run` | **Telemetry.** The Databricks runs the operations app shows, with their state | The operations app's run poller |
 | `schema_version` | **Bookkeeping.** Schema versions applied | The setup job, or the first ingestion run after an upgrade |
 
 ```mermaid
@@ -281,9 +282,16 @@ when the watermark hasn't moved.
 | `started_at`, `finished_at`, `duration_ms` | Timing |
 | `rows_read`, `rows_merged` | Row counts from the Delta commit metrics (NULL when the runtime doesn't report them) |
 | `position_from`, `position_to` | Checkpoint position before and after (CT version, or cursor value) |
-| `pool` | Spark FAIR pools the table's work ran in |
+| `pool` | Spark FAIR pools the table's work ran in; `batch<size>` for a member of a batched append, whose rows are in the run's `detail.batch_rows`, not in `rows_merged` |
 | `error` | Error message for a failed or retried attempt, with its deepest Java cause when Spark's message leaves it out |
 | `retry_count` | Earlier attempts of this table in the run: 0 for the first, 1 for the first retry. Write-conflict retries inside an attempt are logged in the job output only |
+
+Indexes for the operations app's history reads (schema version 8): runs by `started_at` across every
+collection; failed events by `started_at`; and each table's first loads (`ok` events of `seed`, `reseed` or
+`full`) by collection, control row and time, so a database's rows are read without passing over the
+collection's other events. Like every migration they are built in the upgrade's one transaction, which holds
+the telemetry tables' write lock while it builds them: on a database with years of history, run
+`lakefed_ingest_setup` at a quiet time rather than leave the upgrade to the next ingestion run.
 
 ## `control_change` — change log
 
@@ -304,9 +312,13 @@ key changed (see `checkpoint`).
 
 Written by the `lakefed_ingest_discover` job, which reads source catalog metadata only, and reviewed
 in the operations app's Bulk import page.
-- **`discovery`:** one row per (discovery, database), with the connection used (`src_host`,
-  `src_port`, `secret_key`), `status` (`running` | `ok` | `failed`), `error`, and the number of
-  tables found.
+- **`discovery`:** one row per (discovery, database), with the source read: a Unity Catalog connection
+  (`src_connection`, read through `remote_query` with no secret) or a host (`src_host`, `src_port`,
+  `secret_key`); `status` (`running` | `ok` | `failed`, or `listed` for a discovery that only lists the server's
+  databases, as Test connection does), `error`, and the number of tables found. A connection that fails is recorded
+  on the server's `master` row. `listing` (JSON, schema version 11): how it listed its databases, for a later
+  re-discovery: `pattern`, `azure_credential`, `azure_resource_id` and `secret_key_template`. Never a secret. Null
+  for discoveries made before version 11.
 - **`discovered_table`:** one row per table, with size and row counts, whether Change Tracking is
   enabled, and the recommended settings: `select_list` (unsupported column types listed in
   `excluded_columns`), `primary_key`, `load_type` (`ct` if CT and a PK; `cursor` on a rowversion
@@ -320,13 +332,100 @@ Nothing here is used by ingestion; control rows are created only when a reviewer
 Written by the operations app (see "Schedules" in `app/README.md`); the ingestion job doesn't read them.
 - **`schedule`:** `name` (unique among active schedules), `cadence_minutes` (5, 10, 15, 20, 30, 60, 120,
   180, 240, 360, 720 or 1440), `timezone`, `parameters` (ingestion job parameters, JSON), `job_variant`,
-  `stagger`, `paused`, `notify_emails`, who created it and when, and `deleted_at` (soft delete).
+  `stagger`, `paused`, `notify_emails`, `options` (JSON, null = none: `start_minute`, a set start time in
+  minutes after local midnight for daily and every 2 to 12 hours schedules; `rediscover_hour`, the UTC hour of the
+  job's daily re-discovery, absent when off; `rediscovery`, the last re-discovery's record, written by the app),
+  who created it and when, and
+  `deleted_at` (soft delete).
 - **`schedule_member`:** one row per (schedule, collection): `offset_minutes` (start offset within the
-  cadence), `job_id` (the wrapper job the app created), `synced_at`, `sync_error`, and `removed_at`
+  cadence: the schedule's start time plus the member's stagger), `job_id` (the wrapper job the app created), `synced_at`, `sync_error`, and `removed_at`
   (soft remove; the next sync deletes the wrapper job).
+
+## `app_task`: the app's background writes
+
+Written by the operations app (schema version 9). A New ingestion job, Add tables or databases file of more than
+5,000 tables is written off the request, so the browser never waits on it: the request records a task and answers
+at once, and a thread in the app writes the tables in one transaction, 1,000 to a statement. Columns:
+- `kind` (`create`, `tables` or `databases`), `job_id` (the ingestion job, once known), `created_by`;
+- `request_id`: unique; the page sends one per Create or Add, so the same request sent again (a retry after a
+  timeout) finds the same task instead of writing twice;
+- `status` (`running`, `succeeded` or `failed`), `done` of `total` tables, `result` (what the request would have
+  answered), `error`;
+- `created_at`, `heartbeat_at` (moved every 2 seconds while the thread runs), `finished_at`.
+- `progress` (schema version 12, `jsonb`): a by-database write's stage (`checking` or `writing`), databases of how
+  many, and tables written so far. Each database's transaction commits its progress with its rows.
+
+The write's last statement, in its own transaction, sets `result`, so the result commits with the tables or not at
+all. A running task whose heartbeat stopped for 2 minutes (the app restarted) is ended when it is next read: with
+no `result` it failed and its transaction was rolled back with the app, so nothing of it was written and it can be
+sent again; with a `result` its tables were written and only the sync of the job's Databricks jobs was missed.
+
+A by-database write (a source of more than 5,000 tables, by reference) commits one database per transaction, so a
+restart leaves the databases before the one it was writing committed, with `progress` set and no `result`. That task
+shows as failed with its progress ("writing database 1,240 of 22,000"), and the same request id again resumes it
+(`queries.resume_task_sql`): a database whose sinks the job already has is skipped, so none is written twice. A job
+created this way and left half-written stays as it is until finished (same request id) or deleted (Delete refuses
+while a write to the job is running).
+
+## `table_upload` and `table_upload_line`: CSV files of tables
+
+Written by the operations app (schema version 9). New ingestion job and Add tables post a CSV of tables once
+(`POST /api/uploads`); it is kept here, so the pages show its servers and databases and page its tables from
+Lakebase, and Create names the upload and what of it to take instead of sending the file again.
+- `table_upload`: one row per file: `upload_id`, `file_name`, `uploaded_by`, `uploaded_at`, `columns` (its header),
+  `lines`, `tables` (lines that can be taken) and `invalid`.
+- `table_upload_line`: one row per line, keyed by (`upload_id`, `line`, the file's line number): `server` (its UC
+  connection, or host and port), `src_database`, `src_schema`, `src_table`, `load_type` (the file's own, if any),
+  `fields` (the line as read, `{column: value}`), `status` (`ok`, or `invalid` when it can't name a table on a
+  server) and `errors`. Indexed by (`upload_id`, `server`, `src_database`) for the database view.
+
+Uploads are kept: the app has no DELETE privilege. Prune old ones by `uploaded_at` as the database's owner.
+
+## `job_selection`: what an ingestion job was made from
+
+Written by the operations app (schema version 9), in the transaction that writes the job's tables, when they were
+chosen from an upload or a discovery. One row per part: `job_id`, `scope` (`server`: every database of the server
+matching `filter`; `database`: a whole database; `tables`: the `tables` named, as schema.table), `server`,
+`src_database`, `source_kind` (`discovery` or `upload`) and `source_id`, `created_by`, `created_at`. A later
+re-discovery reads it: a whole server takes its new databases, a whole database its new tables, chosen tables
+nothing more (see Re-discovery in [app/README.md](../app/README.md)). Tables given as CSV lines in the request body
+record nothing here. A job's Delete removes its rows:
+the delete job (`lakefed_ingest_delete_job`) deletes them in the transaction that deletes the job's groups.
 
 Telemetry tables grow with every run. To keep long-term history cheaply, snapshot them to Delta
 (see [monitoring.md](monitoring.md)) and prune old rows from Lakebase.
+
+## `databricks_run`: the Databricks runs the app shows
+
+Written by the operations app's run poller (`app/src/run_poller.py`), which lists each job the app shows runs of every
+15 seconds and writes a run only when its state changed. The pages read this table rather than the Jobs API.
+- **`run_id`** (primary key), **`job_id`**, and **`kind`**: `wrapper` (a schedule's wrapper job), `check`, `group` (the
+  ingestion job, its variants and a schedule's cluster copy), `setup`, `discover`, `delete`, or `copies`.
+- **`schedule_id`** (wrapper, group copy and check runs) and **`task_collection`** (what the run ingests).
+- **`trigger`**, **`parameters`** (the run's job parameters, JSON), **`life_cycle_state`** (QUEUED ... TERMINATED,
+  SKIPPED, INTERNAL_ERROR, or NOT_FOUND when the Jobs API has no such run), **`result_state`**, **`state_message`**,
+  **`run_page_url`**, **`started_at`**, **`ended_at`**, and **`seen_at`** (when the poller last saw a change).
+- The app has no DELETE on Lakebase, so rows are never removed: prune old ones as the owner, as with `ingest_run`.
+- Added by the schema version that created it. Its statements are `create table if not exists` and `create index if not exists` only,
+  so the upgrade takes no lock on an existing table.
+
+## `rollup_database` and `rollup_group`: monitoring rollups
+
+The operations app's pages read these instead of scanning `control` and `checkpoint` on every refresh.
+
+- `rollup_database` has one row per database and grain (`task_collection`, `src_database`, `server`,
+  `src_connection`, `src_host`, `instance_label`; blanks are `''`). It holds the enabled tables (`tables`), tables
+  without a freshness target, tables failing, waiting for a first load and loaded (current or late), the oldest and
+  newest success, `earliest_due_at` (the earliest moment a loaded table with a freshness target goes late, from its
+  last success or its creation), and `control_rows` (the control rows in the grain, enabled or not; 0 once none).
+  The app's "late" is `earliest_due_at < now()`, so it is live without a scan. Index: `(task_collection,
+  earliest_due_at)`.
+- `rollup_group` has one row per ingestion group: its totals over its databases, and how many databases it has
+  (with an enabled table) and servers.
+- The rewrite (`state_store.rollup_database_rewrite_sql`, `rollup_group_rewrite_sql`; the app copies the text and a
+  test keeps them equal) recounts the named databases from their own rows, then the groups. Nothing is kept by
+  deltas, so a missed write only delays the counts until the next write of that database. A group with no rollup
+  row yet is counted from its control rows by the app until a write or a check gives it one.
 
 ## `schema_version` — schema versions applied
 
@@ -340,6 +439,9 @@ before versions were recorded) counts as version 0.
 
 Neither the ingestion job nor the operations app deletes configuration or history (a re-run
 discovery replaces only its own `discovered_table` rows), and the app has no `DELETE` privilege.
+The one exception is an app job's Delete: the `lakefed_ingest_delete_job` job, run as the deployer, deletes that
+job's groups' control rows and their state (run history and `control_change` stay), and, when asked, the target
+tables only they write (`src/lakefed_ingest/delete_job.py`).
 
 **To stop ingesting a table,** disable it: `task_enabled = false`, or **Disable** in the app. Runs skip
 it from then on; it's reversible and logged.
@@ -371,8 +473,11 @@ commit;
 
 ## Changing the schema
 
-An upgrade doesn't run only the new statements: it re-applies the whole of `lakebase_schema.sql`, plus
-the pending `state_store.RENAMES`, to a database at any earlier version. So every statement must be:
+An upgrade re-reads the whole of `lakebase_schema.sql`, plus the pending `state_store.RENAMES`, and runs
+them against a database at any earlier version. `StateStore.migrate` skips a statement the catalog
+(`pg_catalog`) shows is already in place: a table or index that exists, a column that exists with the same
+type, nullability and default, or a backfill whose probe query (`UPDATE_PROBES`) finds no rows. A statement
+it can't decide from the catalog still runs. A fresh database runs the whole file. So every statement must be:
 
 - **Idempotent:** safe to run again. Use `create ... if not exists`, `add column if not exists`, and
   `drop constraint if exists` right before `add constraint`. A backfill (`update`) must be a no-op
@@ -390,6 +495,27 @@ renaming one: add the new column, write both, move the readers, and drop the old
 checks each statement's form. A statement that changes an existing column or rows (`alter column`,
 `update`) must be reviewed as a no-op once applied and listed in `REVIEWED_NON_ADDITIVE`. Then bump
 `state_store.SCHEMA_VERSION` and add the new fingerprint to `SCHEMA_FINGERPRINTS`; the test says what to add.
+
+### Locks and waiting
+
+The whole migration is one transaction, and a statement that changes a table takes an `ACCESS EXCLUSIVE`
+lock on it, held until the commit. So a migration waits for running loads that hold those tables. Each
+attempt waits at most 3 s for a lock (`LOCK_TIMEOUT_S`, the Postgres `lock_timeout`). On a `55P03` timeout
+the transaction is rolled back and the migration retries after 5, 10, 20, then 40 s, for up to 10 attempts
+(`MIGRATE_ATTEMPTS`, about 5 minutes in all). If the last attempt times out, `StateStore.migrate` raises
+`MigrationLockTimeout`, the setup job fails with a message to run it again, and nothing has changed.
+
+An ingestion run that finds a migration pending and can't get it done does not ingest. It logs that the
+migration waits, exits the notebook with `status: migration_waiting` and `schema_version` set, and the job
+run succeeds. No `ingest_run` row is written for that run, and the next run tries the migration again.
+Any other migration error still fails the run.
+
+Two things still hold the locks for the whole transaction on every upgrade. The 14 constraint
+re-declarations (`drop constraint if exists`, then `add constraint`, 28 statements) always run, because a
+stored CHECK definition can't yet be compared with the file. Adding a CHECK validates every existing row, so
+on `control` (the largest table) that holds an `ACCESS EXCLUSIVE` lock for the scan. Until those are decided
+from the catalog or written as `NOT VALID` plus a later `VALIDATE`, an upgrade that touches the `control` or
+`checkpoint` constraints should run between ingestion runs, not during them.
 
 Upgrades that only add columns, tables or indexes are safe while runs are going. A version that renames,
 or adds a constraint to a table the ingestion job writes, can fail tables of a run still on the old code

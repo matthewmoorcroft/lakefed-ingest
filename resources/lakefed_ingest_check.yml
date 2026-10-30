@@ -3,7 +3,8 @@
 # quiet cycle starts no ingest cluster.
 #
 # A group is `task_collections`: a schedule's members when an operations-app schedule in group mode
-# starts it (one wrapper job per schedule), or blank for every collection with enabled rows. Without an
+# starts it (one wrapper job per schedule, which also passes the schedule's id, `schedule_id`, so the
+# check reads the members from Lakebase), or blank for every collection with enabled rows. Without an
 # app schedule, this job's own schedule (paused) is the cadence. The runs are started with run-now, as
 # the app's Run now starts them: no For each, and no job is created. The job's run-as identity needs
 # CAN_MANAGE_RUN on lakefed_ingest (the deployer has it on both). It starts no more runs than
@@ -31,7 +32,8 @@ resources:
             notebook_path: ../src/lakefed_ingest/check_launch.ipynb
             base_parameters:
               task_collections: "{{job.parameters.task_collections}}"
-              ingest_job_id: ${resources.jobs.lakefed_ingest.id}
+              schedule_id: "{{job.parameters.schedule_id}}"
+              ingest_job_id: "{{job.parameters.ingest_job_id}}"
               launch_id: "{{task.run_id}}"
               db_instance: "{{job.parameters.db_instance}}"
               db_name: "{{job.parameters.db_name}}"
@@ -47,6 +49,7 @@ resources:
               max_queries_per_source: "{{job.parameters.max_queries_per_source}}"
               table_retries: "{{job.parameters.table_retries}}"
               table_retry_budget: "{{job.parameters.table_retry_budget}}"
+              fail_on_table_errors: "{{job.parameters.fail_on_table_errors}}"
               spark_conf: "{{job.parameters.spark_conf}}"
       environments:
         - environment_key: lakebase_client
@@ -62,6 +65,13 @@ resources:
         # The group: comma-separated collections; blank = every collection with an enabled control row.
         - name: task_collections
           default: ""
+        # Or an operations-app ingestion job's id: its groups are read from Lakebase (a long list of groups
+        # doesn't fit in one job parameter, capped at 10,000 characters). Wins over task_collections.
+        - name: schedule_id
+          default: ""
+        # The ingestion job to start: the bundle's, or an app job's copy with its own cluster (cluster_copies.ipynb).
+        - name: ingest_job_id
+          default: ${resources.jobs.lakefed_ingest.id}
         - name: db_instance
           default: ${var.lakebase_instance}
         - name: db_name
@@ -91,6 +101,8 @@ resources:
         - name: table_retries
           default: ""
         - name: table_retry_budget
+          default: ""
+        - name: fail_on_table_errors
           default: ""
         - name: spark_conf
           default: ""
