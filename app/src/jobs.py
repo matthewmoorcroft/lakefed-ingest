@@ -23,6 +23,10 @@ APP_PRINCIPAL = os.environ.get("DATABRICKS_CLIENT_ID")
 # The delete job (lakefed_ingest_delete_job): deletes a deleted app job's groups and, if asked, their target tables,
 # as the deployer, since the app has no DELETE privilege on the Lakebase tables.
 DELETE_JOB_ID = os.environ.get("DELETE_JOB_ID")
+# The running app's own name, set by Databricks Apps: who may manage the app is read from its permissions.
+APP_NAME = os.environ.get("DATABRICKS_APP_NAME")
+# The source this app was deployed from: the bundle's git commit, or what the deploy passed (app_version).
+APP_VERSION = os.environ.get("APP_VERSION") or None
 # Group given CAN_VIEW on the wrapper jobs the app creates for schedules (blank = owner and admins only).
 SCHEDULE_JOB_VIEW_GROUP = os.environ.get("SCHEDULE_JOB_VIEW_GROUP", "users") or None
 
@@ -91,7 +95,7 @@ PERMISSION_RANK = {"CAN_VIEW": 1, "CAN_MANAGE_RUN": 2, "CAN_MANAGE": 3, "IS_OWNE
 ACTION_NEEDS = {"run": ("starting a run", "CAN_MANAGE_RUN"), "change": ("changing the job or its tables", "CAN_MANAGE"),
                 "delete": ("deleting", "CAN_MANAGE")}
 PERMISSION_LABEL = {"CAN_VIEW": "Can View", "CAN_MANAGE_RUN": "Can Manage Run", "CAN_MANAGE": "Can Manage",
-                    "IS_OWNER": "Is Owner"}
+                    "IS_OWNER": "Is Owner", "CAN_USE": "Can Use"}
 
 
 def highest_permission(acl: List[dict], user: str, groups: List[str]) -> Optional[str]:
@@ -189,6 +193,27 @@ def user_job_permission(job_id, user: str) -> Optional[str]:
         acl = workspace().permissions.get("jobs", str(int(job_id))).access_control_list or []
         return [entry.as_dict() for entry in acl]
     return highest_permission(_cached(("acl", str(int(job_id))), read), user, user_groups(user))
+
+
+def user_app_permission(user: str) -> Optional[str]:
+    """The signed-in user's highest permission on this app (Can Use or Can Manage), from the app's access list as its
+    service principal reads it. A workspace admin manages every app, so an admin's is known without the list."""
+    groups = user_groups(user)
+    if (user or "").strip() and "admins" in groups:
+        return "CAN_MANAGE"
+
+    def read():
+        acl = workspace().permissions.get("apps", str(APP_NAME)).access_control_list or []
+        return [entry.as_dict() for entry in acl]
+    return highest_permission(_cached(("app-acl", str(APP_NAME)), read), user, groups)
+
+
+def app_deployment() -> dict:
+    """The app's active deployment as Databricks Apps records it: its id, when it was made and by whom."""
+    deployment = workspace().apps.get(str(APP_NAME)).active_deployment
+    if deployment is None:
+        return {}
+    return {"id": deployment.deployment_id, "created": deployment.create_time, "creator": deployment.creator}
 
 
 def job_settings(job_id) -> dict:

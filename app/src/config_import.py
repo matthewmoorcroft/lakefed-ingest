@@ -19,6 +19,15 @@ CSV_COLUMNS = ("src_connection", "src_host", "src_port", "secret_key", "src_data
                "select_list", "primary_key", "cursor_column", "client_id", "task_collection")
 ATTR_PREFIX = "attr:"
 MAX_LINES = 5000
+# Manage's export of several ingestion jobs says which job each line is in. One import makes one job, so the import
+# reads the column only to refuse a file that holds more than one.
+JOB_COLUMN = "ingestion_job"
+# The export's columns, in order: the job, the import's own (without task_collection, which the import chooses), and
+# the load type Create from one CSV reads per line (new_job.UPLOAD_COLUMNS); then each identity column as attr:<name>.
+EXPORT_COLUMNS = (JOB_COLUMN,) + tuple(c for c in CSV_COLUMNS if c != "task_collection") + ("load_type",)
+# Where a table is read by host and secret. Create from one CSV reads through a connection and refuses these columns,
+# so an export leaves them out when none of its tables has one.
+JDBC_COLUMNS = ("src_host", "src_port", "secret_key")
 
 # A group's settings, each the control column(s) it fills. sink_* are templates over {database}, {schema}, {table}.
 SETTINGS = ("src_type", "use_remote_query", "load_type", "write_mode", "fan_in", "sink_catalog", "sink_schema",
@@ -126,7 +135,8 @@ def effective_settings(given: dict, group_rows: List[dict]):
 def _header_errors(header: List[str]) -> List[str]:
     errors = [f"column {c} is given twice" for c, n in Counter(header).items() if n > 1]
     for column in header:
-        if column in CSV_COLUMNS or (column.startswith(ATTR_PREFIX) and q._ATTR_NAME.match(column[len(ATTR_PREFIX):])):
+        if column in CSV_COLUMNS or column == JOB_COLUMN or (
+                column.startswith(ATTR_PREFIX) and q._ATTR_NAME.match(column[len(ATTR_PREFIX):])):
             continue
         hint = ": a group setting, set at import" if column in SETTINGS else ""
         errors.append(f"unknown column {column}{hint}")
@@ -191,6 +201,10 @@ def plan_import(text: str, group: str, given: dict, group_rows: List[dict], max_
     if lines is None:
         return {"errors": [f"more than {max_lines:,} lines: at most {max_lines:,} in one import"], "lines": [],
                 "settings": {}}
+    named = sorted({(line.get(JOB_COLUMN) or "").strip() for line in lines} - {""})
+    if len(named) > 1:
+        return {"errors": [f"this file holds {len(named)} ingestion jobs ({', '.join(named[:5])}): one import makes "
+                           f"one job, so import each job's lines on their own"], "lines": [], "settings": {}}
     settings, errors = effective_settings(given, group_rows)
     if errors:
         return {"errors": errors, "lines": [], "settings": settings}
@@ -242,6 +256,34 @@ def export_csv(rows: List[dict]) -> str:
         mine = json.loads(value) if isinstance(value, str) and value else value or {}
         cell = lambda v: "" if v is None else v if isinstance(v, str) else json.dumps(v)     # true, 5: as JSON writes them
         writer.writerow([_text(r.get(c)) for c in columns] + [cell(mine.get(a)) for a in attrs])
+    return buffer.getvalue()
+
+
+def export_columns(jdbc: bool) -> tuple:
+    """The export's columns before its identity columns: EXPORT_COLUMNS, less JDBC_COLUMNS when no table needs them."""
+    return EXPORT_COLUMNS if jdbc else tuple(c for c in EXPORT_COLUMNS if c not in JDBC_COLUMNS)
+
+
+def export_header(columns: tuple, attrs: List[str]) -> str:
+    """The export's header line: the columns, then attr:<name> for each identity column."""
+    buffer = io.StringIO()
+    csv.writer(buffer, lineterminator="\n").writerow(list(columns) + [ATTR_PREFIX + a for a in attrs])
+    return buffer.getvalue()
+
+
+def _attr_cell(value) -> str:
+    return "" if value is None else value if isinstance(value, str) else json.dumps(value)
+
+
+def export_lines(rows: List[dict], columns: tuple, attrs: List[str]) -> str:
+    """Control rows (each with its ingestion_job) as export lines under export_header(columns, attrs), in the import's
+    own spelling: a blank for nothing, and true or 5 as JSON writes them in an identity column."""
+    buffer = io.StringIO()
+    writer = csv.writer(buffer, lineterminator="\n")
+    for r in rows:
+        value = r.get("client_attrs")
+        mine = json.loads(value) if isinstance(value, str) and value else value or {}
+        writer.writerow([_text(r.get(c)) for c in columns] + [_attr_cell(mine.get(a)) for a in attrs])
     return buffer.getvalue()
 
 

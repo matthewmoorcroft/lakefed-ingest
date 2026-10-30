@@ -24,8 +24,8 @@ from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Iterable, List, Optional, Tuple
 
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response
+from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -1389,7 +1389,8 @@ def permissions(request: Request):
                                    ("discovery", jobs.DISCOVER_JOB_ID))}
     return {"jobs": {str(sid): refusals for sid, refusals in by_job.items()}, "groups": groups, "run": bundle,
             "new_running_job": {variant: _permission_refusals({"job_variant": variant}, user)["run"]
-                                for variant in jobs.schedule_variants()}}
+                                for variant in jobs.schedule_variants()},
+            "manage": _manage_refusal(user)}
 
 
 @app.get("/api/ingestion-jobs/{job_id}")
@@ -1516,6 +1517,23 @@ def _databricks_job_refusals(job_id, user: str) -> dict:
         reason = f"can't read your permission on {label}: {str(e).split('. ')[0]}"
         return {action: reason for action in jobs.ACTION_NEEDS}
     return {action: jobs.action_refusal(action, level, label) for action in jobs.ACTION_NEEDS}
+
+
+def _manage_refusal(user: str) -> Optional[str]:
+    """Why the user may not manage the app (Manage: the setup job, the Databricks jobs, the export), or None. It is the
+    app's own Databricks permission, Can Manage on the app (workspace admins have it), not one of the app's."""
+    if not (user or "").strip():
+        return NO_IDENTITY
+    if not jobs.APP_NAME:
+        return "the app's name is not set here (DATABRICKS_APP_NAME), so who manages it can't be read"
+    try:
+        level = jobs.user_app_permission(user)
+    except Exception as e:  # Databricks decides, so no answer means no
+        return f"can't read your permission on the app {jobs.APP_NAME}: {str(e).split('. ')[0]}"
+    if jobs.PERMISSION_RANK.get(level or "", 0) >= jobs.PERMISSION_RANK["CAN_MANAGE"]:
+        return None
+    have = f"you have {jobs.PERMISSION_LABEL.get(level, level)}" if level else "you have no access to it"
+    return f"managing the app needs Can Manage on the app {jobs.APP_NAME}; {have}"
 
 
 def _refuse(refusal: Optional[str]) -> None:
@@ -2823,6 +2841,7 @@ def cancel_run(run_id: int, request: Request):
 
 @app.post("/api/jobs/setup/run")
 def run_setup(request: Request):
+    _refuse(_manage_refusal(_user(request)))
     _refuse_run_of(_require(jobs.SETUP_JOB_ID, "setup"), request)
     return {"run_id": jobs.run_now(_require(jobs.SETUP_JOB_ID, "setup"), {})}
 
@@ -2852,6 +2871,72 @@ def setup_run(run_id: int):
     if str(state.get("job_id")) != str(_require(jobs.SETUP_JOB_ID, "setup")):
         raise HTTPException(404, f"setup run {run_id} not found")
     return {"run_id": int(run_id), "outcome": action_states.run_outcome(state, datetime.now(timezone.utc), SETUP_LIMIT_S)}
+
+
+# ---- Manage: the app's own Databricks jobs and the export, for those who manage the app -----------------------------
+MANAGE_JOBS = (("Ingestion", "INGEST_JOB_ID"), ("Check", "CHECK_JOB_ID"), ("Discovery", "DISCOVER_JOB_ID"),
+               ("Cluster copies", "CLUSTER_COPIES_JOB_ID"), ("Delete", "DELETE_JOB_ID"),
+               ("Schema setup", "SETUP_JOB_ID"))
+
+
+@app.get("/api/manage/jobs")
+def manage_jobs(request: Request):
+    """The Databricks jobs the app runs ingestion jobs with, each with its name and a link, as deployed."""
+    _refuse(_manage_refusal(_user(request)))
+    host, out = jobs.workspace_url(), []
+    for role, variable in MANAGE_JOBS:
+        job_id = getattr(jobs, variable, None)
+        if not job_id:
+            continue
+        try:
+            name, error = jobs.job_summary(job_id)["name"], None
+        except Exception as e:
+            name, error = None, str(e).split(". ")[0]
+        out.append({"role": role, "job_id": int(job_id), "name": name, "error": error,
+                    "url": f"{host}/jobs/{job_id}" if host else None})
+    return out
+
+
+@app.get("/api/manage/version")
+def manage_version(request: Request):
+    """Which version of the app runs: the source it was deployed from, and its deployment on Databricks Apps."""
+    _refuse(_manage_refusal(_user(request)))
+    try:
+        deployment, error = jobs.app_deployment(), None
+    except Exception as e:
+        deployment, error = {}, str(e).split(". ")[0]
+    return {"app": jobs.APP_NAME, "version": jobs.APP_VERSION, "deployment": deployment, "error": error}
+
+
+@app.get("/api/manage/export.csv")
+def manage_export(request: Request, jobs_: str = Query("", alias="jobs")):
+    """The configured tables of some ingestion jobs (their ids, comma-separated; blank for every one) as the CSV Create
+    from one CSV reads (config_import.export_columns), each line naming its job. Streamed page by page (keyset by
+    control id), so a 200,000-table export never holds more than a page. Enabled tables only: what the jobs ingest."""
+    _refuse(_manage_refusal(_user(request)))
+    try:
+        ids = [int(part) for part in jobs_.split(",") if part.strip()] or None
+    except ValueError:
+        raise HTTPException(422, "jobs: comma-separated ingestion job ids")
+    members = db.query(q.export_groups_sql(), (ids, ids))
+    job_of = {m["task_collection"]: m["name"] for m in members}
+    groups = sorted(job_of)
+    attrs = [r["name"] for r in db.query(q.export_attr_names_sql(), (groups,))] if groups else []
+    columns = ci.export_columns(bool(groups) and bool(db.query(q.export_reads_jdbc_sql(), (groups,))[0]["jdbc"]))
+
+    def lines():
+        yield ci.export_header(columns, attrs)
+        last = 0
+        while groups:
+            page = db.query(q.export_page_sql(), (groups, last, q.EXPORT_PAGE))
+            if not page:
+                return
+            yield ci.export_lines([{**r, ci.JOB_COLUMN: job_of[r["task_collection"]]} for r in page], columns, attrs)
+            last = page[-1]["id"]
+    name = "ingestion-jobs" if not ids or len(ids) > 1 else q.identifier(members[0]["name"]) if members \
+        else "ingestion-job"
+    return StreamingResponse(lines(), media_type="text/csv",
+                             headers={"Content-Disposition": f'attachment; filename="{name}.csv"'})
 
 
 def _bundle_job_ids() -> list:

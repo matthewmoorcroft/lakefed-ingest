@@ -222,3 +222,19 @@ def test_a_discarded_draft_reads_no_more_and_cant_be_created_from_as_the_apps_ro
     assert client.sql("select count(*) from lakefed_ingest.control") == [(0,)]
     import queries as q
     assert main.db.query(q.drafts_to_purge_sql(), (7200,)) == [{"discovery_id": did}]    # the poller's look, as the app
+
+
+def test_manages_export_reads_as_the_apps_role(client, monkeypatch):
+    did = _discover(client, ["eng_001", "eng_002"])
+    selection = {"discovery_id": did, "databases": [{"server": "sql_a", "database": d} for d in ("eng_001", "eng_002")]}
+    made = client.post("/api/ingestion-jobs", json={"name": "Role", "settings": SETTINGS, "groups_per_server": 1,
+                                                    "dry_run": False, "request_id": "role-export", "source": selection})
+    assert made.status_code in (200, 202), made.text
+    monkeypatch.setattr(main.jobs, "APP_NAME", "lakefed-ops")
+    monkeypatch.setattr(main.jobs, "user_app_permission", lambda user: "CAN_MANAGE")
+    monkeypatch.setattr(main.q, "EXPORT_PAGE", 3)
+    exported = client.get("/api/manage/export.csv")
+    assert exported.status_code == 200, exported.text
+    lines = exported.text.splitlines()
+    assert lines[0].startswith("ingestion_job,src_connection,src_database,") and len(lines) == 5
+    assert {line.split(",")[0] for line in lines[1:]} == {"Role"}

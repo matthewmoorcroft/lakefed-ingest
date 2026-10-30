@@ -14,7 +14,8 @@ root doesn't depend on it, and everything the app does can also be done with SQL
 | **Timeline** | Runs per collection over a window (6 hours to 7 days): planned triggers, runs colored by outcome, and triggers Databricks skipped because the previous run was still going |
 | **Schedules** | Run collections at a cadence (see [Schedules](#schedules)): create, edit, pause, resume and delete schedules; each member's next run, wrapper job, last run, p95 run time, skipped triggers, and warnings for overruns and SLAs a schedule can't meet |
 | **Tables** | Browse control rows with their checkpoint (phase, status, freshness lag, SLA). Filter by collection, text, or failing / SLA breached / no SLA / seeding / disabled. Select one row to **edit** it (every field, plus its change history), or several to **bulk edit** (e.g. move to another collection, or switch to reads through a UC connection), **enable**, **disable** or **force a reseed**. Changing `write_mode` needs a new sink in the same edit (an append sink and a merge sink can't share a table) |
-| **Databricks jobs** | The Databricks ingestion job's own schedule; active and recent runs (with the schedule that started each); **start a run** for a collection; **cancel** a run; run the schema setup job |
+| **Databricks jobs** | Under Schedules and jobs: the Databricks ingestion job's active and recent runs (with the ingestion job that started each); **cancel** a run |
+| **Manage** | Only for those with Can Manage on the app itself (see [Security model](#security-model)): the app's version (the commit it was deployed from, and its active deployment) and state database; **Export as CSV** of one, several or every ingestion job's enabled tables, in the columns Create from one CSV reads, with an `ingestion_job` column naming each line's job (streamed a page at a time, so a 200,000-table export works; one job's lines import as a new ingestion job, and an import refuses a file of several jobs); and the Databricks jobs the app runs, each linked |
 | **Changes** | The change log: every add, register, edit, enable / disable and reseed made in the app, with who, what and when |
 | **Add table** | A form that adds one control row, checked before insert (the database constraints are the backstop): a JDBC source (host and secret) or a UC connection (`use_remote_query`), `write_mode`, `client_attrs` and `jdbc_options` |
 | **Bulk import** | Discover a server's tables (the `lakefed_ingest_discover` job, catalog metadata only), review the recommended settings in an editable grid, set shared fields once (collection, sink catalog / schema / table templates, `client_id` template, freshness SLA), and register the selection. Tables at or above a size threshold (default 1 GB) get a partitioned seed; tables already registered start unticked; duplicates are skipped |
@@ -119,9 +120,7 @@ until the poller records a run going, and **Cancel run** reads **Cancelling…**
 Both read the `databricks_run` table the poller keeps, with no timer on the page. After 15 minutes without a start, or
 10 minutes without a cancel being confirmed, the page says Databricks has not confirmed it and keeps Run now off.
 
-**The other actions wait the same way.** Run setup job shows **Setup job running** while Databricks lists its run going, then
-**succeeded**, or **failed** with Databricks' message; it stays off until the run has ended (a run still listed after 30
-minutes is not confirmed). Add databases, Add tables and Create show done only once their tables are written and the
+**The other actions wait the same way.** Add databases, Add tables and Create show done only once their tables are written and the
 job's Databricks jobs are synced; a wrapper job that did not sync is named. Edit's Save shows saved only once the
 wrapper jobs are synced and any cluster copies run has ended; a copies run that failed says the cluster was not applied.
 
@@ -307,6 +306,10 @@ The app runs as its own service principal (created with the app):
   so a grant to `data-eng` counts for a member of `team-x` inside it. A lookup that fails or passes those caps
   keeps the groups found so far: it can refuse something Databricks would allow, never the reverse.
 
+  Manage and its endpoints (`/api/manage/...`, and starting the setup job) need `CAN_MANAGE` on the app itself (its
+  Databricks permission; workspace admins have it). The service principal reads the app's access list through the
+  Permissions API: where it isn't allowed that read, only workspace admins see Manage, and the refusal says why.
+
   Running the setup or discovery job, or cancelling a run, needs `CAN_MANAGE_RUN` on that job. Groups in no
   ingestion job, and new paused jobs, are open to everyone with `CAN_USE` on the app. The server checks every
   call, and the pages show a refused button disabled with the reason. Permissions are read again after 20
@@ -328,6 +331,8 @@ Prerequisites: the ingestion bundle is deployed and its setup job has run (Lakeb
      bundle prefixes job names (`[dev your_name] lakefed_ingest`), so set the ids or the prefixed
      names for dev targets.
    - `app_name`: 30 characters max.
+   - `app_version`: what Manage shows as the version, by default the git commit deployed from. It is blank when the
+     bundle is deployed from a folder that isn't a git checkout: pass `--var app_version=<commit>` there.
 2. Deploy and start the app, then grant it Lakebase access. Run these from `app/`, as the user who
    manages the Lakebase instance and owns the tables (whoever ran the ingestion setup):
 

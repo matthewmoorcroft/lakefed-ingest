@@ -42,6 +42,8 @@ resources:
             value_from: delete-job
           - name: WAREHOUSE_ID
             value_from: discovery-warehouse
+          - name: APP_VERSION
+            value: ${var.app_version}
       resources:
         - name: ingest-job
           description: The lakefed_ingest ingestion job.

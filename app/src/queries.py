@@ -2021,6 +2021,42 @@ def collection_control_rows_sql() -> str:
     return f"select {cols} from {SCHEMA}.control where task_collection = %s order by id"
 
 
+def export_groups_sql() -> str:
+    """The groups of the ingestion jobs an export takes: each live job's active members, with its name, the jobs given
+    or every live one. Params: the job ids (bigint[]) twice, or null for all."""
+    return (f"select s.id, s.name, m.task_collection from {SCHEMA}.schedule s "
+            f"join {SCHEMA}.schedule_member m on m.schedule_id = s.id and m.removed_at is null "
+            f"where s.deleted_at is null and (%s::bigint[] is null or s.id = any(%s::bigint[])) "
+            f"order by lower(s.name), m.task_collection")
+
+
+def export_attr_names_sql() -> str:
+    """The identity column names an export's enabled rows use, so its header can name them before the first line.
+    Param: the groups (text[])."""
+    return (f"select distinct k.name from {SCHEMA}.control c, jsonb_object_keys(c.client_attrs::jsonb) as k(name) "
+            f"where c.task_collection = any(%s) and c.task_enabled and c.client_attrs is not null order by k.name")
+
+
+def export_reads_jdbc_sql() -> str:
+    """Whether any enabled row of an export's groups is read by host and secret (config_import.JDBC_COLUMNS), so its
+    header knows whether to carry those columns. Param: the groups (text[])."""
+    return (f"select exists (select 1 from {SCHEMA}.control where task_collection = any(%s) and task_enabled "
+            f"and (src_host is not null or src_port is not null or secret_key is not null)) as jdbc")
+
+
+EXPORT_PAGE = 5000
+
+
+def export_page_sql() -> str:
+    """One page of an export: the enabled control rows of some groups after a control id, by id (keyset paging, so a
+    200,000-table export never holds more than a page). Params: the groups (text[]), the last id read, the page size."""
+    cols = ", ".join(("id", "task_collection", "src_connection", "src_host", "src_port", "secret_key", "src_database",
+                      "src_schema", "src_table", "select_list", "primary_key", "cursor_column", "client_id",
+                      "load_type", "client_attrs"))
+    return (f"select {cols} from {SCHEMA}.control where task_collection = any(%s) and task_enabled and id > %s "
+            f"order by id limit %s")
+
+
 def move_controls_sql() -> str:
     """Move control rows into another ingestion group, as a job's groups are spread again. Each table keeps its
     checkpoint, which is by control id, so nothing reloads. Params: the group, list of control ids."""

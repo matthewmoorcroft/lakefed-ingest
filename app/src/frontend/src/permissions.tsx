@@ -10,6 +10,8 @@ export interface Permissions {
   groups: Record<string, string>;
   run: { ingestion: Refusal; setup: Refusal; discovery: Refusal };
   new_running_job: Record<string, Refusal>;
+  /** Why the user may not manage the app (Can Manage on the app), or null when they may: Manage shows only then. */
+  manage: Refusal;
 }
 
 export function usePermissions() {

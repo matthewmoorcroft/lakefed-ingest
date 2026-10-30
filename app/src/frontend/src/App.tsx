@@ -23,6 +23,8 @@ import JobRun from "./pages/JobRun";
 import Sources from "./pages/Sources";
 import Database from "./pages/Database";
 import ImportCsv from "./pages/ImportCsv";
+import Manage from "./pages/Manage";
+import { usePermissions } from "./permissions";
 
 interface Settings { config?: Config }
 const SettingsContext = createContext<Settings>({});
@@ -45,6 +47,9 @@ export default function App() {
   const qc = useQueryClient();
   const { pathname } = useLocation();
   const [stamp, setStamp] = useState<PageStampValue | null>(null);
+  // Manage the app is listed only for those with Can Manage on the app; its page and its calls refuse anyone else.
+  const manages = usePermissions().data?.manage === null;
+  const nav: [string, string][] = manages ? [...NAV, ["/manage", "Manage the app"]] : NAV;
   return (
     <SettingsContext.Provider value={{ config: config.data }}>
       <PageStampContext.Provider value={setStamp}>
@@ -52,7 +57,7 @@ export default function App() {
         <aside className="sidebar">
           <div className="brand"><div>Lakefed Ingest<small>Operations</small></div></div>
           <nav>
-            {NAV.map(([to, label]) => (
+            {nav.map(([to, label]) => (
               <NavLink key={to} to={to} end className={({ isActive }) =>
                 (isActive || (UNDER[to] ?? []).some((p) => pathname.startsWith(p)) ? "active" : "")}>{label}</NavLink>
             ))}
@@ -94,6 +99,7 @@ export default function App() {
             <Route path="/bulk" element={<BulkImport />} />
             <Route path="/import" element={<ImportCsv />} />
             <Route path="/changes" element={<Changes />} />
+            <Route path="/manage" element={<Manage />} />
             <Route path="*" element={<Navigate to="/overview" replace />} />
           </Routes>
           </PageErrorBoundary>
