@@ -517,6 +517,9 @@ and `job_parameters`.
 (`task_collections`, blank for every collection with enabled rows), asks each source database
 whether anything changed, stamps the unchanged ones, and starts `lakefed_ingest` (run-now) only for
 the collections with work, each for its databases with work. A quiet cycle starts no ingest cluster.
+The check then waits for the runs it started and fails if one of them failed (so the check's failure email
+fires). `timeout_s` (default 21600, six hours; 0 = no limit) bounds that wait: the runs still going are cancelled
+and the check fails. While it waits, the check's serverless compute is idle.
 
 ```bash
 databricks bundle run lakefed_ingest_check -t <target> -p <profile> --params task_collections=<c1>,<c2>

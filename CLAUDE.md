@@ -120,7 +120,9 @@ secret). See `README.md`, `docs/deploy.md`, `docs/monitoring.md`, `docs/lakebase
   `max_queries_per_source`, `initial_check.SourceCap`), stamps
   unchanged databases, records each collection's databases with work in `check_work`, starts
   `lakefed_ingest` once per collection with work by run-now (`work_id`; `launcher.py`), watches the
-  runs for `confirm_s` (a run Databricks skips fails the check) and ends. No For each. Its own schedule
+  runs until they end (`wait`, default true; `timeout_s` 21600, then the runs still going are cancelled and the check
+  fails; a run that failed or was skipped fails the check, so the wrapper's failure email fires). Locks are let go
+  when each run starts, so the wait holds none. No For each. Its own schedule
   (paused) is the fallback cadence; an app schedule in group mode starts it with its members.
   With `runs_by` `changes` (the default; `group` keeps one run per collection with work) the cycle is shared out
   by its changes (`initial_check.plan_cycle`, `launcher.cycle_requests`): each database's tables with work

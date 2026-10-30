@@ -52,6 +52,8 @@ resources:
               fail_on_table_errors: "{{job.parameters.fail_on_table_errors}}"
               spark_conf: "{{job.parameters.spark_conf}}"
               runs_by: "{{job.parameters.runs_by}}"
+              wait: "{{job.parameters.wait}}"
+              timeout_s: "{{job.parameters.timeout_s}}"
       environments:
         - environment_key: lakebase_client
           spec:
@@ -112,3 +114,10 @@ resources:
         # load keeps a run of its own); "group" starts one run per group with work, as before.
         - name: runs_by
           default: "changes"
+        # The check waits for the ingest runs it started and fails when one failed. timeout_s bounds that wait in
+        # seconds (0: no limit): the runs still going then are cancelled and the check fails. While it waits the
+        # check's serverless compute is idle, so this bound is also the most a cycle's wait can cost.
+        - name: wait
+          default: "true"
+        - name: timeout_s
+          default: "21600"

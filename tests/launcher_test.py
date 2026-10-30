@@ -243,6 +243,16 @@ def test_a_stopped_step_cancels_the_runs_it_started_that_are_still_going():
     assert sorted(jobs.cancelled) == [101, 102]            # c1 had finished; c2 and c3 are cancelled
 
 
+def test_a_waiting_check_releases_each_collection_when_its_run_starts_not_when_the_wait_ends():
+    jobs, clock = _Jobs({"c1": ["RUNNING", "SUCCESS"], "c2": ["RUNNING", "SUCCESS"]}), _Clock()
+    events = []
+    requests = launcher.run_requests(_per_collection(c1=["a"], c2=["b"]))
+    summary = launcher.launch(jobs, 7, requests, wait=True, poll_s=60, sleep=lambda s: (events.append("wait"),
+                              clock.sleep(s))[1], clock=clock, on_settled=lambda c: events.append(f"released {c}"))
+    assert events[:2] == ["released c1", "released c2"] and events.count("wait") >= 1
+    assert summary["counts"] == {"succeeded": 2}
+
+
 def test_a_timeout_cancels_what_is_still_going_and_fails_the_step():
     jobs, clock = _Jobs({"c1": ["RUNNING", "SUCCESS"], "c2": ["RUNNING"]}), _Clock()
     requests = launcher.run_requests(_per_collection(c1=["a"], c2=["b"]))
@@ -398,8 +408,10 @@ def test_the_check_job_feeds_every_widget_and_brings_its_own_packages():
     job = (Path(__file__).parent.parent / "resources" / "lakefed_ingest_check.yml").read_text()
     passed = set(re.findall(r"^\s+([a-z_]+): ", job.split("base_parameters:")[1].split("environments:")[0], re.M))
     widgets = set(re.findall(r'widget\("(\w+)"', "\n".join(_code_cells("check_launch.ipynb"))))
-    tuning_only = {"check_parallelism", "force_databases", "wait", "confirm_s", "max_running", "poll_s", "timeout_s"}
+    tuning_only = {"check_parallelism", "force_databases", "confirm_s", "max_running", "poll_s"}
     assert (widgets | set(launcher.RUN_PARAMETERS)) - tuning_only == passed   # the rest keep their notebook defaults
+    assert re.search(r'^        - name: wait\n          default: "true"$', job, re.M)
+    assert re.search(r'^        - name: timeout_s\n          default: "21600"$', job, re.M)
     assert '"psycopg[binary]"' in job and "environment_key: lakebase_client" in job
     assert not any(c.lstrip().startswith("%pip") for c in _code_cells("check_launch.ipynb"))
     assert "for_each_task" not in job
