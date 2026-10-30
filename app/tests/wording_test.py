@@ -78,16 +78,22 @@ def test_the_backend_names_the_databricks_job():
 
 def test_discover_says_when_the_login_cant_open_master_and_takes_typed_databases():
     discover = (FRONTEND / "pages" / "Discover.tsx").read_text()
-    assert "this connection's login can't open" in discover and "VIEW ANY DATABASE" in discover
+    assert "If the login can't open master" in discover and "VIEW ANY" in discover
     assert "function TypedDatabases" in discover and "Databases typed by hand are read by name" in discover
 
 
 def test_discover_lists_every_database_then_filters_and_says_which_databases_it_couldnt_read():
     discover = (FRONTEND / "pages" / "Discover.tsx").read_text()
-    assert "Databases matching" not in discover and "Lists every database on the server" in discover
+    assert "Databases matching" not in discover and "listing every database on the server" in discover
     assert "function Unread" in discover and "couldn't be read" in discover
     assert "databasesOfCsv" not in discover and "CSV file" not in discover
     assert "Discover is the first choice" in discover and "the fallback" in discover
+
+
+def test_next_on_the_connection_step_tests_it_with_no_button_of_its_own():
+    discover = (FRONTEND / "pages" / "Discover.tsx").read_text()
+    assert "Test connection" not in discover and "testThenNext" in discover and "Next tests it" in discover
+    assert "<TestFailed" in discover and "actionNote=" in discover
 
 
 def test_discover_can_list_an_azure_sql_server_through_azure_and_reads_the_whole_server_the_same_way():

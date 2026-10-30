@@ -7,17 +7,19 @@ The engine's discovery.py keeps the three-query path for servers reached by host
 because the app deploys only app/src and can't import the engine. Its rules match discovery.recommend, and
 app/tests/source_catalog_test.py runs both on the same tables, so the two can't drift apart unnoticed.
 
+error_codes reads the codes a failed connection test's message names, for the page to show.
+
 Standard library only. Nothing here reads a database: the app runs the statements itself."""
 import re
 from typing import List
 
-# The server's user databases that are online, for Test connection and for discovering a whole server. Read through
+# The server's user databases that are online, for the connection test and for discovering a whole server. Read through
 # master; system databases (ids 1 to 4) are left out. Listed by name, not by HAS_DBACCESS: on Azure SQL a session in
 # master can't reach another database, so HAS_DBACCESS there is 0 for every user database. No ORDER BY: the query may
 # be read as a subquery (remote_query), where SQL Server refuses one, so the caller sorts the names instead.
 DATABASES_SQL = "SELECT name FROM sys.databases WHERE database_id > 4 AND state_desc = 'ONLINE'{name}"
 # A name filter as SQL Server's LIKE reads it (% any run of characters, _ any one character, [ ] a set), as typed in
-# Test connection: letters, digits and those marks only, so it can go into the query as a literal.
+# the connection step: letters, digits and those marks only, so it can go into the query as a literal.
 PATTERN = re.compile(r"^[A-Za-z0-9_%\-\[\]\.$#@]{1,128}$")
 
 
@@ -26,6 +28,29 @@ def pattern_errors(pattern: str) -> List[str]:
     if not pattern or PATTERN.match(pattern):
         return []
     return [f"database filter {pattern!r}: use letters, digits and _ % - [ ] . $ # @ only (at most 128)"]
+
+
+# What a failed connection test's message names, so the page can show its code and say what to do. Databricks puts
+# its error class in brackets ([FAILED_JDBC.CONNECTION]); SQL Server's driver gives its message without the error
+# number, so the number is read from the message's own words, or from "Error 18456" where the text carries it.
+ERROR_CLASS = re.compile(r"\[([A-Z][A-Z0-9_]*(?:\.[A-Z0-9_]+)*)\]")
+SQLSTATE = re.compile(r"SQLSTATE:?\s*([0-9A-Z]{5})\b")
+SQL_SERVER_NUMBER = re.compile(r"\b(?:Error|Msg|error number|errorCode)[ :=]*(\d{3,6})\b", re.IGNORECASE)
+SQL_SERVER_MESSAGES = [("Login failed for user", 18456), ("Cannot open database", 4060),
+                       ("is not allowed to access the server", 40615), ("is not currently available", 40613)]
+
+
+def error_codes(message) -> dict:
+    """The codes in a failed connection test's message: Databricks' error class, SQL Server's error number and the
+    SQLSTATE, each None when the message has none."""
+    text = str(message or "")
+    error_class = ERROR_CLASS.search(text)
+    sqlstate = SQLSTATE.search(text)
+    number = SQL_SERVER_NUMBER.search(text)
+    sql_server_error = int(number.group(1)) if number else next(
+        (code for words, code in SQL_SERVER_MESSAGES if words.lower() in text.lower()), None)
+    return {"error_class": error_class.group(1) if error_class else None, "sql_server_error": sql_server_error,
+            "sqlstate": sqlstate.group(1) if sqlstate else None}
 
 
 def databases_sql(pattern: str = "") -> str:

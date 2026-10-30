@@ -2739,7 +2739,7 @@ def start_discovery(body: DiscoverRequest, request: Request):
 
 class SourceDiscoverRequest(BaseModel):
     """A discovery through a Unity Catalog connection, as Add tables' Discover on a source starts it: list the
-    server's databases (Test connection), or read the tables of some databases or of the whole server."""
+    server's databases (the connection test, run by Next on the connection step), or read the tables of some databases or of the whole server."""
     src_connection: str = Field(min_length=1)
     kind: str = Field(default="tables", pattern="^(list|tables)$")
     databases: List[str] = []
@@ -2752,7 +2752,7 @@ class SourceDiscoverRequest(BaseModel):
     azure_credential: str = Field(default="", max_length=255, pattern=r"^[A-Za-z0-9_\-]*$")
     azure_resource_id: str = Field(default="", max_length=512, pattern=r"^(/subscriptions/[0-9A-Za-z-]+/resourceGroups/"
                                    r"[-\w.()]+/providers/Microsoft\.Sql/(servers|managedInstances)/[a-z0-9][a-z0-9-]*)?$")
-    # Reading a whole server through the SQL warehouse: the discovery its Test connection listed, and the filter the
+    # Reading a whole server through the SQL warehouse: the discovery its connection test listed, and the filter the
     # whole-server tick was made under (in the database's name).
     listing_id: str = Field(default="", max_length=64, pattern=r"^[0-9a-f]*$")
     filter: str = Field(default="", max_length=128)
@@ -2793,7 +2793,7 @@ def _listing_answer(discovery_id: str, connection: str, user: Optional[str], ans
         error = answer.get("error") or f"the listing ended {state}"
         db.execute(q.insert_discovery_rows_sql(1),
                    (discovery_id, "sqlserver", connection, SERVER_DATABASE, "failed", error, None, user, listing))
-        return {**base, "state": "FAILED", "error": error}
+        return {**base, "state": "FAILED", "error": error, "codes": source_catalog.error_codes(error)}
     names = sorted({str(r["name"]) for r in answer["rows"] or []}, key=lambda n: (n.lower(), n))
     for at in range(0, len(names), q.CONTROL_BATCH):
         chunk = names[at:at + q.CONTROL_BATCH]
@@ -2899,7 +2899,7 @@ def start_source_discovery(body: SourceDiscoverRequest, request: Request):
         raise HTTPException(422, "listing through Azure takes both a service credential and the server's resource id")
     _require_connection(body.src_connection)
     if body.kind == "list" and warehouse.configured() and not body.azure_credential:
-        # Test connection is the listing: one statement on the warehouse, every database (the filter comes after).
+        # The connection test is the listing: one statement on the warehouse, every database (the filter comes after).
         did = uuid.uuid4().hex[:12]
         statement, parameters = warehouse.remote_query_statement(body.src_connection, SERVER_DATABASE,
                                                                  source_catalog.databases_sql(""))
@@ -2945,7 +2945,9 @@ def discoveries(limit: int = 50):
 
 @app.get("/api/discoveries/{discovery_id}/databases")
 def discovery_databases(discovery_id: str):
-    return db.query(q.discovery_databases_sql(), (discovery_id,))
+    """A discovery's databases; one that failed also carries the codes its error names (source_catalog.error_codes)."""
+    return [{**row, "codes": source_catalog.error_codes(row.get("error"))} if row.get("status") == "failed" else row
+            for row in db.query(q.discovery_databases_sql(), (discovery_id,))]
 
 
 @app.get("/api/discoveries/{discovery_id}/listing")

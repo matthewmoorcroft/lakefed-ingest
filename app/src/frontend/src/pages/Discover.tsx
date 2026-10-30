@@ -5,10 +5,11 @@ import { ErrorBox, Modal, Notice, OutLink, Pager, Tag, Tip, fmtInt, plural, Twis
 import { useSettings } from "../App";
 import { DatabaseTables } from "./SourcePick";
 import { accessOf, countsText, likeContaining, readable, selectionCounts, serverRowPick, underFilter, type Pick, type ServerCount } from "./pickState";
-import { connectionNextBlock, discoveryWait, readsProgress, warehouseReadsState, warehouseRunState, waitingSince, type RunWait } from "../pending";
+import { connectionFailure, connectionNextBlock, connectionNextLabel, discoveryWait, readsProgress, warehouseReadsState, warehouseRunState, waitingSince,
+         type ErrorCodes, type RunWait } from "../pending";
 
 // Add tables, Discover on a source: as Lakeflow Connect's Connection and Source steps. Step 1 is the Unity Catalog
-// connection, tested before anything is discovered; step 2 picks the whole server, whole databases or single tables in
+// connection, tested by Next before anything is discovered; step 2 picks the whole server, whole databases or single tables in
 // a tree, a row chosen in part showing a filled square. The tables found stay in Lakebase (discovered_table): a
 // database's tables are shown a page at a time when it is opened, and what is picked is handed to New and Edit by
 // reference (the discoveries, and the whole server, whole databases or tables chosen), never as the tables themselves.
@@ -32,6 +33,17 @@ function useNow(on: boolean): Date {
   return now;
 }
 
+/** A discovery that failed, with the codes its error names (source_catalog.error_codes) when the backend read any. */
+class SourceError extends Error {
+  codes: ErrorCodes | null;
+  constructor(message: string, codes?: ErrorCodes | null) { super(message); this.codes = codes ?? null; }
+}
+
+/** For an Azure SQL server: a service credential with Reader on it and its resource id, so the discovery job lists the
+ *  databases through Azure instead of master. Both or neither. */
+const azureOf = (credential: string, resource: string): Row => credential.trim() && resource.trim()
+  ? { azure_credential: credential.trim(), azure_resource_id: resource.trim() } : {};
+
 /** A discovery that has ended: its id, whether it ran through the SQL warehouse, and for a whole-server read there how
  *  many databases it left out because the login can't open them. */
 type Discovered = { id: string; via: string; leftOut: number };
@@ -50,7 +62,7 @@ async function discover(connection: string, request: Row, onWait?: (wait: RunWai
     let answer = started;
     for (;;) {
       if (answer.state === "SUCCEEDED") return { id, via: "warehouse", leftOut: Number(started.left_out ?? 0) };
-      if (answer.state === "FAILED" || answer.error) throw new Error(String(answer.error ?? "the listing failed").split("\n")[0]);
+      if (answer.state === "FAILED" || answer.error) throw new SourceError(String(answer.error ?? "the listing failed").split("\n")[0], answer.codes);
       const listing = answer.statement_id != null;
       const next = waitingSince(waiting, listing ? warehouseRunState(answer) : warehouseReadsState(answer), new Date());
       if (next !== waiting) { waiting = next; onWait?.(next); }
@@ -69,7 +81,8 @@ async function discover(connection: string, request: Row, onWait?: (wait: RunWai
       if (run.result && run.result !== "SUCCESS") {
         const rows = await api.get<Row[]>(`/discoveries/${started.discovery_id}/databases`);
         const failed = rows.find((r) => r.status === "failed");
-        throw new Error(failed?.error ? String(failed.error).split("\n")[0] : run.message || `the discovery run ended ${run.result}`);
+        throw new SourceError(failed?.error ? String(failed.error).split("\n")[0] : run.message || `the discovery run ended ${run.result}`,
+                              failed?.codes);
       }
       return { id: String(started.discovery_id), via: "job", leftOut: 0 };
     }
@@ -110,6 +123,19 @@ export function TriBox({ pick, label, onClick }: { pick: Pick; label: string; on
 /** A test that failed because the login can't open master, where SQL Server lists its databases. */
 const cantList = (error: unknown) => /FAILED_JDBC\.CONNECTION|Login failed|Cannot open database|HV000/i.test(String((error as Error)?.message ?? error));
 
+/** A failed connection test: its codes, the source's message and what to do. When the login may not open master, the
+ *  databases can still be typed below, or listed through Azure. */
+function TestFailed({ error }: { error: unknown }) {
+  const failure = connectionFailure(String((error as Error)?.message ?? error), (error as SourceError)?.codes);
+  return <Notice tone="bad">
+    <p><b>The connection failed its test</b>{failure.code && <>: <span className="mono">{failure.code}</span></>}</p>
+    <p className="mono">{failure.message}</p>
+    <p>{failure.hint}</p>
+    {cantList(error) && failure.code !== "SQL Server error 4060" && <p>If the login can't open master, where the server lists its
+      databases, they may still be readable through the connection: type them below. Or give the login a user in master (VIEW ANY
+      DATABASE) and test again. On Azure SQL, Azure can list them instead: see Azure SQL below.</p>}</Notice>;
+}
+
 /** The databases typed by hand, for a login that can't list the server's. */
 function TypedDatabases({ onUse }: { onUse: (names: string[]) => void }) {
   const [text, setText] = useState("");
@@ -125,20 +151,15 @@ function TypedDatabases({ onUse }: { onUse: (names: string[]) => void }) {
   );
 }
 
-function Step1({ chosen, setChosen, tested, setTested, waiting, setWaiting }: { chosen: string; setChosen: (c: string) => void;
-                 tested: Row | null; setTested: (t: Row | null) => void; waiting: string | null;
-                 setWaiting: (wait: DialogWait | null) => void }) {
+function Step1({ chosen, setChosen, tested, setTested, testing, error, setError, azureCredential, setAzureCredential,
+                 azureResource, setAzureResource }: { chosen: string; setChosen: (c: string) => void; tested: Row | null;
+                 setTested: (t: Row | null) => void; testing: boolean; error: unknown; setError: (e: unknown) => void;
+                 azureCredential: string; setAzureCredential: (c: string) => void; azureResource: string;
+                 setAzureResource: (r: string) => void }) {
   const { config } = useSettings();
   const [how, setHow] = useState<"existing" | "create">("existing");
   const [search, setSearch] = useState("");
-  const [testing, setTesting] = useState(false);
-  // For an Azure SQL server: a service credential with Reader on it and its resource id, so the discovery job lists
-  // the databases through Azure instead of master. Both or neither.
-  const [azureCredential, setAzureCredential] = useState("");
-  const [azureResource, setAzureResource] = useState("");
-  const azure: Row = azureCredential.trim() && azureResource.trim()
-    ? { azure_credential: azureCredential.trim(), azure_resource_id: azureResource.trim() } : {};
-  const [error, setError] = useState<unknown>(null);
+  const azure = azureOf(azureCredential, azureResource);
   const qc = useQueryClient();
   const list = useQuery({ queryKey: ["connections"], queryFn: () => api.get<Row>("/connections") });
   const [refreshing, setRefreshing] = useState(false);
@@ -149,21 +170,11 @@ function Step1({ chosen, setChosen, tested, setTested, waiting, setWaiting }: { 
     finally { setRefreshing(false); }
   };
   const found: Row[] = (list.data?.connections ?? []).filter((c: Row) => c.discoverable && c.name.toLowerCase().includes(search.toLowerCase()));
-  const test = async () => {
-    setTesting(true); setError(null); setTested(null);
-    const asked = new Date();
-    const reading = "Reading the server's databases";
-    setWaiting({ wait: null, asked, reading });
-    try {
-      const { id, via } = await discover(chosen, { kind: "list", ...azure }, (wait) => setWaiting({ wait, asked, reading }));
-      const rows = await api.get<Row[]>(`/discoveries/${id}/databases`);
-      setTested({ discovery_id: id, via, databases: rows.filter((r) => r.status === "listed").map((r) => r.src_database), azure });
-    } catch (e) { setError(e); } finally { setTesting(false); setWaiting(null); }
-  };
   return (
     <>
-      <p className="muted">The Unity Catalog connection the tables are read through. It is tested before anything is discovered, so a
-        source that cannot be reached is found here, not in the first run.</p>
+      <p className="muted">The Unity Catalog connection the tables are read through. Next tests it before anything is discovered,
+        listing every database on the server (you filter them on the next step), so a source that cannot be reached is found
+        here, not in the first run.</p>
       <label className="radio-row"><input type="radio" checked={how === "existing"} onChange={() => setHow("existing")} /> Use an existing connection</label>
       {how === "existing" && (
         <div className="radio-body">
@@ -176,7 +187,7 @@ function Step1({ chosen, setChosen, tested, setTested, waiting, setWaiting }: { 
             <thead><tr><th></th><th>Name</th><th>Type</th><th>Host</th><th>Owner</th></tr></thead>
             <tbody>
               {found.map((c) => (
-                <tr key={c.name} className="pick-row" onClick={() => { setChosen(c.name); setTested(null); }}>
+                <tr key={c.name} className="pick-row" onClick={() => { if (!testing) setChosen(c.name); }}>
                   <td><input type="radio" checked={chosen === c.name} readOnly aria-label={`Use ${c.name}`} /></td>
                   <td className="name"><b>{c.name}</b></td><td>{c.connection_type}</td><td className="mono">{c.host}</td><td>{c.owner}</td>
                 </tr>
@@ -186,18 +197,10 @@ function Step1({ chosen, setChosen, tested, setTested, waiting, setWaiting }: { 
                   USE CONNECTION on: the connection's owner grants it in Catalog Explorer, Connections, the connection, Permissions. Then Refresh.</>}</td></tr>}
             </tbody>
           </table></div>
-          <div className="toolbar">
-            <button disabled={!chosen || testing} onClick={test}>{testing ? "Testing…" : "Test connection"}</button>
-            {!testing && !tested && <span className="muted">Lists every database on the server; you filter them on the next step.</span>}
-            {tested && <span><Tag tone="ok">{tested.typed ? "Typed" : "Connected"}</Tag> <span className="muted">{tested.typed ? "uses" : "reads"}{" "}
-              {fmtInt(tested.databases.length)} {plural(tested.databases.length, "database")} through {chosen}</span></span>}
-          </div>
-          {error != null && <Notice tone="bad">The connection failed its test: {String((error as Error).message ?? error)}
-            {cantList(error) && <p>The server's databases are listed from its master database, and this connection's login can't open
-              it, so they can't be listed here. The databases themselves may still be readable through the connection: type them below.
-              Or give the login access to
-              master (a user there with VIEW ANY DATABASE) and test again. On Azure SQL, Azure can list them instead: see
-              Azure SQL below.</p>}</Notice>}
+          {tested && <div className="toolbar"><span><Tag tone="ok">{tested.typed ? "Typed" : "Connected"}</Tag> <span className="muted">
+            {tested.typed ? "uses" : "reads"} {fmtInt(tested.databases.length)} {plural(tested.databases.length, "database")} through {chosen}
+          </span></span></div>}
+          {error != null && <TestFailed error={error} />}
           <details className="advanced">
             <summary><b>Azure SQL</b> <span className="muted">list the databases through Azure instead of master
               {azure.azure_credential ? <>: on, with {azure.azure_credential}</> : ", for a login that can't open master"}</span></summary>
@@ -207,10 +210,10 @@ function Step1({ chosen, setChosen, tested, setTested, waiting, setWaiting }: { 
               and Managed Instance only.</p>
             <div className="toolbar">
               <label className="inline">Service credential<input className="search" placeholder="e.g. sql_reader" value={azureCredential}
-                onChange={(e) => { setAzureCredential(e.target.value); setTested(null); }} /></label>
+                disabled={testing} onChange={(e) => { setAzureCredential(e.target.value); setTested(null); setError(null); }} /></label>
               <label className="inline">Server resource id<input className="search" size={60}
                 placeholder="/subscriptions/…/resourceGroups/…/providers/Microsoft.Sql/servers/…" value={azureResource}
-                onChange={(e) => { setAzureResource(e.target.value); setTested(null); }} /></label>
+                disabled={testing} onChange={(e) => { setAzureResource(e.target.value); setTested(null); setError(null); }} /></label>
             </div>
             {Boolean(azureCredential.trim()) !== Boolean(azureResource.trim()) &&
               <span className="muted">Both are needed; with one, the databases are listed through master.</span>}
@@ -420,6 +423,12 @@ function Step2({ connection, discoveryId, checksOn, typedNames, picks, setPicks,
   );
 }
 
+/** Beside Next after a failed test: that it failed, with its codes; the message and what to do are above. */
+const testFailedNote = (error: unknown) => {
+  const { code } = connectionFailure(String((error as Error)?.message ?? error), (error as SourceError)?.codes);
+  return `The test failed${code ? `: ${code}` : ""}. Next tests it again`;
+};
+
 /** What Discover hands to New and Edit: the discoveries the tables are in, and what of them was chosen (main.Selection). */
 export type DiscoveredPick = { source: Row; label: string };
 
@@ -428,6 +437,10 @@ export function DiscoverDialog({ onClose }: { onClose: (pick: DiscoveredPick | n
   const [step, setStep] = useState<1 | 2 | 3>(1);
   const [connection, setConnection] = useState("");
   const [tested, setTested] = useState<Row | null>(null);
+  const [testing, setTesting] = useState(false);
+  const [testError, setTestError] = useState<unknown>(null);
+  const [azureCredential, setAzureCredential] = useState("");
+  const [azureResource, setAzureResource] = useState("");
   const [picks, setPicks] = useState<Picks>({});
   const [wholeServer, setWholeServer] = useState<WholeServer>({ on: false, filter: "" });
   // The whole server's discovery, read once (under its filter, through Azure if tested so); its databases aren't listed here.
@@ -442,6 +455,23 @@ export function DiscoverDialog({ onClose }: { onClose: (pick: DiscoveredPick | n
   const discoveryId: string | null = tested?.discovery_id ?? null;
   const throughWarehouse = tested?.via === "warehouse";
   const [counts, setCounts] = useState<Counts | null>(null);
+  const choose = (name: string) => { setConnection(name); setTested(null); setTestError(null); };
+  // Next on the connection step: the test (the server's databases listed), then step 2 once it passes. A test that
+  // passed for the connection chosen isn't run again; choosing another clears it.
+  const testThenNext = async () => {
+    if (tested) return setStep(2);
+    const azure = azureOf(azureCredential, azureResource);
+    setTesting(true); setTestError(null);
+    const asked = new Date();
+    const reading = "Reading the server's databases";
+    setWaiting({ wait: null, asked, reading });
+    try {
+      const { id, via } = await discover(connection, { kind: "list", ...azure }, (wait) => setWaiting({ wait, asked, reading }));
+      const rows = await api.get<Row[]>(`/discoveries/${id}/databases`);
+      setTested({ discovery_id: id, via, databases: rows.filter((r) => r.status === "listed").map((r) => r.src_database), azure });
+      setStep(2);
+    } catch (e) { setTestError(e); } finally { setTesting(false); setWaiting(null); }
+  };
   const countsLine = counts ? countsText(counts, counts.listed) : "";
   const typedNames: string[] = discoveryId == null ? (tested?.databases ?? []) : [];
   const whole = Object.keys(picks).filter((d) => picks[d] === "all" && !coveredByServer(wholeServer, d));
@@ -495,20 +525,21 @@ export function DiscoverDialog({ onClose }: { onClose: (pick: DiscoveredPick | n
     } catch (e) { setError(e); setStep(2); } finally { setWaiting(null); }
   };
   const title = step === 1 ? "Add tables · Step 1 of 2: the connection" : `Add tables · Step 2 of 2: choose on ${connection}`;
-  const blocked = step === 1 ? connectionNextBlock(Boolean(tested), waitText)
+  const blocked = step === 1 ? connectionNextBlock(Boolean(connection), Boolean(tested), testing ? waitText ?? "starting" : null)
     : step === 3 ? waitText ?? "Reading the chosen databases' tables" : chosen ? undefined : "Choose the server, databases or tables first";
   return (
-    <Modal title={title} action={step === 1 ? "Next: choose tables" : step === 3 ? "Reading…" : "Add the tables chosen"}
-      actionDisabled={blocked} onClose={(ok) => {
+    <Modal title={title} action={step === 1 ? connectionNextLabel(testing) : step === 3 ? "Reading…" : "Add the tables chosen"}
+      actionDisabled={blocked} actionNote={step === 1 && testError != null ? testFailedNote(testError) : undefined} onClose={(ok) => {
         if (!ok) return onClose(null);
-        if (step === 1) return setStep(2);
+        if (step === 1) return testThenNext();
         finish();
       }}>
       <div className="discover">
         {step === 1 && <p className="muted">Discover is the first choice: it reads the tables through the connection. A CSV upload
           is the fallback, for a list Discover can't find.</p>}
-        {step === 1 && <Step1 chosen={connection} setChosen={setConnection} tested={tested} setTested={setTested}
-          waiting={waitText} setWaiting={setWaiting} />}
+        {step === 1 && <Step1 chosen={connection} setChosen={choose} tested={tested} setTested={setTested} testing={testing}
+          error={testError} setError={setTestError} azureCredential={azureCredential} setAzureCredential={setAzureCredential}
+          azureResource={azureResource} setAzureResource={setAzureResource} />}
         {step >= 2 && <Step2 connection={connection} discoveryId={discoveryId} checksOn={throughWarehouse} typedNames={typedNames}
           picks={picks} setPicks={setPicks} wholeServer={wholeServer} setWholeServer={setWholeServer} read={read} setRead={setRead}
           failed={failed} setFailed={setFailed} onCounts={setCounts} />}

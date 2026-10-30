@@ -45,7 +45,7 @@ def _rows(conn, sql, params=()):
 
 
 def _listed(conn, names):
-    """A new listing of these databases, as Test connection through the warehouse saves it: its discovery id."""
+    """A new listing of these databases, as the connection test through the warehouse saves it: its discovery id."""
     did = uuid.uuid4().hex[:12]
     conn.execute(q.insert_discovery_rows_sql(len(names)),
                  tuple(v for n in names for v in (did, "sqlserver", "sql_a", n, "listed", None, None, "op@example.com", LISTING)))

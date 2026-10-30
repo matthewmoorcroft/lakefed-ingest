@@ -186,3 +186,21 @@ def _order_by_depths(sql):
         elif text.startswith("ORDER BY", position):
             depths.append(depth)
     return depths
+
+
+@pytest.mark.parametrize("message, codes", [
+    ("[FAILED_JDBC.CONNECTION] Failed JDBC jdbc: on the operation: Login failed for user 'reader'. SQLSTATE: HV000",
+     {"error_class": "FAILED_JDBC.CONNECTION", "sql_server_error": 18456, "sqlstate": "HV000"}),
+    ("com.microsoft.sqlserver.jdbc.SQLServerException: Cannot open server 'sql-a' requested by the login. Client with IP "
+     "address '10.0.0.1' is not allowed to access the server.", {"error_class": None, "sql_server_error": 40615, "sqlstate": None}),
+    ("Database 'eng_001' on server 'sql-a' is not currently available. Please retry the connection later.",
+     {"error_class": None, "sql_server_error": 40613, "sqlstate": None}),
+    # A number the text carries wins over the words.
+    ("Msg 18452, Level 14: Login failed for user ''.", {"error_class": None, "sql_server_error": 18452, "sqlstate": None}),
+    ("The TCP/IP connection to the host sql-a, port 1433 has failed. SQLSTATE: 08S01",
+     {"error_class": None, "sql_server_error": None, "sqlstate": "08S01"}),
+    ("", {"error_class": None, "sql_server_error": None, "sqlstate": None}),
+    (None, {"error_class": None, "sql_server_error": None, "sqlstate": None}),
+])
+def test_a_failed_connection_tests_codes_are_read_from_its_message(message, codes):
+    assert catalog.error_codes(message) == codes

@@ -1,4 +1,4 @@
-"""Test connection and the database listing through the SQL warehouse (POST /api/discoveries/source with a warehouse
+"""The connection test and the database listing through the SQL warehouse (POST /api/discoveries/source with a warehouse
 set, then GET /api/discoveries/{id}/warehouse/{statement}), with the warehouse client and the database faked."""
 import json
 
@@ -116,6 +116,17 @@ def test_a_failed_listing_says_why_and_records_it_on_master(client):
     rows = _rows_written(client)
     assert [(r["src_database"], r["status"], r["error"]) for r in rows] == \
         [("master", "failed", "[REMOTE_QUERY] Login failed for user 'x'.")]
+    # The codes it names go with it, for the page to show beside Next.
+    assert body["codes"] == {"error_class": "REMOTE_QUERY", "sql_server_error": 18456, "sqlstate": None}
+
+
+def test_a_failed_database_of_a_discovery_carries_its_codes_and_a_listed_one_none(monkeypatch):
+    monkeypatch.setattr(main.db, "query", lambda sql, params=(): [
+        {"src_database": "master", "status": "failed", "error": "[FAILED_JDBC.CONNECTION] Cannot open database. SQLSTATE: HV000"},
+        {"src_database": "eng_001", "status": "listed", "error": None}])
+    rows = TestClient(main.app).get("/api/discoveries/abc/databases").json()
+    assert rows[0]["codes"] == {"error_class": "FAILED_JDBC.CONNECTION", "sql_server_error": 4060, "sqlstate": "HV000"}
+    assert "codes" not in rows[1]
 
 
 def test_a_server_with_no_user_database_lists_none_and_says_so(client):

@@ -280,12 +280,52 @@ export function discoveryWait(wait: RunWait | null, asked: Date, reading: string
   return `${reading}: ${time}`;
 }
 
-/** Why Next is off on the connection step: it needs a passed connection test, and while the test runs, what it is
- *  doing. Said once, beside Next. Nothing once the test has passed. */
-export function connectionNextBlock(passed: boolean, testing: string | null): string | undefined {
+/** Why Next is off on the connection step, said once beside it: a connection is chosen first, and while Next tests it,
+ *  what the test is doing. Nothing once a connection is chosen: Next tests it, or moves on once a test has passed. */
+export function connectionNextBlock(chosen: boolean, passed: boolean, testing: string | null): string | undefined {
   if (passed) return undefined;
-  if (testing) return `Next needs a passed connection test. Testing now: ${testing}`;
-  return "Next needs a passed connection test: choose a connection, then Test connection";
+  if (testing) return `Testing the connection: ${testing}`;
+  if (!chosen) return "Choose a connection first";
+  return undefined;
+}
+
+/** Next on the connection step: it runs the test itself, as Databricks' connection dialogs do, and reads so meanwhile. */
+export const connectionNextLabel = (testing: boolean) => testing ? "Testing the connection…" : "Next: choose tables";
+
+/** The codes a failed connection test names (the backend reads them from the message: source_catalog.error_codes). */
+export interface ErrorCodes { error_class?: string | null; sql_server_error?: number | null; sqlstate?: string | null }
+
+/** A failed connection test as the step shows it: its codes on one line ("FAILED_JDBC.CONNECTION · SQL Server error
+ *  18456"), the source's message, and what to do next. */
+export interface ConnectionFailure { code: string | null; message: string; hint: string }
+
+const SQL_SERVER_HINTS: Record<number, string> = {
+  18456: "The server refused the connection's login: check its user and password in Catalog Explorer (Connections, the "
+         + "connection, Edit), and that the login exists on the server.",
+  4060: "The login can't open master, where the server lists its databases: type the databases below, or give the login "
+        + "a user in master (VIEW ANY DATABASE) and test again.",
+  40615: "The server's firewall refuses Databricks: allow serverless compute on the server (a network connectivity "
+         + "configuration's private endpoint or firewall rule), then test again.",
+  40613: "The database isn't available right now (a paused serverless database takes a minute or so to resume): test again.",
+};
+const CLASS_HINTS: Record<string, string> = {
+  "FAILED_JDBC.CONNECTION": "Databricks couldn't connect to the server: check the connection's host, port, user and password "
+                            + "in Catalog Explorer, and that serverless compute has a network path to the server.",
+};
+const DEFAULT_HINT = "Check the connection in Catalog Explorer (Connections, the connection), then press Next to test again.";
+
+/** A failed test's codes, message and hint: SQL Server's own error number says most, then Databricks' error class, then
+ *  a SQLSTATE of class 28 (a login refused) or 08 (no connection); else a hint that fits any failure. */
+export function connectionFailure(message: string, codes?: ErrorCodes | null): ConnectionFailure {
+  const number = codes?.sql_server_error ?? null;
+  const errorClass = codes?.error_class ?? null;
+  const state = codes?.sqlstate ?? null;
+  const code = [errorClass, number != null ? `SQL Server error ${number}` : null, state ? `SQLSTATE ${state}` : null]
+    .filter(Boolean).join(" · ");
+  const hint = (number != null ? SQL_SERVER_HINTS[number] : undefined) ?? (errorClass ? CLASS_HINTS[errorClass] : undefined)
+    ?? (state?.startsWith("28") ? SQL_SERVER_HINTS[18456] : undefined)
+    ?? (state?.startsWith("08") ? CLASS_HINTS["FAILED_JDBC.CONNECTION"] : undefined) ?? DEFAULT_HINT;
+  return { code: code || null, message, hint };
 }
 
 /** A warehouse statement's state as the wait reads it: a statement not started yet waits for the warehouse to start

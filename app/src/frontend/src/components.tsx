@@ -506,9 +506,11 @@ export function Notice({ tone = "info", children }: { tone?: "info" | "ok" | "wa
 }
 
 /** A dialog as the Databricks UI asks before a change: a title, what it does, then Cancel and the action at the right,
- * red when it destroys or disables something. Escape, a click outside and Cancel all cancel. */
-export function Modal({ title, action, danger, actionDisabled, onClose, children }: { title: string; action: string;
-                        danger?: boolean; actionDisabled?: string; onClose: (confirmed: boolean) => void; children?: ReactNode }) {
+ * red when it destroys or disables something. Escape, a click outside and Cancel all cancel. Beside the action: why it
+ * is off (actionDisabled), or else a note on what it did last (actionNote, such as a test that failed). */
+export function Modal({ title, action, danger, actionDisabled, actionNote, onClose, children }: { title: string; action: string;
+                        danger?: boolean; actionDisabled?: string; actionNote?: string; onClose: (confirmed: boolean) => void;
+                        children?: ReactNode }) {
   const id = useId();
   const box = useRef<HTMLDivElement>(null);
   const cancel = useRef<HTMLButtonElement>(null);
@@ -539,7 +541,8 @@ export function Modal({ title, action, danger, actionDisabled, onClose, children
         <h2 id={id}>{title}</h2>
         {children && <div className="modal-body">{children}</div>}
         <div className="modal-actions">
-          {actionDisabled && <span className="modal-why muted" role="status">{actionDisabled}</span>}
+          {actionDisabled ? <span className="modal-why muted" role="status">{actionDisabled}</span>
+            : actionNote && <span className="modal-why bad" role="alert">{actionNote}</span>}
           <button ref={cancel} onClick={() => onClose(false)}>Cancel</button>
           <button className={danger ? "danger" : "primary"} disabled={!!actionDisabled} title={actionDisabled}
             onClick={() => onClose(true)}>{action}</button>

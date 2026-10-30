@@ -132,7 +132,7 @@ service principal.
 
 | Step | What runs on the warehouse |
 |---|---|
-| Test connection | one statement in master listing the server's online user databases (`source_catalog.DATABASES_SQL`); the filter works on the next step |
+| The connection test (Next on the connection step) | one statement in master listing the server's online user databases (`source_catalog.DATABASES_SQL`); the filter works on the next step. A failed test shows its codes beside Next (Databricks' error class, SQL Server's error number, the SQLSTATE: `source_catalog.error_codes`), the source's message and what to do; Next moves on only once it passes |
 | The database list | one statement per database (`warehouse_reads.ACCESS_SQL`): opening it is the check, and it counts its tables. The page shown is checked first, then the rest while the step is open. A database the login can't open is greyed out, can't be ticked, and says why on hover; ticking the whole server takes only the others and says how many it left out |
 | Reading the chosen tables | one statement per database (`source_catalog.TABLE_SUMMARY_SQL`, one row per user table), saved to `discovered_table` with the same recommendations as the discovery job |
 
@@ -265,11 +265,11 @@ The app runs as its own service principal (created with the app):
   the grant for any connection it can't see.
 - **Discovery warehouse:** `CAN_USE` on the bundle's `lakefed_ingest discovery` SQL warehouse, through an app
   resource. The statements run as the service principal, which holds `USE CONNECTION` on the connections above.
-- **Azure SQL listing (optional):** for a login that can't open master, Discover's Test connection can have the
+- **Azure SQL listing (optional):** for a login that can't open master, Discover's connection test can have the
   discovery job list an Azure SQL server's (or Managed Instance's) databases through Azure Resource Manager instead.
   It takes a Unity Catalog service credential (Catalog Explorer, External data, Credentials) on an access connector
   whose managed identity has Reader on the server, `ACCESS` on that credential for whoever runs the discovery job,
-  and the server's resource id, both typed under Azure SQL on the Test connection step. The app never calls Azure;
+  and the server's resource id, both typed under Azure SQL on the connection step. The app never calls Azure;
   each listed database is then read through the connection, and one the login can't open fails on its own.
 - **Who can act:** every action on an existing ingestion job follows the signed-in user's own Databricks
   permission on the job its runs execute as (the check job on a check schedule, else the ingestion job), as the

@@ -2,7 +2,7 @@
 // strips the types in pending.ts as it loads it). frontend_pending_test.py runs this file from pytest.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { changeInProgress, connectionNextBlock, deleteNotice, discoveryWait, readsProgress, warehouseReadsState, warehouseRunState, waitingSince, isUnconfirmed, requestWriteNotice, runButton, runTimeoutNotice, rediscoveryBusy, rediscoveryButton, rediscoveryNotice, saveNotice, setupRunBlocks, setupRunNotice, syncFailureLines }
+import { changeInProgress, connectionFailure, connectionNextBlock, connectionNextLabel, deleteNotice, discoveryWait, readsProgress, warehouseReadsState, warehouseRunState, waitingSince, isUnconfirmed, requestWriteNotice, runButton, runTimeoutNotice, rediscoveryBusy, rediscoveryButton, rediscoveryNotice, saveNotice, setupRunBlocks, setupRunNotice, syncFailureLines }
   from "../../src/frontend/src/pending.ts";
 
 const IDLE = { phase: "idle", timed_out: false, run_url: null, blocked: null, refused: null };
@@ -391,15 +391,40 @@ test("times before ten in the morning keep their leading zero, and an hour reads
                "Reading: 61 min 3 s so far, since 09:05");
 });
 
-test("Next on the connection step says it needs a passed test, and what the test is doing while it runs", () => {
-  assert.equal(connectionNextBlock(false, null), "Next needs a passed connection test: choose a connection, then Test connection");
-  assert.equal(connectionNextBlock(false, "Waiting for compute: 5 s so far, since 20:42"),
-               "Next needs a passed connection test. Testing now: Waiting for compute: 5 s so far, since 20:42");
+test("Next on the connection step runs the test itself: off until a connection is chosen, and while the test runs", () => {
+  assert.equal(connectionNextBlock(false, false, null), "Choose a connection first");
+  // Chosen and not tested yet, or after a failed test: Next is on, and pressing it tests.
+  assert.equal(connectionNextBlock(true, false, null), undefined);
+  assert.equal(connectionNextBlock(true, false, "Waiting for compute: 5 s so far, since 20:42"),
+               "Testing the connection: Waiting for compute: 5 s so far, since 20:42");
   // Said once, beside Next, in full: nothing else in the dialog repeats it.
-  assert.equal(connectionNextBlock(false, discoveryWait({ state: "PENDING", since: ASKED }, ASKED, "Reading", LATER)),
-               "Next needs a passed connection test. Testing now: Waiting for compute: 2 min 44 s so far, since 20:42. "
+  assert.equal(connectionNextBlock(true, false, discoveryWait({ state: "PENDING", since: ASKED }, ASKED, "Reading", LATER)),
+               "Testing the connection: Waiting for compute: 2 min 44 s so far, since 20:42. "
                + "The discovery job's compute is starting (its cluster stops after an hour unused), which can take a few minutes");
-  assert.equal(connectionNextBlock(true, null), undefined);
+  assert.equal(connectionNextBlock(true, true, null), undefined);
+  assert.equal(connectionNextLabel(false), "Next: choose tables");
+  assert.equal(connectionNextLabel(true), "Testing the connection…");
+});
+
+test("a failed connection test shows its codes, the source's message and what to do", () => {
+  const login = connectionFailure("[FAILED_JDBC.CONNECTION] Login failed for user 'reader'. SQLSTATE: HV000",
+                                  { error_class: "FAILED_JDBC.CONNECTION", sql_server_error: 18456, sqlstate: "HV000" });
+  assert.equal(login.code, "FAILED_JDBC.CONNECTION · SQL Server error 18456 · SQLSTATE HV000");
+  assert.equal(login.message, "[FAILED_JDBC.CONNECTION] Login failed for user 'reader'. SQLSTATE: HV000");
+  assert.match(login.hint, /refused the connection's login: check its user and password/);
+  // SQL Server's number says more than Databricks' class; the class alone still gets its own hint.
+  assert.match(connectionFailure("x", { error_class: "FAILED_JDBC.CONNECTION", sql_server_error: 40615 }).hint, /firewall/);
+  assert.match(connectionFailure("x", { error_class: "FAILED_JDBC.CONNECTION" }).hint, /host, port, user and password/);
+  assert.match(connectionFailure("x", { sqlstate: "28000" }).hint, /refused the connection's login/);
+  assert.match(connectionFailure("x", { sqlstate: "08S01" }).hint, /network path/);
+});
+
+test("a failed test with no code, such as the app refusing the request, says so plainly and still says what to do", () => {
+  const plain = connectionFailure("the app has no USE CONNECTION on sql_a", null);
+  assert.equal(plain.code, null);
+  assert.equal(plain.hint, "Check the connection in Catalog Explorer (Connections, the connection), then press Next to test again.");
+  assert.equal(connectionFailure("x", { error_class: "SOMETHING_NEW" }).code, "SOMETHING_NEW");
+  assert.equal(connectionFailure("x", { error_class: "SOMETHING_NEW" }).hint, plain.hint);
 });
 
 test("a statement on the SQL warehouse says whether the warehouse is starting or busy, then what it reads", () => {
@@ -411,8 +436,8 @@ test("a statement on the SQL warehouse says whether the warehouse is starting or
                "The SQL warehouse is starting: 2 min 44 s so far, since 20:42. It usually takes a few seconds");
   assert.equal(discoveryWait({ state: "WAREHOUSE_QUEUED", since: ASKED }, ASKED, "Reading the server's databases", LATER),
                "Waiting for the SQL warehouse: 2 min 44 s so far, since 20:42. Other statements are ahead of this one");
-  assert.equal(connectionNextBlock(false, discoveryWait({ state: "WAREHOUSE_STARTING", since: ASKED }, ASKED, "Reading", LATER)),
-               "Next needs a passed connection test. Testing now: The SQL warehouse is starting: 2 min 44 s so far, since 20:42. "
+  assert.equal(connectionNextBlock(true, false, discoveryWait({ state: "WAREHOUSE_STARTING", since: ASKED }, ASKED, "Reading", LATER)),
+               "Testing the connection: The SQL warehouse is starting: 2 min 44 s so far, since 20:42. "
                + "It usually takes a few seconds");
 });
 
