@@ -21,6 +21,14 @@ def row(**over):
     return {**base, **over}
 
 
+def test_a_typed_target_name_keeps_its_text_and_is_refused_under_unity_catalog():
+    typed = dict(SETTINGS, sink_table="Sales 2024")
+    refused = ci.plan_import(CSV, "g1", typed, group_rows=[], unity_catalog=True)
+    assert refused["lines"] == [] and "Unity Catalog refuses" in refused["errors"][0]
+    kept = ci.plan_import(CSV, "g1", typed, group_rows=[])
+    assert kept["errors"] == [] and kept["lines"][0]["row"]["sink_table"] == "Sales 2024"
+
+
 def test_each_line_and_the_groups_settings_make_one_control_row():
     found = ci.plan_import(CSV, "g1", SETTINGS, group_rows=[])
     assert found["errors"] == [] and [line["status"] for line in found["lines"]] == ["valid", "valid"]
@@ -131,6 +139,18 @@ def test_an_exported_group_imports_back_into_the_same_rows():
     assert [{k: line["row"][k] for k in keys} for line in found["lines"]] == [{k: r[k] for k in keys} for r in rows]
     assert [json.loads(line["row"]["client_attrs"]) for line in found["lines"]] == [{"business_unit": "North"},
                                                                                      {"business_unit": "South"}]
+
+
+def test_a_retired_lowercase_setting_is_ignored_on_import_and_an_exported_old_job_imports_back_with_its_names():
+    for sink_schema, sink_table in (("bronze", "orders"), ("Bronze", "Order-Line")):
+        rows = [row(sink_schema=sink_schema, sink_table=sink_table)]
+        text = ci.export_csv(rows)
+        assert "lowercase" not in text.splitlines()[0]
+        plain = ci.plan_import(text, "g1", {}, group_rows=rows)
+        retired = ci.plan_import(text, "g1", {"lowercase": "no"}, group_rows=rows)
+        assert retired["errors"] == [] and retired["lines"] == plain["lines"]
+        assert [(line["row"]["sink_schema"], line["row"]["sink_table"]) for line in retired["lines"]] == [
+            (sink_schema, sink_table)]
 
 
 def test_a_sink_template_is_found_when_a_database_name_is_part_of_the_schema_name():

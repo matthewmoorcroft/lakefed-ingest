@@ -1,4 +1,4 @@
-import type { ReactNode } from "react";
+import { Fragment, type ReactNode } from "react";
 import type { Row } from "../api";
 import { Info, Required, fmtInt, plural } from "../components";
 
@@ -21,8 +21,8 @@ const TAGS_HELP = <>Valid tags: <span className="mono">{TAGS}</span>, with any t
   {" {database}"} can't be used in target names: they would give every database its own table.</>;
 
 /** How it writes: fan-in, the write modes, the freshness target and the target names, in one grid. */
-export function WritesFields({ w, setW, stored, modeNote, targetsNote }: { w: Row; setW: (w: Row) => void; stored?: Row;
-                              modeNote?: ReactNode; targetsNote?: ReactNode }) {
+export function WritesFields({ w, setW, stored, modeNote, targetsNote, reseed }: { w: Row; setW: (w: Row) => void; stored?: Row;
+                              modeNote?: ReactNode; targetsNote?: ReactNode; reseed?: ReactNode }) {
   return (
     <>
       <div className="form-grid">
@@ -41,7 +41,7 @@ export function WritesFields({ w, setW, stored, modeNote, targetsNote }: { w: Ro
         <label><span>Target catalog<Required /></span><input value={w.sink_catalog ?? ""} placeholder="catalog" onChange={(e) => setW({ ...w, sink_catalog: e.target.value })} /><Mixed s={stored?.sink_catalog} /></label>
         <label><span>Target schema<Required /></span><input value={w.sink_schema ?? ""} placeholder="schema" onChange={(e) => setW({ ...w, sink_schema: e.target.value })} /><Mixed s={stored?.sink_schema} /></label>
         <label><span>Target table<Required /><Info label="About target names">{TAGS_HELP}</Info></span><input value={w.sink_table ?? ""} onChange={(e) => setW({ ...w, sink_table: e.target.value })} /><Mixed s={stored?.sink_table} /></label>
-        <label className="checkbox"><input type="checkbox" checked={!!w.lowercase} onChange={(e) => setW({ ...w, lowercase: e.target.checked })} /> Lower-case names</label>
+        {reseed}
       </div>
       {modeNote}
       {targetsNote}
@@ -50,9 +50,11 @@ export function WritesFields({ w, setW, stored, modeNote, targetsNote }: { w: Ro
 }
 
 /** Identity columns: __client_id__ (fan-in only) and any others, each a template filled per database. */
-export function IdentityFields({ w, setW, identity, setIdentity, differing = {}, setDiffering, stored, tables }: {
+export function IdentityFields({ w, setW, identity, setIdentity, differing = {}, setDiffering, stored, tables, newJob, sharedKey }: {
   w: Row; setW: (w: Row) => void; identity: [string, string][]; setIdentity: (i: [string, string][]) => void;
-  differing?: Record<string, string>; setDiffering?: (d: Record<string, string>) => void; stored?: Row; tables?: number }) {
+  differing?: Record<string, string>; setDiffering?: (d: Record<string, string>) => void; stored?: Row; tables?: number;
+  /** New job: the key is the server's template (sharedKey), shown read-only rather than typed. */
+  newJob?: boolean; sharedKey?: string }) {
   return (
     <>
       <table className="data identity">
@@ -61,9 +63,14 @@ export function IdentityFields({ w, setW, identity, setIdentity, differing = {},
           it.</Info></th><th></th></tr></thead>
         <tbody>
           {stored?.identity?.mixed && !Object.keys(differing).length && <tr><td colSpan={3}><Mixed s={stored.identity} /></td></tr>}
-          <tr><td className="mono">__client_id__<Info label="About __client_id__">Keeps each database's rows apart in the shared
-            tables (fan-in only).</Info></td><td><input className="mono" value={w.client_id ?? ""} disabled={w.fan_in === false}
-            onChange={(e) => setW({ ...w, client_id: e.target.value })} /></td><td></td></tr>
+          {newJob ? (
+            <tr><td className="mono">__client_id__</td><td className="help">{w.fan_in === true
+              ? <>filled from the server and database: <span className="mono">{sharedKey}</span></> : "fan-in only"}</td><td></td></tr>
+          ) : (
+            <tr><td className="mono">__client_id__<Info label="About __client_id__">Keeps each database's rows apart in the shared
+              tables (fan-in only).</Info></td><td><input className="mono" value={w.client_id ?? ""} disabled={w.fan_in === false}
+              onChange={(e) => setW({ ...w, client_id: e.target.value })} /></td><td></td></tr>
+          )}
           {Object.entries(differing).map(([name, template]) => (
             <tr key={`differs-${name}`}>
               <td className="mono">{name}</td>
@@ -82,6 +89,9 @@ export function IdentityFields({ w, setW, identity, setIdentity, differing = {},
           ))}
         </tbody>
       </table>
+      {newJob && w.fan_in === true && <p className="help"><span className="info" aria-hidden>ⓘ</span> The server is the UC
+        connection, or the host and port, in lower case. A named instance (host\instance) is refused, and so is a database
+        name with a character the key can't hold, such as a space: Create names the server and database.</p>}
       <div className="toolbar"><button className="ghost" onClick={() => setIdentity([...identity, ["", ""]])}>Add a column</button></div>
     </>
   );
@@ -114,43 +124,64 @@ export const TUNING: Record<string, [string, string]> = {
   trust_server_certificate: ["Trust the server certificate", "Accept the SQL Server's TLS certificate without checking it against a trusted authority."],
   secret_scope: ["Secret scope", "The secret scope holding each database's login, for tables read by host and password."],
   snapshot_isolation: ["Read changes under snapshot isolation", "Needs ALLOW_SNAPSHOT_ISOLATION on every source database."],
-  reseed_on_new_columns: ["Reload when columns are added", "Off: a table that gains columns carries on, the new columns empty for the rows loaded before."],
+  reseed_on_new_columns: ["Reload when columns are added", "A reload copies the table again in full from the source, so a large table takes the time and source load of its first load."],
   append_batch_size: ["Tables per append batch", "Tables appending to the same shared table that are read and written together."],
-  max_seeds_per_run: ["First loads per run", "At most this many first loads in one run; the rest wait for later runs. 0 is no limit."],
+  max_seeds_per_run: ["Most tables to load for the first time in one run", "A new job's tables each need a first full copy. This caps how many one run does; the rest continue in the next runs, while loaded tables keep picking up changes. 0 means all in the first run."],
   freshness_interval_s: ["Freshness interval (seconds)", "An unchanged table's last check is written at most this often. 0 writes it every run."],
   max_queries_per_source: ["Queries per source server", "At most this many queries on one source server at once, across every run. 0 is no limit."],
-  table_retries: ["Retries per table", "Extra attempts at a table after a passing source error. 0 is off."],
+  table_retries: ["Retries per table", "Extra attempts at a table after a transient source error, such as a dropped connection or a timeout. 0 is off."],
   table_retry_budget: ["Retries per run", "Retries in a whole run; once spent, failures fail at once."],
 };
 
+/** The settings only a table read by host and password uses (Spark JDBC with the job's secret scope). A table read through
+ *  a connection uses neither, so New job never shows them and Edit shows them for a job with such a table. */
+const HOST_READ_KEYS = ["trust_server_certificate", "secret_scope"];
+const RETRY_KEYS = ["table_retries", "table_retry_budget"];
+const WRITE_KEYS = ["reseed_on_new_columns"];
+export const HOST_READ_REASON = "Used only by this job's tables read by host and password, not by those read through a connection.";
+
 /** The ingestion job's tuning keys, each showing its value: the Databricks job's default until changed. A value left at
- * the default is not saved, so the job follows the default if it changes; a changed one has Reset beside it. */
-export function ParameterFields({ params, setParams, options }: { params: Record<string, string>;
-                                 setParams: (p: Record<string, string>) => void; options?: Row }) {
+ * the default is not saved, so the job follows the default if it changes; a changed one has Reset beside it. Keys
+ * hidden here keep their stored values in params, which Save sends back as they are. */
+export function ParameterFields({ params, setParams, options, hostReads = false }: { params: Record<string, string>;
+                                 setParams: (p: Record<string, string>) => void; options?: Row; hostReads?: boolean }) {
   // A run with a table still failed at its end is a failed run, with no setting; an old job's stored value is kept.
-  const names: string[] = (options?.parameters ?? []).filter((k: string) => k !== "fail_on_table_errors");
-  const defaults: Record<string, string> = options?.defaults ?? {};
-  const set = (k: string, value: string) => {
-    const next = { ...params };
-    if (value === "" || value === defaults[k]) delete next[k]; else next[k] = value;
-    setParams(next);
-  };
-  const reset = (k: string) => { const next = { ...params }; delete next[k]; setParams(next); };
+  const names: string[] = (options?.parameters ?? []).filter((k: string) => k !== "fail_on_table_errors"
+    && !WRITE_KEYS.includes(k) && (hostReads || !HOST_READ_KEYS.includes(k)));
+  const lastHostKey = names.filter((k) => HOST_READ_KEYS.includes(k)).pop();
   return (
     <div className="form-grid">
-      {names.map((k) => {
-        const [label, about] = TUNING[k] ?? [k.replace(/_/g, " ").replace(/^./, (c) => c.toUpperCase()), ""];
-        const value = params[k] ?? defaults[k] ?? "";
-        const changed = params[k] !== undefined && params[k] !== "";
-        const resetButton = changed && <button className="ghost link reset" onClick={() => reset(k)}
-          title={`Back to the default${defaults[k] ? `, ${defaults[k]}` : ""}`}>Reset</button>;
-        return (options?.flags ?? []).includes(k)
-          ? <label key={k} className="checkbox"><input type="checkbox" checked={value === "true"}
-              onChange={(e) => set(k, e.target.checked ? "true" : "false")} /> {label}
-              {about && <Info label={`About ${label}`}>{about}</Info>}{resetButton}</label>
-          : <label key={k}><span>{label}{about && <Info label={`About ${label}`}>{about}</Info>}{resetButton}</span>
-              <input value={value} onChange={(e) => set(k, e.target.value)} /></label>;
-      })}
+      {names.map((k) => (
+        <Fragment key={k}>
+          {k === RETRY_KEYS[0] && <h4 className="wide">Retries</h4>}
+          <ParameterField name={k} params={params} setParams={setParams} options={options} />
+          {hostReads && k === lastHostKey && <p className="help wide">{HOST_READ_REASON}</p>}
+        </Fragment>
+      ))}
     </div>
   );
+}
+
+/** One tuning key's field. Advanced configuration shows most keys; How it writes shows reseed_on_new_columns. */
+export function ParameterField({ name, params, setParams, options }: { name: string; params: Record<string, string>;
+                                 setParams: (p: Record<string, string>) => void; options?: Row }) {
+  if (!(options?.parameters ?? []).includes(name)) return null;
+  const defaults: Record<string, string> = options?.defaults ?? {};
+  const set = (value: string) => {
+    const next = { ...params };
+    if (value === "" || value === defaults[name]) delete next[name]; else next[name] = value;
+    setParams(next);
+  };
+  const reset = () => { const next = { ...params }; delete next[name]; setParams(next); };
+  const [label, about] = TUNING[name] ?? [name.replace(/_/g, " ").replace(/^./, (c) => c.toUpperCase()), ""];
+  const value = params[name] ?? defaults[name] ?? "";
+  const changed = params[name] !== undefined && params[name] !== "";
+  const resetButton = changed && <button className="ghost link reset" onClick={reset}
+    title={`Back to the default${defaults[name] ? `, ${defaults[name]}` : ""}`}>Reset</button>;
+  return (options?.flags ?? []).includes(name)
+    ? <label className="checkbox"><input type="checkbox" checked={value === "true"}
+        onChange={(e) => set(e.target.checked ? "true" : "false")} /> {label}
+        {about && <Info label={`About ${label}`}>{about}</Info>}{resetButton}</label>
+    : <label><span>{label}{about && <Info label={`About ${label}`}>{about}</Info>}{resetButton}</span>
+        <input value={value} onChange={(e) => set(e.target.value)} /></label>;
 }

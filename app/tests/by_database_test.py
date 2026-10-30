@@ -9,6 +9,7 @@ import time
 import pytest
 
 import by_database as bd
+import job_settings as js
 import new_job as nj
 import queries as q
 
@@ -152,6 +153,27 @@ def test_a_database_is_planned_into_the_group_the_whole_job_gives_it():
     plan = bd.plan_database("Big job", FAN_IN, rows, COLUMNS, {"sql_a": 423}, set(), set())
     assert plan["errors"] == [] and [line["line"] for line in plan["lines"]] == [2, 3, 4]
     assert plan["groups"] == [nj.group_name("Big job", "sql_a", "eng_007", 423)]
+
+
+def test_a_database_of_a_new_job_is_keyed_by_its_server_and_an_existing_job_keeps_the_database_alone():
+    rows = [{"server": "sql_a", "src_database": "eng_007", "src_schema": "gen", "src_table": "t1", "line": 2,
+             "fields": {"src_connection": "sql_a", "src_database": "eng_007", "src_schema": "gen", "src_table": "t1",
+                        "select_list": "id", "primary_key": "id"}}]
+    new = bd.plan_database("Big job", FAN_IN, rows, COLUMNS, {"sql_a": 423}, set(), set(), new_job=True)
+    assert new["lines"][0]["row"]["client_id"] == "sql_a_eng_007"
+    existing = bd.plan_database("Big job", FAN_IN, rows, COLUMNS, {"sql_a": 423}, set(), set())
+    assert existing["lines"][0]["row"]["client_id"] == "eng_007"
+
+
+def test_a_database_is_named_by_unity_catalog_rules_unless_its_job_is_older():
+    rows = [{"server": "sql_a", "src_database": "eng_007", "src_schema": "gen", "src_table": "Order-Lines", "line": 2,
+             "fields": {"src_connection": "sql_a", "src_database": "eng_007", "src_schema": "gen",
+                        "src_table": "Order-Lines", "select_list": "id, a", "primary_key": "id"}}]
+    newer = bd.plan_database("Big job", FAN_IN, rows, COLUMNS, {"sql_a": 1}, set(), set())
+    older = bd.plan_database("Big job", FAN_IN, rows, COLUMNS, {"sql_a": 1}, set(), set(),
+                             unity_catalog=js.unity_catalog_of({}))
+    assert [line["row"]["sink_table"] for line in newer["lines"]] == ["order-lines"]
+    assert [line["row"]["sink_table"] for line in older["lines"]] == ["order_lines"]
 
 
 def test_a_group_another_job_uses_is_refused_unless_the_job_owns_it():
@@ -426,7 +448,7 @@ def _big_client(monkeypatch):
     synced = []
     monkeypatch.setattr(main, "_sync", lambda sid, user: synced.append(sid) or [])
     c = TestClient(main.app, headers={"X-Forwarded-Email": "op@example.com"})
-    c.store, c.tasks, c.synced = store, tasks, synced
+    c.store, c.tasks, c.synced, c.db = store, tasks, synced, fake
     return c
 
 
@@ -439,6 +461,13 @@ def _create(client, request_id="big-1", dry_run=False, groups_per_server=None):
     return client.post("/api/ingestion-jobs", json={"name": "Big job", "settings": FAN_IN, "dry_run": dry_run,
                                                     "request_id": request_id, "groups_per_server": groups_per_server,
                                                     "source": {"upload_id": "u1", "whole_server": True}})
+
+
+def test_a_database_create_stores_unity_catalog_names(big):
+    assert _create(big).status_code == 202
+    big.tasks.run()
+    [schedule] = big.db.of("insert into lakefed_ingest.schedule (")
+    assert json.loads(schedule[8])["target_names"] == "unity_catalog"
 
 
 def test_a_big_create_spreads_its_databases_evenly_over_the_groups_advanced_sets(big):

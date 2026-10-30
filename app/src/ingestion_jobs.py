@@ -5,6 +5,7 @@ group runs of a window, and this module places and sums them, so it is tested wi
 A job run is one trigger of a schedule (schedules.job_runs places group runs by cadence slot). Placement is
 by the schedule as it is now, so it is exact for scheduled runs; a run started by hand inside a slot is an
 extra run, and a cluster start slower than the cadence can land a run in the next slot."""
+import math
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Iterable, List, Optional
 
@@ -103,7 +104,7 @@ def summarize(job: dict, job_run: dict, running_by_run: dict, group_tables: Dict
     work_starts = [_when(r["work_started_at"]) for r in ran if r.get("work_started_at")]
     work_ends = [_when(r["work_finished_at"]) for r in ran if r.get("work_finished_at")]
     loaded = sum(q.loaded_tables(r) for r in ran)
-    running = outcome["label"] == "Running"
+    running = outcome["label"] in q.RUNNING_OUTCOMES
     speed = None
     if work_starts and work_ends and loaded and not running:
         speed = round(loaded / (max((max(work_ends) - min(work_starts)).total_seconds(), 1) / 60), 1)
@@ -172,7 +173,8 @@ def _check_status(check: dict) -> dict:
             "tone": "ok", "note": None}
 
 
-def member_views(job_run: dict, running_by_run: dict, group_tables: Dict[str, int], now: datetime) -> List[dict]:
+def member_views(job_run: dict, running_by_run: dict, group_tables: Dict[str, int], now: datetime,
+                 terminating: Iterable[str] = ()) -> List[dict]:
     """A job run's lines: its checks first, each a line of its own (check: True), then its group runs, one row per
     member: running first, then waiting, then finished. Each with its state, start or planned start, took or
     running for, progress, speed, parallelism, cluster and failed tables; extra runs follow their member."""
@@ -186,6 +188,8 @@ def member_views(job_run: dict, running_by_run: dict, group_tables: Dict[str, in
         for i, run in enumerate([m.get("run")] + list(m.get("extra") or [])):
             if i and not run:
                 continue
+            if run and str(run.get("job_run_id") or "") in terminating:
+                run = dict(run, cancelling=True)
             p = running_by_run.get((run or {}).get("run_id")) if run else None
             if run:
                 status = q.run_outcome(run, p if run.get("status") == "running" else None)
@@ -233,7 +237,8 @@ def status(job: dict, running: Optional[dict], last: Optional[dict], top_cause: 
         parts = [f"{100 * checked // p['total'] if p['total'] else 0}% checked"]
         if failing:
             parts.append(f"{failing:,} {'table' if failing == 1 else 'tables'} failing")
-        return {"label": "Running", "tone": "run", "detail": parts, "expected_end": running.get("expected_end"),
+        return {"label": running["outcome"]["label"], "tone": "run", "detail": parts,
+                "expected_end": running.get("expected_end"),
                 "cause": top_cause if failing else None}
     paused = {"detail": ["paused"], "paused_since": job.get("updated_at")} if job.get("paused") else {"detail": []}
     if failing:
@@ -252,51 +257,61 @@ def status(job: dict, running: Optional[dict], last: Optional[dict], top_cause: 
     return {"label": "Current", "tone": "ok", "detail": [], "cause": None}
 
 
-DELETING, DELETE_FAILED, DELETE_GONE = "deleting", "failed", "gone"
-# A deleted job whose delete job run is not recorded yet is still starting for this long after the delete (the run is
-# recorded as the delete starts); after that, a missing run is a failure to show, not a start to wait for.
-DELETE_STARTING_S = 300
+KEPT, DELETING, DELETE_FAILED, DELETE_GONE = "kept", "deleting", "failed", "gone"
 
 
-def delete_state(job: dict, tables_left: bool, run: Optional[dict], now: datetime) -> dict:
-    """See _delete_state; adds whether the job's Delete drops its target tables, so Run again starts it the same way."""
-    return {**_delete_state(job, tables_left, run, now), "drop_targets": bool(sch.options_of(job).get("delete_drop_targets"))}
+def _aware(value) -> datetime:
+    value = _when(value)
+    return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
 
 
-def _delete_state(job: dict, tables_left: bool, run: Optional[dict], now: datetime) -> dict:
-    """Where a deleted job's Delete stands. ``deleting`` while its delete job runs (or is starting), ``failed`` with
-    the reason when the start or the run failed, ``gone`` once the delete job succeeded and no tables are left: only
-    then does the job leave the Ingestion jobs list. ``run_again`` says whether the Delete can be run again (only
-    while tables remain: a drop that failed after the rows were removed has nothing left to delete again)."""
-    start_error = sch.options_of(job).get("delete_start_error")
-    if start_error:
-        return {"state": DELETE_FAILED, "reason": start_error, "run_again": True, "run": None}
+def expires_at(deleted_at, retention_days: int) -> datetime:
+    """When a deleted job's retention runs out: the purge deletes it from then on."""
+    return _aware(deleted_at) + timedelta(days=retention_days)
+
+
+def days_left(deleted_at, retention_days: int, now: datetime) -> int:
+    """Whole days until the retention runs out, rounded up; 0 once it has (the daily purge takes the job then)."""
+    return max(0, math.ceil((expires_at(deleted_at, retention_days) - now).total_seconds() / 86400))
+
+
+def delete_state(job: dict, tables_left: bool, run: Optional[dict], now: datetime, retention_days: int) -> dict:
+    """Where a deleted job stands. ``kept`` until its purge starts (the daily purge takes it once the retention has run
+    out, Delete now at once), with the days left. ``deleting`` while its delete job run goes, ``failed`` with the reason
+    when a start or a run failed. ``gone`` once the purge finished: the list leaves the job. A run that finished with
+    tables still there is a failure, since the purge should have removed them. ``run`` is the job's latest delete job
+    run, None when none has started."""
+    options = sch.options_of(job)
+    state = {"drop_targets": bool(options.get("delete_drop_targets")), "run": run,
+             "expires_at": expires_at(job["deleted_at"], retention_days).isoformat(),
+             "days_left": days_left(job["deleted_at"], retention_days, now)}
+    if options.get("delete_start_error"):
+        return {**state, "state": DELETE_FAILED, "reason": options["delete_start_error"], "run": None}
     if run is None:
-        if not tables_left:
-            return {"state": DELETE_GONE, "reason": None, "run_again": False, "run": None}
-        deleted_at = _when(job.get("deleted_at"))
-        if deleted_at.tzinfo is None:
-            deleted_at = deleted_at.replace(tzinfo=timezone.utc)
-        if now - deleted_at < timedelta(seconds=DELETE_STARTING_S):
-            return {"state": DELETING, "reason": None, "run_again": False, "run": None}
-        return {"state": DELETE_FAILED, "reason": "its delete job run was never recorded", "run_again": True, "run": None}
+        return {**state, "state": KEPT, "reason": None}
     if is_active(run):
-        return {"state": DELETING, "reason": None, "run_again": False, "run": run}
+        return {**state, "state": DELETING, "reason": None}
     if run.get("state") == "TERMINATED" and run.get("result") == "SUCCESS":
         if tables_left:
-            return {"state": DELETE_FAILED, "reason": "the delete job finished, but tables are still there",
-                    "run_again": True, "run": run}
-        return {"state": DELETE_GONE, "reason": None, "run_again": False, "run": run}
+            return {**state, "state": DELETE_FAILED, "reason": "the delete job finished, but tables are still there"}
+        return {**state, "state": DELETE_GONE, "reason": None}
     how = run.get("result") or run.get("state") or "without a result"
-    reason = run.get("message") or f"the delete job ended {how}"
-    return {"state": DELETE_FAILED, "reason": reason, "run_again": tables_left, "run": run}
+    return {**state, "state": DELETE_FAILED, "reason": run.get("message") or f"the delete job ended {how}"}
+
+
+def kept_text(days: int) -> str:
+    """How long a kept deleted job has left, in words for a status cell."""
+    if days <= 0:
+        return "due for purge"
+    return f"{days} {'day' if days == 1 else 'days'} left"
 
 
 def delete_status(delete: dict) -> dict:
-    """A deleted job's Status cell while its Delete is pending or failed."""
+    """A deleted job's Status cell: kept (Deleted, with the days left), its delete job running, or its delete failed."""
+    if delete["state"] == KEPT:
+        return {"label": "Deleted", "tone": "neutral", "detail": [kept_text(delete["days_left"])], "cause": None}
     if delete["state"] == DELETING:
-        starting = "starting its delete job" if delete.get("run") is None else "its delete job is running"
-        return {"label": "Deleting", "tone": "run", "detail": [starting], "cause": None}
+        return {"label": "Deleting", "tone": "run", "detail": ["its delete job is running"], "cause": None}
     return {"label": "Delete failed", "tone": "bad", "detail": [delete["reason"]] if delete.get("reason") else [],
             "cause": None}
 
@@ -304,7 +319,7 @@ def delete_status(delete: dict) -> dict:
 def last_finished(summaries: List[dict]) -> Optional[dict]:
     """A job's last finished job run (newest first): the newest one that ran. A trigger that did not run (a paused
     job's, say) is never it; None when none of them ran."""
-    return next((s for s in summaries if s["outcome"]["label"] not in ("Running", "Not run")), None)
+    return next((s for s in summaries if s["outcome"]["label"] not in (*q.RUNNING_OUTCOMES, "Not run")), None)
 
 
 def newest_slots(runs: List[dict], job: dict, members: List[dict]) -> List[datetime]:
@@ -329,12 +344,18 @@ def consecutive_failed(summaries: List[dict]) -> int:
     did not run (Not run) are passed over, as they say nothing about the tables."""
     count = 0
     for s in summaries:
-        if s["outcome"]["label"] in ("Running", "Not run"):
+        if s["outcome"]["label"] in (*q.RUNNING_OUTCOMES, "Not run"):
             continue
         if not s["failed_tables"]:
             break
         count += 1
     return count
+
+
+def needs_attention(job: dict) -> bool:
+    """Whether a job needs a look: tables failing now, or its last ingestion run ended without finishing."""
+    last = job["last_job_run"]
+    return bool(job["state_failing"]) or bool(last and last["outcome"]["label"] == "Ended without finishing")
 
 
 def jobs_view(schedules: List[dict], members: List[dict], states: List[dict], running: List[dict],
@@ -366,7 +387,7 @@ def jobs_view(schedules: List[dict], members: List[dict], states: List[dict], ru
             start = min(start, min(oldest_running) - timedelta(minutes=cadence))
         placed = current_and_past(s, members, runs, start, now)     # removed members keep their past job runs
         summaries = [summarize(s, jr, running_by_run, group_tables, p50_by_group, now) for jr in placed]
-        current = next((x for x in summaries if x["outcome"]["label"] == "Running"), None)
+        current = next((x for x in summaries if x["outcome"]["label"] in q.RUNNING_OUTCOMES), None)
         last = last_finished(summaries) or earlier_last_by_job.get(s["id"])
         mine = [m for m in active if m["schedule_id"] == s["id"]]
         causes = causes_by_job.get(s["id"]) or []
@@ -383,11 +404,10 @@ def jobs_view(schedules: List[dict], members: List[dict], states: List[dict], ru
         if s.get("delete"):
             row.update(status=delete_status(s["delete"]), next_start=None, delete=s["delete"])
         rows.append(row)
-        running_job_runs += [x for x in summaries if x["outcome"]["label"] == "Running"]
+        running_job_runs += [x for x in summaries if x["outcome"]["label"] in q.RUNNING_OUTCOMES]
     rows.sort(key=lambda j: (-1 if j["running_job_run"] and j["state_failing"] else 0 if j["state_failing"] else
                              1 if j["late_databases"] else 2, str(j["name"]).lower()))
-    attention = [j for j in rows if j["state_failing"]
-                 or (j["last_job_run"] and j["last_job_run"]["outcome"]["label"] == "Ended without finishing")]
+    attention = [j for j in rows if needs_attention(j)]
     attention.sort(key=lambda j: (-q._count(j, "state_failing"), str(j["name"]).lower()))
     running_job_runs.sort(key=lambda r: r.get("started_at") or r["slot"])
     totals = {**{k: sum(q._count(g, k) for g in groups.values())
@@ -505,7 +525,9 @@ def run_state_label(run: dict) -> dict:
         return {"label": "Queued", "tone": ""}
     if state == "PENDING":
         return {"label": "Starting", "tone": "run", "note": "its cluster is starting"}
-    if state in ("RUNNING", "TERMINATING"):
+    if state == "TERMINATING":
+        return {"label": "Cancelling", "tone": "run"}
+    if state == "RUNNING":
         return {"label": "Running", "tone": "run"}
     if result == "SUCCESS":
         return {"label": "Succeeded", "tone": "ok"}

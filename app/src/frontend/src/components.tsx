@@ -19,6 +19,9 @@ const theme = gridTheme;
 
 /** The element's current width in pixels, kept up to date as the window resizes. A callback ref, so it also
  * measures elements that appear later (after data loads). */
+// A job run the server reports as live: running, or cancelling until the run it cancelled has closed.
+export const isLiveOutcome = (label: string | undefined) => label === "Running" || label === "Cancelling";
+
 export function useWidth<T extends HTMLElement>(): [(element: T | null) => void, number] {
   const [element, setElement] = useState<T | null>(null);
   const [width, setWidth] = useState(0);
@@ -392,14 +395,57 @@ function Segments({ parts, total, big }: { parts: BarPart[]; total: number; big?
   );
 }
 
-/** Each state now as one bar, with its counts written under it. full: a card's bar, every state counted. */
-export function StateBar({ row, full }: { row: StateCounts; full?: boolean }) {
+/** Each state now as one bar, with its counts written under it. full: a card's bar, every state counted. saysAllDone false
+ * keeps "All N loaded" out (the jobs lists count "N of N loaded" instead). */
+export function StateBar({ row, full, saysAllDone = true }: { row: StateCounts; full?: boolean; saysAllDone?: boolean }) {
   const { parts } = stateParts(row);
   return (
     <div className="state-bar">
       <Segments parts={parts} total={parts.reduce((a, p) => a + p.count, 0)} big={full} />
-      <BarCountsLine summary={stateSummary(row, full)} stacked={full} />
+      <BarCountsLine summary={stateSummary(row, full, saysAllDone)} stacked={full} />
     </div>
+  );
+}
+
+/** A count split into states: one bar, and under it a legend of the counts that are not zero. legend false leaves the
+ * legend out when the bar and the headline already say it; note is a line in its place. links name a state's words. */
+export function CountBar({ parts, links = {}, legend = true, note, whole }: { parts: BarPart[]; links?: Record<string, string>;
+                           legend?: boolean; note?: ReactNode; whole?: number }) {
+  const total = Math.max(whole ?? 0, parts.reduce((sum, part) => sum + part.count, 0));
+  return (
+    <div className="summary">
+      <Segments parts={parts} total={total} />
+      {(legend || note) && <div className="key">
+        {legend && parts.filter((part) => part.count > 0).map((part) => (
+          <span key={part.tone}><i className={`seg-${part.tone}`} /><b>{fmtInt(part.count)}</b>{" "}
+            {links[part.tone] ? <Link to={links[part.tone]}>{part.word}</Link> : part.word}</span>))}
+        {note}
+      </div>}
+    </div>
+  );
+}
+
+/** A card's tables by state: the total, one bar and a legend of the counts that are not all loaded. A late table counts
+ * as loaded. Once every table is loaded the legend is left out, as the total and the full bar say it; looksGood writes
+ * "Looks good" in its place, and lateDatabases adds the late databases beneath, when there are any. */
+export function StateSummary({ row, links = {}, looksGood, lateDatabases }: { row: StateCounts; links?: Record<string, string>;
+                               looksGood?: boolean; lateDatabases?: boolean }) {
+  const parts: BarPart[] = [
+    { count: Number(row.state_loaded ?? row.state_current ?? 0) + Number(row.state_late ?? 0), word: "loaded", tone: "loaded" },
+    { count: Number(row.state_first_load ?? 0), word: "waiting for a first load", tone: "waiting" },
+    { count: Number(row.state_failing ?? 0), word: "failing", tone: "failing" },
+  ];
+  const total = parts.reduce((sum, part) => sum + part.count, 0);
+  if (!total) return <div className="metric-value muted">No tables yet</div>;
+  const allLoaded = parts[1].count === 0 && parts[2].count === 0;
+  const late = Number(row.late_databases ?? 0);
+  return (
+    <>
+      <div className="metric-value">{fmtInt(total)}<small>{plural(total, "table")}</small></div>
+      <CountBar parts={parts} links={links} legend={!allLoaded}
+        note={allLoaded && looksGood ? <span className="all-done"><Check /> Looks good</span> : undefined} />
+      {lateDatabases && late > 0 && <div className="metric-sub">{fmtInt(late)} late {plural(late, "database")}</div>}
+    </>
   );
 }
 
@@ -432,6 +478,17 @@ export function ProgressBar({ p, big }: { p: Progress; big?: boolean }) {
       <Segments parts={parts} total={Math.max(p.total, parts.reduce((a, part) => a + part.count, 0))} big={big} />
       {!big && <BarCountsLine summary={progressSummary(p)} />}
     </div>
+  );
+}
+
+/** A run's tables for a running-now row: the count, then one bar with the states done, in flight and failed. The empty
+ * part of the bar is still to go, so the legend leaves it out. */
+export function RunBar({ p }: { p: Progress }) {
+  return (
+    <>
+      <div className="count"><b>{fmtInt(p.total)}</b> {plural(p.total, "table")}</div>
+      <CountBar parts={progressParts(p).filter((part) => part.tone !== "notrun")} whole={p.total} />
+    </>
   );
 }
 
@@ -527,6 +584,11 @@ export function ErrorBox({ error }: { error: unknown }) {
     <div className="alert bad">
       <strong>Error:</strong> {e.message ?? String(error)}
       {e.hint && <div className="hint">{e.hint}</div>}
+      {Array.isArray(e.detail?.jobs) && e.detail.jobs.map((job: Row) => (
+        <div className="hint" key={job.id}>
+          Open ingestion job <Link to={`/ingestion-jobs/${job.id}`}>{job.name}</Link>
+        </div>
+      ))}
     </div>
   );
 }

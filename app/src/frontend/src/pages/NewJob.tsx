@@ -3,7 +3,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "react-router-dom";
 import { api, type Row } from "../api";
 import { Busy, StatusLine, Crumbs, ErrorBox, Info, Menu, Modal, Notice, PageHead, Section, Twisty, fmtInt, plural, useConfirm, Chevron } from "../components";
-import { CADENCES, IdentityFields, ParameterFields, RunFields, WritesFields } from "./jobForm";
+import { CADENCES, IdentityFields, ParameterField, ParameterFields, RunFields, WritesFields } from "./jobForm";
 import { DiscoverDialog, discardDrafts } from "./Discover";
 import { serverRowCells, targetBlock } from "./previewRows";
 import { ClusterFields, TablesPerGroup, ownCluster } from "./JobEdit";
@@ -27,6 +27,8 @@ const CSV_EXAMPLE = "src_database,src_schema,src_table,select_list,primary_key\n
 // One line per table, and one per database: every table of a database line is found by name when the job is created.
 const CSV_TEMPLATE = "src_database,src_schema,src_table,select_list,primary_key,cursor_column,client_id,load_type\n"
   + "sales_01,dbo,orders,\"id, amount\",id,,,ct\n" + "sales_02,,,,,,,\n";
+// How many of the file's first lines the import's preview shows, under its header.
+const PREVIEW_LINES = 5;
 
 /** Tables chosen by reference: what Create sends as its source, and how the page names it. Chosen by Discover through
  *  the SQL warehouse, their reads may still be going (drafts): the preview keeps them going, Create waits for them, and
@@ -65,10 +67,11 @@ export default function NewJob() {
   const [requestId, setRequestId] = useState(newRequestId);
   const [task, setTask] = useState<Row | null>(null);
   const [loadType, setLoadType] = useState("ct");
+  // A null client_id or identity is sent as null: the server gives a new fan-in job its key and readable columns.
   const [w, setW] = useState<Row>({ fan_in: false, write_mode_changes: "merge", write_mode_full: "merge", sink_catalog: "",
-                                    sink_schema: "", sink_table: "{table}", lowercase: true, client_id: "{database}",
+                                    sink_schema: "", sink_table: "{table}", client_id: null,
                                     freshness_sla_minutes: "" });
-  const [identity, setIdentity] = useState<[string, string][]>([]);
+  const [identity, setIdentity] = useState<[string, string][] | null>(null);
   const [run, setRun] = useState<Row>({ cadence_minutes: 60, start: "00:00", timezone: "Europe/London", paused: true, notify_emails: "" });
   const [params, setParams] = useState<Record<string, string>>({});
   // Unchanged, the job follows the default size (null); the field shows that default.
@@ -83,6 +86,9 @@ export default function NewJob() {
   const variants: string[] = options.data?.variants ?? [];
   // Runs start through the check job where there is one, as every job has been set up; there is no choice on the page.
   const jobVariant = variants.includes("check") ? "check" : "default";
+  // Until the user changes the columns, a fan-in job shows the server's readable columns and sends none of its own.
+  const sharedIdentity = Object.entries(options.data?.shared_identity ?? {}) as [string, string][];
+  const identityRows = identity ?? (w.fan_in === true ? sharedIdentity : []);
 
   const body = (dryRun: boolean) => {
     const cadence = Number(run.cadence_minutes);
@@ -91,7 +97,7 @@ export default function NewJob() {
       name: name.trim(), source: chosen?.source, ...(tablesPerGroup ? { tables_per_group: tablesPerGroup } : {}), dry_run: dryRun,
       request_id: requestId,
       settings: { ...w, load_type: loadType, freshness_sla_minutes: w.freshness_sla_minutes === "" ? null : Number(w.freshness_sla_minutes),
-                  identity: Object.fromEntries(identity.filter(([n, t]) => n.trim() && t.trim()).map(([n, t]) => [n.trim(), t.trim()])) },
+                  identity: identity === null ? null : Object.fromEntries(identity.filter(([n, t]) => n.trim() && t.trim()).map(([n, t]) => [n.trim(), t.trim()])) },
       run: { cadence_minutes: cadence, timezone: cadence <= 60 ? "UTC" : run.timezone || "Europe/London", paused: run.paused,
              notify_emails: run.notify_emails || null, job_variant: jobVariant,
              options: { ...(cadence > 60 ? { start_minute: (h || 0) * 60 + (m || 0) } : {}), ...(own ? { cluster: own } : {}) },
@@ -153,11 +159,17 @@ export default function NewJob() {
       .then((ok) => ok && navigate("/ingestion-jobs"));
   };
 
+  // The two ways to add tables: the Add tables menu and the empty state both offer them.
+  const addTableChoices = (<>
+    <button onClick={() => setDiscovering(true)}>Discover on a source</button>
+    <button onClick={() => setImporting(true)}>Import a CSV</button>
+  </>);
+
   return (
     <>
       <PageHead crumb={<Crumbs steps={[["Ingestion jobs", "/ingestion-jobs"], ["New"]]} />} tab="New ingestion job"
         title={<span className="title-edit-row">
-          <input className="title-edit" aria-label="Job name" value={name} onChange={(e) => setName(e.target.value)}
+          <input className="title-edit" aria-label="Job name" value={name} readOnly={create.isPending} onChange={(e) => setName(e.target.value)}
             onBlur={() => { if (!name.trim()) setName(defaultName); }} />
           {taken && name !== defaultName && <span className="title-note">Another job uses this name</span>}</span>}
         lead={summary ? <><strong>{fmtInt(summary.tables)}</strong> {plural(summary.tables, "table")} in{" "}
@@ -165,7 +177,7 @@ export default function NewJob() {
           : discoveringDatabases !== null ? "Reading tables…"
           : "No tables yet: add them in What it ingests."}
         right={<span className="card-actions">
-          <button onClick={cancel}>Cancel</button>
+          <button onClick={cancel} disabled={create.isPending}>Cancel</button>
           <button className="primary" disabled={!!blocked || create.isPending} title={blocked ?? undefined}
             onClick={() => create.mutate(body(false))}>{create.isPending ? "Creating…" : "Create"}</button></span>} />
       {confirm.dialog}
@@ -176,67 +188,71 @@ export default function NewJob() {
         : <ErrorBox error={isUnconfirmed(create.error) ? null : create.error} />}
       {create.data && !create.data.created && <Notice tone="warn">Not created: fix the invalid lines below first.</Notice>}
 
-      <Section title="What it ingests"
-        actions={<Menu label={<>Add tables <Chevron open /></>} buttonClass="ghost" title="Add tables">
-          <button onClick={() => setDiscovering(true)}>Discover on a source</button>
-          <button onClick={() => setImporting(true)}>Import a CSV</button>
-        </Menu>}>
-        {!chosen ? <p className="empty-drop">No tables yet. Add them with <b>Add tables</b>.</p> : (
-          <>
-            <p className="muted">From {chosen.label}.</p>
-            {readProgress && <Busy label="Reading tables" {...readProgress} />}
-            {draftCreateBlock(reading) && <Notice tone="bad">{draftCreateBlock(reading)}:<ul>
-              {(reading?.failed_databases ?? []).slice(0, 20).map(([d, why]: [string, string]) => <li key={d}><b>{d}</b>: {why}</li>)}</ul></Notice>}
-            {Number(reading?.left_out) > 0 && <p className="muted">The whole server leaves out {fmtInt(reading.left_out)}{" "}
-              {plural(reading.left_out, "database")} the connection's login can't open.</p>}
-            {discoveringDatabases !== null && <Busy label="Reading tables" />}
-            <div className="table-wrap"><table className="data tree">
-              <thead><tr><th>Server › database › table</th><th>Read through · load type</th><th className="num">Databases · tables</th></tr></thead>
-              <tbody>
-                {(Array.isArray(summary?.servers) ? summary.servers : []).map((s: Row) => {
-                  const cells = serverRowCells(s, LOAD_TYPES);
-                  const open = openServer === cells.server;
-                  return <Fragment key={cells.server}>
-                    <tr><td className="name"><Twisty open={open} onToggle={() => setOpenServer(open ? null : cells.server)}><b>{cells.server}</b></Twisty></td>
-                      <td>{cells.readThrough} · {cells.loadTypes}</td>
-                      <td className="num"><span className="row-end">{cells.counts}
-                        <button className="ghost icon remove" aria-label="Remove the tables" title="Remove the tables" onClick={removeTables}>×</button></span></td></tr>
-                    {open && <ChosenDatabases source={chosen.source} server={cells.server} />}
-                  </Fragment>;
-                })}
-              </tbody>
-            </table></div>
-            {summary && Number(summary.discovered) > 0 && <p className="muted">{fmtInt(summary.discovered)} {plural(summary.discovered, "table")}
-              found by name for the file's database lines{Number(summary.covered) > 0
-                ? `; ${fmtInt(summary.covered)} the file names in a row of its own, whose settings are used` : ""}.</p>}
-            {(summary?.invalid ?? []).length > 0 && <Notice tone="bad">{fmtInt(summary!.invalid.length)} {plural(summary!.invalid.length, "line")} can't be
-              added:<ul>{summary!.invalid.slice(0, 20).map((l: Row) => <li key={l.line}>line {l.line}, {l.table}: {l.errors.join("; ")}</li>)}</ul>
-              {summary!.invalid.length > 20 && <span className="muted">and {fmtInt(summary!.invalid.length - 20)} more.</span>}</Notice>}
-            <ErrorBox error={preview.error} />
-          </>
-        )}
-      </Section>
-      {discovering && <DiscoverDialog drafts onClose={(pick) => { setDiscovering(false); if (pick) setChosen(pick); }} />}
-      {importing && <ImportCsvDialog loadType={loadType} onClose={(next) => {
-        setImporting(false); if (next) { setChosen(next); setLoadType(next.loadType); } }} />}
+      <fieldset className="create-lock" disabled={create.isPending}>
+        <Section title="What it ingests"
+          actions={<Menu label={<>Add tables <Chevron open /></>} buttonClass="ghost" title="Add tables">{addTableChoices}</Menu>}>
+          {!chosen ? <div className="empty-drop">
+            <p>No tables yet. Add them with <b>Add tables</b>.</p>
+            <div className="empty-choices">{addTableChoices}</div>
+          </div> : (
+            <>
+              <p className="muted">From {chosen.label}.</p>
+              {readProgress && <Busy label="Reading tables" {...readProgress} />}
+              {draftCreateBlock(reading) && <Notice tone="bad">{draftCreateBlock(reading)}:<ul>
+                {(reading?.failed_databases ?? []).slice(0, 20).map(([d, why]: [string, string]) => <li key={d}><b>{d}</b>: {why}</li>)}</ul></Notice>}
+              {Number(reading?.left_out) > 0 && <p className="muted">The whole server leaves out {fmtInt(reading.left_out)}{" "}
+                {plural(reading.left_out, "database")} the connection's login can't open.</p>}
+              {discoveringDatabases !== null && <Busy label="Reading tables" />}
+              <div className="table-wrap"><table className="data tree">
+                <thead><tr><th>Server › database › table</th><th>Read through · load type</th><th className="num">Databases · tables</th></tr></thead>
+                <tbody>
+                  {(Array.isArray(summary?.servers) ? summary.servers : []).map((s: Row) => {
+                    const cells = serverRowCells(s, LOAD_TYPES);
+                    const open = openServer === cells.server;
+                    return <Fragment key={cells.server}>
+                      <tr><td className="name"><Twisty open={open} onToggle={() => setOpenServer(open ? null : cells.server)}><b>{cells.server}</b></Twisty></td>
+                        <td>{cells.readThrough} · {cells.loadTypes}</td>
+                        <td className="num"><span className="row-end">{cells.counts}
+                          <button className="ghost icon remove" aria-label="Remove the tables" title="Remove the tables" onClick={removeTables}>×</button></span></td></tr>
+                      {open && <ChosenDatabases source={chosen.source} server={cells.server} />}
+                    </Fragment>;
+                  })}
+                </tbody>
+              </table></div>
+              {summary && Number(summary.discovered) > 0 && <p className="muted">{fmtInt(summary.discovered)} {plural(summary.discovered, "table")}
+                found by name for the file's database lines{Number(summary.covered) > 0
+                  ? `; ${fmtInt(summary.covered)} the file names in a row of its own, whose settings are used` : ""}.</p>}
+              {(summary?.invalid ?? []).length > 0 && <Notice tone="bad">{fmtInt(summary!.invalid.length)} {plural(summary!.invalid.length, "line")} can't be
+                added:<ul>{summary!.invalid.slice(0, 20).map((l: Row) => <li key={l.line}>line {l.line}, {l.table}: {l.errors.join("; ")}</li>)}</ul>
+                {summary!.invalid.length > 20 && <span className="muted">and {fmtInt(summary!.invalid.length - 20)} more.</span>}</Notice>}
+              <ErrorBox error={preview.error} />
+            </>
+          )}
+        </Section>
+        {discovering && <DiscoverDialog drafts onClose={(pick) => { setDiscovering(false); if (pick) setChosen(pick); }} />}
+        {importing && <ImportCsvDialog loadType={loadType} onClose={(next) => {
+          setImporting(false); if (next) { setChosen(next); setLoadType(next.loadType); } }} />}
 
-      <Section title="How it writes"><WritesFields w={w} setW={setW} /></Section>
-      <Section title={<>Identity columns<Info label="About identity columns">Written on every row next to __client_id__, so the shared
-        tables say whose rows they are.</Info></>}>
-        <IdentityFields w={w} setW={setW} identity={identity} setIdentity={setIdentity} />
-      </Section>
-      <Section title="When it runs" note="A new job starts paused: resume it from its page once you have checked it.">
-        <RunFields run={run} setRun={setRun} cadences={options.data?.cadences ?? CADENCES} />
-      </Section>
+        <Section title="How it writes"><WritesFields w={w} setW={setW}
+          reseed={<ParameterField name="reseed_on_new_columns" params={params} setParams={setParams} options={options.data} />} /></Section>
+        <Section title={<>Identity columns<Info label="About identity columns">Written on every row next to __client_id__, so the shared
+          tables say whose rows they are.</Info></>}>
+          <IdentityFields w={w} setW={setW} identity={identityRows} setIdentity={setIdentity} newJob
+                          sharedKey={options.data?.shared_client_id} />
+        </Section>
+        <Section title="When it runs" note="A new job starts paused: resume it from its page once you have checked it.">
+          <RunFields run={run} setRun={setRun} cadences={options.data?.cadences ?? CADENCES} />
+        </Section>
 
-      <details className="card advanced">
-        <summary><b>Advanced configuration</b></summary>
-        <h3>Compute</h3>
-        <div className="form-grid"><TablesPerGroup value={tablesPerGroup} onChange={setTablesPerGroup} /></div>
-        <ClusterFields info={clusterInfo.data} error={clusterInfo.error} cluster={cluster} setCluster={setCluster} locked={null} after="Create" />
-        <h3>Tuning</h3>
-        <ParameterFields params={params} setParams={setParams} options={options.data} />
-      </details>
+        <details className="card advanced">
+          <summary><b>Advanced configuration</b></summary>
+          <h3>Compute</h3>
+          <div className="form-grid"><TablesPerGroup value={tablesPerGroup} onChange={setTablesPerGroup} /></div>
+          <ClusterFields info={clusterInfo.data} error={clusterInfo.error} cluster={cluster} setCluster={setCluster} locked={null} after="Create" />
+          <h3>Tuning</h3>
+          <ParameterFields params={params} setParams={setParams} options={options.data} />
+        </details>
+      </fieldset>
     </>
   );
 }
@@ -249,6 +265,21 @@ function downloadTemplate() {
   link.download = "tables-template.csv";
   link.click();
   URL.revokeObjectURL(url);
+}
+
+/** The first lines of an uploaded file as the file gave them: the header's columns, then each line's values. */
+function FirstLines({ columns, lines }: { columns: string[]; lines: Row[] }) {
+  return (
+    <div className="table-wrap"><table className="data dense">
+      <thead><tr><th className="num">Line</th>{columns.map((column) => <th key={column}>{column}</th>)}</tr></thead>
+      <tbody>
+        {lines.map((line) => (
+          <tr key={line.line}><td className="num">{line.line}</td>
+            {columns.map((column) => <td key={column} className="name">{String(line.fields?.[column] ?? "")}</td>)}</tr>
+        ))}
+      </tbody>
+    </table></div>
+  );
 }
 
 /** The Unity Catalog connection a file is read through, chosen before the file: the connections the app can read. */
@@ -270,67 +301,107 @@ function ConnectionPick({ value, onChange }: { value: string; onChange: (name: s
   );
 }
 
-/** Import a CSV: the connection the file is read through, then the file of its tables and databases, uploaded once
- *  (POST /api/uploads); then its servers and databases to choose from (SourcePick). New and Edit both use it. */
+/** Import a CSV in three steps: the connection, the file (dropped, picked or pasted), then a preview of what the file holds
+ *  and the lines that can't be taken, and the tables chosen from it (SourcePick). The file is uploaded once and kept
+ *  (POST /api/uploads). New and Edit both use it. */
 export function ImportCsvDialog({ loadType, onClose }: { loadType: string;
                          onClose: (next: (Chosen & { loadType: string }) | null) => void }) {
+  const [step, setStep] = useState<1 | 2 | 3>(1);
   const [connection, setConnection] = useState("");
   const [text, setText] = useState("");
   const [fileName, setFileName] = useState<string | null>(null);
+  const [pasting, setPasting] = useState(false);
+  const [dragging, setDragging] = useState(false);
+  const fileInput = useRef<HTMLInputElement>(null);
   const [load, setLoad] = useState(loadType);
   const [upload, setUpload] = useState<Row | null>(null);
   const [picked, setPicked] = useState<Picked>(nothingPicked);
   const send = useMutation({
     mutationFn: () => api.post<Row>("/uploads", { csv: text, file_name: fileName, connection }),
-    onSuccess: (r) => { setUpload(r); setText(""); },
+    onSuccess: (r) => { setUpload(r); setText(""); setStep(3); },
   });
-  const step1 = !upload;
+  const firstLines = useQuery({
+    queryKey: ["upload-lines", upload?.upload_id], enabled: !!upload,
+    queryFn: () => api.get<Row>(`/uploads/${upload!.upload_id}/lines?limit=${PREVIEW_LINES}`),
+  });
   const databases = Number(upload?.databases ?? 0);
+  const tables = Number(upload?.tables ?? 0);
   const invalid = Number(upload?.invalid ?? 0);
+  const readFile = async (file: File) => { setText(await file.text()); setFileName(file.name); };
+  const blocked = step === 1 ? (connection ? undefined : "Choose the connection first")
+    : step === 2 ? (send.isPending ? "Uploading the file" : !connection ? "Choose the connection first"
+      : text.trim() ? undefined : "Choose a file or paste its lines first")
+    : pickedAny(picked) || databases > 0 ? undefined : "Choose the server, databases or tables first";
+  const action = step === 1 ? "Next: the file" : step === 2 ? (send.isPending ? "Uploading…" : "Upload and preview") : "Add the tables chosen";
   return (
-    <Modal title={step1 ? "Import a CSV · Step 1 of 2: the connection and the file" : "Import a CSV · Step 2 of 2: choose its tables"}
-      action={step1 ? (send.isPending ? "Uploading…" : "Next: choose tables") : "Add the tables chosen"}
-      actionDisabled={step1 ? (send.isPending ? "Uploading the file" : !connection ? "Choose the connection first"
-          : text.trim() ? undefined : "Choose a file or paste its lines first")
-        : pickedAny(picked) || databases > 0 ? undefined : "Choose the server, databases or tables first"}
+    <Modal title={`Import a CSV · Step ${step} of 3: ${step === 1 ? "the connection" : step === 2 ? "the file" : "preview and choose tables"}`}
+      action={action} actionDisabled={blocked}
       onClose={(ok) => {
         if (!ok) return onClose(null);
-        if (step1) return send.mutate();
+        if (step === 1) return setStep(2);
+        if (step === 2) return send.mutate();
         const databaseWords = databases ? `${fmtInt(databases)} ${plural(databases, "database")} discovered at Create` : "";
         const chosenWords = [pickedAny(picked) ? pickedText(picked) : "", databaseWords].filter(Boolean).join(", ");
         onClose({ source: { upload_id: upload!.upload_id, ...picked }, loadType: load,
                   label: `${upload!.file_name ?? "the uploaded file"}: ${chosenWords}` });
       }}>
-      {step1 ? (
+      {step === 1 && (
+        <div className="form-grid">
+          <ConnectionPick value={connection} onChange={setConnection} />
+          <label>How its tables load<select value={load} onChange={(e) => setLoad(e.target.value)}>
+            {LOAD_TYPES.map(([k, label]) => <option key={k} value={k}>{label}</option>)}</select>
+            <span className="help">A line's own load_type wins. Change a table's load type later in Edit.</span></label>
+        </div>
+      )}
+      {step === 2 && (
         <>
-          <p>One line per table or per database, read through the connection chosen here. Columns: <span className="mono">src_database</span>{" "}
-            (required); <span className="mono">src_schema</span> and <span className="mono">src_table</span> together for one table, or neither
-            for every table of that database, found by name when the job is created. Then, optionally, <span className="mono">select_list</span>,{" "}
-            <span className="mono">primary_key</span>, <span className="mono">cursor_column</span>, <span className="mono">client_id</span> and{" "}
-            <span className="mono">load_type</span>, and <span className="mono">attr:&lt;column&gt;</span> identity values. The file has no
-            connection column: a row that names another connection refuses the file. The file is uploaded once and kept; then you choose its
-            databases or tables.</p>
-          <div className="toolbar"><button className="ghost" onClick={downloadTemplate}>Download template</button></div>
-          <div className="form-grid">
-            <ConnectionPick value={connection} onChange={setConnection} />
-            <label className="wide">File<input type="file" accept=".csv,text/csv" onChange={async (e) => {
-                const f = e.target.files?.[0]; if (f) { setText(await f.text()); setFileName(f.name); } }} />
-              <textarea rows={6} value={text.length > 20000 ? `${text.slice(0, 20000)}\n…` : text} placeholder={CSV_EXAMPLE}
-                readOnly={text.length > 20000} onChange={(e) => { setText(e.target.value); setFileName(null); }} /></label>
-            <label>How its tables load<select value={load} onChange={(e) => setLoad(e.target.value)}>
-              {LOAD_TYPES.map(([k, label]) => <option key={k} value={k}>{label}</option>)}</select>
-              <span className="help">A line's own load_type wins. Change a table's load type later in Edit.</span></label>
+          <div className="toolbar">
+            <button className="ghost" onClick={downloadTemplate}>Download template</button>
+            <Info label="About the CSV's columns">One line per table or per database. Columns: <span className="mono">src_database</span>{" "}
+              (required); <span className="mono">src_schema</span> and <span className="mono">src_table</span> together for one table, or neither
+              for every table of that database, found by name when the job is created. Then, optionally, <span className="mono">select_list</span>,{" "}
+              <span className="mono">primary_key</span>, <span className="mono">cursor_column</span>, <span className="mono">client_id</span> and{" "}
+              <span className="mono">load_type</span>, and <span className="mono">attr:&lt;column&gt;</span> identity values. The file has no
+              connection column: a row that names another connection refuses the file.</Info>
           </div>
+          {pasting ? (
+            <label>Paste the CSV<textarea rows={6} value={text.length > 20000 ? `${text.slice(0, 20000)}\n…` : text} placeholder={CSV_EXAMPLE}
+              readOnly={text.length > 20000} onChange={(e) => { setText(e.target.value); setFileName(null); }} /></label>
+          ) : (
+            <div className={`drop-zone${dragging ? " over" : ""}`}
+              onDragOver={(e) => { e.preventDefault(); setDragging(true); }}
+              onDragLeave={() => setDragging(false)}
+              onDrop={(e) => { e.preventDefault(); setDragging(false); const file = e.dataTransfer.files[0]; if (file) readFile(file); }}>
+              <p>{fileName ? <>Chosen: <span className="mono">{fileName}</span></> : "Drop a CSV file here"}</p>
+              <button className="ghost" onClick={() => fileInput.current?.click()}>Choose a file</button>
+              <input ref={fileInput} type="file" accept=".csv,text/csv" hidden
+                onChange={(e) => { const file = e.target.files?.[0]; if (file) readFile(file); }} />
+            </div>
+          )}
+          <p className="toolbar">
+            <button className="ghost link" onClick={() => setPasting(!pasting)}>{pasting ? "Choose a file instead" : "Paste CSV instead"}</button>
+            <button className="ghost link" onClick={() => setStep(1)}>Back to the connection</button>
+          </p>
           <ErrorBox error={send.error} />
         </>
-      ) : (
+      )}
+      {step === 3 && upload && (
         <div className="discover">
-          <p className="muted">Uploaded: {fmtInt(upload!.tables)} {plural(upload!.tables, "table")}, {fmtInt(databases)}{" "}
-            {plural(databases, "database")} (discovered at Create){invalid ? `, ${fmtInt(invalid)} ${plural(invalid, "line")} that can't be taken` : ""}.</p>
+          <p className="muted">Uploaded {upload.file_name ?? "the file"}: {fmtInt(tables)} {plural(tables, "table")}, {fmtInt(databases)}{" "}
+            {plural(databases, "database")} (discovered at Create), {fmtInt(invalid)} {plural(invalid, "line")} that can't be taken.</p>
+          {(upload.columns ?? []).length > 0 && <p className="muted">Columns found: <span className="mono">{(upload.columns as string[]).join(", ")}</span>.</p>}
+          {(firstLines.data?.lines ?? []).length > 0 && <>
+            <p className="muted">The first {fmtInt(firstLines.data!.lines.length)} of {fmtInt(Number(upload.lines))} lines:</p>
+            <FirstLines columns={firstLines.data!.columns} lines={firstLines.data!.lines} />
+          </>}
+          {invalid > 0 && <Notice tone="warn">These lines can't be taken, and are left out:<ul>
+            {(upload.invalid_lines ?? []).map((l: Row) => <li key={l.line}>line {l.line}{l.table ? `, ${l.table}` : ""}: {l.errors.join("; ")}</li>)}
+          </ul>{invalid > (upload.invalid_lines ?? []).length && <p className="muted">Showing the first {fmtInt((upload.invalid_lines ?? []).length)} of {fmtInt(invalid)}.</p>}</Notice>}
           {databases > 0 && <p className="muted">Its database lines are always taken: each database's tables are found by name through{" "}
-            {upload!.connection} when the job is created. The table lines are taken as chosen below.</p>}
-          <SourcePick kind="upload" sourceId={upload!.upload_id} picked={picked} setPicked={setPicked} />
+            {upload.connection} when the job is created. The table lines are taken as chosen below.</p>}
+          <SourcePick kind="upload" sourceId={upload.upload_id} picked={picked} setPicked={setPicked} />
           <p className="muted">Chosen: {pickedText(picked)}.</p>
+          <p className="toolbar"><button className="ghost link" onClick={() => { setUpload(null); setStep(2); }}>Upload a different file</button></p>
         </div>
       )}
     </Modal>

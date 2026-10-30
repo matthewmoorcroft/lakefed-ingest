@@ -162,8 +162,8 @@ export default function BulkImport() {
     partition_size_mb: config?.defaults.partition_size_mb ?? 512, include_default: true,
   });
   const review = useQuery({
-    queryKey: ["review", did, shared, progress],
-    queryFn: () => api.post<Row[]>(`/discoveries/${did}/review`, { shared }),
+    queryKey: ["review", did, shared, progress, collection.trim()],
+    queryFn: () => api.post<Row[]>(`/discoveries/${did}/review`, { shared, task_collection: collection.trim() }),
     enabled: !!did && !!dbs.data && !running,
   });
   const [rows, setRows] = useState<Row[]>([]);

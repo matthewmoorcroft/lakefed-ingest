@@ -332,7 +332,7 @@ left join lateral (
     select round(percentile_cont(0.5) within group (order by extract(epoch from (x.finished_at - x.started_at)))::numeric) as p50_s,
            round(percentile_cont(0.95) within group (order by extract(epoch from (x.finished_at - x.started_at)))::numeric) as p95_s
     from {SCHEMA}.ingest_run x
-    where x.task_collection = r.task_collection and x.finished_at is not null and x.status <> 'skipped'
+    where x.task_collection = r.task_collection and x.finished_at is not null and x.status not in ('skipped', 'cancelled')
       and {not_a_check("x")}
       and x.total is not null and x.started_at > now() - interval '7 days') p on true
 order by r.started_at desc"""
@@ -419,7 +419,7 @@ select r.run_id, r.task_collection, r.job_run_id, r.started_at, r.parallelism,
        (select count(*) from {SCHEMA}.ingest_event e where e.run_id = r.run_id and e.status = 'running') as tables_running,
        (select round(percentile_cont(0.5) within group (order by extract(epoch from (x.finished_at - x.started_at)))::numeric)
           from (select started_at, finished_at from {SCHEMA}.ingest_run x
-                where x.task_collection = r.task_collection and x.finished_at is not null and x.status <> 'skipped'
+                where x.task_collection = r.task_collection and x.finished_at is not null and x.status not in ('skipped', 'cancelled')
                 order by x.started_at desc limit 20) x)                                                as typical_s,
        coalesce(r.total, (select count(*) from {SCHEMA}.control t
          where t.task_collection = r.task_collection and t.task_enabled))                     as enabled_tables,
@@ -843,12 +843,38 @@ def close_ended_run_sql() -> str:
     )
 
 
+def close_cancelled_run_sql() -> str:
+    """Close one run still 'running' whose Databricks run was cancelled, as cancelled, with Databricks' end time (or now
+    when it gave none). Its events still running, or waiting for a retry that never came, close as cancelled too, so
+    the run has no failed or running event left; a late failure the cluster writes after the cancel is not counted.
+    Params: finished_at (a timestamp or null), detail, run_id, reason (the error of an event that has none).
+    Returns (runs closed, events closed)."""
+    return (
+        f"with dead as (update {SCHEMA}.ingest_run set status = 'cancelled', "
+        "finished_at = coalesce(%s::timestamptz, now()), detail = %s "
+        "where run_id = %s and status = 'running' returning run_id, finished_at), "
+        f"events as (update {SCHEMA}.ingest_event e set status = 'cancelled', "
+        "finished_at = coalesce(e.finished_at, dead.finished_at), "
+        "duration_ms = coalesce(e.duration_ms, "
+        "greatest(0, (extract(epoch from (dead.finished_at - e.started_at)) * 1000)::bigint)), "
+        "error = coalesce(e.error, %s::text) "
+        "from dead where e.run_id = dead.run_id and (e.status = 'running' or ("
+        f"e.status = 'retried' and not exists (select 1 from {SCHEMA}.ingest_event later "
+        "where later.run_id = e.run_id and later.control_id = e.control_id and later.id > e.id))) "
+        "returning e.id) "
+        "select (select count(*) from dead), (select count(*) from events)"
+    )
+
+
 def run_outcome(run: dict, progress: Optional[dict] = None) -> dict:
     """What a group run's engine record means, as the pages show it: a label, a tone and an optional note.
     The engine records a run that loaded with some table failures as failed, and a run another run closed
-    (it stopped without finishing) as failed with closed_by_run in its detail. A running run is detecting
-    changes until its first table is checked or loaded, then loading changed tables."""
+    (it stopped without finishing) as failed with closed_by_run in its detail. A run cancelled, in Databricks or from
+    the app, is cancelled whatever its events say. A running run is detecting changes until its first table is checked
+    or loaded, then loading changed tables."""
     status, failed = run.get("status"), _count(run, "failed")
+    if run.get("cancelling") and status in ("running", "cancelled"):
+        return {"label": "Cancelling", "tone": "run", "note": None}
     if status == "completed" and not failed:
         return {"label": "Succeeded", "tone": "ok", "note": None}
     if status == "skipped":
@@ -858,6 +884,8 @@ def run_outcome(run: dict, progress: Optional[dict] = None) -> dict:
             return {"label": "Running", "tone": "run", "note": None}
         started = any(_count(progress, k) for k in ("tables_ok", "tables_failed", "tables_running", "tables_checked"))
         return {"label": "Loading changed tables" if started else "Detecting changes", "tone": "run", "note": None}
+    if status == "cancelled":
+        return {"label": "Cancelled", "tone": "neutral", "note": _detail(run).get("reason")}
     closed_by = _detail(run).get("closed_by_run")
     if closed_by is not None:
         return {"label": "Ended without finishing", "tone": "bad", "note": f"closed by run {closed_by}"}
@@ -904,7 +932,8 @@ def work_speed(run: dict) -> Optional[float]:
 
 
 # A finished job run's outcome is the worst of its group runs', in this order.
-JOB_RUN_ORDER = ("Ended without finishing", "Failed", "Succeeded with failures", "Succeeded")
+JOB_RUN_ORDER = ("Ended without finishing", "Failed", "Succeeded with failures", "Cancelled", "Succeeded")
+RUNNING_OUTCOMES = ("Running", "Cancelling")
 
 
 def job_run_outcome(members: List[dict]) -> dict:
@@ -912,7 +941,8 @@ def job_run_outcome(members: List[dict]) -> dict:
     included) is running or any member is waiting for or starting its trigger, or being checked; otherwise the worst
     of its group runs' outcomes, extra runs included, with a member its check found unchanged as completed and one
     whose check failed as failed, or "Not run" when none ran. The note counts the members that did not run, as
-    "17 of 18 group runs, 1 skipped"."""
+    "17 of 18 group runs, 1 skipped". A group run that a Cancel asked Databricks to stop, and that is not closed
+    yet, makes the job run cancelling."""
     runs = [m["run"] for m in members if m.get("run")]
     ran = [r for r in runs if r.get("status") != "skipped"]
     extras = [r for m in members for r in m.get("extra") or [] if r.get("status") != "skipped"]
@@ -928,6 +958,8 @@ def job_run_outcome(members: List[dict]) -> dict:
                          + ([f"{unchanged} unchanged"] if unchanged else [])
                          + ([f"{check_failed} check failed"] if check_failed else [])
                          + ([f"{no_run} not run"] if no_run else []))
+    if any(r.get("cancelling") and r.get("status") == "running" for r in runs + extras):
+        return {"label": "Cancelling", "tone": "run", "note": note}
     if (any(m["state"] in ("waiting", "starting", "checking") for m in members)
             or any(r.get("status") == "running" for r in runs + extras)):
         return {"label": "Running", "tone": "run", "note": note}
@@ -936,7 +968,7 @@ def job_run_outcome(members: List[dict]) -> dict:
     # A member its check found unchanged completed with nothing to load; one whose check failed failed.
     labels = [run_outcome(r)["label"] for r in ran + extras] + ["Succeeded"] * unchanged + ["Failed"] * check_failed
     worst = min(labels, key=lambda label: JOB_RUN_ORDER.index(label) if label in JOB_RUN_ORDER else len(JOB_RUN_ORDER))
-    tone = {"Succeeded": "ok", "Succeeded with failures": "warn"}.get(worst, "bad")
+    tone = {"Succeeded": "ok", "Succeeded with failures": "warn", "Cancelled": "neutral"}.get(worst, "bad")
     return {"label": worst, "tone": tone, "note": note}
 
 
@@ -1119,6 +1151,121 @@ def group_errors(rows: List[dict]) -> List[dict]:
     return out
 
 
+# How far back a failing table's failures are read: how long it has been failing (since its first failure after
+# its last success) and how many runs failed it. A table failing for longer shows the start of this window.
+FAILING_WINDOW_DAYS = 30
+
+
+def failing_tables_sql() -> str:
+    """The failing tables of a job's groups: enabled tables whose checkpoint is failed, each with its latest failure's
+    error, class and kind (blank for failures recorded before schema 14), when it started failing, and how many runs
+    and failures it has had since. Param: groups."""
+    window = f"now() - make_interval(days => {FAILING_WINDOW_DAYS})"
+    return f"""
+with failing as (
+    select t.id as control_id, t.task_collection, {SERVER} as server, coalesce(t.src_database, '') as src_database,
+           t.src_schema, t.src_table, cp.detail as checkpoint_detail
+    from {SCHEMA}.control t join {SCHEMA}.checkpoint cp on cp.control_id = t.id
+    where t.task_collection = any(%s) and t.task_enabled and {_FAILING}
+),
+last_ok as (
+    select o.control_id, max(o.started_at) as at from {SCHEMA}.ingest_event o
+    where o.status = 'ok' and o.started_at > {window} and o.control_id in (select control_id from failing)
+    group by o.control_id
+),
+failures as (
+    select e.id, e.control_id, e.run_id, e.started_at, e.error, e.error_kind, e.error_class
+    from {SCHEMA}.ingest_event e left join last_ok lo on lo.control_id = e.control_id
+    where e.status = 'failed' and e.control_id in (select control_id from failing)
+      and e.started_at > coalesce(lo.at, {window})
+),
+since as (
+    select control_id, min(started_at) as failing_since, count(distinct run_id) as runs, count(*) as failures
+    from failures group by control_id
+),
+latest as (
+    select distinct on (control_id) control_id, error, error_kind, error_class
+    from failures order by control_id, started_at desc, id desc
+)
+select f.control_id, f.task_collection, f.server, f.src_database, f.src_schema, f.src_table, f.checkpoint_detail,
+       s.failing_since, s.runs, s.failures, l.error, l.error_kind, l.error_class
+from failing f
+left join since s on s.control_id = f.control_id
+left join latest l on l.control_id = f.control_id
+order by s.failing_since nulls last, f.task_collection, f.server, f.src_database, f.src_schema, f.src_table"""
+
+
+def failing_table_rows(rows: List[dict]) -> List[dict]:
+    """failing_tables_sql's rows as the job page shows them. The class is the engine's error class (a Spark error
+    class, or the exception's type) and the app's word for the cause when that is not recorded; the kind is transient,
+    permanent or unknown. The message is the latest failure's, else the checkpoint's note."""
+    out = []
+    for r in rows:
+        message = r.get("error") or r.get("checkpoint_detail") or ""
+        since = r.get("failing_since")
+        out.append({
+            "control_id": r["control_id"], "task_collection": r["task_collection"], "server": r["server"],
+            "src_database": r["src_database"], "src_schema": r["src_schema"], "src_table": r["src_table"],
+            "table": f"{r['src_schema']}.{r['src_table']}",
+            "error_class": r.get("error_class") or classify_error(message)[1],
+            "error_kind": r.get("error_kind") or None,
+            "message": message[:2000],
+            "failing_since": since.isoformat() if since else None,
+            "runs": int(r.get("runs") or 0),
+            "failures": int(r.get("failures") or 0),
+        })
+    return out
+
+
+def retry_database_sql() -> str:
+    """Record one database's work list for a run started by hand: its enabled rows in one group on one server, under
+    work_id, as the check job records a work list (the source is the same key the check uses). Params: work_id,
+    group, server, database. Returns the database it recorded, none when it has no enabled rows."""
+    return (f"insert into {SCHEMA}.check_work (work_id, task_collection, source, src_database) "
+            f"select distinct %s::text, t.task_collection, {database_source_sql('t')}, coalesce(t.src_database, '') "
+            f"from {SCHEMA}.control t where t.task_enabled and t.task_collection = %s and {SERVER} = %s "
+            f"and coalesce(t.src_database, '') = %s returning src_database")
+
+
+def job_own_groups_sql() -> str:
+    """The groups of a live job that no other live job holds: the only groups a table can be removed from without
+    changing another job's tables (the delete job's job_groups_sql). Params: schedule id, schedule id."""
+    return (f"select distinct m.task_collection from {SCHEMA}.schedule_member m where m.schedule_id = %s "
+            f"and m.removed_at is null and not exists (select 1 from {SCHEMA}.schedule_member o "
+            f"join {SCHEMA}.schedule s on s.id = o.schedule_id where o.task_collection = m.task_collection "
+            f"and o.removed_at is null and s.deleted_at is null and o.schedule_id <> %s) order by 1")
+
+
+def table_rows_by_ids_sql() -> str:
+    """The control rows named by id, with their server (connection or host), group, database and table names.
+    Param: control ids (bigint[])."""
+    return (f"select t.id, t.task_collection, coalesce(t.src_connection, t.src_host, '') as server, "
+            f"coalesce(t.src_database, '') as src_database, t.src_schema, t.src_table "
+            f"from {SCHEMA}.control t where t.id = any(%s) order by t.id")
+
+
+def set_table_remove_sql() -> str:
+    """Merge removal records into a job's table_remove option, keyed by control id (table_remove.requests). Params:
+    the records as a JSON object, job id. Written by the app: the app never deletes."""
+    return (f"update {SCHEMA}.schedule set options = jsonb_set(coalesce(options, '{{}}'::jsonb), '{{table_remove}}', "
+            f"coalesce(options -> 'table_remove', '{{}}'::jsonb) || %s::jsonb) where id = %s")
+
+
+def add_exclusions_sql() -> str:
+    """Merge the tables a removal leaves out into a job's table_exclude option, keyed by table (table_removal.
+    exclusion_records): they stay out of a re-discovery and of whole databases until Add tables names them. Params:
+    the records as a JSON object, job id."""
+    return (f"update {SCHEMA}.schedule set options = jsonb_set(coalesce(options, '{{}}'::jsonb), '{{table_exclude}}', "
+            f"coalesce(options -> 'table_exclude', '{{}}'::jsonb) || %s::jsonb) where id = %s")
+
+
+def clear_exclusions_sql() -> str:
+    """Take tables back in from a job's table_exclude option: the ones Add tables named explicitly. Params: their
+    exclusion keys (text[]), job id."""
+    return (f"update {SCHEMA}.schedule set options = jsonb_set(coalesce(options, '{{}}'::jsonb), '{{table_exclude}}', "
+            f"coalesce(options -> 'table_exclude', '{{}}'::jsonb) - %s::text[]) where id = %s")
+
+
 # ---- UC connections (bulk import) ---------------------------------------------------------------
 
 def connection_databases_sql() -> str:
@@ -1236,6 +1383,7 @@ CONTROL_INSERT_COLUMNS = (
 )
 WRITE_MODES = ("merge", "append")
 _ATTR_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,127}$")     # ct_engine.client_attrs
+CLIENT_ID_PATTERN = r"^[A-Za-z0-9_.:-]{1,128}$"                  # the shared key, as ct_engine accepts it
 
 
 def _truthy(v) -> bool:
@@ -1327,7 +1475,7 @@ def validate_control_row(row: dict) -> List[str]:
         if not ok:
             errs.append("freshness_sla_minutes must be a whole number of minutes greater than 0 (blank = no SLA)")
     cid = row.get("client_id")
-    if cid not in (None, "") and not re.match(r"^[A-Za-z0-9_.:-]{1,128}$", str(cid)):
+    if cid not in (None, "") and not re.match(CLIENT_ID_PATTERN, str(cid)):
         errs.append("client_id may only use letters, digits and _ . : - (1-128 characters)")
     if "__client_id__" in {c.strip().lower() for c in str(row.get("select_list") or "").split(",")}:
         errs.append("select_list must not include __client_id__ (consolidated sinks add it)")
@@ -1641,11 +1789,24 @@ def identifier(text: str) -> str:
     return out or "t"
 
 
-def render(template: Optional[str], database: str, schema: str, table: str, as_identifier: bool = True):
-    """Fill {database} / {schema} / {table} in a template; blank template -> None."""
+# Characters Unity Catalog refuses in catalog, schema and table names: period, space, forward slash, ASCII
+# control characters 00-1F and DELETE (7F). Backticks quote the rest.
+# Source: https://docs.databricks.com/en/sql/language-manual/sql-ref-names.html
+UNITY_CATALOG_REJECTED = re.compile(r"[. /\x00-\x1f\x7f]")
+
+
+def unity_catalog_identifier(text) -> str:
+    """A lower-case name Unity Catalog accepts: each refused character becomes an underscore, the rest is kept."""
+    return UNITY_CATALOG_REJECTED.sub("_", str(text)).lower()
+
+
+def render(template: Optional[str], database: str, schema: str, table: str, as_identifier: bool = True,
+           unity_catalog: bool = False):
+    """Fill {database} / {schema} / {table} in a template; blank template -> None. The values become names by the
+    older identifier rule, or by Unity Catalog's when unity_catalog is set (a new job's names)."""
     if not str(template or "").strip():
         return None
-    f = identifier if as_identifier else (lambda v: v)
+    f = (unity_catalog_identifier if unity_catalog else identifier) if as_identifier else (lambda v: v)
     return (str(template).replace("{database}", f(database)).replace("{schema}", f(schema))
             .replace("{table}", f(table)).strip())
 
@@ -1657,10 +1818,11 @@ def recommended_partitioning(size_mb, partition_candidate, threshold_mb: float, 
     return False, None, None
 
 
-def review_rows(discovered: List[dict], shared: dict) -> List[dict]:
+def review_rows(discovered: List[dict], shared: dict, unity_catalog: bool = False) -> List[dict]:
     """The review grid: one editable row per discovered table, from the recommendations plus the
     shared fields (sink templates, client_id template, partition threshold). Registered tables and
-    tables with no readable columns start excluded."""
+    tables with no readable columns start excluded. unity_catalog: the naming rule of the group the rows go
+    into (a job's own rule; see render)."""
     rows = []
     for t in discovered:
         db, sch, tbl = t["src_database"], t["src_schema"], t["src_table"]
@@ -1676,9 +1838,9 @@ def review_rows(discovered: List[dict], shared: dict) -> List[dict]:
             "load_type": t.get("load_type"), "primary_key": t.get("primary_key"),
             "cursor_column": t.get("cursor_column"),
             "load_partitioned": part, "partition_col": pcol, "partition_size_mb": psize,
-            "sink_catalog": render(shared.get("sink_catalog"), db, sch, tbl),
-            "sink_schema": render(shared.get("sink_schema"), db, sch, tbl),
-            "sink_table": render(shared.get("sink_table"), db, sch, tbl),
+            "sink_catalog": render(shared.get("sink_catalog"), db, sch, tbl, unity_catalog=unity_catalog),
+            "sink_schema": render(shared.get("sink_schema"), db, sch, tbl, unity_catalog=unity_catalog),
+            "sink_table": render(shared.get("sink_table"), db, sch, tbl, unity_catalog=unity_catalog),
             "client_id": render(shared.get("client_id"), db, sch, tbl, as_identifier=False),
             "freshness_sla_minutes": shared.get("freshness_sla_minutes") or None,
             "registered_id": registered, "notes": t.get("notes"),
@@ -2009,6 +2171,76 @@ def control_groups_sql() -> str:
     return f"select distinct task_collection from {SCHEMA}.control where id = any(%s)"
 
 
+def control_groups_for_secret_key_sql() -> str:
+    """The groups of the control rows that read one secret key: who may change them decides who may write that
+    key's login (main._refuse_groups). Param: secret_key."""
+    return f"select distinct task_collection from {SCHEMA}.control where secret_key = %s"
+
+
+def jdbc_login_insert_sql() -> str:
+    """One row per login the app writes, outcome 'rotated' when an earlier login for the same scope and key exists
+    (checked in the same statement, before the row is added). Params: id, connection, secret_scope, secret_key,
+    entered_by, then secret_scope and secret_key for that check."""
+    return (f"insert into {SCHEMA}.jdbc_login_write (id, connection, secret_scope, secret_key, entered_by, outcome) "
+            f"select %s, %s, %s, %s, %s, case when exists (select 1 from {SCHEMA}.jdbc_login_write "
+            "where secret_scope = %s and secret_key = %s) then 'rotated' else 'saved' end "
+            "returning id, outcome, entered_at")
+
+
+def jdbc_login_latest_sql() -> str:
+    """The newest login written for one scope and secret key (never the password, which the table doesn't hold).
+    Params: secret_scope, secret_key."""
+    return (f"select id, connection, secret_scope, secret_key, entered_by, entered_at, outcome from {SCHEMA}.jdbc_login_write "
+            "where secret_scope = %s and secret_key = %s order by entered_at desc, id desc limit 1")
+
+
+def jdbc_login_lock_sql() -> str:
+    """Wait for one secret key's login lock, held to the end of the transaction: two saves of one key take turns, so
+    its newest record always names the login it holds. Param: jdbc_login_lock_key."""
+    return "select pg_advisory_xact_lock(hashtextextended(%s, 0))"
+
+
+def jdbc_login_lock_key(scope: str, secret_key: str) -> str:
+    """The lock key of one scope's secret key, apart from every collection's run lock key."""
+    return f"{SCHEMA}:jdbc_login:{scope}/{secret_key}"
+
+
+def jdbc_connection_groups_sql() -> str:
+    """The groups of the live jobs made from discoveries through one JDBC connection: whoever may change them may
+    save its logins. Param: the connection's name."""
+    return (f"select distinct m.task_collection from {SCHEMA}.job_selection s "
+            f"join {SCHEMA}.discovery d on d.discovery_id = any(string_to_array(s.source_id, ',')) "
+            f"join {SCHEMA}.schedule_member m on m.schedule_id = s.job_id and m.removed_at is null "
+            f"join {SCHEMA}.schedule j on j.id = s.job_id and j.deleted_at is null "
+            "where s.source_kind = 'discovery' and d.listing ->> 'jdbc_connection' = %s")
+
+
+def jdbc_login_writers_sql() -> str:
+    """Who typed each earlier login under one scope and key, and who made the connection it was typed for (null when
+    that connection isn't stored): they may write the key again before a job reads it. Params: secret_scope,
+    secret_key."""
+    return (f"select distinct w.entered_by, c.created_by from {SCHEMA}.jdbc_login_write w "
+            f"left join {SCHEMA}.jdbc_connection c on c.name = w.connection "
+            "where w.secret_scope = %s and w.secret_key = %s")
+
+
+def jdbc_connection_login_sql() -> str:
+    """The keys of the logins one user typed in one scope under a connection's name, newest first. The caller keeps the
+    keys that fit the connection's key template (jdbc_connections.key_fits): a connection in the login scope is made only
+    when its maker typed a login for one of them. Params: secret_scope, connection name, entered_by."""
+    return (f"select secret_key from {SCHEMA}.jdbc_login_write where secret_scope = %s and connection = %s "
+            "and entered_by = %s order by entered_at desc, id desc")
+
+
+def jdbc_login_latest_per_key_sql() -> str:
+    """The newest login written for each of some secret keys in one scope, one row per key that has any (never the
+    password). A JDBC read checks that the login each of its keys holds was typed under the connection that reads it.
+    Params: secret_scope, secret_keys (text[])."""
+    return (f"select distinct on (secret_key) secret_key, id, connection, entered_by, entered_at, outcome "
+            f"from {SCHEMA}.jdbc_login_write where secret_scope = %s and secret_key = any(%s) "
+            "order by secret_key, entered_at desc, id desc")
+
+
 def control_row_sql() -> str:
     cols = ", ".join(("id",) + CONTROL_EDIT_COLUMNS)
     return f"select {cols} from {SCHEMA}.control where id = %s"
@@ -2280,6 +2512,14 @@ def split_databases_sql() -> str:
             f"and {key} in (select key from k) group by 1 having count(distinct t.task_collection) > 1")
 
 
+def clash_jobs_sql() -> str:
+    """The live ingestion jobs that hold any of the given groups, so a refusal for databases whose tables sit in more
+    than one group can name them and link to each. Param: groups (list). Returns id and name, by name, at most 20."""
+    return (f"select s.id, s.name from {SCHEMA}.schedule_member m join {SCHEMA}.schedule s on s.id = m.schedule_id "
+            f"where m.task_collection = any(%s) and m.removed_at is null and s.deleted_at is null "
+            f"group by s.id, s.name order by s.name, s.id limit 20")
+
+
 def log_change_sql() -> str:
     """Params: changed_by, action, control_id, task_collection, field, old_value, new_value,
     reseed_reason, batch_id."""
@@ -2311,15 +2551,37 @@ SCHEDULE_FIELDS = ("name", "cadence_minutes", "timezone", "parameters", "job_var
 JSON_SCHEDULE_FIELDS = ("parameters", "options")
 
 
+# A deleted job whose purge finished: the delete job marks it, in the transaction that removed its groups' rows.
+PURGED_OPTION = "(coalesce(options, '{}'::jsonb) ? 'delete_finished')"
+
+
+def group_job_options_sql() -> str:
+    """The options of the job that holds one ingestion group (its member not removed), first by name as schedules_sql
+    lists the jobs, a deleted job not purged yet included; no row when no job holds it. Param: task_collection."""
+    return (f"select s.id, s.options from {SCHEMA}.schedule s join {SCHEMA}.schedule_member m on m.schedule_id = s.id "
+            f"where m.task_collection = %s and m.removed_at is null and (s.deleted_at is null or not {PURGED_OPTION}) "
+            "order by lower(s.name), s.id limit 1")
+
+
 def schedules_sql() -> str:
-    """Schedules by name: the active ones, and the deleted ones whose Delete is still pending, so the Ingestion jobs
-    list, the Overview and the job page show them as Deleting (or Delete failed) until the app marks them finished
-    (ingestion_jobs.delete_state: the delete job succeeded and no tables are left). A deleted job whose start failed
-    stays too, under ``delete_start_error``. A deleted job with no tables never started a delete job, so never shows."""
+    """Schedules by name: the active ones, and the deleted ones not yet purged. A deleted job is kept for its retention
+    period so a Restore can bring it back (ingestion_jobs.delete_state shows it as Deleted, with the days left); it
+    leaves this list once its purge has finished."""
     return (f"select id, {', '.join(SCHEDULE_FIELDS)}, created_by, created_at, updated_at, deleted_at "
-            f"from {SCHEMA}.schedule where deleted_at is null "
-            f"or options ? 'delete_start_error' "
-            f"or (options ? 'delete_drop_targets' and not options ? 'delete_finished') order by lower(name)")
+            f"from {SCHEMA}.schedule where deleted_at is null or not {PURGED_OPTION} order by lower(name)")
+
+
+def deleted_jobs_sql() -> str:
+    """One page of the deleted jobs kept for a Restore (not yet purged), the newest deletion first. Params: limit,
+    offset."""
+    return (f"select id, {', '.join(SCHEDULE_FIELDS)}, created_by, created_at, updated_at, deleted_at "
+            f"from {SCHEMA}.schedule where deleted_at is not null and not {PURGED_OPTION} "
+            f"order by deleted_at desc, id desc limit %s offset %s")
+
+
+def deleted_jobs_count_sql() -> str:
+    """How many deleted jobs are kept for a Restore (not yet purged). Column: total."""
+    return f"select count(*) as total from {SCHEMA}.schedule where deleted_at is not null and not {PURGED_OPTION}"
 
 
 def deleted_tables_left_sql() -> str:
@@ -2451,6 +2713,74 @@ def delete_schedule_sql() -> str:
     return f"update {SCHEMA}.schedule set deleted_at = now(), updated_at = now() where id = %s and deleted_at is null"
 
 
+def restore_schedule_sql() -> str:
+    """Restore a deleted job not yet purged: live again and paused (nothing runs until it is resumed), its delete
+    options cleared. Matches no row once its purge has finished. Param: id."""
+    return (f"update {SCHEMA}.schedule set deleted_at = null, paused = true, "
+            f"options = coalesce(options, '{{}}'::jsonb) - array['delete_drop_targets', 'delete_run_id', "
+            f"'delete_start_error', 'delete_finished'], updated_at = now() "
+            f"where id = %s and deleted_at is not null and not {PURGED_OPTION}")
+
+
+def restore_members_sql() -> str:
+    """Put back the members the job's Delete removed: those removed in the same instant the job was deleted (the delete
+    sets both with now(), in one transaction), so members removed earlier stay removed. Run before
+    restore_schedule_sql, which clears deleted_at. Params: schedule id, schedule id."""
+    return (f"update {SCHEMA}.schedule_member m set removed_at = null where m.schedule_id = %s "
+            f"and m.removed_at = (select d.deleted_at from {SCHEMA}.schedule d where d.id = %s)")
+
+
+def live_name_taken_sql() -> str:
+    """A live job other than the given one with this name, names compared without case. Params: name, schedule id."""
+    return f"select id from {SCHEMA}.schedule where lower(name) = lower(%s) and deleted_at is null and id <> %s"
+
+
+def groups_held_elsewhere_sql() -> str:
+    """The given groups that a live job other than the given one holds. Params: groups (list), schedule id. Columns:
+    task_collection, name (of that job)."""
+    return (f"select m.task_collection, s.name from {SCHEMA}.schedule_member m "
+            f"join {SCHEMA}.schedule s on s.id = m.schedule_id "
+            f"where m.task_collection = any(%s) and m.removed_at is null and s.deleted_at is null "
+            f"and m.schedule_id <> %s order by 1")
+
+
+def restore_conflicts_sql() -> str:
+    """What the given groups would share with a live job's groups: a source database (the key split_databases_sql
+    compares) or a target table (compared without case, as Unity Catalog does) that a live job's group also reads or
+    writes. At most 20 rows. Params: groups (list), groups (list). Columns: kind ('database' or 'target'), item,
+    name (of
+    the live job)."""
+    live = (f"join {SCHEMA}.schedule_member om on om.task_collection = o.task_collection and om.removed_at is null "
+            f"join {SCHEMA}.schedule s on s.id = om.schedule_id and s.deleted_at is null")
+    database_key = lambda alias: f"{database_source_sql(alias)} || chr(31) || coalesce({alias}.src_database, '')"
+    return (f"select 'database' as kind, c.src_database as item, s.name as name from {SCHEMA}.control c "
+            f"join {SCHEMA}.control o on o.src_database = c.src_database and {database_key('o')} = {database_key('c')} "
+            f"and o.task_collection <> c.task_collection {live} where c.task_collection = any(%s) "
+            f"union "
+            f"select 'target', lower(c.sink_catalog || '.' || c.sink_schema || '.' || c.sink_table), s.name "
+            f"from {SCHEMA}.control c join {SCHEMA}.control o on lower(o.sink_catalog) = lower(c.sink_catalog) "
+            f"and lower(o.sink_schema) = lower(c.sink_schema) and lower(o.sink_table) = lower(c.sink_table) "
+            f"and o.task_collection <> c.task_collection {live} where c.task_collection = any(%s) "
+            f"order by 1, 2 limit 20")
+
+
+def deleted_database_owners_sql() -> str:
+    """The deleted jobs kept for a Restore whose groups read the given databases, and that no live job holds: the
+    first one, by name, as the database (the name as written), the job's name and id. Param: database keys (text[]),
+    as database_key builds them."""
+    key = f"{database_source_sql('t')} || chr(31) || coalesce(t.src_database, '')"
+    return (f"with k as (select unnest(%s::text[]) as key) "
+            f"select min(t.src_database) as database, d.name as job, d.id as schedule_id "
+            f"from {SCHEMA}.control t join {SCHEMA}.schedule_member m on m.task_collection = t.task_collection "
+            f"join {SCHEMA}.schedule d on d.id = m.schedule_id "
+            f"where d.deleted_at is not null and not {PURGED_OPTION} "
+            f"and t.src_database in (select split_part(key, chr(31), -1) from k) and {key} in (select key from k) "
+            f"and not exists (select 1 from {SCHEMA}.schedule_member o join {SCHEMA}.schedule s "
+            f"on s.id = o.schedule_id "
+            f"where o.task_collection = t.task_collection and o.removed_at is null and s.deleted_at is null) "
+            f"group by d.id, d.name order by d.name, d.id limit 1")
+
+
 def insert_member_if_absent_sql() -> str:
     """insert_member_sql for a group a job already has a member for (a resumed write): skipped, not refused. It returns
     the new member's id, or nothing when it was skipped. Params: schedule_id, task_collection, offset_minutes."""
@@ -2515,12 +2845,11 @@ def delete_groups_sql() -> str:
             f"and o.schedule_id <> %s) order by 1")
 
 
-def deleting_groups_sql() -> str:
-    """The groups of deleted jobs whose Delete runs the delete job (``options.delete_drop_targets`` set) and that no
-    live job holds: they belong to the deleted job, shown under Deleted jobs as deleting (or as a failed delete to run
-    again), until the delete job removes them, never as "Not in any job"."""
+def deleted_groups_sql() -> str:
+    """The groups of deleted jobs kept for a Restore (not yet purged) that no live job holds. They belong to the deleted
+    job, shown under Deleted jobs, never as "Not in any job"."""
     return (f"select distinct m.task_collection from {SCHEMA}.schedule_member m join {SCHEMA}.schedule d "
-            f"on d.id = m.schedule_id where d.deleted_at is not null and d.options ? 'delete_drop_targets' "
+            f"on d.id = m.schedule_id where d.deleted_at is not null and not {PURGED_OPTION} "
             f"and not exists (select 1 from {SCHEMA}.schedule_member o join {SCHEMA}.schedule s on s.id = o.schedule_id "
             f"where o.task_collection = m.task_collection and o.removed_at is null and s.deleted_at is null) order by 1")
 
@@ -2542,20 +2871,6 @@ def delete_targets_sql() -> str:
             f"(select coalesce(json_agg(k order by k), '[]'::json) from (select sink_catalog || '.' || sink_schema "
             f"|| '.' || sink_table as k from marked where shared order by 1 limit {DELETE_KEPT_LISTED}) named) "
             f"as kept_names")
-
-
-def deletions_sql() -> str:
-    """The latest deleted jobs whose Delete finished (the app marked them ``delete_finished``, once the delete job
-    succeeded and no tables were left), newest first: the Deleted jobs history on the Ingestion jobs page. Pending and
-    failed deletions are in the jobs list instead, a page at a time. Params: how many, how many to skip."""
-    return (f"select id, name, options, deleted_at from {SCHEMA}.schedule where deleted_at is not null "
-            f"and options ? 'delete_finished' order by deleted_at desc, id desc limit %s offset %s")
-
-
-def deletions_count_sql() -> str:
-    """How many deleted jobs the Deleted jobs history has (deletions_sql's rows, all pages)."""
-    return (f"select count(*) as total from {SCHEMA}.schedule where deleted_at is not null "
-            f"and options ? 'delete_finished'")
 
 
 def member_synced_sql() -> str:
@@ -2581,8 +2896,8 @@ with r as (
 ),
 agg as (
     select task_collection,
-           round(percentile_cont(0.95) within group (order by dur_s) filter (where finished_at is not null and status <> 'skipped')::numeric) as p95_s,
-           round(percentile_cont(0.5) within group (order by dur_s) filter (where finished_at is not null and status <> 'skipped')::numeric) as p50_s,
+           round(percentile_cont(0.95) within group (order by dur_s) filter (where finished_at is not null and status not in ('skipped', 'cancelled'))::numeric) as p95_s,
+           round(percentile_cont(0.5) within group (order by dur_s) filter (where finished_at is not null and status not in ('skipped', 'cancelled'))::numeric) as p50_s,
            count(*) filter (where started_at > now() - interval '24 hours')                      as runs_24h,
            count(*) filter (where started_at > now() - interval '24 hours' and status = 'failed') as failed_24h,
            count(*) filter (where started_at > now() - interval '24 hours' and status = 'skipped') as lock_skipped_24h
@@ -2668,6 +2983,15 @@ def upload_database_lines_sql() -> str:
 def upload_databases_count_sql() -> str:
     """How many database-only lines an upload has. Param: upload_id."""
     return f"select count(*) as n from {SCHEMA}.table_upload_line where upload_id = %s and status = 'database'"
+
+
+def upload_head_sql() -> str:
+    """An upload's header and its first lines in file order, for the import's preview: one row per line, each carrying
+    the header's columns and the line's number and fields. An upload with no line (or none at all) gives a row with no
+    line, or no row. Params: limit, upload_id."""
+    return (f"select u.columns, l.line, l.fields from {SCHEMA}.table_upload u "
+            f"left join lateral (select line, fields from {SCHEMA}.table_upload_line where upload_id = u.upload_id "
+            f"order by line limit %s) l on true where u.upload_id = %s")
 
 
 def source_rows_sql(kind: str) -> str:
@@ -2871,7 +3195,8 @@ def databricks_run_upsert_sql() -> str:
 
 def databricks_run_states_sql() -> str:
     """The recorded state of some Databricks runs. Param: list of run ids."""
-    return f"select {DATABRICKS_RUN_COLUMNS} from {SCHEMA}.databricks_run where run_id = any(%s)"
+    return (f"select {DATABRICKS_RUN_COLUMNS}, cancel_requested_at from {SCHEMA}.databricks_run "
+            "where run_id = any(%s)")
 
 
 def active_databricks_runs_sql() -> str:
@@ -2879,10 +3204,18 @@ def active_databricks_runs_sql() -> str:
     return f"select {DATABRICKS_RUN_COLUMNS} from {SCHEMA}.databricks_run where life_cycle_state = any(%s)"
 
 
-def mark_terminating_sql() -> str:
-    """Show runs the app cancelled as terminating, while they are still active. Params: run ids, active states."""
-    return (f"update {SCHEMA}.databricks_run set life_cycle_state = 'TERMINATING', seen_at = now() "
+def mark_cancel_requested_sql() -> str:
+    """Show runs the app cancelled as terminating, while they are still active, and keep when the cancel was first
+    asked for (a second Cancel doesn't restart the clock the poller's fallback close runs on). Params: run ids,
+    active states."""
+    return (f"update {SCHEMA}.databricks_run set life_cycle_state = 'TERMINATING', "
+            "cancel_requested_at = coalesce(cancel_requested_at, now()), seen_at = now() "
             "where run_id = any(%s) and life_cycle_state = any(%s)")
+
+
+def cancel_requested_runs_sql() -> str:
+    """Which of the given Databricks run ids a Cancel asked Databricks to stop, ended or not yet. Param: run ids."""
+    return f"select run_id from {SCHEMA}.databricks_run where run_id = any(%s) and cancel_requested_at is not null"
 
 
 def databricks_runs_of_job_sql() -> str:
@@ -2902,4 +3235,6 @@ def skipped_databricks_runs_sql() -> str:
 
 def databricks_run_table_sql() -> str:
     """1 when the poller's table exists yet (the app reads the Jobs API until it does)."""
-    return f"select to_regclass('{SCHEMA}.databricks_run') is not null as ready"
+    return (f"select to_regclass('{SCHEMA}.databricks_run') is not null and exists (select 1 from pg_attribute "
+            f"where attrelid = to_regclass('{SCHEMA}.databricks_run') and attname = 'cancel_requested_at' "
+            "and not attisdropped) as ready")

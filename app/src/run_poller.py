@@ -9,10 +9,12 @@ Only one instance polls. It takes a session-level advisory lock on a connection 
 lock lasts as long as that session. A transaction-level lock would be released at the end of each poll, and another
 instance could poll at the same time. When the leader's session dies, the lock frees and another instance takes it.
 
-The poller also closes the ingest runs whose Databricks run has ended (the pages used to do this on their reads). The
-rules are the same as before: a run is closed only when Databricks says TERMINATED, SKIPPED or INTERNAL_ERROR, or when
-the Jobs API no longer has a run that began over NOT_FOUND_AFTER ago. A queued, pending, running, terminating or
-unreadable run is never touched, and nothing is cancelled here.
+The poller also closes the ingest runs whose Databricks run has ended (the pages used to do this on their reads). A
+run is closed only when Databricks says TERMINATED, SKIPPED or INTERNAL_ERROR, or when the Jobs API no longer has a run
+that began over NOT_FOUND_AFTER ago. It closes as cancelled when the app asked for the cancel (mark_stopping) or
+Databricks says CANCELED, else as failed. A run the app cancelled that Databricks still has going CANCEL_CLOSE_AFTER
+later closes as cancelled too. A queued, pending, running, terminating or unreadable run is otherwise never touched, and
+the poller never cancels a run itself.
 
 Until the table exists (the schema has not been migrated), the readers below fall back to the Jobs API.
 """
@@ -43,6 +45,10 @@ NOT_FOUND = "NOT_FOUND"
 # A run the Jobs API doesn't know is closed only once it began this long ago: a run of another workspace sharing the
 # state database, or one the API briefly can't find, is never taken for ended while it may still be going.
 NOT_FOUND_AFTER = timedelta(hours=24)
+# A run the app cancelled closes as cancelled this long after the cancel when Databricks still hasn't ended it, so a
+# Databricks run that never answers doesn't keep its records running for ever.
+CANCEL_CLOSE_AFTER = timedelta(minutes=2)
+CANCELLED_RESULTS = ("CANCELED", "CANCELLED")
 # Wrapper jobs are listed newest first on every poll, not only while active, so a SKIPPED trigger (a run Databricks
 # never runs; it is over at once) is recorded and the schedules' skipped counts stay exact.
 WRAPPER_LIMIT = 25
@@ -83,26 +89,65 @@ def ended_reason(ended: dict) -> str:
     return f"its Databricks run ended {how}{at} without finishing{why}"[:1000]
 
 
+def cancelled_reason(ended: dict) -> str:
+    """Why the app closed a cancelled run, in the run's own words: how its Databricks run ended, and when."""
+    if ended["state"] == NOT_FOUND:
+        return "cancelled, and its Databricks run no longer exists"
+    how = ended.get("result") or ended["state"]
+    at = f" at {ended['ended']}" if ended.get("ended") else ""
+    return f"cancelled, and its Databricks run ended {how}{at}"[:1000]
+
+
+def _aware(value) -> datetime:
+    """A timestamp as a timezone-aware datetime: lakebase.query sends them as ISO text, and a naive one is UTC."""
+    when = q._when(value)
+    return when if when.tzinfo else when.replace(tzinfo=timezone.utc)
+
+
 def should_close(state_row: dict, ingest_started_at, now: datetime) -> bool:
     """Whether a run recorded as running may be closed, given the recorded state of its Databricks run."""
     if state_row["life_cycle_state"] in ENDED_STATES:
         return True
     if state_row["life_cycle_state"] != NOT_FOUND or ingest_started_at is None:
         return False
-    when = q._when(ingest_started_at)
-    return (when if when.tzinfo else when.replace(tzinfo=timezone.utc)) < now - NOT_FOUND_AFTER
+    return _aware(ingest_started_at) < now - NOT_FOUND_AFTER
+
+
+def closing_status(state_row: dict) -> str:
+    """How a run whose Databricks run has ended is closed: cancelled when the app asked for the cancel or Databricks
+    says it was cancelled, else failed."""
+    if state_row.get("cancel_requested_at") or state_row.get("result_state") in CANCELLED_RESULTS:
+        return "cancelled"
+    return "failed"
 
 
 def closure(state_row: dict, ingest_started_at, databricks_run: int, now: datetime) -> Optional[dict]:
-    """The detail and the reason a run's close is recorded with, or None when the run stays as it is."""
-    if not should_close(state_row, ingest_started_at, now):
+    """How a run recorded as running is closed: its status, the time it finished (Databricks' end, or None for now), the
+    detail it is closed with and the reason in it. None when the run stays as it is. A run the app cancelled that
+    Databricks still hasn't ended CANCEL_CLOSE_AFTER after the cancel closes as cancelled, without a Databricks end."""
+    if should_close(state_row, ingest_started_at, now):
+        ended = {"state": state_row["life_cycle_state"], "result": state_row.get("result_state"),
+                 "message": state_row.get("state_message"), "ended": state_row.get("ended_at")}
+        status = closing_status(state_row)
+        reason = ended_reason(ended) if status == "failed" else cancelled_reason(ended)
+        finished_at = state_row.get("ended_at")
+    elif state_row.get("cancel_requested_at") and now - _aware(state_row["cancel_requested_at"]) > CANCEL_CLOSE_AFTER:
+        ended = {"state": state_row["life_cycle_state"], "result": None, "message": None, "ended": None}
+        status, finished_at = "cancelled", None
+        reason = "cancelled from the app, and Databricks had not ended its run 2 minutes after the cancel"
+    else:
         return None
-    ended = {"state": state_row["life_cycle_state"], "result": state_row.get("result_state"),
-             "message": state_row.get("state_message"), "ended": state_row.get("ended_at")}
-    reason = ended_reason(ended)
     detail = {"closed_by_app": "reconcile", "reason": reason, "databricks_run": databricks_run,
               "databricks_state": ended["state"], "databricks_result": ended["result"]}
-    return {"detail": json.dumps(detail), "reason": reason}
+    return {"status": status, "finished_at": finished_at, "detail": json.dumps(detail), "reason": reason}
+
+
+def write_close(cur, run_id: int, close: dict) -> None:
+    """Write one run's close (see closure) on an open transaction."""
+    if close["status"] == "cancelled":
+        cur.execute(q.close_cancelled_run_sql(), (close["finished_at"], close["detail"], run_id, close["reason"]))
+    else:
+        cur.execute(q.close_ended_run_sql(), (close["detail"], run_id, close["reason"], close["reason"]))
 
 
 def row_from_run(run: dict, kind: str, schedule_id: Optional[int]) -> dict:
@@ -350,8 +395,7 @@ class Poller:
             if close is None:
                 continue
             with db.transaction() as cur:
-                cur.execute(q.close_ended_run_sql(),
-                            (close["detail"], int(r["run_id"]), close["reason"], close["reason"]))
+                write_close(cur, int(r["run_id"]), close)
             closed += 1
         return closed
 
@@ -394,11 +438,12 @@ def note_started(job_id, run_id, job_parameters: dict) -> None:
 
 
 def mark_stopping(run_ids) -> None:
-    """Show runs the app just asked Databricks to cancel as terminating. Never raises: the cancel has happened."""
+    """Show runs the app just asked Databricks to cancel as terminating, from now until Databricks ends them (the page
+    reads this as Cancelling). Never raises: the cancel has happened."""
     try:
         if run_ids and table_ready():
             with db.transaction() as cur:
-                cur.execute(q.mark_terminating_sql(), (list(run_ids), list(ACTIVE_STATES)))
+                cur.execute(q.mark_cancel_requested_sql(), (list(run_ids), list(ACTIVE_STATES)))
             POLLER.wake()
     except Exception:
         pass

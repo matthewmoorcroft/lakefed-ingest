@@ -191,16 +191,18 @@ def transactions_of(checked: List[Checked]) -> Iterator[List[Checked]]:
 
 def plan_database(job_name: str, given: dict, rows: List[dict], columns: List[str], groups: Dict[str, int],
                   taken: set, own: set, group_of: Optional[Callable[[str, str], str]] = None,
-                  have: Optional[set] = None, join=None) -> dict:
+                  have: Optional[set] = None, join=None, new_job: bool = False, unity_catalog: bool = True) -> dict:
     """The plan of one database's rows (each {server, src_database, src_schema, src_table, line, fields}), made as
     new_job.plan makes a file's: its lines, groups and errors. groups is {server: its groups} (groups_by_server) and
     taken the groups other jobs use; the job's own groups (own) are not taken. A new job places its databases by
-    groups; an existing job passes its own group_of and have (new_job.job_inputs). Each line's number is its line in
-    the uploaded file, or None for a discovery."""
+    groups; an existing job passes its own group_of and have (new_job.job_inputs). new_job is the job being created
+    (new_job.plan's flag), and unity_catalog its naming rule (job_settings.unity_catalog_of). Each line's number is its
+    line in the uploaded file, or None for a discovery."""
     text = nj.csv_of(columns, [row["fields"] for row in rows])
     if group_of is None:
         group_of = lambda server, database: nj.group_name(job_name, server, database, groups.get(server, 1))
-    plan = nj.plan(job_name, text, given, taken_groups=set(taken) - set(own), group_of=group_of, have=have, join=join)
+    plan = nj.plan(job_name, text, given, taken_groups=set(taken) - set(own), group_of=group_of, have=have, join=join,
+                   new_job=new_job, unity_catalog=unity_catalog)
     for line, row in zip(plan["lines"], rows):
         line["line"] = row.get("line") or None
     return plan

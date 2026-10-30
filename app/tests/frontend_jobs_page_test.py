@@ -28,6 +28,13 @@ def test_the_job_list_has_a_header_and_no_colour_key():
     assert "StateKey" not in JOBS
 
 
+def test_the_jobs_table_bars_count_n_of_n_loaded_and_never_say_all_n_loaded():
+    overview = (PAGES / "Overview.tsx").read_text()
+    assert overview.count("<StateBar row={j} saysAllDone={false} />") == 1
+    assert overview.count("<StateBar row={notInJob} saysAllDone={false} />") == 1
+    assert "<StateBar row={j} />" not in overview
+
+
 def test_new_ingestion_job_is_on_the_filter_row_at_its_end():
     toolbar = JOBS[JOBS.index('<div className="toolbar">'):JOBS.index('<Section title="Jobs">')]
     assert 'className="primary toolbar-end"' in toolbar and "New ingestion job" in toolbar
@@ -101,8 +108,8 @@ def test_tuning_shows_the_defaults_saves_unchanged_as_the_default_and_can_reset(
 def test_deleted_jobs_are_folded_counted_and_paged():
     assert "Deleted jobs (" in JOBS and "DELETED_PAGE" in JOBS and "<Pager" in JOBS
     assert "rows: open" in JOBS
-    for word in ("Restore", "retention", "days left"):
-        assert word not in JOBS, word
+    for words in ("Restore", "Delete now"):             # a kept deleted job is restored or purged from this section
+        assert words in JOBS, words
 
 
 def test_the_menu_is_one_flat_list():
@@ -119,4 +126,4 @@ def test_a_run_with_failed_tables_fails_with_no_box_and_the_page_never_sets_the_
     assert "Also email when tables fail" not in FORM
     for text in (FORM, NEW_JOB, JOB_EDIT):
         assert "fail_on_table_errors:" not in text and "fail_on_table_errors =" not in text
-    assert 'filter((k: string) => k !== "fail_on_table_errors")' in FORM      # not a tuning field either
+    assert '.filter((k: string) => k !== "fail_on_table_errors"' in FORM      # not a tuning field either

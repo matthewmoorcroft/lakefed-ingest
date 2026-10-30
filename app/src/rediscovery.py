@@ -14,7 +14,7 @@ due, the discovery specs that read each server again, the rules, and the record 
 and writes the tables through the same path as Add tables."""
 import re
 from datetime import datetime, timezone
-from typing import List, Optional, Tuple
+from typing import List, Optional, Set, Tuple
 
 SETTING = "rediscover_hour"
 RECORD = "rediscovery"
@@ -152,6 +152,8 @@ def specs(parts: List[dict], sources: List[dict]) -> Tuple[List[Tuple[str, dict]
                 groups = list(by_secret.items())
         for secret, group_names in groups:
             spec = dict(base)
+            if listing.get("jdbc_connection"):
+                spec["jdbc_connection"] = listing["jdbc_connection"]
             if newest.get("src_connection"):
                 spec["src_connection"] = newest["src_connection"]
             else:
@@ -174,12 +176,14 @@ def table_key(server: str, database: str, schema: str, table: str) -> tuple:
     return tuple(str(part or "").lower() for part in (server_key(server), database, schema, table))
 
 
-def wanted(parts: List[dict], found: List[dict], statuses: List[dict], job_rows: List[dict]) -> dict:
+def wanted(parts: List[dict], found: List[dict], statuses: List[dict], job_rows: List[dict],
+           excluded: Set[tuple] = frozenset()) -> dict:
     """What the rules add to a job, given what the re-discovery found now.
 
     parts: the job's selection parts (scope, server, src_database, filter). found: the tables the discovery found
     (server, src_database, src_schema, src_table, fields). statuses: each database the discovery read (server,
-    src_database, status 'ok' or 'failed', error). job_rows: the job's control rows now.
+    src_database, status 'ok' or 'failed', error). job_rows: the job's control rows now. excluded: the tables the job
+    removed (table keys): they are not added again, and a database whose only new tables are excluded is not new.
 
     Returns {"add": the found rows to add (sorted by table), "new_databases": "server/database" names that a whole
     server part adds, "vanished": tables the job has that the source no longer has (kept, reported),
@@ -201,10 +205,10 @@ def wanted(parts: List[dict], found: List[dict], statuses: List[dict], job_rows:
                 database = str(row["src_database"])
                 if server_key(row["server"]) != server or needle not in database.lower():
                     continue
-                if (server, database.lower()) in have_databases:
+                key = table_key(row["server"], database, row["src_schema"], row["src_table"])
+                if (server, database.lower()) in have_databases or key in excluded:
                     continue
                 new_databases.add(f"{server}/{database}")
-                key = table_key(row["server"], database, row["src_schema"], row["src_table"])
                 if key not in have_tables:
                     add.setdefault(key, row)
         elif part["scope"] == "database":
@@ -213,7 +217,7 @@ def wanted(parts: List[dict], found: List[dict], statuses: List[dict], job_rows:
                 if row_database != (server, str(part["src_database"]).lower()):
                     continue
                 key = table_key(row["server"], row["src_database"], row["src_schema"], row["src_table"])
-                if key not in have_tables:
+                if key not in have_tables and key not in excluded:
                     add.setdefault(key, row)
     vanished = []
     for row in job_rows:

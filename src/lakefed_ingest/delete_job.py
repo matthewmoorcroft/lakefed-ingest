@@ -1,10 +1,15 @@
 """Deleting an operations-app job's tables (run by delete_job.ipynb, job lakefed_ingest_delete_job).
 
-The app has no DELETE privilege on the Lakebase tables, so when a job is deleted in the app its groups' tables would
-stay behind, as groups in no job. This job runs as the deployer (the state database's owner) and removes them:
+The app has no DELETE privilege on the Lakebase tables, so a deleted job's groups' rows can only be removed here. The
+app marks a job deleted and keeps it for the retention period (the bundle variable deleted_job_retention_days), so a
+Restore can bring it back. This job runs as the deployer (the state database's owner) and purges it:
 
 - **Which groups:** the deleted job's members that no other live job holds (a group is in one job, but a removed
   member could have joined another job since).
+- **When:** a job's delete run (its id given) purges it at once, from the app's Delete now. The daily run purges
+  every deleted job whose retention has run out (purge_expired), each in its own transaction.
+- **Finished:** the purge sets the job's options.delete_finished in the same transaction as the rows, so the app
+  lists it as purged and refuses a Restore.
 - **What goes, in one transaction under each group's run lock:** the groups' control rows and what is keyed by them
   (checkpoint, reseed_queue) or by the group (database_check, check_work, and the monitoring rollups
   rollup_database and rollup_group). A run of any of the groups refuses the
@@ -16,6 +21,9 @@ stay behind, as groups in no job. This job runs as the deployer (the state datab
   changes can still be read after it is gone; their rows keep the group and control id of rows that no longer exist.
 - **Target tables, when asked:** after the commit, the tables only these groups write; one another job's rows also
   write is kept and named. A schema is never dropped.
+- **One table (control_ids, with schedule_id):** a live job's table removed in the app. Its control row and its
+  checkpoint and reseed_queue rows go, in one transaction under its group's run lock; the rollups of its database
+  and group are recounted; its target table and the job's other tables stay (delete_table_rows).
 - **Drafts (purge_drafts):** the app reads a choice's tables as they are chosen, into discovery rows marked draft,
   before the job exists. A draft discarded (the page was cancelled or left) or that nobody has asked about for
   draft_ttl_s is purged: its discovery and discovered_table rows. A draft a Create or an Add took has no mark, so it
@@ -29,14 +37,41 @@ from __future__ import annotations
 from typing import Dict, List, Optional
 
 from ct_engine import sink_fqn
-from state_store import ROLLUP_DATABASE_TABLE, ROLLUP_GROUP_TABLE, collection_lock_key, delete_rollups_sql
+from state_store import (ROLLUP_DATABASE_TABLE, ROLLUP_GROUP_TABLE, ROLLUP_LOCK_NAMESPACE, collection_lock_key,
+                         delete_rollups_sql, rollup_database_rewrite_sql, rollup_group_lock_sql,
+                         rollup_group_rewrite_sql)
 
 SCHEMA = "lakefed_ingest"
 
 
 def schedule_sql() -> str:
-    """The job, deleted or not. Param: schedule id."""
-    return f"select id, name, deleted_at from {SCHEMA}.schedule where id = %s"
+    """The job, deleted or not, locked for this transaction: a Restore of it waits for the purge, then finds it purged.
+    Param: schedule id."""
+    return f"select id, name, deleted_at from {SCHEMA}.schedule where id = %s for update"
+
+
+def expired_jobs_sql() -> str:
+    """The deleted jobs whose retention has run out and whose delete hasn't finished, oldest first: their id, name and
+    whether they asked for their target tables to go. Param: retention days."""
+    return (f"select id, name, coalesce((options ->> 'delete_drop_targets')::boolean, false) as drop_targets "
+            f"from {SCHEMA}.schedule where deleted_at is not null and deleted_at <= now() - make_interval(days => %s) "
+            f"and not coalesce((options ->> 'delete_finished')::boolean, false) order by deleted_at, id")
+
+
+def expired_check_sql() -> str:
+    """One deleted job's row when its retention has run out and its delete hasn't finished, locked for this
+    transaction (a Restore waits for it), with whether it asked for its target tables to go. Params: schedule id,
+    retention days."""
+    return (f"select coalesce((options ->> 'delete_drop_targets')::boolean, false) from {SCHEMA}.schedule "
+            f"where id = %s and deleted_at is not null and deleted_at <= now() - make_interval(days => %s) "
+            f"and not coalesce((options ->> 'delete_finished')::boolean, false) for update")
+
+
+def finished_sql() -> str:
+    """Mark a deleted job's delete finished: its groups' rows are gone, so the app lists it as purged. Param: schedule
+    id."""
+    return (f"update {SCHEMA}.schedule set options = jsonb_set(coalesce(options, '{{}}'::jsonb), "
+            f"'{{delete_finished}}', 'true'::jsonb) where id = %s")
 
 
 def groups_sql() -> str:
@@ -136,21 +171,139 @@ def delete_rows(cur, schedule_id: int) -> dict:
         raise ValueError(f"ingestion job {job['name']} ({schedule_id}) isn't deleted: delete it in the app first")
     cur.execute(groups_sql(), (int(schedule_id), int(schedule_id)))
     groups = [r["task_collection"] for r in _rows(cur)]
-    if not groups:
-        return {"job": job["name"], "groups": [], "deleted": _forget_selection(cur, schedule_id),
+    deleted, targets = {}, {"drop": [], "kept": []}
+    if groups:
+        for group in groups:
+            cur.execute(lock_sql(), (collection_lock_key(group),))
+            if not cur.fetchone()[0]:
+                raise RunGoing(f"a run of group {group} is loading: nothing was deleted; "
+                               "run the delete again once it ends")
+        cur.execute(targets_sql(), (groups, groups))
+        targets = plan_targets(_rows(cur))
+        for table, sql in DELETES:
+            cur.execute(sql, (groups,))
+            deleted[table] = cur.rowcount
+    deleted.update(_forget_selection(cur, schedule_id))
+    cur.execute(finished_sql(), (int(schedule_id),))
+    return {"job": job["name"], "groups": groups, "deleted": deleted, "targets": targets}
+
+
+def job_groups_sql() -> str:
+    """The groups of a live job that no other live job holds: the only groups a table can leave without changing
+    another job's tables. Params: schedule id, schedule id."""
+    return (f"select distinct m.task_collection from {SCHEMA}.schedule_member m where m.schedule_id = %s "
+            f"and m.removed_at is null and not exists (select 1 from {SCHEMA}.schedule_member o "
+            f"join {SCHEMA}.schedule s on s.id = o.schedule_id where o.task_collection = m.task_collection "
+            f"and o.removed_at is null and s.deleted_at is null and o.schedule_id <> %s) order by 1")
+
+
+def table_rows_sql() -> str:
+    """The control rows named by id, with the group and database each belongs to and its target. Param: control ids."""
+    return (f"select id, task_collection, coalesce(src_database, '') as src_database, sink_catalog, sink_schema, "
+            f"sink_table from {SCHEMA}.control where id = any(%s) order by id")
+
+
+# A removed table's own state, keyed by its control row. The target table, database_check (a whole database's stamp,
+# still true for the tables that stay) and check_work (keyed by database) are not touched.
+TABLE_DELETES = (
+    ("reseed_queue", f"delete from {SCHEMA}.reseed_queue where control_id = any(%s)"),
+    ("checkpoint", f"delete from {SCHEMA}.checkpoint where control_id = any(%s)"),
+    ("control", f"delete from {SCHEMA}.control where id = any(%s)"),
+)
+
+
+def delete_table_rows(cur, schedule_id: int, control_ids) -> dict:
+    """Inside the caller's transaction: remove some tables from a live job. Their control rows and their own state go
+    (checkpoint, reseed_queue), the rollups of their databases and groups are recounted, and the target tables are
+    kept. The job, its other tables and run history stay. Takes the same run locks as a job's Delete: a run of a
+    table's group refuses the lot. Returns {"job", "groups", "control_ids", "missing", "deleted", "databases",
+    "targets"}. Raises ValueError for a deleted job, a row outside the job's own groups, or no ids; RunGoing while a
+    group is loading."""
+    ids = sorted({int(i) for i in control_ids})
+    if not ids:
+        raise ValueError("no control ids to remove")
+    cur.execute(schedule_sql(), (int(schedule_id),))
+    found = _rows(cur)
+    if not found:
+        raise ValueError(f"ingestion job {schedule_id} doesn't exist")
+    job = found[0]
+    if job["deleted_at"] is not None:
+        raise ValueError(f"ingestion job {job['name']} ({schedule_id}) is deleted: its delete job removes its tables")
+    cur.execute(job_groups_sql(), (int(schedule_id), int(schedule_id)))
+    own = {r["task_collection"] for r in _rows(cur)}
+    cur.execute(table_rows_sql(), (ids,))
+    rows = _rows(cur)
+    stray = sorted({r["task_collection"] for r in rows} - own)
+    if stray:
+        raise ValueError(f"group(s) {', '.join(stray)} aren't held by ingestion job {job['name']} alone: remove the "
+                         "table in the other job, or delete that group's job")
+    missing = sorted(set(ids) - {r["id"] for r in rows})
+    if not rows:
+        return {"job": job["name"], "groups": [], "control_ids": [], "missing": missing,
+                "deleted": {table: 0 for table, _ in TABLE_DELETES}, "databases": 0,
                 "targets": {"drop": [], "kept": []}}
+    groups = sorted({r["task_collection"] for r in rows})
     for group in groups:
         cur.execute(lock_sql(), (collection_lock_key(group),))
         if not cur.fetchone()[0]:
-            raise RunGoing(f"a run of group {group} is loading: nothing was deleted; run the delete again once it ends")
-    cur.execute(targets_sql(), (groups, groups))
-    targets = plan_targets(_rows(cur))
+            raise RunGoing(f"a run of group {group} is loading: nothing was removed; remove the table again once it ends")
+    live = [r["id"] for r in rows]
+    cur.execute(rollup_group_lock_sql(), (ROLLUP_LOCK_NAMESPACE, groups))
     deleted = {}
-    for table, sql in DELETES:
-        cur.execute(sql, (groups,))
+    for table, sql in TABLE_DELETES:
+        cur.execute(sql, (live,))
         deleted[table] = cur.rowcount
-    deleted.update(_forget_selection(cur, schedule_id))
-    return {"job": job["name"], "groups": groups, "deleted": deleted, "targets": targets}
+    databases = sorted({(r["task_collection"], r["src_database"]) for r in rows})
+    cur.execute(rollup_database_rewrite_sql(), ([g for g, _ in databases], [d for _, d in databases]))
+    cur.execute(rollup_group_rewrite_sql(), (groups,))
+    kept = list(dict.fromkeys(sink_fqn(r) for r in rows))
+    return {"job": job["name"], "groups": groups, "control_ids": live, "missing": missing, "deleted": deleted,
+            "databases": len(databases), "targets": {"drop": [], "kept": kept}}
+
+
+def expired_jobs(cur, retention_days: int) -> List[dict]:
+    """Inside the caller's transaction: the deleted jobs whose retention has run out, as {"id", "name",
+    "drop_targets"} rows (see expired_jobs_sql)."""
+    cur.execute(expired_jobs_sql(), (int(retention_days),))
+    return _rows(cur)
+
+
+def delete_expired(cur, schedule_id: int, retention_days: int) -> Optional[dict]:
+    """Inside the caller's transaction: delete_rows for one deleted job whose retention has run out, with its
+    ``drop_targets`` choice added. Returns None when it has no longer (a Restore, or its purge, came first): nothing
+    is deleted then. Raises RunGoing as delete_rows does."""
+    cur.execute(expired_check_sql(), (int(schedule_id), int(retention_days)))
+    found = cur.fetchall()
+    if not found:
+        return None
+    result = delete_rows(cur, schedule_id)
+    result["drop_targets"] = bool(found[0][0])
+    return result
+
+
+def purge_expired(transaction, retention_days: int, drop_tables) -> dict:
+    """Purge every deleted job whose retention has run out, each in its own transaction, so one job's run going
+    doesn't hold up the others (a job whose group is loading waits for the next daily run). ``transaction()`` opens
+    one transaction and yields its cursor; ``drop_tables(tables)`` drops them after the commit and returns
+    {table: error} for the ones it couldn't. A job's target tables are dropped only if it asked for them.
+    Returns {"listed", "purged": [summary per job], "waiting": [{"job", "reason"}], "failed": {table: error}}."""
+    with transaction() as cur:
+        listed = expired_jobs(cur, retention_days)
+    purged, waiting, failed = [], [], {}
+    for job in listed:
+        try:
+            with transaction() as cur:
+                result = delete_expired(cur, job["id"], retention_days)
+        except RunGoing as error:
+            waiting.append({"job": job["name"], "reason": str(error)})
+            continue
+        if result is None:
+            continue
+        to_drop = result["targets"]["drop"] if result["drop_targets"] else []
+        drop_failed = drop_tables(to_drop) if to_drop else {}
+        failed.update(drop_failed)
+        purged.append(summary(result, [t for t in to_drop if t not in drop_failed], drop_failed))
+    return {"listed": len(listed), "purged": purged, "waiting": waiting, "failed": failed}
 
 
 DRAFT_TTL_S = 2 * 3600

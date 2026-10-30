@@ -211,6 +211,10 @@ class WorkSlots:
                 self._free.put(slot)
 
 
+class Cancelled(Exception):
+    """Raised by a worker whose item was stopped by a cancel: the item is recorded as 'cancelled', not 'failed'."""
+
+
 def run_parallel(
     items: Iterable,
     worker: Callable,
@@ -229,7 +233,7 @@ def run_parallel(
     - ``item_id`` maps an item to a short identifier for the result record (default: the item).
 
     Returns one result dict per item, in input order:
-        {"item": <id>, "pool": <pool>, "status": "ok"|"failed", "detail": <worker return | error>}
+        {"item": <id>, "pool": <pool>, "status": "ok"|"failed"|"cancelled", "detail": <worker return | error>}
     """
     items = list(items)
     max_parallel = max(1, int(max_parallel))
@@ -245,6 +249,9 @@ def run_parallel(
             if set_pool is not None:
                 set_pool(pool)
             rec["detail"] = worker(item)
+        except Cancelled as e:
+            rec["status"] = "cancelled"
+            rec["detail"] = str(e)
         except Exception as e:  # isolate: one bad item must not fail the batch
             rec["status"] = "failed"
             rec["detail"] = str(e)
@@ -259,11 +266,14 @@ def run_parallel(
 
 
 def summarize(results: List[dict]) -> dict:
-    """Count results by status and by worker outcome (the 'detail' string on success)."""
-    summary = {"total": len(results), "ok": 0, "failed": 0, "by_outcome": {}}
+    """Count results by status and by worker outcome (the 'detail' string on success). A cancelled result is
+    counted apart from the failures, so a cancel never reads as a failure."""
+    summary = {"total": len(results), "ok": 0, "failed": 0, "cancelled": 0, "by_outcome": {}}
     for r in results:
         if r.get("status") == "failed":
             summary["failed"] += 1
+        elif r.get("status") == "cancelled":
+            summary["cancelled"] += 1
         else:
             summary["ok"] += 1
             outcome = str(r.get("detail"))

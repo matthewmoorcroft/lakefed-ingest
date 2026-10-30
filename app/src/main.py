@@ -25,6 +25,8 @@ from datetime import datetime, timedelta, timezone
 from typing import Dict, Iterable, List, Optional, Tuple
 
 from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -33,10 +35,12 @@ import action_states
 import compute
 import config_import as ci
 import ingestion_jobs as ij
+import jdbc_connections as jc
 import job_settings as js
 import job_settings_sql as jss
 import jobs
 import by_database
+import jdbc_logins as jl
 import lakebase as db
 import new_job as nj
 import placement
@@ -44,6 +48,7 @@ import queries as q
 import rediscovery
 import rollup
 import run_poller
+import table_removal
 import schedules as sch
 import schema_upgrade
 import source_catalog
@@ -132,6 +137,15 @@ async def _errors(request: Request, exc: Exception):
     return JSONResponse(status_code=500, content={"detail": msg[:2000], "hint": hint})
 
 
+@app.exception_handler(RequestValidationError)
+async def _invalid_input(request: Request, exc: RequestValidationError):
+    """FastAPI's 422 echoes each failing field's input, which on the JDBC login route is a password: that route keeps
+    only where and why a field failed. Every other route keeps FastAPI's own 422."""
+    if request.url.path != jl.ROUTE:
+        return await request_validation_exception_handler(request, exc)
+    return JSONResponse(status_code=422, content={"detail": jl.safe_validation_errors(exc.errors())})
+
+
 def _user(request: Request) -> str:
     return (request.headers.get("X-Forwarded-Email") or request.headers.get("X-Forwarded-User") or "").strip()
 
@@ -145,13 +159,30 @@ async def _writes_need_a_user(request: Request, call_next):
     return await call_next(request)
 
 
+# The reason a refusal's detail carries when a run of a group holds its lock, so a caller (re-discovery's "deferred")
+# reads it from the detail's fields, never from its text, which also names jobs.
+RUNNING_REASON = "running"
+
+
+def _running_refusal(group: str) -> HTTPException:
+    """The 409 for a group whose run holds its lock: its message, the reason RUNNING_REASON and the group."""
+    return HTTPException(409, {"message": f"its ingestion job is running (group '{group}'); try again after the run "
+                                          "finishes", "reason": RUNNING_REASON, "group": group})
+
+
+def _refused_while_running(error: HTTPException) -> bool:
+    """Whether a refusal is the one a running group gives (_running_refusal), by its reason field."""
+    return (error.status_code == 409 and isinstance(error.detail, dict)
+            and error.detail.get("reason") == RUNNING_REASON)
+
+
 def _lock_collections(cur, collections):
     """Take each collection's run lock for this transaction, or refuse: changing tables while their
     collection is running could race the run's own checkpoint writes."""
     for c in sorted({c for c in collections if c}):
         cur.execute(q.collection_lock_sql(), (q.collection_lock_key(c),))
         if not cur.fetchone()[0]:
-            raise HTTPException(409, f"its ingestion job is running (group '{c}'); try again after the run finishes")
+            raise _running_refusal(c)
 
 
 def _lock_collections_together(cur, collections):
@@ -163,7 +194,7 @@ def _lock_collections_together(cur, collections):
     got = {key: taken for key, taken in cur.fetchall()}
     for c in collections:
         if not got.get(q.collection_lock_key(c)):
-            raise HTTPException(409, f"its ingestion job is running (group '{c}'); try again after the run finishes")
+            raise _running_refusal(c)
 
 
 def _refuse_mixed_sinks(cur, rows):
@@ -189,9 +220,45 @@ def _refuse_split_databases(cur, rows):
     cur.execute(q.split_databases_sql(), (keys,))
     split = cur.fetchall()
     if split:
-        _, database, collections = split[0]
-        raise HTTPException(409, f"database {database} would have tables in more than one ingestion group "
-                                 f"({', '.join(collections)}); move all of its tables together")
+        cur.execute(q.clash_jobs_sql(), (sorted({group for row in split for group in row[2]}),))
+        jobs = [{"id": row[0], "name": row[1]} for row in cur.fetchall()]
+        raise HTTPException(409, {"message": _split_message(split, [job["name"] for job in jobs]), "jobs": jobs})
+
+
+def _split_message(split, job_names=()) -> str:
+    """The refusal for databases with tables in more than one ingestion group: the one database and its groups, or the
+    first three databases and a count for the rest. When live jobs hold some of those groups, it names them too. Only
+    names already read are used; the write is rolled back."""
+    def first_three(names):
+        shown = ", ".join(names[:3])
+        return f"{shown} and {len(names) - 3} more" if len(names) > 3 else shown
+    databases = [row[1] for row in split]
+    groups = first_three(sorted({group for row in split for group in row[2]}))
+    holders = ""
+    if job_names:
+        kind = "job" if len(job_names) == 1 else "jobs"
+        holders = f" Some of these groups are in ingestion {kind} {first_three(job_names)}."
+    if len(databases) == 1:
+        return (f"Database {databases[0]} has tables in more than one ingestion group ({groups}).{holders} "
+                "Move all of its tables into one group. Nothing was written.")
+    count, names = len(databases), first_three(databases)
+    return (f"{count} databases have tables in more than one ingestion group: {names}.{holders} "
+            "Move all of each database's tables into one group. Nothing was written.")
+
+
+def _refuse_deleted_databases(cur, rows):
+    """Before writing new control rows, in the same transaction: refuse when a database they read is one a deleted job
+    still keeps (not yet purged). Its tables would share the job's groups' state, so the job is restored or purged
+    first."""
+    keys = sorted({q.database_key(r) for r in rows})
+    if not keys:
+        return
+    cur.execute(q.deleted_database_owners_sql(), (keys,))
+    owners = cur.fetchall()
+    if owners:
+        database, job, _ = owners[0]
+        raise HTTPException(409, f"database {database} is in the deleted ingestion job {job}, which is kept until "
+                                 f"it is purged: Restore {job}, or Delete now to purge it, then add these tables")
 
 
 def _log(cur, user, action, control_id, collection, field=None, old=None, new=None, reseed=None, batch=None):
@@ -211,8 +278,14 @@ def _log_lines(cur, lines, per_statement=q.CONTROL_BATCH):
 
 
 def _taken_target(row: dict) -> str:
-    return (f"another table already writes {row['sink_catalog']}.{row['sink_schema']}.{row['sink_table']}"
-            + (f" for {row['client_id']}" if row.get("client_id") else ""))
+    """Why a row's target is refused. A consolidated row is named by its database and server in words: its client_id
+    is an internal identity key that no one typed, so it stays out of the message."""
+    sink = f"{row['sink_catalog']}.{row['sink_schema']}.{row['sink_table']}"
+    if not row.get("client_id"):
+        return f"another table already writes {sink}"
+    server = str(row.get("src_connection") or row.get("src_host") or "").strip()
+    return (f"another table already writes {sink} for database {row['src_database']}"
+            + (f" on {server}" if server else ""))
 
 
 def _insert_controls(cur, rows, user, batch, skip_taken=False, progress=None,
@@ -221,6 +294,7 @@ def _insert_controls(cur, rows, user, batch, skip_taken=False, progress=None,
     to a statement, inside the caller's transaction. A row whose target another table writes refuses the lot (409), or
     with skip_taken is left out. Returns (row, id) for each row written; progress(n) is told how many rows are done
     after each statement."""
+    _refuse_deleted_databases(cur, rows)
     written = []
     for at in range(0, len(rows), q.CONTROL_BATCH):
         chunk = rows[at:at + q.CONTROL_BATCH]
@@ -286,6 +360,7 @@ def _apply_plans(cur, rows, plans, user, batch):
     """Write planned edits (queries.plan_edit) inside the caller's transaction: each changed field, its change log
     line, a reseed where the plan needs one, then the mixed-sink and split-database checks over the rows as they
     now are."""
+    _refuse_connection_edits(rows, plans, cur=cur, user=user)
     by_id = {r["id"]: r for r in rows}
     before = [(by_id[p["id"]]["task_collection"], by_id[p["id"]].get("src_database")) for p in plans]
     for p in plans:
@@ -439,6 +514,8 @@ def _error_text(e: BaseException) -> str:
         detail = e.detail
         if isinstance(detail, dict) and detail.get("errors"):
             return "; ".join(str(x) for x in detail["errors"][:20])[:4000]
+        if isinstance(detail, dict) and detail.get("message"):
+            return str(detail["message"])[:4000]
         return str(detail)[:4000]
     return (str(e) or type(e).__name__)[:4000]
 
@@ -622,6 +699,17 @@ def upload_tables(body: UploadRequest, request: Request):
     return {"upload_id": upload_id, "file_name": body.file_name, "connection": read["connection"],
             "columns": read["columns"], "lines": len(lines), "tables": tables, "databases": databases,
             "invalid": invalid, "invalid_lines": invalid_lines}
+
+
+@app.get("/api/uploads/{upload_id}/lines")
+def upload_first_lines(upload_id: str, limit: int = 5):
+    """An upload's header and its first lines as the file gave them, for the import's preview: the header's columns, and
+    each line's number and fields, read from Lakebase. At most 20 lines, however many are asked for."""
+    rows = db.query(q.upload_head_sql(), (max(1, min(int(limit), 20)), upload_id))
+    if not rows:
+        raise HTTPException(404, f"upload {upload_id} not found")
+    return {"columns": list(rows[0]["columns"]),
+            "lines": [{"line": r["line"], "fields": r["fields"]} for r in rows if r["line"] is not None]}
 
 
 SOURCE_KINDS = ("upload", "discovery")
@@ -989,20 +1077,12 @@ def _running() -> List[dict]:
     return _shared("running", compute)
 
 
-def _older_than(started_at, age: timedelta) -> bool:
-    if started_at is None:
-        return False
-    when = q._when(started_at)
-    return (when if when.tzinfo else when.replace(tzinfo=timezone.utc)) < datetime.now(timezone.utc) - age
-
-
-def _close_ended_runs(user: Optional[str] = None) -> int:
-    """Close each run recorded as running whose Databricks run has ended (cancelled in Databricks, or its cluster
-    gone): failed, with how its Databricks run ended, and its events still running, as the engine closes an abandoned
-    run. A run with no job run id (run by hand outside a job), whose state can't be read now, or still going in
-    Databricks (queued, pending, running, terminating, or retrying) is left as it is; nothing is ever cancelled here.
-    Returns how many were closed."""
+def _close_ended_runs() -> int:
+    """Close each run recorded as running whose Databricks run has ended, while the poller's table does not exist yet
+    (the poller does it once it does, run_poller.closure). A run with no job run id, or whose state can't be read now,
+    or still going in Databricks, is left as it is; nothing is ever cancelled here. Returns how many were closed."""
     closed = 0
+    now = datetime.now(timezone.utc)
     for r in db.query(q.open_runs_sql()):
         job_run = str(r.get("job_run_id") or "").strip()
         if not job_run.isdigit():
@@ -1011,14 +1091,15 @@ def _close_ended_runs(user: Optional[str] = None) -> int:
             ended = jobs.run_ended(job_run)
         except Exception:
             continue
-        if not ended or (ended["state"] == "NOT_FOUND" and not _older_than(r.get("started_at"),
-                                                                         run_poller.NOT_FOUND_AFTER)):
+        if not ended:
             continue
-        reason = run_poller.ended_reason(ended)
-        detail = json.dumps({"closed_by_app": user or "reconcile", "reason": reason, "databricks_run": int(job_run),
-                             "databricks_state": ended["state"], "databricks_result": ended.get("result")})
+        state_row = {"life_cycle_state": ended["state"], "result_state": ended.get("result"),
+                     "state_message": ended.get("message"), "ended_at": ended.get("ended")}
+        close = run_poller.closure(state_row, r.get("started_at"), int(job_run), now)
+        if close is None:
+            continue
         with _write() as cur:
-            cur.execute(q.close_ended_run_sql(), (detail, int(r["run_id"]), reason, reason))
+            run_poller.write_close(cur, int(r["run_id"]), close)
         closed += 1
     return closed
 
@@ -1135,8 +1216,9 @@ def _schedules():
 
 
 def _with_delete_states(rows: List[dict], now: datetime) -> List[dict]:
-    """The rows with each deleted job's delete state. One whose delete is finished (the delete job succeeded and no
-    tables are left) is marked ``delete_finished`` and leaves the list: the Deleted jobs history keeps it."""
+    """The rows with each deleted job's delete state (ingestion_jobs.delete_state). One whose purge finished (the delete
+    job succeeded and no tables are left) is marked ``delete_finished`` and leaves the list. Its own marking does this
+    too; this catches a delete job run from before it did."""
     deleted = [r for r in rows if r.get("deleted_at") is not None]
     if not deleted:
         return rows
@@ -1146,7 +1228,7 @@ def _with_delete_states(rows: List[dict], now: datetime) -> List[dict]:
         if r.get("deleted_at") is None:
             out.append(r)
             continue
-        state = ij.delete_state(r, r["id"] in left, _delete_run(r), now)
+        state = ij.delete_state(r, r["id"] in left, _delete_run(r), now, jobs.DELETED_JOB_RETENTION_DAYS)
         if state["state"] == ij.DELETE_GONE:
             with db.transaction() as cur:
                 cur.execute(q.set_schedule_flag_sql(), (["delete_finished"], True, int(r["id"])))
@@ -1155,10 +1237,10 @@ def _with_delete_states(rows: List[dict], now: datetime) -> List[dict]:
     return out
 
 
-def _deleting() -> set:
-    """The groups of jobs being deleted (queries.deleting_groups_sql), shared like _schedules: they stay with their
-    job, under Deleted jobs, until the delete job removes them."""
-    return _shared("deleting", lambda: {r["task_collection"] for r in db.query(q.deleting_groups_sql())})
+def _deleted_groups() -> set:
+    """The groups of deleted jobs kept for a Restore (queries.deleted_groups_sql), shared like _schedules: they stay
+    with their job, under Deleted jobs, until the purge removes them."""
+    return _shared("deleted_groups", lambda: {r["task_collection"] for r in db.query(q.deleted_groups_sql())})
 
 
 def _active(members: List[dict]) -> List[dict]:
@@ -1176,7 +1258,21 @@ def _group_stats() -> dict:
 
 def _group_runs(groups: List[str], start: datetime, end: datetime) -> List[dict]:
     """The group runs of some groups that started in [start, end), with their work and outcome."""
-    return _with_rows_written(db.query(q.group_runs_sql(), (sorted(groups), start, end))) if groups else []
+    if not groups:
+        return []
+    return _with_cancelling(_with_rows_written(db.query(q.group_runs_sql(), (sorted(groups), start, end))))
+
+
+def _with_cancelling(runs: List[dict]) -> List[dict]:
+    """The running group runs whose Databricks run a Cancel asked to stop, marked cancelling until the poller
+    closes them (queries.job_run_outcome reads the mark). Every page that places group runs reads them here."""
+    ids = sorted({int(r["job_run_id"]) for r in runs
+                  if r.get("status") == "running" and str(r.get("job_run_id") or "").isdigit()})
+    if not ids or not run_poller.table_ready():
+        return runs
+    asked = {str(row["run_id"]) for row in db.query(q.cancel_requested_runs_sql(), (ids,))}
+    return [dict(r, cancelling=True) if r.get("status") == "running" and str(r.get("job_run_id") or "") in asked
+            else r for r in runs]
 
 
 def _schedule(job_id: int) -> dict:
@@ -1226,7 +1322,8 @@ def _last_ran(jobs: List[dict], now: datetime) -> dict:
     windows = [(m["task_collection"], *_runs_window(j, newest[j["id"]], newest[j["id"]] + timedelta(seconds=1)))
                for j in jobs if j["id"] in newest for m in members if m["schedule_id"] == j["id"]]
     groups, starts, ends = (list(column) for column in zip(*windows)) if windows else ([], [], [])
-    runs = _with_rows_written(db.query(q.group_runs_in_windows_sql(), (groups, starts, ends))) if windows else []
+    runs = (_with_cancelling(_with_rows_written(db.query(q.group_runs_in_windows_sql(), (groups, starts, ends))))
+            if windows else [])
     found = {}
     for job in jobs:
         if job["id"] not in newest:
@@ -1252,7 +1349,7 @@ def _jobs_view() -> dict:
         start = min([ij.window(int(s["cadence_minutes"]), ij.RECENT_JOB_RUNS + 1, now) for s in schedules]
                     + [q._when(r["started_at"]) - timedelta(days=1) for r in running if r.get("started_at")], default=now)
         runs = _group_runs(groups, start, now + timedelta(seconds=1))
-        deleting = _deleting()
+        deleting = _deleted_groups()
         view = ij.jobs_view(schedules, members, states, running, runs, stats, now, deleting=deleting)
         by_id = {s["id"]: s for s in schedules}
         # A job none of whose recent triggers ran (paused overnight, say): its last job run is found before them.
@@ -1274,14 +1371,15 @@ def _jobs_view() -> dict:
     return _shared("jobs_view", compute)
 
 
-JOB_FILTERS = ("all", "running", "failing", "late", "paused")
+JOB_FILTERS = ("all", "running", "failing", "late", "paused", "attention")
 # The sums a group row shows: its databases, enabled tables, late databases, and its tables by state (rollup.STATES).
 GROUP_SUMS = ("databases", "enabled_tables", "late_databases") + rollup.STATES
 
 
 def _job_filter(job: dict, name: str) -> bool:
     return {"all": True, "running": bool(job.get("running_job_run")), "failing": bool(job["state_failing"]),
-            "late": bool(job["late_databases"]), "paused": bool(job.get("paused"))}[name]
+            "late": bool(job["late_databases"]), "paused": bool(job.get("paused")),
+            "attention": ij.needs_attention(job)}[name]
 
 
 # Columns the Ingestion jobs list sorts by, besides its own order (failing first, then late, then by name).
@@ -1308,7 +1406,8 @@ def ingestion_jobs(filter: str = "all", search: str = "", offset: int = 0, limit
     audits = {s["id"]: _audit(s) for s in _schedules()[0]}
     needle = search.strip().lower()
     found = [{**j, **audits.get(j["id"], {})} for j in view["jobs"]
-             if not needle or needle in str(j["name"]).lower() or any(needle in g.lower() for g in j["groups"])]
+             if not j.get("delete") and (not needle or needle in str(j["name"]).lower()
+                                         or any(needle in g.lower() for g in j["groups"]))]
     counts = {f: sum(1 for j in found if _job_filter(j, f)) for f in JOB_FILTERS}
     rows = [j for j in found if _job_filter(j, filter)]
     if sort:
@@ -1327,7 +1426,7 @@ def groups_not_in_job():
     """The groups in no ingestion job, as a page of their own: their tables by state and each group's last run, so a
     deployment with no jobs (a read-only share) still opens its groups and tables from the jobs list."""
     schedules, members = _schedules()
-    _, not_in_job = rollup.jobs(_states(), schedules, members, _deleting())
+    _, not_in_job = rollup.jobs(_states(), schedules, members, _deleted_groups())
     not_in_job = not_in_job or {"groups": []}
     groups, stats, last_runs = rollup.groups(_states()), _group_stats(), _last_runs()
     rows = []
@@ -1340,21 +1439,25 @@ def groups_not_in_job():
 
 
 @app.get("/api/ingestion-jobs/deletions")
-def job_deletions(offset: int = 0, limit: int = 0, rows: bool = True):
-    """The deleted jobs whose Delete runs the delete job, newest first, a page at a time (limit 0: DELETIONS_LISTED),
-    and how many there are; with rows false only how many, for the closed list's header. Each row: its delete job run
-    (going, finished or failed, with its message), whether it drops the target tables, and how many of its tables are
-    left (none once the delete job has finished). Each row asks Databricks for its run, so a page is kept small."""
+def job_deletions(request: Request, offset: int = 0, limit: int = 0, rows: bool = True):
+    """The deleted jobs kept for a Restore (not yet purged), newest deletion first, a page at a time (limit 0:
+    DELETIONS_LISTED), and how many there are; with rows false only how many, for the closed list's header. Each row has
+    its delete state (kept with the days left, deleting, or failed with the reason), whether it asked to drop its target
+    tables, how many of its tables are left, and why it can't be restored or purged now (delete_refusal)."""
+    user = _user(request)
+    now = datetime.now(timezone.utc)
     limit = min(max(int(limit or DELETIONS_LISTED), 1), DELETIONS_PAGE_MAX)
-    total = int(db.query(q.deletions_count_sql())[0]["total"])
-    out = []
-    for s in db.query(q.deletions_sql(), (limit, max(0, int(offset)))) if rows else []:
+    offset = max(int(offset), 0)
+    total = int(db.query(q.deleted_jobs_count_sql())[0]["total"])
+    deleted = []
+    for s in _with_delete_states(db.query(q.deleted_jobs_sql(), (limit, offset)), now) if rows else []:
         plan = _delete_plan(s["id"])
-        out.append({"id": s["id"], "name": s["name"], "deleted_at": s["deleted_at"],
-                    "drop_targets": bool(sch.options_of(s).get("delete_drop_targets")), "run": _delete_run(s),
-                    "tables_left": plan["tables"], "groups_left": len(plan["groups"])})
-    return {"deletions": out, "total": total, "offset": max(0, int(offset)), "limit": limit,
-            "configured": bool(jobs.DELETE_JOB_ID)}
+        deleted.append({"id": s["id"], "name": s["name"], "deleted_at": s["deleted_at"],
+                        "drop_targets": bool(sch.options_of(s).get("delete_drop_targets")), "delete": s["delete"],
+                        "tables_left": plan["tables"], "groups_left": len(plan["groups"]),
+                        "delete_refusal": _delete_refusal(s, plan["groups"], user)})
+    return {"deleted": deleted, "total": total, "offset": offset, "limit": limit,
+            "configured": bool(jobs.DELETE_JOB_ID), "retention_days": jobs.DELETED_JOB_RETENTION_DAYS}
 
 
 @app.get("/api/ingestion-jobs/{job_id}/delete-preview")
@@ -1370,6 +1473,7 @@ def delete_preview(job_id: int):
     if not blocker and plan["tables"] and not jobs.DELETE_JOB_ID:
         blocker = NO_DELETE_JOB
     return {**plan, "groups_kept": kept_groups, "configured": bool(jobs.DELETE_JOB_ID),
+            "retention_days": jobs.DELETED_JOB_RETENTION_DAYS,
             "blocked": blocker.get("message") if isinstance(blocker, dict) else blocker}
 
 
@@ -1412,7 +1516,7 @@ def ingestion_job(job_id: int, request: Request):
     cadence = int(job["cadence_minutes"])
     start = sch.start_minute(job)
     finished = [r for r in _job_runs_of(job, now - timedelta(days=7), now + timedelta(seconds=1), now)
-                if r["outcome"]["label"] != "Running"]
+                if r["outcome"]["label"] not in q.RUNNING_OUTCOMES]
     week = [r["took_s"] for r in finished if r["took_s"] is not None]
     groups = rollup.groups(_states())
     group_rows = []
@@ -1446,7 +1550,10 @@ def ingestion_job(job_id: int, request: Request):
                         "groups": len(mine), "check": job.get("job_variant") == sch.CHECK_VARIANT,
                         **_run_phase_of(job, mine, now)},
             "delete_blocked": refusals["delete"], "change_blocked": refusals["change"],
-            "delete": job.get("delete"), "rediscovery": _rediscovery_view(job, now), **_audit(job)}
+            "delete": job.get("delete"),
+            "delete_refusal": (_delete_refusal(job, _delete_plan(job["id"])["groups"], _user(request))
+                               if job.get("delete") else None),
+            "rediscovery": _rediscovery_view(job, now), **_audit(job)}
 
 
 def _job_groups(job_id: int) -> List[str]:
@@ -1479,14 +1586,14 @@ def _started_job(job: dict) -> Optional[str]:
 NO_IDENTITY = "the app can't tell who you are (the Databricks Apps proxy sent no user), so it refuses this"
 
 
-DELETED_JOB = ("this job is deleted: its runs and tables can't change while its delete runs or after it, and it "
-               "can't be run or edited; Run again on it starts its delete job again")
+DELETED_JOB = ("this job is deleted: it can't be run or edited until it is restored; Restore brings it back paused, "
+               "and Delete now purges it for good")
 
 
 def _permission_refusals(job: dict, user: str) -> dict:
     """{action: why the user may not take it, or None} for each action on an ingestion job (run, change, delete),
     from their Databricks permission on the job its runs execute as. A deleted job can't be run or changed; its
-    delete stays open, for Run again."""
+    delete stays open, for Restore and Delete now."""
     refusals = _job_permission_refusals(job, user)
     if job.get("deleted_at") is None:
         return refusals
@@ -1521,6 +1628,12 @@ def _databricks_job_refusals(job_id, user: str) -> dict:
         reason = f"can't read your permission on {label}: {str(e).split('. ')[0]}"
         return {action: reason for action in jobs.ACTION_NEEDS}
     return {action: jobs.action_refusal(action, level, label) for action in jobs.ACTION_NEEDS}
+
+
+def _signed_in_refusal(user: str) -> Optional[str]:
+    """Why a call with no signed-in user may not change a JDBC connection or login, or None. Beyond this, the
+    checks on the ingestion jobs that read the key decide."""
+    return None if (user or "").strip() else NO_IDENTITY
 
 
 def _manage_refusal(user: str) -> Optional[str]:
@@ -1664,6 +1777,14 @@ def run_ingestion_job(job_id: int, request: Request):
     return {"started": started}
 
 
+def _ingest_target(job: dict) -> Optional[int]:
+    """The Databricks ingest job that the group runs of an ingestion job execute as: its own copy, else its variant's.
+    A check schedule's wrapper starts the check, so its ingest job is its copy, else the default variant's."""
+    if (job.get("job_variant") or "default") == sch.CHECK_VARIANT:
+        return sch.copy_job_id(job) or _ingest_job_id("default")
+    return _wrapper_target(job)
+
+
 def _job_active_runs(job: dict, members: List[dict]) -> List[dict]:
     """Every Databricks run of an ingestion job that is still active, from the poller's table: its wrapper runs, its
     check job's run (check kind), and the group runs of its groups. Cancel run cancels all of them, so Cancelling
@@ -1674,7 +1795,7 @@ def _job_active_runs(job: dict, members: List[dict]) -> List[dict]:
     if check_kind and jobs.CHECK_JOB_ID:
         runs += [r for r in run_poller.runs_of(jobs.CHECK_JOB_ID, active_only=True, limit=10)
                  if ij.check_run_of(r, job["id"], groups)]
-    target = (sch.copy_job_id(job) or _ingest_job_id("default")) if check_kind else _wrapper_target(job)
+    target = _ingest_target(job)
     if target and groups:
         runs += [r for r in run_poller.runs_of(target, active_only=True, limit=50) if r.get("task_collection") in groups]
     return runs
@@ -1728,9 +1849,10 @@ def ingestion_job_live(job_id: int):
 @app.post("/api/ingestion-jobs/{job_id}/stop")
 def stop_ingestion_job(job_id: int, request: Request):
     """Stop the job's run going now, as the Databricks job run page's Cancel run does: cancel its wrapper runs, its
-    check run and the group runs of its groups (those the Jobs API lists, and any its groups' records name), then
-    close the records of the runs it cancelled or found already over (the cancel itself takes Databricks a moment).
-    A record whose run it could neither cancel nor read stays running. Needs what Run now needs. Nothing going: 409."""
+    check run and the group runs of its groups (those the Jobs API lists, and any its groups' records name). The
+    records are not closed here: the run poller closes each one as cancelled when Databricks ends its run, so the page
+    shows Cancelling until then. A run it could neither cancel nor read is left as it is. Needs what Run now needs.
+    Nothing going: 409."""
     job, members = _load_schedule(job_id)
     _refuse_job(job, request, "run")
     members = [m for m in members if m.get("removed_at") is None]
@@ -1745,16 +1867,14 @@ def stop_ingestion_job(job_id: int, request: Request):
     if not going and not recorded:
         raise HTTPException(409, "no run of this job is going")
     jobs.forget_run_states()
-    errors, over = [], set()
+    errors = []
     listed = {int(r["run_id"]) for r in going}
     for r in recorded:
         job_run = str(r.get("job_run_id") or "").strip()
         if not job_run.isdigit() or int(job_run) in listed:
             continue
         try:        # a run the list missed (an older one on a busy ingestion job) is cancelled too
-            if run_poller.ended_of(job_run):
-                over.add(int(job_run))
-            else:
+            if not run_poller.ended_of(job_run):
                 going.append({"kind": "group", "run_id": int(job_run),
                               "parameters": {"task_collection": r["task_collection"]}})
                 listed.add(int(job_run))
@@ -1768,21 +1888,13 @@ def stop_ingestion_job(job_id: int, request: Request):
                               "task_collection": (r.get("parameters") or {}).get("task_collection")})
         except Exception as e:      # one that ended meanwhile, or a refusal: the others are still stopped
             errors.append(f"run {r['run_id']}: {str(e).split('. ')[0][:200]}")
-    stopped = over | {int(r["run_id"]) for r in cancelled}
-    closing = [r for r in recorded
-               if str(r.get("job_run_id") or "").strip().isdigit() and int(r["job_run_id"]) in stopped]
-    reason = f"stopped from the app by {user}"
-    detail = json.dumps({"closed_by_app": user, "reason": reason})
     batch = uuid.uuid4().hex[:12]
     with _write() as cur:
-        for r in closing:
-            cur.execute(q.close_ended_run_sql(), (detail, int(r["run_id"]), reason, reason))
-        for group in sorted({r.get("task_collection") for r in cancelled if r.get("task_collection")} |
-                            {r["task_collection"] for r in closing}) or [None]:
+        for group in sorted({r.get("task_collection") for r in cancelled if r.get("task_collection")}) or [None]:
             _log(cur, user, "job_stop", None, group, "run", None, f"{job['name']}: {len(cancelled)} Databricks runs cancelled",
                  batch=batch)
     jobs.forget_run_states()
-    return {"cancelled": cancelled, "closed": len(closing), "errors": errors}
+    return {"cancelled": cancelled, "errors": errors}
 
 
 @app.get("/api/ingestion-jobs/{job_id}/compute")
@@ -1880,11 +1992,14 @@ def ingestion_job_settings(job_id: int):
     with its value or its most common values."""
     groups = _job_groups(job_id)
     if not groups:
-        return {"job_id": int(job_id), "groups": groups, "tables": 0, "settings": js.read([])}
+        return {"job_id": int(job_id), "groups": groups, "tables": 0, "settings": js.read([]), "reads_by_host": False}
+    unity_catalog = _unity_catalog(_load_schedule(job_id)[0])
     with _snapshot() as fetch:
-        tables, settings = fetch(q.groups_row_count_sql(), (groups,))[0]["n"], jss.read(fetch, groups)
+        tables, settings = fetch(q.groups_row_count_sql(), (groups,))[0]["n"], jss.read(fetch, groups, unity_catalog)
+        reads_by_host = _reads_by_host(fetch, groups)
     return {"job_id": int(job_id), "groups": groups, "tables": tables, "settings": settings,
-            "identity_differs": js.differing_identity_columns(settings["identity"], tables)}
+            "identity_differs": js.differing_identity_columns(settings["identity"], tables),
+            "reads_by_host": reads_by_host}
 
 
 @app.post("/api/ingestion-jobs/{job_id}/settings")
@@ -1897,9 +2012,11 @@ def edit_ingestion_job_settings(job_id: int, body: JobSettingsRequest, request: 
     groups = _job_groups(job_id)
     if not groups:
         return {"summary": {"rows": 0, "changed": 0, "reseed": 0, "errors": 0, "applied": False}, "errors": []}
+    job = _load_schedule(job_id)[0]
+    unity_catalog = _unity_catalog(job)
 
     def checked(fetch, groups):
-        now = jss.read(fetch, groups)
+        now = jss.read(fetch, groups, unity_catalog)
         found = jss.preview(fetch, groups, body.settings, now)
         if found["errors"]:
             raise HTTPException(422, {"errors": found["errors"], "summary": found["summary"]})
@@ -1908,7 +2025,7 @@ def edit_ingestion_job_settings(job_id: int, body: JobSettingsRequest, request: 
     if body.dry_run:
         with _snapshot() as fetch:
             return checked(fetch, groups)[1]
-    _refuse_job_tables(_load_schedule(job_id)[0], groups, request)
+    _refuse_job_tables(job, groups, request)
     try:
         with _write() as cur:
             groups = _lock_job(cur, job_id)
@@ -1942,6 +2059,12 @@ def _snapshot():
         yield lambda sql, params=(): db.fetch(cur, sql, params)
 
 
+def _reads_by_host(fetch, groups: List[str]) -> bool:
+    """Whether any enabled table of a job is read by host and password rather than through a connection: the Manage
+    export's own question (q.export_reads_jdbc_sql). Edit shows the two settings only such a job uses."""
+    return bool(fetch(q.export_reads_jdbc_sql(), (groups,))[0]["jdbc"])
+
+
 @app.get("/api/ingestion-jobs/{job_id}/tree")
 def ingestion_job_tree(job_id: int, server: str = "", database: str = "", search: str = "", offset: int = 0,
                        limit: int = 50):
@@ -1961,8 +2084,10 @@ def ingestion_job_tree(job_id: int, server: str = "", database: str = "", search
         for r in rows:
             r["columns"] = len([c for c in str(r.pop("select_list") or "").split(",") if c.strip()])
     total = rows[0]["total"] if rows else 0
+    # The job-level JDBC connection is shown with its servers (the top level); the page polls the job, not the tree.
     return {"level": level, "server": server or None, "database": database or None, "total": total,
-            "offset": offset, "limit": limit, "items": [{k: v for k, v in r.items() if k != "total"} for r in rows]}
+            "offset": offset, "limit": limit, "items": [{k: v for k, v in r.items() if k != "total"} for r in rows],
+            "jdbc": _job_jdbc(job_id) if not server else None}
 
 
 @app.get("/api/ingestion-jobs/{job_id}/targets")
@@ -1992,6 +2117,123 @@ def ingestion_job_target_sources(job_id: int, target: str, offset: int = 0, limi
     rows = db.query(q.job_target_sources_sql(), (groups, groups, *parts, limit, offset)) if groups else []
     return {"target": target, "total": rows[0]["total"] if rows else 0, "offset": offset, "limit": limit,
             "items": [{k: v for k, v in r.items() if k != "total"} for r in rows]}
+
+
+@app.get("/api/ingestion-jobs/{job_id}/failing-tables")
+def ingestion_job_failing_tables(job_id: int):
+    """The job's failing tables: enabled tables whose checkpoint is failed, each with its latest error, its class and
+    kind, when it started failing and how many runs failed it. The job page shows its section only when there are some."""
+    job, members = _load_schedule(job_id)
+    groups = sorted({m["task_collection"] for m in _active(members)})
+    rows = q.failing_table_rows(db.query(q.failing_tables_sql(), (groups,))) if groups else []
+    removals = table_removal.entries(sch.options_of(job))
+    now = datetime.now(timezone.utc)
+    for row in rows:
+        entry = removals.get(str(row["control_id"]))
+        row["remove"] = table_removal.state_of(entry, _removal_run(entry), now)
+    return {"tables": rows}
+
+
+def _removal_run(entry: Optional[dict]) -> Optional[dict]:
+    """The delete job's run a table's removal started, as the Jobs API has it, or None (not started, or unreadable)."""
+    if not entry or entry.get("run_id") is None:
+        return None
+    try:
+        return run_poller.run_state_of(entry["run_id"])
+    except Exception:
+        return None
+
+
+class RetryDatabaseRequest(BaseModel):
+    task_collection: str
+    server: str = ""
+    database: str = ""
+
+
+@app.post("/api/ingestion-jobs/{job_id}/failing-tables/retry")
+def retry_failing_database(job_id: int, body: RetryDatabaseRequest, request: Request):
+    """Start one ingest run for one database, and no other: the job's ingest job, with a work list of just that database
+    (the way the check job starts a run for the databases with work). Refused while a run of its group is going, since
+    Databricks would skip a second one."""
+    job, members = _load_schedule(job_id)
+    _refuse_job(job, request, "run")
+    mine = [m for m in _active(members) if m["task_collection"] == body.task_collection]
+    if not mine:
+        raise HTTPException(404, f"ingestion group {body.task_collection} is not in this job")
+    if _job_active_runs(job, mine) or _recorded_running(mine):
+        raise HTTPException(409, f"a run of {body.task_collection} is going: wait for it to end, or cancel it")
+    target = _ingest_target(job)
+    if not target:
+        raise HTTPException(409, "the job's ingest job is not synced yet")
+    work_id = f"retry-{uuid.uuid4().hex[:12]}:{body.task_collection}"
+    with _write() as cur:
+        recorded = db.fetch(cur, q.retry_database_sql(), (work_id, body.task_collection, body.server, body.database))
+        if not recorded:
+            raise HTTPException(409, f"{body.database or 'that database'} has no enabled tables in {body.task_collection} now")
+    run_id = jobs.run_now(target, {**sch.run_parameters(job, body.task_collection), "work_id": work_id})
+    host = jobs.workspace_url()
+    return {"started": {"job_id": int(target), "run_id": run_id, "work_id": work_id, "database": body.database,
+                        "url": f"{host}/jobs/{target}/runs/{run_id}" if host else None}}
+
+
+class RemoveTablesRequest(BaseModel):
+    control_ids: List[int] = Field(min_length=1)
+    confirmed: bool = False
+
+
+@app.post("/api/ingestion-jobs/{job_id}/tables/remove")
+def remove_job_tables(job_id: int, body: RemoveTablesRequest, request: Request):
+    """Remove tables from a live job for good. The app records the request on the job and starts the delete job, which
+    deletes each table's control row and its state as the deployer and keeps the target tables. Needs the permission
+    Delete needs, and only a request the user confirmed (the page asks first). A group another live job also holds
+    can't be removed this way: that would change the other job's tables too."""
+    why = table_removal.confirmation_missing(body.confirmed)
+    if why:
+        raise HTTPException(422, why)
+    user = _user(request)
+    job, members = _load_schedule(job_id)
+    _refuse_job(job, request, "delete")
+    if not jobs.DELETE_JOB_ID:
+        raise HTTPException(409, NO_TABLE_REMOVE_JOB)
+    ids = sorted(set(body.control_ids))
+    rows = db.query(q.table_rows_by_ids_sql(), (ids,))
+    missing = sorted(set(ids) - {r["id"] for r in rows})
+    if missing:
+        raise HTTPException(404, f"table(s) {', '.join(str(i) for i in missing)} not found")
+    wanted = {r["task_collection"] for r in rows}
+    outside = sorted(wanted - {m["task_collection"] for m in _active(members)})
+    if outside:
+        raise HTTPException(422, f"group(s) {', '.join(outside)} aren't in ingestion job {job_id}")
+    own = {r["task_collection"] for r in db.query(q.job_own_groups_sql(), (int(job_id), int(job_id)))}
+    removals = table_removal.entries(sch.options_of(job))
+    now_dt = datetime.now(timezone.utc)
+    still = table_removal.removing(removals, ids, {i: _removal_run(removals.get(str(i))) for i in ids}, now_dt)
+    mine = [m for m in _active(members) if m["task_collection"] in wanted]
+    running = bool(_job_active_runs(job, mine) or _recorded_running(mine))
+    refused = table_removal.refusal(job.get("deleted_at") is not None, sorted(wanted - own), running, bool(still))
+    if refused:
+        raise HTTPException(409, refused)
+    now = now_dt.isoformat()
+    with _write() as cur:
+        _lock_job(cur, int(job_id))
+        cur.execute(q.set_table_remove_sql(), (json.dumps(table_removal.requests(ids, user, now)), int(job_id)))
+        cur.execute(q.add_exclusions_sql(), (json.dumps(table_removal.exclusion_records(rows, user, now)), int(job_id)))
+        for r in rows:
+            _log(cur, user, "remove", r["id"], r["task_collection"])
+    try:
+        run_id = jobs.start_table_remove(job_id, ids)
+    except Exception as e:
+        error = f"the delete job didn't start: {str(e).split('. ')[0]}"
+        with _write() as cur:
+            cur.execute(q.set_table_remove_sql(),
+                        (json.dumps(table_removal.requests(ids, user, now, error=error)), int(job_id)))
+        return {"removing": [], "error": error, "run": None}
+    with _write() as cur:
+        cur.execute(q.set_table_remove_sql(),
+                    (json.dumps(table_removal.requests(ids, user, now, run_id=run_id)), int(job_id)))
+    host = jobs.workspace_url()
+    url = f"{host}/jobs/{jobs.DELETE_JOB_ID}/runs/{run_id}" if host else None
+    return {"removing": ids, "error": None, "run": {"run_id": run_id, "url": url}}
 
 
 class JobScope(BaseModel):
@@ -2111,7 +2353,8 @@ def add_job_databases(job_id: int, body: JobDatabasesRequest, request: Request):
     job = _load_schedule(job_id)[0]
 
     def planned(rows):
-        plan = js.plan_databases(rows, entries, job["name"], _sizing(body, job), body.full_list)
+        plan = js.plan_databases(rows, entries, job["name"], _sizing(body, job), body.full_list,
+                                 unity_catalog=_unity_catalog(job))
         if plan["errors"]:
             raise HTTPException(422, {"errors": plan["errors"]})
         summary = {"databases": len(entries), "new_tables": len(plan["new"]), "enable": len(plan["enable"]),
@@ -2131,6 +2374,11 @@ def add_job_databases(job_id: int, body: JobDatabasesRequest, request: Request):
             rows = db.fetch(cur, q.groups_control_rows_sql(for_update=True), (groups,)) if groups else []
             plan, summary = planned(rows)
             _lock_collections(cur, groups + plan["new_groups"])
+            connection = _job_connection_row(job_id)
+            if connection is not None:
+                _refuse_connection_rows(connection, plan["new"], cur=cur)
+            else:
+                _refuse_host_reads(plan["new"], user, {})
             written = _insert_controls(cur, plan["new"], user, batch, skip_taken=True, progress=progress)
             off = [control_id for row, control_id in written if not row["task_enabled"]]
             if off:
@@ -2326,7 +2574,7 @@ class JobTablesRequest(_TablesFrom):
 
 
 def _write_planned_tables(cur, job: dict, plan: dict, user: str, batch: str, progress=None,
-                          skip_taken: bool = False) -> List[tuple]:
+                          skip_taken: bool = False, reader: Optional[str] = None) -> List[tuple]:
     """Inside the caller's transaction, with the job's groups locked: the plan's valid lines as control rows (each with
     its change log line), their groups' run locks, the mixed-sink and split-database checks, and the job's new groups
     as members with offsets. Returns the (row, id) pairs written; skip_taken leaves out a row whose target another
@@ -2334,6 +2582,11 @@ def _write_planned_tables(cur, job: dict, plan: dict, user: str, batch: str, pro
     job_id = int(job["id"])
     _lock_collections(cur, plan["groups"])
     rows = [line["row"] for line in plan["lines"] if line["status"] == "valid"]
+    connection = _job_connection_row(job_id)
+    if connection is not None:
+        _refuse_connection_rows(connection, rows, cur=cur)
+    else:
+        _refuse_host_reads(rows, reader or user, {})
     written = _insert_controls(cur, rows, user, batch, skip_taken=skip_taken, progress=progress)
     _refuse_mixed_sinks(cur, [row for row, _ in written])
     _refuse_split_databases(cur, [row for row, _ in written])
@@ -2354,7 +2607,18 @@ def add_job_tables(job_id: int, body: JobTablesRequest, request: Request):
     its group, a new one joins its server's groups, a new server gets new groups. Applying is one transaction under
     the job's lock and its groups' run locks; tables the job already writes are left; then new groups are synced. The
     tables come as CSV lines (csv) or by reference to an upload or discovery (source), which is kept with the job."""
+    if _jdbc_source(body.source) is not None:
+        raise HTTPException(422, {"errors": ["these tables come from a JDBC connection, whose scope and trust belong to "
+                                              "a job of their own: make a new ingestion job from them"]})
     return _add_job_tables(job_id, body, request)
+
+
+def _explicit_tables(selected: Optional[dict]) -> bool:
+    """Whether Add tables names its tables one by one: a CSV, or a selection of tables only. Then a table the job
+    removed is taken back in. A whole server or database takes every table it holds, so the removed ones stay out."""
+    if selected is None:
+        return True
+    return not selected["database_lines"] and all(part[0] == "tables" for part in selected["parts"])
 
 
 def _add_job_tables(job_id: int, body: "JobTablesRequest", request: Request, inline: bool = False, progress=None,
@@ -2386,15 +2650,21 @@ def _add_job_tables(job_id: int, body: "JobTablesRequest", request: Request, inl
     if selected is not None and selected.get("discovering"):
         return {"summary": None, "applied": False, "discovering": True, "databases": selected["databases"]}
 
-    def planned(rows):
-        plan = _file_lines(nj.plan_for_job(job["name"], text, body.load_type, rows, _sizing(body, job), taken),
-                           selected)
+    explicit = _explicit_tables(selected)
+
+    def planned(rows, excluded):
+        plan = _file_lines(nj.plan_for_job(job["name"], text, body.load_type, rows, _sizing(body, job), taken,
+                                           unity_catalog=_unity_catalog(job)), selected)
         if plan["errors"]:
             raise HTTPException(422, {"errors": plan["errors"]})
+        if not explicit and table_removal.leave_out(plan["lines"], excluded):
+            used = {line["group"] for line in plan["lines"] if line["status"] == "valid"}
+            plan["new_groups"] = [group for group in plan["new_groups"] if group in used]
         return plan
 
     groups = _job_groups(job_id)
-    plan = planned(db.query(q.groups_control_rows_sql(), (groups,)) if groups else [])
+    plan = planned(db.query(q.groups_control_rows_sql(), (groups,)) if groups else [],
+                   table_removal.exclusions_of(sch.options_of(job)))
     if body.dry_run:
         return {"summary": nj.summary(plan), "applied": False}
     _refuse_job_tables(job, groups + plan["groups"], request)
@@ -2403,11 +2673,15 @@ def _add_job_tables(job_id: int, body: "JobTablesRequest", request: Request, inl
     def write(progress, task_id):
         with _write() as cur:
             groups = _lock_job(cur, job_id)
-            plan = planned(db.fetch(cur, q.groups_control_rows_sql(for_update=True), (groups,)) if groups else [])
+            excluded = table_removal.exclusions_of(sch.options_of(_load_schedule(job_id, cur)[0]))
+            plan = planned(db.fetch(cur, q.groups_control_rows_sql(for_update=True), (groups,)) if groups else [],
+                           excluded)
             summary = nj.summary(plan)
             if summary["invalid"]:
                 return {"summary": summary, "applied": False, "new_groups": []}
             written = _write_planned_tables(cur, job, plan, user, batch, progress=progress)
+            if explicit:
+                cur.execute(q.clear_exclusions_sql(), (table_removal.line_keys(plan["lines"]), int(job_id)))
             _keep_selection(cur, job_id, selected, user)
             _touch(cur, user, [job_id])
             result = {"summary": summary, "applied": True}
@@ -2471,8 +2745,10 @@ def ingestion_job_run(job_id: int, slot: str):
     running = {r["run_id"]: r for r in _running()}
     tables = {name: g["enabled_tables"] for name, g in rollup.groups(_states()).items()}
     ids = found["run_ids"]
+    terminating = [str(r["run_id"]) for r in db.query(q.active_databricks_runs_sql(), (["TERMINATING"],))] \
+        if run_poller.table_ready() else []
     return {**{k: v for k, v in found.items() if k != "placed"},
-            "group_runs": ij.member_views(found["placed"], running, tables, now),
+            "group_runs": ij.member_views(found["placed"], running, tables, now, terminating),
             "databases": db.query(q.job_run_databases_sql(), (ids,)) if ids else [],
             "failures": q.group_errors(db.query(q.run_failures_sql(), (ids,))) if ids and found["failed_tables"] else [],
             "failed_before": ij.consecutive_failed(earlier), "cadence_minutes": cadence, "paused": job.get("paused"),
@@ -2496,7 +2772,7 @@ def job_runs_across(job: Optional[str] = None, outcome: Optional[str] = None, be
     schedules, members = _schedules()
     if job == "none":
         unscheduled = sorted({s["task_collection"] for s in _states()} - {m["task_collection"] for m in _active(members)}
-                             - _deleting())
+                             - _deleted_groups())
         rows = _with_rows_written(db.query(q.group_runs_before_sql(), (unscheduled, end, limit + 1))) if unscheduled else []
         more = len(rows) > limit
         rows = rows[:limit]
@@ -2510,7 +2786,8 @@ def job_runs_across(job: Optional[str] = None, outcome: Optional[str] = None, be
             batch += _job_runs_of(s, window_start, start, now)
         for r in batch:
             counts[r["outcome"]["label"]] = counts.get(r["outcome"]["label"], 0) + 1
-        found += [r for r in batch if r["outcome"]["label"] != "Running" and (not outcome or r["outcome"]["label"] == outcome)]
+        found += [r for r in batch if r["outcome"]["label"] not in q.RUNNING_OUTCOMES
+                  and (not outcome or r["outcome"]["label"] == outcome)]
         start = window_start
         if not outcome or len(found) > limit or end - start >= JOB_RUNS_HISTORY:
             break
@@ -2518,7 +2795,7 @@ def job_runs_across(job: Optional[str] = None, outcome: Optional[str] = None, be
     rest = found[:limit]
     # Running job runs come from the Overview's read, so one overrunning its window is still listed.
     running = [r for r in _jobs_view()["running_job_runs"] if (job is None or str(r["job_id"]) == str(job))
-               and (not outcome or outcome == "Running")] if not before else []
+               and (not outcome or outcome in q.RUNNING_OUTCOMES)] if not before else []
     more = len(found) > limit or (not outcome and len(found) >= limit)
     return {"job_runs": [{k: v for k, v in r.items() if k != "placed"} for r in running + rest],
             "counts": counts, "next_before": rest[-1]["slot"] if rest and more else None,
@@ -2538,7 +2815,7 @@ def sources():
             listed, listed_error = _connections(), None
         except Exception as e:
             listed, listed_error = [], str(e)
-        view = rollup.sources(_states(), listed, db.query(q.not_ingested_sql()), schedules, members, _deleting())
+        view = rollup.sources(_states(), listed, db.query(q.not_ingested_sql()), schedules, members, _deleted_groups())
         for instance in view["instances"]:
             for j in instance["jobs"]:
                 if j.get("cadence_minutes"):
@@ -2729,6 +3006,8 @@ def add_table(row: dict, request: Request):
     errs = q.validate_control_row(row)
     if errs:
         raise HTTPException(422, {"errors": errs})
+    _refuse_rows_off_connections([row])
+    _refuse_host_reads([row], _user(request))
     with _write() as cur:
         _lock_collections(cur, [row.get("task_collection")])
         cur.execute(q.insert_control_sql(), q.control_params(row))
@@ -2936,10 +3215,12 @@ def _bundle_job_ids() -> list:
 # ---- bulk import --------------------------------------------------------------------------------
 
 class DiscoverRequest(BaseModel):
-    src_host: str = Field(min_length=1)
+    # Blank when a JDBC connection is named: its host, port and secret key come from the connection (jdbc_connections).
+    src_host: str = ""
     src_port: Optional[int] = None
     databases: str = Field(min_length=1, description="comma- or newline-separated")
     secret_key_template: str = Field(default="{database}", min_length=1)
+    jdbc_connection: Optional[str] = Field(None, max_length=64)
 
 
 @app.post("/api/discoveries")
@@ -2947,13 +3228,380 @@ def start_discovery(body: DiscoverRequest, request: Request):
     names = q.parse_databases(body.databases)
     if not names:
         raise HTTPException(422, "at least one database is required")
+    if not body.jdbc_connection and not body.src_host.strip():
+        raise HTTPException(422, "a host is required, or a JDBC connection")
+    if not body.jdbc_connection:
+        _refuse(_host_read_refusal(_user(request)))
     _refuse_run_of(_require(jobs.DISCOVER_JOB_ID, "discovery"), request)
     did = uuid.uuid4().hex[:12]
     spec = {"src_type": "sqlserver", "src_host": body.src_host.strip(), "src_port": body.src_port or None,
             "databases": names, "secret_key_template": body.secret_key_template.strip(),
             "requested_by": _user(request)}
-    rid = jobs.run_now(_require(jobs.DISCOVER_JOB_ID, "discovery"), {"discovery_id": did, "spec": json.dumps(spec)})
+    parameters: dict = {}
+    if body.jdbc_connection:
+        connection_spec, parameters = _jdbc_discovery(body.jdbc_connection, names)
+        spec.update(connection_spec)
+    rid = jobs.run_now(_require(jobs.DISCOVER_JOB_ID, "discovery"),
+                       {"discovery_id": did, "spec": json.dumps(spec), **parameters})
     return {"discovery_id": did, "run_id": rid, "databases": len(names)}
+
+
+class JdbcConnectionRequest(BaseModel):
+    """A JDBC connection entered by hand (jdbc_connections.py). The secret itself is never sent: the admin creates the
+    scope and its JSON secret beforehand, and the connection names the scope and the key."""
+    name: str = ""
+    src_type: str = "sqlserver"
+    src_host: str = ""
+    src_port: Optional[int] = None
+    secret_scope: str = ""
+    secret_key: str = ""
+    trust_server_certificate: bool = False
+
+
+@app.get("/api/jdbc-connections")
+def jdbc_connections() -> dict:
+    """The JDBC connections made by hand: each one's name, where its source is, its scope and key names, and its trust
+    choice. Names only, so anyone who can see Discover can see them."""
+    return {"connections": [jc.public(row) for row in db.query(jc.list_sql())]}
+
+
+@app.post("/api/jdbc-connections")
+def create_jdbc_connection(body: JdbcConnectionRequest, request: Request):
+    """Make a JDBC connection by hand. Any signed-in user may: it names a host, a scope and a key, never a secret.
+    The app stores the names it is given, and a name already taken is refused, not replaced."""
+    user = _user(request)
+    _refuse(_signed_in_refusal(user))
+    clean, errors = jc.validate(body.model_dump())
+    if errors:
+        raise HTTPException(422, {"errors": errors})
+    refusal = _connection_scope_refusal({**clean, "created_by": user})
+    if refusal:
+        raise HTTPException(422, {"errors": [refusal]})
+    scope = jl.dedicated_scope()
+    if scope and clean["secret_scope"] == scope and not _login_typed_for(clean, user):
+        raise HTTPException(422, {"errors": [f"a connection in the login scope {scope} needs its login first: save the "
+                                              "login under this connection's name and key, as the same user, then make "
+                                              "the connection"]})
+    with db.transaction() as cur:
+        cur.execute(jc.insert_sql(), jc.insert_params(clean, user))
+        made = cur.fetchone()
+    if made is None:
+        raise HTTPException(409, f"a JDBC connection named '{clean['name']}' already exists")
+    return {"connection": jc.public(db.query(jc.get_sql(), (clean["name"],))[0])}
+
+
+def _jdbc_discovery(name: str, databases: Iterable[str] = ()) -> Tuple[dict, dict]:
+    """(the discovery spec's parts, the discover job's parameters) for a discovery through the JDBC connection named
+    here: its host, port, type, key template and name, and its scope and trust. Read from the stored connection, never
+    from the request, so a discovery can't name a scope the connection doesn't. The databases it names must each have
+    a login typed under this connection (_refuse_connection_read)."""
+    rows = db.query(jc.get_sql(), (name,))
+    if not rows:
+        raise HTTPException(422, {"errors": [f"no JDBC connection named '{name}'"]})
+    connection = rows[0]
+    if databases == "*" and _per_database_logins(connection):
+        raise HTTPException(422, {"errors": [
+            f"a whole server can't be read through the connection {connection['name']}: it takes one login per "
+            "database, and each is checked by the database's name before it is read, which a whole server's "
+            "databases don't have until they are listed. Name the databases instead"]})
+    _refuse_connection_read(connection, _database_keys(connection, databases))
+    spec = {"src_type": connection["src_type"], "src_host": connection["src_host"],
+            "src_port": connection["src_port"], "secret_key_template": connection["secret_key"],
+            "jdbc_connection": connection["name"]}
+    return spec, jc.job_parameters(connection)
+
+
+def _rediscovery_reading(spec: dict, maker: Optional[str] = None) -> Tuple[dict, dict]:
+    """(the spec, the discover job's parameters) a re-discovery runs. A spec read through a JDBC connection takes the
+    connection's host, port, type and key template, and its scope and trust, as stored now, and its keys are checked
+    as a new discovery's are (_jdbc_discovery). A spec read by host and password outside a connection runs only for a
+    job an app manager made (maker), as a new discovery by host is a manager's (_host_read_refusal). Any other spec
+    runs as it is, with the job's own defaults."""
+    name = str(spec.get("jdbc_connection") or "")
+    if not name:
+        if not spec.get("src_connection"):
+            refusal = _host_read_refusal(maker or "")
+            if refusal:
+                raise HTTPException(403, refusal)
+        return spec, {}
+    connection_spec, parameters = _jdbc_discovery(name, spec.get("databases") or [])
+    return {**spec, **connection_spec}, parameters
+
+
+JDBC_PARAMETERS = ("secret_scope", "trust_server_certificate")
+
+
+def _jdbc_source(source: Optional[Selection]) -> Optional[dict]:
+    """The JDBC connection a selection's discoveries were made through (its row), or None when none was. A selection
+    that mixes a JDBC discovery with another source, or with a second connection, is refused: one job reads one login."""
+    if source is None or source.upload_id:
+        return None
+    rows = db.query(q.selection_discoveries_sql(), (source.source()[1],))
+    names = {str((row.get("listing") or {}).get("jdbc_connection") or "") for row in rows}
+    if not any(names):
+        return None
+    if "" in names or len(names) > 1:
+        raise HTTPException(422, {"errors": ["a job reads one source: its tables can't come from a JDBC connection and "
+                                              "from another source, or from two JDBC connections"]})
+    connection = db.query(jc.get_sql(), (next(iter(names)),))
+    if not connection:
+        raise HTTPException(422, {"errors": [f"no JDBC connection named '{next(iter(names))}'"]})
+    _refuse_connection_read(connection[0])
+    return connection[0]
+
+
+def _job_jdbc(job_id: int) -> Optional[dict]:
+    """The JDBC connection an ingestion job reads through, for its page and its Edit: its name, host, port, type, secret
+    scope and key names, and trust (jdbc_connections.public). None for a job that reads through none."""
+    selection = db.query(q.job_selection_sql(), (int(job_id),))
+    ids = sorted({i for part in selection if part["source_kind"] == "discovery"
+                  for i in str(part["source_id"] or "").split(",") if i})
+    names = {str((row.get("listing") or {}).get("jdbc_connection") or "")
+             for row in (db.query(q.selection_discoveries_sql(), (ids,)) if ids else [])}
+    if len(names) != 1 or "" in names:
+        return None
+    name = next(iter(names))
+    rows = db.query(jc.get_sql(), (name,))
+    return jc.public(rows[0]) if rows else {"name": name, "missing": True}
+
+
+def _job_connection_row(job_id: int) -> Optional[dict]:
+    """The stored row of the JDBC connection an ingestion job reads through, or None when it reads through none or its
+    connection has gone. The raw row, not the public view: jc.job_parameters reads the trust choice as stored."""
+    shown = _job_jdbc(job_id)
+    if shown is None or shown.get("missing"):
+        return None
+    rows = db.query(jc.get_sql(), (shown["name"],))
+    return rows[0] if rows else None
+
+
+def _names_login_scope(parameters: Optional[dict]) -> bool:
+    """Whether job parameters name the login scope as their secret scope."""
+    scope = jl.dedicated_scope()
+    return bool(scope) and str((parameters or {}).get("secret_scope") or "") == scope
+
+
+def _refuse_login_scope(parameters: Optional[dict], connection: Optional[dict]) -> None:
+    """The login scope keeps the logins typed into the app. A job reads it only through a JDBC connection, which reads
+    its own login (see _login_typed_for); any other job that names it is refused."""
+    if connection is None and _names_login_scope(parameters):
+        scope = jl.dedicated_scope()
+        reason = (f"the scope {scope} keeps the logins typed into the app: a job reads it only through "
+                  "a JDBC connection")
+        raise HTTPException(422, {"errors": [reason]})
+
+
+def _login_typed_for(connection: dict, user: str) -> bool:
+    """Whether this user typed a login under the connection's name for a key its key template makes. A connection in the
+    login scope is made only then, so it can't name a login another user typed. The shape is matched here; each
+    database's key is checked exactly where it is read (_login_key_reasons)."""
+    keys = db.query(q.jdbc_connection_login_sql(), (jl.dedicated_scope(), connection["name"], user))
+    return any(jc.key_fits(connection["secret_key"], row["secret_key"]) for row in keys)
+
+
+def _connection_scope_refusal(connection: dict) -> Optional[str]:
+    """Why a JDBC connection may not read the secret scope it names, or None when it may. The login scope is open to any
+    connection: its logins are typed into the app, and a connection there is backed by one (_login_typed_for). Any other
+    scope holds secrets an admin wrote, so only a connection its maker could manage the app with may name it. This is
+    checked when a connection is made and again when it is read, so a connection made before the rule, or with no maker
+    on record, is held to it too."""
+    scope = jl.dedicated_scope()
+    if scope and connection["secret_scope"] == scope:
+        return None
+    if _manage_refusal(connection.get("created_by") or "") is None:
+        return None
+    return (f"the secret scope {connection['secret_scope']} holds secrets an admin wrote, so a JDBC connection may name it "
+            "only when an app manager makes it. Any signed-in user may make a connection in the login scope "
+            f"{scope or '(not set here)'}, which holds the logins typed into the app")
+
+
+def _per_database_logins(connection: dict) -> bool:
+    """Whether a connection reads one typed login per database: it is in the login scope and its key holds {database}."""
+    scope = jl.dedicated_scope()
+    return bool(scope) and connection["secret_scope"] == scope and jc.DATABASE_TOKEN in connection["secret_key"]
+
+
+def _database_keys(connection: dict, databases) -> List[str]:
+    """The secret keys a discovery through the connection reads: its key template with each named database's name in
+    place of {database}. A whole server ('*') reads its own database (master) to list the others, so that key is read
+    too. The databases a whole server lists are named by the source, not by the request, so they can't be checked
+    before the read: _jdbc_discovery refuses a whole server through a connection with one login per database."""
+    names = [SERVER_DATABASE] if databases == "*" else [str(name) for name in databases]
+    return [connection["secret_key"].replace(jc.DATABASE_TOKEN, name) for name in names]
+
+
+def _login_key_reasons(connection: dict, keys: Iterable[str], cur=None) -> List[str]:
+    """Why some of the keys a read through the connection names can't be read, or [] when all can. Only a connection in
+    the login scope is checked. Each key must hold the newest login typed under this connection's name, so a login typed
+    for another connection never reaches this connection's host. The keys are exact: one per database the read names."""
+    scope = jl.dedicated_scope()
+    if not scope or connection["secret_scope"] != scope:
+        return []
+    wanted = sorted({str(key) for key in keys if key})
+    if not wanted:
+        return []
+    params = (scope, wanted)
+    found = db.fetch(cur, q.jdbc_login_latest_per_key_sql(), params) if cur is not None \
+        else db.query(q.jdbc_login_latest_per_key_sql(), params)
+    newest = {row["secret_key"]: row["connection"] for row in found}
+    missing = [key for key in wanted if newest.get(key) != connection["name"]]
+    if not missing:
+        return []
+    shown = ", ".join(missing[:5]) + (f" and {len(missing) - 5} more" if len(missing) > 5 else "")
+    return [f"the newest login under the key(s) {shown} was not typed for the connection {connection['name']}: save "
+            "each database's login with this connection's name first"]
+
+
+def _refuse_connection_read(connection: dict, keys: Iterable[str] = (), cur=None) -> None:
+    """Refuses a read through a JDBC connection whose maker may not name its scope (_connection_scope_refusal), or whose
+    keys don't hold the newest login typed under its name (_login_key_reasons)."""
+    refusal = _connection_scope_refusal(connection)
+    if refusal:
+        raise HTTPException(422, {"errors": [refusal]})
+    reasons = _login_key_reasons(connection, keys, cur=cur)
+    if reasons:
+        raise HTTPException(422, {"errors": reasons})
+
+
+# A control row's source and login: where it reads and with which secret. On a row of a job that reads through a stored
+# JDBC connection they belong to the connection, so they are never edited there, and a row written into such a job must
+# carry the connection's own.
+CONNECTION_FIELDS = ("src_type", "src_host", "src_port", "secret_key", "use_remote_query", "src_connection")
+
+
+def _port_of(value, src_type: str) -> Optional[int]:
+    """A row's port as a number, its source type's default port when blank, or None when it isn't a number."""
+    if value in (None, ""):
+        return q.DEFAULT_PORTS.get(src_type, 1433)
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _connection_row_reasons(connection: dict, rows: Iterable[dict]) -> List[str]:
+    """Why some control rows don't read through the JDBC connection whose job they are written into, or [] when all do.
+    Each must read the connection's host, port and source type, by host rather than through a Unity Catalog
+    connection, with a secret key the connection's key template makes."""
+    src_type = str(connection["src_type"] or "sqlserver").lower()
+    expected = (str(connection["src_host"] or "").strip().lower(), _port_of(connection["src_port"], src_type), src_type)
+    off = []
+    for row in rows:
+        row_type = str(row.get("src_type") or "sqlserver").lower()
+        where = (str(row.get("src_host") or "").strip().lower(), _port_of(row.get("src_port"), row_type), row_type)
+        if (where != expected or q._truthy(row.get("use_remote_query")) or str(row.get("src_connection") or "").strip()
+                or not jc.key_fits(connection["secret_key"], str(row.get("secret_key") or ""))):
+            off.append(".".join(str(row.get(part) or "") for part in ("src_database", "src_schema", "src_table")))
+    if not off:
+        return []
+    shown = ", ".join(off[:5]) + (f" and {len(off) - 5} more" if len(off) > 5 else "")
+    return [f"the job reads through the JDBC connection {connection['name']}, so its tables take that connection's host, "
+            f"port, source type and key: {shown} name another"]
+
+
+def _refuse_connection_rows(connection: dict, rows: List[dict], cur=None) -> None:
+    """Refuses writing control rows into a job that reads through this JDBC connection unless each reads through it
+    (_connection_row_reasons), the connection may read its scope, and each row's key holds the newest login typed
+    under the connection's name (_refuse_connection_read)."""
+    reasons = _connection_row_reasons(connection, rows)
+    if reasons:
+        raise HTTPException(422, {"errors": reasons})
+    _refuse_connection_read(connection, [row.get("secret_key") for row in rows], cur=cur)
+
+
+def _group_connections(groups: Iterable[Optional[str]]) -> Dict[str, dict]:
+    """The stored JDBC connection each of these ingestion groups reads through: the connection of the job that holds it.
+    A group whose job reads through none is left out. Read fresh, not shared."""
+    wanted = {g for g in groups if g}
+    if not wanted:
+        return {}
+    schedules = db.query(q.schedules_sql())
+    members = db.query(q.schedule_members_sql(), ([s["id"] for s in schedules],)) if schedules else []
+    of_job: Dict[int, Optional[dict]] = {}
+    found: Dict[str, dict] = {}
+    for member in members:
+        if member["removed_at"] is not None or member["task_collection"] not in wanted:
+            continue
+        job_id = int(member["schedule_id"])
+        if job_id not in of_job:
+            of_job[job_id] = _job_connection_row(job_id)
+        if of_job[job_id] is not None:
+            found[member["task_collection"]] = of_job[job_id]
+    return found
+
+
+def _refuse_rows_off_connections(rows: List[dict], cur=None, connections: Optional[Dict[str, dict]] = None) -> None:
+    """Refuses control rows written into the groups of a job that reads through a JDBC connection, unless each reads
+    through that connection (_refuse_connection_rows). Rows of any other group pass."""
+    by_group: Dict[str, List[dict]] = {}
+    for row in rows:
+        by_group.setdefault(row.get("task_collection") or "", []).append(row)
+    connections = _group_connections(by_group) if connections is None else connections
+    for group in sorted(by_group):
+        if group in connections:
+            _refuse_connection_rows(connections[group], by_group[group], cur=cur)
+
+
+def _refuse_connection_edits(rows: List[dict], plans: List[dict], cur=None, user: Optional[str] = None) -> None:
+    """Refuses an edit of a table's source or login (CONNECTION_FIELDS) on a row of a job that reads through a JDBC
+    connection: they belong to the connection, and an edited key or host would send its login elsewhere. A row moved
+    into such a job's group must read through its connection, as a row written there must. Outside a connection, an
+    edit of those fields that leaves a table read by host and password is an app manager's (_refuse_host_reads)."""
+    by_id = {r["id"]: r for r in rows}
+    edited = [dict(by_id[p["id"]], **{f: v[1] for f, v in p["changes"].items()}) for p in plans if p["changes"]]
+    connections = _group_connections({r["task_collection"] for r in rows} | {r["task_collection"] for r in edited})
+    if user is not None:
+        resourced = [dict(by_id[p["id"]], **{f: v[1] for f, v in p["changes"].items()}) for p in plans
+                     if set(p["changes"]) & set(CONNECTION_FIELDS)]
+        _refuse_host_reads(resourced, user, connections)
+    if not connections:
+        return
+    for p in plans:
+        group = by_id[p["id"]]["task_collection"]
+        touched = sorted(set(p["changes"]) & set(CONNECTION_FIELDS))
+        if group in connections and touched:
+            raise HTTPException(422, {"errors": [
+                f"{', '.join(touched)} of a table read through the JDBC connection {connections[group]['name']} belong "
+                "to the connection and can't be edited on the table"]})
+    _refuse_rows_off_connections(edited, cur=cur, connections=connections)
+
+
+def _reads_a_secret(row: dict) -> bool:
+    """Whether a control row reads its source with a secret from its job's scope: by host (Spark JDBC) and not through
+    a Unity Catalog connection's remote_query, which takes no secret."""
+    return not q._truthy(row.get("use_remote_query"))
+
+
+def _host_read_refusal(user: str) -> Optional[str]:
+    """Why this user may not set up a read by host and password outside a JDBC connection, or None. Such a read takes
+    its login from the secret scope its job names, by default the admin's scope, whose secrets an admin wrote, and
+    sends it to the host the request names. So, as for a connection naming such a scope (_connection_scope_refusal),
+    only an app manager may; anyone else reads through a JDBC connection in the login scope."""
+    refusal = _manage_refusal(user)
+    if refusal is None:
+        return None
+    return ("a read by host and password outside a JDBC connection takes its login from a secret scope an admin "
+            "wrote, so only an app manager may set one up: make a JDBC connection in the login scope and read "
+            f"through it instead ({refusal})")
+
+
+def _refuse_host_reads(rows: List[dict], user: str, connections: Optional[Dict[str, dict]] = None) -> None:
+    """Refuses writing control rows that read by host and password (_reads_a_secret) into groups whose job reads
+    through no JDBC connection, unless the user is an app manager (_host_read_refusal). Rows of a connection's job are
+    held to the connection instead (_refuse_rows_off_connections)."""
+    groups = {row.get("task_collection") or "" for row in rows}
+    connections = _group_connections(groups) if connections is None else connections
+    if any(_reads_a_secret(row) and (row.get("task_collection") or "") not in connections for row in rows):
+        _refuse(_host_read_refusal(user))
+
+
+def _refuse_scope_parameter(parameters: Optional[dict], user: str, stored: Optional[dict] = None) -> None:
+    """Refuses a job's secret_scope parameter set or changed by someone who isn't an app manager: it names the scope
+    the job's tables read by host and password take their logins from. A job reading through a JDBC connection takes
+    its connection's scope instead, so it never comes here; an edit that keeps the stored value passes."""
+    wanted = str((parameters or {}).get("secret_scope") or "")
+    if wanted and wanted != str((stored or {}).get("secret_scope") or ""):
+        _refuse(_host_read_refusal(user))
 
 
 class SourceDiscoverRequest(BaseModel):
@@ -3273,13 +3921,18 @@ class Shared(BaseModel):
 
 class ReviewRequest(BaseModel):
     shared: Shared = Shared()
+    task_collection: Optional[str] = None
 
 
 @app.post("/api/discoveries/{discovery_id}/review")
 def review(discovery_id: str, body: ReviewRequest):
-    """Review grid rows computed from the discovery and the shared fields."""
+    """Review grid rows computed from the discovery and the shared fields, named by the rule of the job holding the
+    target group (a group no job holds, or none given, takes Unity Catalog's)."""
     discovered = db.query(q.discovered_tables_sql(), (discovery_id,))
-    return [q.public_review_row(r) for r in q.review_rows(discovered, body.shared.model_dump())]
+    group = (body.task_collection or "").strip()
+    unity_catalog = _group_unity_catalog(group) if group else True
+    return [q.public_review_row(r)
+            for r in q.review_rows(discovered, body.shared.model_dump(), unity_catalog=unity_catalog)]
 
 
 class RegisterRequest(BaseModel):
@@ -3293,13 +3946,20 @@ class RegisterRequest(BaseModel):
 def register(discovery_id: str, body: RegisterRequest, request: Request):
     """Validate (dry_run) or register the included tables. Rows are rebuilt from the stored discovery
     and only the reviewer's editable fields are applied (queries.merge_review_edits)."""
+    taken = {r["task_collection"] for r in db.query(q.collections_sql())}
+    connection = _jdbc_source(Selection(discovery_id=discovery_id, whole_server=True))
+    if body.task_collection in taken and connection is not None:
+        raise HTTPException(422, {"errors": ["these tables come from a JDBC connection, whose scope and trust belong to "
+                                              "a job of their own: register them into a new job"]})
     discovered = db.query(q.discovered_tables_sql(), (discovery_id,))
-    rows = q.merge_review_edits(q.review_rows(discovered, body.shared.model_dump()), body.edits)
+    unity_catalog = _group_unity_catalog(body.task_collection)
+    rows = q.merge_review_edits(q.review_rows(discovered, body.shared.model_dump(), unity_catalog=unity_catalog),
+                                body.edits)
     chosen = [r for r in rows if r.get("include")]
     results, valid = [], []
     for r in chosen:
         row = q.control_row_from_review(r, body.task_collection)
-        errs = q.validate_control_row(row)
+        errs = q.validate_control_row(row) + js.typed_name_errors(row, unity_catalog)
         name = ".".join(q.review_key(r))
         if errs:
             results.append({"table": name, "status": "invalid", "errors": errs})
@@ -3308,6 +3968,10 @@ def register(discovery_id: str, body: RegisterRequest, request: Request):
     if not body.dry_run and valid:
         _refuse_groups_outside_jobs([body.task_collection])
         _refuse_groups([body.task_collection], request)
+        if connection is not None:
+            _refuse_connection_rows(connection, [row for _, row in valid])
+        _refuse_rows_off_connections([row for _, row in valid])
+        _refuse_host_reads([row for _, row in valid], _user(request))
         batch = uuid.uuid4().hex[:12]
         with _write() as cur:
             _lock_collections(cur, [body.task_collection])
@@ -3355,9 +4019,10 @@ def import_csv(body: ImportRequest, request: Request):
     inserts each line's row unless its sink is taken (skipped), logs it as an import, and runs the mixed-sink
     check, as Bulk import's register does. Tables the group already has are skipped."""
     group = body.task_collection.strip()
+    unity_catalog = _group_unity_catalog(group)
 
     def planned(rows):
-        plan = ci.plan_import(body.csv, group, body.settings, rows)
+        plan = ci.plan_import(body.csv, group, body.settings, rows, unity_catalog=unity_catalog)
         if plan["errors"]:
             raise HTTPException(422, {"errors": plan["errors"]})
         return plan
@@ -3380,6 +4045,9 @@ def import_csv(body: ImportRequest, request: Request):
             invalid = counted(plan["lines"]).get("invalid")
             if invalid:
                 raise HTTPException(422, {"errors": ["fix the invalid lines first"], "invalid": invalid})
+            adding = [line["row"] for line in plan["lines"] if line["status"] != "registered"]
+            _refuse_rows_off_connections(adding, cur=cur)
+            _refuse_host_reads(adding, _user(request))
             for line in plan["lines"]:
                 if line["status"] == "registered":
                     line["status"] = "skipped"
@@ -3487,8 +4155,11 @@ def _validate_schedule(body: ScheduleBody):
 # applying it, and a deleted job's delete job run and whether it drops the target tables. A request's values for them are ignored, and the stored ones kept.
 # A job's tables per group, set at Create or by a regroup that names one.
 TABLES_PER_GROUP_OPTION = "tables_per_group"
+# A job made by Create stores its target names' rule here (job_settings.UNITY_CATALOG_NAMES); a job without it keeps the
+# older rule, so its names are as they were.
 MANAGED_OPTIONS = ("updated_by", sch.COPY_OPTION, "cluster_copy_run_id", "delete_run_id", "delete_drop_targets",
-                   rediscovery.RECORD, TABLES_PER_GROUP_OPTION)
+                   "delete_start_error", "delete_finished", rediscovery.RECORD, TABLES_PER_GROUP_OPTION,
+                   js.TARGET_NAMES_OPTION, table_removal.OPTION, table_removal.EXCLUDED)
 
 
 def _requested_options(body: "ScheduleBody") -> dict:
@@ -3648,6 +4319,7 @@ def schedule_options():
     except Exception:
         defaults = {}
     return {"cadences": sch.CADENCES, "parameters": list(sch.PARAMETERS), "flags": sch.FLAGS, "defaults": defaults,
+            "shared_client_id": js.SHARED_CLIENT_ID, "shared_identity": js.SHARED_IDENTITY,
             "variants": sorted(jobs.schedule_variants()),
             "collections": [r["task_collection"] for r in db.query(q.collections_sql())], "scheduled": scheduled,
             "view_group": jobs.SCHEDULE_JOB_VIEW_GROUP}
@@ -3658,7 +4330,11 @@ def create_schedule(body: ScheduleBody, request: Request):
     import psycopg
     body.options = _requested_options(body)
     _validate_schedule(body)
+    _refuse_login_scope(body.parameters, None)
+    _refuse_scope_parameter(body.parameters, _user(request))
     _refuse_unknown_node_types(sch.own_cluster(body.model_dump()))
+    # Set after validation: the app writes this option, a request may not send it.
+    body.options = {**body.options, js.TARGET_NAMES_OPTION: js.UNITY_CATALOG_NAMES}
     user = _user(request)
     # A check schedule's one wrapper fires every member at once.
     body.stagger = body.stagger and body.job_variant != sch.CHECK_VARIANT
@@ -3745,6 +4421,8 @@ class ChunkJob:
     task_id: int
     stages: by_database.Stages
     log_members: bool = True
+    # The JDBC connection the job reads through (its rows are held to it), or None (a row read by host is a manager's).
+    connection: Optional[dict] = None
 
 
 def _schedule_create_line(job: ChunkJob, group: str) -> tuple:
@@ -3773,6 +4451,7 @@ def _write_chunk(cur, plans: List[dict], job: ChunkJob, state: dict) -> None:
             if (str(row.get("src_database") or "").lower(), line["sink"], str(row.get("client_id") or ""),
                 row["task_collection"]) not in have]
     if todo:
+        _refuse_job_rows(todo, job.connection, job.user, cur=cur)
         _insert_controls(cur, todo, job.user, job.batch, log_per_statement=by_database.TABLES_PER_TRANSACTION)
         _refuse_mixed_sinks(cur, todo)
         _refuse_split_databases(cur, todo)
@@ -3821,7 +4500,8 @@ def _create_by_database(body: NewJobRequest, request: Request, selection: Select
     run = body.run.model_copy()
     run.stagger = run.stagger and run.job_variant != sch.CHECK_VARIANT
     user = _user(request)
-    settings = nj.settings_of(body.settings)
+    connection = _new_job_source(run, selection, user, applying=not body.dry_run)
+    settings = nj.settings_of(body.settings, new_job=True)
     errors = nj.given_errors(body.settings) + nj.setting_errors(settings, require_target=not body.dry_run)
     if not name and not body.dry_run:
         errors.insert(0, "name the job")
@@ -3861,7 +4541,8 @@ def _create_by_database(body: NewJobRequest, request: Request, selection: Select
 
     def plan_of(rows, own, stages):
         with stages.timed("plan"):
-            return by_database.plan_database(name, body.settings, rows, columns, groups_of, taken, own, group_of=group_of)
+            return by_database.plan_database(name, body.settings, rows, columns, groups_of, taken, own, group_of=group_of,
+                                            new_job=True)
 
     def read_of(chunk, stages):
         with stages.timed("read"):
@@ -3873,6 +4554,7 @@ def _create_by_database(body: NewJobRequest, request: Request, selection: Select
         when keep is True, so the write does not plan it again."""
         errors_found, counted = [], []
         for read_batch in by_database.read_batches(list(units())):
+            batch_rows = []
             for unit, rows in read_of(read_batch, stages):
                 if not rows:
                     continue
@@ -3882,7 +4564,9 @@ def _create_by_database(body: NewJobRequest, request: Request, selection: Select
                 for line in plan["lines"]:
                     if line["status"] == "invalid":
                         errors_found.append(f"{unit.database} {line['table']}: {'; '.join(line['errors'])}")
+                batch_rows += [line["row"] for line in plan["lines"] if line["status"] == "valid"]
                 counted.append(by_database.Checked(unit, len(rows), plan if keep else None))
+            _refuse_job_rows(batch_rows, connection, user)
         if errors_found:
             raise HTTPException(422, {"errors": errors_found[:20] + (
                 [f"{len(errors_found)} lines cannot be taken"] if len(errors_found) > 20 else [])})
@@ -3914,7 +4598,7 @@ def _create_by_database(body: NewJobRequest, request: Request, selection: Select
             except psycopg.errors.UniqueViolation:
                 raise HTTPException(409, f"an ingestion job named '{name}' already exists")
         job = ChunkJob(sid=sid, name=name, user=user, batch=batch, cadence_minutes=run.cadence_minutes,
-                       timezone=timezone_, offsets=offs, task_id=task_id, stages=stages)
+                       timezone=timezone_, offsets=offs, task_id=task_id, stages=stages, connection=connection)
         for chunk in by_database.transactions_of(counted):
             plans = [checked.plan for checked in chunk] if keep else [
                 plan_of(rows, own, stages) for _, rows in read_of([checked.unit for checked in chunk], stages) if rows]
@@ -3948,10 +4632,13 @@ def _add_by_database(job_id: int, body: "JobTablesRequest", request: Request, ki
     are synced once at the end. The same request id after a stop finishes the job, skipping the rows already in."""
     job = _load_schedule(job_id)[0]
     selection = body.source
+    explicit = not selection.whole_server and not selection.databases
+    excluded = table_removal.exclusions_of(sch.options_of(job))
     groups = _job_groups(job_id)
     _refuse_job_tables(job, groups, request)
+    connection = _job_connection_row(job_id)
     inputs = nj.job_inputs(job["name"], db.query(q.groups_control_rows_sql(), (groups,)) if groups else [],
-                           body.groups_per_server)
+                           body.groups_per_server, unity_catalog=_unity_catalog(job))
     if inputs["errors"]:
         raise HTTPException(422, {"errors": inputs["errors"]})
     taken = {r["task_collection"] for r in db.query(q.collections_sql())}
@@ -3975,19 +4662,38 @@ def _add_by_database(job_id: int, body: "JobTablesRequest", request: Request, ki
     def plan_of(rows, stages):
         with stages.timed("plan"):
             return by_database.plan_database(job["name"], given, rows, columns, {}, taken, set(groups),
-                                             group_of=group_of, have=inputs["have"], join=inputs["join"])
+                                             group_of=group_of, have=inputs["have"], join=inputs["join"],
+                                             unity_catalog=_unity_catalog(job))
 
     def read_of(chunk, stages):
         with stages.timed("read"):
             return _rows_of_units(kind, param, chunk)
 
+    def not_removed(rows):
+        """The rows Add tables takes: a table the job removed is left out, unless the selection named its tables."""
+        if explicit:
+            return rows
+        return [row for row in rows if not table_removal.is_excluded(
+            row["server"], row["src_database"], row["src_schema"], row["src_table"], excluded)]
+
+    def plans_of(units, stages):
+        plans = []
+        for _, rows in read_of(units, stages):
+            kept = not_removed(rows)
+            if kept:
+                plans.append(plan_of(kept, stages))
+        return plans
+
     def check(stages, keep):
         """Every database planned, nothing written: the lines that cannot be taken, and the groups the job would add.
         Returns those totals, and each database with its table count, in order, for the write to pack into
         transactions."""
-        invalid, tables, in_job, new_groups, counted = [], 0, 0, set(), []
+        invalid, tables, in_job, new_groups, counted, left_out = [], 0, 0, set(), [], 0
         for read_batch in by_database.read_batches(list(_units_of(kind, param, selection))):
-            for unit, rows in read_of(read_batch, stages):
+            batch_rows = []
+            for unit, all_rows in read_of(read_batch, stages):
+                rows = not_removed(all_rows)
+                left_out += len(all_rows) - len(rows)
                 if not rows:
                     continue
                 plan = plan_of(rows, stages)
@@ -4000,12 +4706,14 @@ def _add_by_database(job_id: int, body: "JobTablesRequest", request: Request, ki
                         in_job += 1
                     else:
                         tables += 1
+                        batch_rows.append(line["row"])
                 new_groups |= set(plan["groups"]) - set(groups)
                 counted.append(by_database.Checked(unit, len(rows), plan if keep else None))
+            _refuse_job_rows(batch_rows, connection, user)
         if invalid:
             raise HTTPException(422, {"errors": invalid[:20] + (
                 [f"{len(invalid)} lines cannot be taken"] if len(invalid) > 20 else [])})
-        return {"tables": tables, "in_job": in_job, "new_groups": sorted(new_groups)}, counted
+        return {"tables": tables, "in_job": in_job, "left_out": left_out, "new_groups": sorted(new_groups)}, counted
 
     def write(progress, task_id):
         stages = by_database.Stages()
@@ -4021,14 +4729,18 @@ def _add_by_database(job_id: int, body: "JobTablesRequest", request: Request, ki
         state["stage"] = "writing"
         chunk_job = ChunkJob(sid=job_id, name=job["name"], user=user, batch=batch,
                              cadence_minutes=int(job["cadence_minutes"]), timezone=job["timezone"], offsets=offs,
-                             task_id=task_id, stages=stages, log_members=False)
+                             task_id=task_id, stages=stages, log_members=False, connection=connection)
         for chunk in by_database.transactions_of(counted):
-            plans = [checked.plan for checked in chunk] if keep else [
-                plan_of(rows, stages) for _, rows in read_of([checked.unit for checked in chunk], stages) if rows]
+            plans = ([checked.plan for checked in chunk] if keep
+                     else plans_of([checked.unit for checked in chunk], stages))
             if plans:
                 with _write() as cur:
                     _lock_job(cur, job_id)
                     _write_chunk(cur, plans, chunk_job, state)
+                    if explicit:
+                        cur.execute(q.clear_exclusions_sql(),
+                                    (table_removal.line_keys([line for plan in plans for line in plan["lines"]]),
+                                     int(job_id)))
         result = {"summary": {**found, "tables": state["tables_written"], "by_database": True, "checked": True},
                   "applied": True, "databases": state["databases_written"]}
         with _write() as cur:
@@ -4102,10 +4814,12 @@ def _create_now(body: NewJobRequest, request: Request, inline=None):
 
 def _create_options(body: "NewJobRequest") -> dict:
     """A new job's options: the run's, less those only the app's own steps write, with the job's tables per group when
-    Create names one (Add tables and a regroup later read it back, _sizing)."""
+    Create names one (Add tables and a regroup later read it back, _sizing), and its target names by Unity Catalog's
+    rules."""
     options = {k: v for k, v in (body.run.options or {}).items() if k not in MANAGED_OPTIONS}
     if body.tables_per_group:
         options[TABLES_PER_GROUP_OPTION] = int(body.tables_per_group)
+    options[js.TARGET_NAMES_OPTION] = js.UNITY_CATALOG_NAMES
     return options
 
 
@@ -4115,6 +4829,19 @@ def _sizing(body, job: Optional[dict] = None) -> placement.Groups:
     return placement.sizing(getattr(body, "groups_per_server", None), getattr(body, "tables_per_group", None), stored)
 
 
+def _unity_catalog(job: dict) -> bool:
+    """Whether a job's target names follow Unity Catalog's rules (job_settings.unity_catalog_of): every job Create
+    makes from now on, and not one made before."""
+    return js.unity_catalog_of(sch.options_of(job))
+
+
+def _group_unity_catalog(group: str) -> bool:
+    """Whether the tables of an ingestion group are named by Unity Catalog's rules: the rule of the job that holds the
+    group. A group no job holds takes Unity Catalog's, as a new job's would; a write into it is refused anyway."""
+    held = db.query(q.group_job_options_sql(), (group,))
+    return _unity_catalog(held[0]) if held else True
+
+
 # The name a preview groups the tables under while the job has none yet: the groups are named from the job's name.
 PREVIEW_NAME = "new job"
 
@@ -4122,6 +4849,31 @@ PREVIEW_NAME = "new job"
 def _target_missing(settings: dict) -> List[str]:
     """The target fields a preview's settings leave blank, by name, for the page to say what Create needs."""
     return [label for key, label in js.TARGET_SETTINGS if not str(settings.get(key) or "").strip()]
+
+
+def _new_job_source(run, source: Optional[Selection], user: str, applying: bool) -> Optional[dict]:
+    """The checks of a new job's source and secret scope, on every path that makes one (_create_job, and
+    _create_by_database for more than BACKGROUND_ROWS tables). A job made from a JDBC connection's discoveries takes the
+    connection's scope and trust in place of the request's (run.parameters is set here); a job reading through none may
+    not name the login scope, and, when it is made rather than previewed, names another scope only as an app manager.
+    Returns the connection, or None."""
+    connection = _jdbc_source(source)
+    if connection:
+        run.parameters = {**{k: v for k, v in run.parameters.items() if k not in JDBC_PARAMETERS},
+                          **jc.job_parameters(connection)}
+    _refuse_login_scope(run.parameters, connection)
+    if connection is None and applying:
+        _refuse_scope_parameter(run.parameters, user)
+    return connection
+
+
+def _refuse_job_rows(rows: List[dict], connection: Optional[dict], user: str, cur=None) -> None:
+    """The checks of control rows written into one job: through the job's JDBC connection, each must read through it
+    (_refuse_connection_rows); without one, a row read by host and password is an app manager's (_refuse_host_reads)."""
+    if connection is not None:
+        _refuse_connection_rows(connection, rows, cur=cur)
+    else:
+        _refuse_host_reads(rows, user, {})
 
 
 def _create_job(body: NewJobRequest, request: Request, inline: bool = False, progress=None, task_id=None):
@@ -4141,6 +4893,7 @@ def _create_job(body: NewJobRequest, request: Request, inline: bool = False, pro
     run = body.run.model_copy()
     run.stagger = run.stagger and run.job_variant != sch.CHECK_VARIANT
     taken = {r["task_collection"] for r in db.query(q.collections_sql())}
+    connection = _new_job_source(run, body.source, user, applying=not body.dry_run)
     text, selected = body.text(request, wait=inline)
     if selected is not None and selected.get("discovering"):
         return {"discovering": True, "summary": None, "settings": {}, "created": False, "databases": selected["databases"]}
@@ -4149,7 +4902,8 @@ def _create_job(body: NewJobRequest, request: Request, inline: bool = False, pro
         # A preview with no name yet groups the tables under PREVIEW_NAME and checks no group against the taken ones.
         unnamed_preview = body.dry_run and not name
         plan = _file_lines(nj.plan(PREVIEW_NAME if unnamed_preview else name, text, body.settings, _sizing(body),
-                                   set() if unnamed_preview else taken, require_target=not body.dry_run), selected)
+                                   set() if unnamed_preview else taken, require_target=not body.dry_run,
+                                   new_job=True), selected)
         errors = list(plan["errors"])
         if not errors and plan["groups"] and not unnamed_preview:
             schedule = {**run.model_dump(), "name": name, "members": plan["groups"],
@@ -4166,6 +4920,7 @@ def _create_job(body: NewJobRequest, request: Request, inline: bool = False, pro
                 "target_missing": _target_missing(plan["settings"]), "name_missing": not name}
     if not run.paused:     # anyone may set up a job, but one that runs needs the right to run what it starts
         _refuse(_permission_refusals({"job_variant": run.job_variant}, user)["run"])
+    _refuse_job_rows([line["row"] for line in plan["lines"]], connection, user)
     options = create_options
     _refuse_unknown_node_types(sch.own_cluster({"options": options}))
     timezone_ = sch.timezone_for(run.cadence_minutes, run.timezone)
@@ -4241,11 +4996,17 @@ def _create_after_reading(body: NewJobRequest, request: Request):
 
 def _create_after_discovery(body: NewJobRequest, request: Request, progress, task_id) -> dict:
     """The background half of a Create with database-only lines: their tables are discovered by name (the task's stage
-    says so), then the Create is written as an inline one is."""
+    says so), then the Create is written as an inline one is. A plan with lines it can't take makes no job, and answers
+    as a preview does; here that is refused with each such line, so the task ends failed with the reason."""
     _task_stage(task_id, "discovering")
     _resolve_databases(_selected(body.source), wait=True, request=request)
     _task_stage(task_id, "writing")
-    return _create_job(body, request, inline=True, progress=progress, task_id=task_id)
+    result = _create_job(body, request, inline=True, progress=progress, task_id=task_id)
+    if not result.get("created"):
+        invalid = (result.get("summary") or {}).get("invalid") or []
+        raise HTTPException(422, {"errors": [f"line {line['line']} ({line['table']}): {'; '.join(line['errors'])}"
+                                             for line in invalid] or ["the file takes no tables"]})
+    return result
 
 
 @app.post("/api/schedules/{sid}")
@@ -4266,6 +5027,13 @@ def update_schedule(sid: int, body: ScheduleBody, request: Request):
         _refuse(_permission_refusals({"job_variant": body.job_variant}, user)["run"])
     body.stagger = body.stagger and body.job_variant != sch.CHECK_VARIANT
     new = body.model_dump()
+    job_connection = _job_connection_row(sid)
+    if job_connection is not None:
+        new["parameters"] = {**{k: v for k, v in (new.get("parameters") or {}).items() if k not in JDBC_PARAMETERS},
+                             **jc.job_parameters(job_connection)}
+    _refuse_login_scope(new.get("parameters"), job_connection)
+    if job_connection is None:
+        _refuse_scope_parameter(new.get("parameters"), user, _parameters_of(s))
     new["notify_emails"] = new["notify_emails"] or None
     new["job_variant"] = new["job_variant"] or "default"
     stored = sch.options_of(s)
@@ -4348,14 +5116,18 @@ class DeleteJobBody(BaseModel):
 
 @app.post("/api/schedules/{sid}/delete")
 def delete_schedule(sid: int, request: Request, body: Optional[DeleteJobBody] = None):
-    """Delete a schedule (an ingestion job): it is marked deleted (the row is kept), its wrapper jobs are deleted, and
-    the delete job starts, which deletes its groups' tables and their state as the deployer (the app has no DELETE
-    privilege) and, with ``drop_targets``, the target tables only those groups write. Run history and the change log
-    stay. Refused while a run of the job is going. On a job already deleted, it starts the delete job again (Run
-    again on Ingestion jobs), with the flag it was deleted with unless the body sets it."""
+    """Delete an ingestion job softly: it is marked deleted and kept for the retention period, so Restore can bring it
+    back. Its wrapper jobs are deleted and its members removed. Its groups' tables and state stay until the purge
+    (Delete
+    now, or the delete job's daily run once the retention has run out), which deletes them as the deployer: the app has
+    no DELETE privilege. ``drop_targets`` says the purge also drops the target tables only its groups write.
+    Refused while
+    a run of the job is going."""
     user = _user(request)
     s, members = _load_schedule(sid)
     _refuse_job(s, request, "delete")
+    if s.get("deleted_at") is not None:
+        raise HTTPException(409, "ingestion job is already deleted: Restore it, or Delete now to purge it")
     active = [m for m in members if m["removed_at"] is None]
     plan = _delete_plan(sid)
     blocker = _delete_blocker(s, active, plan["groups"])
@@ -4363,31 +5135,26 @@ def delete_schedule(sid: int, request: Request, body: Optional[DeleteJobBody] = 
         raise HTTPException(409, blocker)
     if plan["tables"] and not jobs.DELETE_JOB_ID:
         raise HTTPException(409, NO_DELETE_JOB)
-    if s.get("deleted_at") is not None:
-        if not plan["tables"]:
-            return {"id": sid, "deleted": True, "sync": [], "delete_run": None}
-        drop = body.drop_targets if body else bool(sch.options_of(s).get("delete_drop_targets"))
-        with _write() as cur:
-            _record_delete(cur, sid, drop)
-        return {"id": sid, "deleted": True, "sync": [], "delete_run": _start_delete_job(sid, drop)}
     drop = bool(body and body.drop_targets)
     with _write() as cur:
         cur.execute(q.delete_schedule_sql(), (int(sid),))
         if active:
-            cur.execute(q.remove_members_sql(), ([m["id"] for m in active],))   # their jobs are deleted by the sync below
-        if plan["tables"]:
-            _record_delete(cur, sid, drop)
+            # Their wrapper jobs go in the sync below.
+            cur.execute(q.remove_members_sql(), ([m["id"] for m in active],))
+        _record_delete(cur, sid, drop)
         _log(cur, user, "schedule_delete", None, None, s["name"], None, "drop_targets" if drop else None)
     synced = _sync(sid, user)
     if sch.options_of(s).get(sch.COPY_OPTION):     # its copy of the ingestion job goes too
         _apply_cluster(sid)
-    return {"id": sid, "deleted": True, "sync": synced,
-            "delete_run": _start_delete_job(sid, drop) if plan["tables"] else None}
+    return {"id": sid, "deleted": True, "retention_days": jobs.DELETED_JOB_RETENTION_DAYS, "sync": synced,
+            "delete_run": None}
 
 
 NO_DELETE_JOB = ("no delete job is configured for this app, so the job's groups and their tables would stay behind "
                  "outside any job: deploy the engine bundle, then the app, and delete again")
-# Deleted jobs the Ingestion jobs page lists with their delete job run.
+NO_TABLE_REMOVE_JOB = ("no delete job is configured for this app, so a table can't be removed from its job: deploy the "
+                       "engine bundle, then the app, and remove it again")
+# Kept deleted jobs the Ingestion jobs page lists, a page at a time: the default page and the largest one.
 DELETIONS_LISTED = 10
 DELETIONS_PAGE_MAX = 50
 
@@ -4458,6 +5225,103 @@ def _delete_run(job: dict) -> Optional[dict]:
     except Exception as e:
         return {"run_id": run_id, "state": None, "result": None, "url": None,
                 "message": f"can't read the delete job's run: {str(e).split('. ')[0]}"}
+
+
+PURGED = ("ingestion job was purged: its state and tables are gone, so it can't be restored; create it again")
+
+
+@app.post("/api/schedules/{sid}/purge")
+def purge_schedule(sid: int, request: Request):
+    """Delete now: the delete job purges a deleted job at once, not waiting for its retention to run out. Its groups'
+    tables and state go for good, and its target tables too when its Delete asked for them."""
+    s, _ = _load_schedule(sid)
+    _refuse_job(s, request, "delete")
+    if s.get("deleted_at") is None:
+        raise HTTPException(409, "ingestion job is not deleted: delete it first")
+    if sch.options_of(s).get("delete_finished"):
+        raise HTTPException(409, PURGED)
+    if not jobs.DELETE_JOB_ID:
+        raise HTTPException(409, NO_DELETE_JOB)
+    blocker = _delete_blocker(s, [], _delete_plan(sid)["groups"])
+    if blocker:
+        raise HTTPException(409, blocker)
+    with _write() as cur:
+        cur.execute(q.clear_schedule_option_sql(), ("delete_start_error", int(sid)))
+    return {"id": sid, "delete_run": _start_delete_job(sid, bool(sch.options_of(s).get("delete_drop_targets")))}
+
+
+@app.post("/api/schedules/{sid}/restore")
+def restore_schedule(sid: int, request: Request):
+    """Restore a deleted job that its purge has not reached. It is live again, paused (nothing runs until it is
+    resumed),
+    with the members its Delete removed; members removed before the delete stay removed, and its groups' tables and
+    state are as they were. Refused when its name is taken, one of its groups is now in another live job, a live job
+    shares a database or target table with it, or its purge is going or has finished."""
+    user = _user(request)
+    s, _ = _load_schedule(sid)
+    _refuse_job(s, request, "delete")
+    if s.get("deleted_at") is None:
+        raise HTTPException(409, "ingestion job is not deleted")
+    with _write() as cur:
+        cur.execute(q.schedule_lock_sql(), (q.SCHEDULE_LOCK_CLASS, q.schedule_lock_key(sid)))
+        s, members = _load_schedule(sid, cur)
+        if s.get("deleted_at") is None:
+            raise HTTPException(409, "ingestion job is not deleted: it was restored already")
+        if sch.options_of(s).get("delete_finished"):
+            raise HTTPException(409, PURGED)
+        restored = sorted({m["task_collection"] for m in members
+                           if m["removed_at"] is not None and m["removed_at"] == s["deleted_at"]})
+        blocker = _delete_blocker(s, [], restored)
+        if blocker:
+            raise HTTPException(409, blocker)
+        _restore_refusals(cur, s, restored)
+        cur.execute(q.restore_members_sql(), (int(sid), int(sid)))
+        cur.execute(q.restore_schedule_sql(), (int(sid),))
+        if cur.rowcount != 1:
+            raise HTTPException(409, PURGED)
+        _log(cur, user, "schedule_restore", None, None, s["name"], None, None)
+        _touch(cur, user, [sid])
+    synced = _sync(sid, user)
+    cluster = _apply_cluster(sid) if sch.own_cluster(s) else None
+    return {"id": sid, "restored": True, "sync": synced, "cluster_error": cluster}
+
+
+def _restore_refusals(cur, job: dict, groups: List[str]) -> None:
+    """Inside a Restore's transaction: refuse when a live job has the deleted job's name, holds one of its groups now,
+    or
+    has a database or a target table in common with them. Each message says what to change first."""
+    cur.execute(q.live_name_taken_sql(), (job["name"], int(job["id"])))
+    if cur.fetchall():
+        raise HTTPException(409, f"another ingestion job is already named {job['name']}: rename or delete it, then "
+                                 "restore this one")
+    if not groups:
+        return
+    cur.execute(q.groups_held_elsewhere_sql(), (groups, int(job["id"])))
+    held = cur.fetchall()
+    if held:
+        group, holder = held[0]
+        raise HTTPException(409, f"ingestion group {group} is now in the ingestion job {holder}: take it out "
+                                 f"of that job, "
+                                 "then restore this one")
+    cur.execute(q.restore_conflicts_sql(), (groups, groups))
+    conflicts = cur.fetchall()
+    if conflicts:
+        kind, item, holder = conflicts[0]
+        what = f"database {item}" if kind == "database" else f"target table {item}"
+        raise HTTPException(409, f"{what} is also read or written by the live ingestion job {holder}: move one "
+                                 f"of the two "
+                                 "jobs apart, then restore this one")
+
+
+def _delete_refusal(job: dict, groups: List[str], user: str) -> Optional[str]:
+    """Why a deleted job can't be restored or purged now, for its Restore and Delete now buttons: the user may not
+    delete
+    it, or its runs or its purge are going."""
+    refusal = _permission_refusals(job, user)["delete"]
+    if refusal:
+        return refusal
+    blocker = _delete_blocker(job, [], groups)
+    return blocker.get("message") if isinstance(blocker, dict) else blocker
 
 
 @app.post("/api/schedules/{sid}/sync")
@@ -4551,6 +5415,137 @@ def _connections() -> List[dict]:
         out.append({"name": c.name, "connection_type": kind, "host": options.get("host"), "port": options.get("port"),
                     "owner": c.owner, "comment": c.comment, "discoverable": kind in DISCOVERABLE_CONNECTION_TYPES})
     return sorted(out, key=lambda c: c["name"])
+
+
+@app.post("/api/jdbc-logins")
+def write_jdbc_login(body: jl.JdbcLoginRequest, request: Request):
+    """Write a JDBC login into the dedicated secret scope as the app's own service principal, and record who entered
+    it. Writing a key again replaces its login, recorded as 'rotated'; who may is _login_write_refusal's. The password
+    is never stored, logged or returned."""
+    scope = jl.dedicated_scope()
+    if not scope:
+        raise HTTPException(503, f"no dedicated login scope is set ({jl.SCOPE_ENV}): deploy the app bundle")
+    password = body.password.get_secret_value()
+    entered_by = _user(request)
+    _refuse(_signed_in_refusal(entered_by))
+    key = body.resolved_secret_key()
+    seen = _newest_login(scope, key)
+    _refuse(_login_write_refusal(scope, key, entered_by, body.connection, seen))
+    value = jl.secret_value(body.user_name, body.password)
+    entry_id = uuid.uuid4().hex
+    put = False
+    # One transaction under the key's lock: the record first, then the secret, then the commit. A refused write rolls
+    # the record back, and two saves of one key take turns, so the newest record always names the login the key holds.
+    try:
+        with db.transaction() as cur:
+            cur.execute(q.jdbc_login_lock_sql(), (q.jdbc_login_lock_key(scope, key),))
+            now = db.fetch(cur, q.jdbc_login_latest_sql(), (scope, key))
+            if (now[0]["id"] if now else None) != (seen["id"] if seen else None):
+                raise HTTPException(409, f"another login was saved under {key} meanwhile: look at it, then save again")
+            try:
+                entry = db.fetch(cur, q.jdbc_login_insert_sql(),
+                                 (entry_id, body.connection, scope, key, entered_by, scope, key))[0]
+            except Exception as error:
+                raise HTTPException(500, jl.redact(f"the login could not be recorded ({error}); nothing was saved",
+                                                   password)) from None
+            try:
+                jl.put_login(scope, key, value)
+            except Exception as error:
+                status, message = jl.write_refusal(error, scope, key, (password, value))
+                logging.getLogger(__name__).warning("jdbc login write to %s/%s refused with %s", scope, key, status)
+                raise HTTPException(status, message) from None
+            put = True
+    except HTTPException:
+        raise
+    except Exception as error:
+        said = (f"the login was written to {scope}/{key} but its record did not commit ({error}): save it again"
+                if put else f"the login could not be saved ({error}); nothing was written")
+        raise HTTPException(500, jl.redact(said, password, value)) from None
+    logging.getLogger(__name__).info("jdbc login %s for %s/%s by %s", entry["outcome"], scope, key, entered_by)
+    return {"id": entry_id, "connection": body.connection, "scope": scope, "secret_key": key,
+            "entered_by": entered_by, "entered_at": entry["entered_at"], "outcome": entry["outcome"]}
+
+
+def _parameters_of(job: dict) -> dict:
+    """A job's stored parameters as a dict, whether the read gave them as JSON text or already decoded."""
+    parameters = job.get("parameters") or {}
+    if isinstance(parameters, str):
+        try:
+            parameters = json.loads(parameters)
+        except ValueError:
+            return {}
+    return parameters if isinstance(parameters, dict) else {}
+
+
+def _scope_groups(groups: Iterable[str], scope: str) -> set:
+    """The groups among these whose job reads its secrets from this scope (its secret_scope parameter): control rows
+    don't record their scope, so a row in another job reads the same key name from another scope. Read fresh."""
+    wanted = {g for g in groups if g}
+    if not wanted:
+        return set()
+    in_scope = [s["id"] for s in db.query(q.schedules_sql()) if _parameters_of(s).get("secret_scope") == scope]
+    members = db.query(q.schedule_members_sql(), (in_scope,)) if in_scope else []
+    return {m["task_collection"] for m in members if m["removed_at"] is None and m["task_collection"] in wanted}
+
+
+def _newest_login(scope: str, key: str) -> Optional[dict]:
+    """The newest jdbc_login_write row for one scope and key, or None when the key holds no typed login."""
+    rows = db.query(q.jdbc_login_latest_sql(), (scope, key))
+    return rows[0] if rows else None
+
+
+def _same_user(one, other) -> bool:
+    return bool(str(one or "").strip()) and str(one or "").strip().lower() == str(other or "").strip().lower()
+
+
+def _login_write_refusal(scope: str, key: str, user: str, connection: str = "",
+                         newest: Optional[dict] = None) -> Optional[str]:
+    """Why this user may not write the login under a key of the login scope for this connection, or None.
+
+    - A key some job reads through this scope is written by whoever may change those jobs (the edit path's check).
+    - A key with no login yet is open to any signed-in user, as a new job is.
+    - A key whose newest login was typed for another connection: only someone who may change that connection's jobs,
+      or, while it has none, who typed that login or made that connection, may save one under another connection.
+    - Otherwise, for the same connection: someone who may change its jobs, typed a login under the key before, or made
+      a connection one was typed for. So a login a connection uses can't be replaced by any signed-in user before a job
+      reads it."""
+    groups = {r["task_collection"] for r in db.query(q.control_groups_for_secret_key_sql(), (key,))}
+    reading = _scope_groups(groups, scope)
+    if reading:
+        return _groups_refusal(reading, user)
+    newest = newest if newest is not None else _newest_login(scope, key)
+    if newest is None:
+        return None
+    owner = newest["connection"]
+    owner_groups = sorted({r["task_collection"] for r in db.query(q.jdbc_connection_groups_sql(), (owner,))})
+    if owner_groups and _groups_refusal(owner_groups, user) is None:
+        return None
+    maker = next((row.get("created_by") for row in db.query(jc.get_sql(), (owner,))), None)
+    if owner != connection:
+        if not owner_groups and (_same_user(user, newest["entered_by"]) or _same_user(user, maker)):
+            return None
+        return (f"the newest login under the key {key} was typed for the JDBC connection {owner}: only someone who may "
+                "change that connection's jobs (or, while it has none, who typed that login or made the connection) "
+                "may save one under another connection")
+    earlier = db.query(q.jdbc_login_writers_sql(), (scope, key))
+    if any(_same_user(user, row["entered_by"]) or _same_user(user, row["created_by"]) for row in earlier):
+        return None
+    return (f"the key {key} already holds a login typed into the app: only someone who typed a login under it, who "
+            "made a connection one was typed for, or who may change its connection's jobs may replace it")
+
+
+@app.get("/api/jdbc-logins")
+def last_jdbc_login(secret_key: str = Query(default="", max_length=128)):
+    """The dedicated login scope, and, when a secret key is named, the newest login written for it: who entered it,
+    when, and whether it replaced an earlier one. Never the password, which the app doesn't keep. The form asks for the
+    scope alone, before a key is named, to know which scope its logins go to."""
+    scope = jl.dedicated_scope()
+    if not scope:
+        raise HTTPException(503, f"no dedicated login scope is set ({jl.SCOPE_ENV}): deploy the app bundle")
+    if not secret_key:
+        return {"scope": scope, "secret_key": "", "login": None}
+    rows = db.query(q.jdbc_login_latest_sql(), (scope, secret_key))
+    return {"scope": scope, "secret_key": secret_key, "login": rows[0] if rows else None}
 
 
 @app.get("/api/connections")
@@ -4677,7 +5672,7 @@ def _run_rediscovery(sid: int, started: datetime) -> None:
     try:
         record.update(status="done", **_rediscover(sid, report))
     except HTTPException as e:
-        deferred = e.status_code == 409 and "running" in str(e.detail)
+        deferred = _refused_while_running(e)
         record.update(status="deferred" if deferred else "failed", error=_error_text(e))
     except Exception as e:
         record.update(status="failed", error=_error_text(e))
@@ -4730,8 +5725,13 @@ def _rediscover(sid: int, report=lambda **fields: None) -> dict:
             if failed:
                 errors.append(f"{server}: {failed}")
             continue
+        try:
+            spec, parameters = _rediscovery_reading(spec, job.get("created_by"))
+        except HTTPException as refused:
+            errors.append(f"{server}: {_error_text(refused)}")
+            continue
         run_id = jobs.run_now(_require(jobs.DISCOVER_JOB_ID, "discovery"),
-                              {"discovery_id": discovery_id, "spec": json.dumps(spec)})
+                              {"discovery_id": discovery_id, "spec": json.dumps(spec), **parameters})
         report(phase=rediscovery.DISCOVERING, run_id=run_id, server=server)
         ended = _wait_for_run(run_id)
         if ended.get("result") != "SUCCESS":
@@ -4747,7 +5747,8 @@ def _rediscover(sid: int, report=lambda **fields: None) -> dict:
         with _write() as cur:
             groups = _lock_job(cur, sid)
             job_rows = db.fetch(cur, q.groups_control_rows_sql(for_update=True), (groups,)) if groups else []
-            picked = rediscovery.wanted(discovery_parts, found, statuses, job_rows)
+            excluded = table_removal.exclusions_of(sch.options_of(_load_schedule(sid, cur)[0]))
+            picked = rediscovery.wanted(discovery_parts, found, statuses, job_rows, excluded)
             limit = rediscovery.REPORT_LIMIT
             outcome = {"found": len(picked["add"]), "added": 0, "skipped": 0,
                        "new_databases": picked["new_databases"][:limit],
@@ -4757,10 +5758,11 @@ def _rediscover(sid: int, report=lambda **fields: None) -> dict:
             if not picked["add"]:
                 return outcome, []
             plan = nj.plan_for_job(job["name"], nj.csv_of(nj.DISCOVERY_COLUMNS, [r["fields"] for r in picked["add"]]),
-                                   "ct", job_rows, None, taken)
+                                   "ct", job_rows, None, taken, unity_catalog=_unity_catalog(job))
             if plan["errors"]:
                 raise HTTPException(422, {"errors": plan["errors"]})
-            written = _write_planned_tables(cur, job, plan, user, batch, skip_taken=True)
+            written = _write_planned_tables(cur, job, plan, user, batch, skip_taken=True,
+                                            reader=job.get("created_by") or "")
             if written:
                 _touch(cur, user, [sid])
             outcome["added"] = len(written)

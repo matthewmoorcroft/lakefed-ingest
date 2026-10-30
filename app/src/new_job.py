@@ -8,12 +8,14 @@ database access, so main.py writes the plan in one transaction."""
 import csv
 import io
 import json
+import re
 from typing import Callable, Dict, List, Optional, Tuple
 
 import config_import as ci
 import job_settings as js
 import placement
 import queries as q
+import table_removal
 
 LOAD_TYPES = ("ct", "cursor", "full")
 DEFAULT_GROUPS_PER_SERVER = 4
@@ -23,16 +25,17 @@ MAX_LINES = 120_000
 MAX_GROUPS_PER_SERVER = 64
 DEFAULTS = {"src_type": "sqlserver", "load_type": "ct", "fan_in": False, "write_mode_changes": "merge",
             "write_mode_full": "merge", "sink_catalog": "", "sink_schema": "", "sink_table": "{table}",
-            "lowercase": True, "client_id": "{database}", "identity": {}, "freshness_sla_minutes": None}
+            "client_id": js.SHARED_CLIENT_ID, "identity": {}, "freshness_sla_minutes": None}
 
 
-BOOLEAN_SETTINGS = ("fan_in", "lowercase")
+BOOLEAN_SETTINGS = ("fan_in",)
 
 
 def given_errors(given: dict) -> List[str]:
     """What is wrong with the settings as given: a name the job has no setting for (a typo would otherwise be
     ignored), or a yes or no setting that is neither."""
-    errors = [f"unknown setting {name}" for name in (given or {}) if name not in DEFAULTS]
+    errors = [f"unknown setting {name}" for name in (given or {})
+              if name not in DEFAULTS and name not in js.RETIRED_SETTINGS]
     for name in BOOLEAN_SETTINGS:
         if (given or {}).get(name) is not None:
             try:
@@ -42,15 +45,23 @@ def given_errors(given: dict) -> List[str]:
     return errors
 
 
-def settings_of(given: dict) -> dict:
-    """The job's settings as given, each blank or missing one at its default."""
+def settings_of(given: dict, new_job: bool = False) -> dict:
+    """The job's settings as given, each blank or missing one at its default. A job made before the server went into
+    the key keeps the database alone as its client_id, so only a new job takes the new default."""
     out = dict(DEFAULTS)
+    if not new_job:
+        out["client_id"] = js.LEGACY_CLIENT_ID
     out.update({k: v for k, v in (given or {}).items() if k in DEFAULTS and v is not None})
+    if not str(out["client_id"] or "").strip():
+        out["client_id"] = js.SHARED_CLIENT_ID if new_job else js.LEGACY_CLIENT_ID
     for name in BOOLEAN_SETTINGS:
         try:
             out[name] = q.parse_bool(out[name])
         except ValueError:
             out[name] = DEFAULTS[name]      # given_errors reports it, and nothing is written while it does
+    # Only an identity left out takes the defaults: an empty one is the user removing them.
+    if new_job and out["fan_in"] and (given or {}).get("identity") is None:
+        out["identity"] = dict(js.SHARED_IDENTITY)
     out["identity"] = {str(k).strip(): str(v).strip() for k, v in (out.get("identity") or {}).items() if str(k).strip()}
     return out
 
@@ -96,20 +107,30 @@ def group_names(job_name: str, server: str, groups_per_server: int) -> List[str]
     return [f"{q.identifier(job_name)}_{q.identifier(server)}_c{number:02d}" for number in range(1, groups_per_server + 1)]
 
 
+def key_errors(server: str, database: str, key: Optional[str]) -> List[str]:
+    """Why a new job's client_id for one database would be refused, naming the server and database; none when the key
+    is allowed. A named instance (host\\instance) keeps its backslash in the server, which the key can't carry."""
+    if key is None or re.match(q.CLIENT_ID_PATTERN, str(key)):
+        return []
+    instance = " (a named instance, host\\instance, can't be in the key: give the host and port)" if "\\" in server else ""
+    return [f"server {server} and database {database} would get the client_id {key!r}: letters, digits and _ . : - "
+            f"only, 1 to 128 characters{instance}"]
+
+
 def target_errors(settings: dict) -> List[str]:
     """The target fields left blank: needed to create the job, never to preview what it would take."""
     return [f"set the {label}" for key, label in js.TARGET_SETTINGS if not str(settings[key] or "").strip()]
 
 
-def setting_errors(settings: dict, require_target: bool = True) -> List[str]:
+def setting_errors(settings: dict, require_target: bool = True, unity_catalog: bool = True) -> List[str]:
     """What is wrong with the job's settings. A preview passes require_target False: a blank target is a check on
-    Create, so the preview still shows what the selection takes."""
+    Create, so the preview still shows what the selection takes. unity_catalog is the naming rule the names will follow."""
     errors = []
     if settings["load_type"] not in LOAD_TYPES:
         errors.append(f"load type must be one of {', '.join(LOAD_TYPES)}")
     if require_target:
         errors += target_errors(settings)
-    return errors + js.check_templates(settings, bool(settings["fan_in"]))
+    return errors + js.typed_name_errors(settings, unity_catalog) + js.check_templates(settings, bool(settings["fan_in"]))
 
 
 def _write_mode(load_type: str, settings: dict) -> str:
@@ -119,32 +140,45 @@ def _write_mode(load_type: str, settings: dict) -> str:
 
 
 def _line_load_types(text: str):
-    """(the file without its load_type column, {file line number: load type}). A discovered table carries the load
-    type discovery recommends for it; a plain CSV has none, and every line takes the job's."""
+    """(the file without its load_type column, {line number: load type}). A discovered table carries the load type
+    discovery recommends for it; a plain CSV has none, and every line takes the job's. The lines are numbered as
+    config_import.plan_import numbers the file it is given: from 2, counting only the lines with a value left once the
+    load_type column is gone, so a blank or all-empty line shifts no table onto another's load type."""
     reader = csv.reader(io.StringIO(text.lstrip("\ufeff")))
     rows = list(reader)
     if not rows or "load_type" not in [h.strip() for h in rows[0]]:
         return text, {}
     at = [h.strip() for h in rows[0]].index("load_type")
-    types = {number: (row[at].strip() if at < len(row) else "") for number, row in enumerate(rows[1:], start=2)}
+    types, number = {}, 1
+    for row in rows[1:]:
+        if not any(cell.strip() for cell in row[:at] + row[at + 1:]):
+            continue
+        number += 1
+        load_type = row[at].strip() if at < len(row) else ""
+        if load_type:
+            types[number] = load_type
     out = io.StringIO()
     csv.writer(out, lineterminator="\n").writerows([row[:at] + row[at + 1:] for row in rows])
-    return out.getvalue(), {n: t for n, t in types.items() if t}
+    return out.getvalue(), types
 
 
 def plan(job_name: str, text: str, given: dict, groups_per_server: Optional[int] = None,
          taken_groups: Optional[set] = None, group_of: Optional[Callable[[str, str], str]] = None,
-         have: Optional[set] = None, require_target: bool = True, join: Optional[placement.Lightest] = None) -> dict:
+         have: Optional[set] = None, require_target: bool = True, join: Optional[placement.Lightest] = None,
+         new_job: bool = False, unity_catalog: bool = True) -> dict:
     """What creating the job writes: {"errors": problems with the file or the settings (nothing is written while there
     are any), "lines": one per CSV line with its control row, status (valid, invalid, or in_job for a table the job
     already has) and errors, "groups": the groups its lines go to, "settings": the job's settings}. taken_groups are
     names other jobs or tables already use; group_of(server, database) is the group of a database an existing job has
-    (None for any other), and join places a new database on one of that job's servers (its lightest group). Every other database is spread evenly over its server's new groups by tables
-    (placement): groups_per_server of them, or by default as many as the server's tables in the file need. have holds
-    the (target, client_id) pairs a job already writes."""
-    settings = settings_of(given)
-    out = {"errors": given_errors(given) + setting_errors(settings, require_target), "lines": [], "groups": [],
-           "settings": settings}
+    (None for any other), and join places a new database on one of that job's servers (its lightest group). Every
+    other database is spread evenly over its server's new groups by tables (placement): groups_per_server of them, or
+    by default as many as the server's tables in the file need. have holds the (target, client_id) pairs a job already
+    writes. new_job gives a fan-in job the server-and-database key and checks each key's characters; an existing job
+    keeps its own key format (Add databases and Add tables). unity_catalog is the job's naming rule: a new job takes
+    Unity Catalog's, an existing one its own (job_settings.unity_catalog_of)."""
+    settings = settings_of(given, new_job)
+    out = {"errors": given_errors(given) + setting_errors(settings, require_target, unity_catalog), "lines": [],
+           "groups": [], "settings": settings}
     if not str(job_name or "").strip():
         out["errors"].insert(0, "name the job")
     if isinstance(groups_per_server, int) and not 1 <= groups_per_server <= MAX_GROUPS_PER_SERVER:
@@ -157,7 +191,8 @@ def plan(job_name: str, text: str, given: dict, groups_per_server: Optional[int]
                                          "use_remote_query": False, "write_mode": "merge", "fan_in": False,
                                          "sink_catalog": "c", "sink_schema": "s", "sink_table": "{table}_{database}",
                                          "freshness_sla_minutes": settings["freshness_sla_minutes"]}, [],
-                         max_lines=MAX_LINES, check_rows=False)
+                         max_lines=MAX_LINES, check_rows=False,
+                         unity_catalog=unity_catalog)
     if read["errors"]:
         out["errors"] = read["errors"]
         return out
@@ -180,15 +215,23 @@ def plan(job_name: str, text: str, given: dict, groups_per_server: Optional[int]
         row["task_collection"] = place(server, row.get("src_database") or "")
         row["write_mode"] = _write_mode(row["load_type"], settings)
         for key, _ in js.TARGET_SETTINGS:
-            row[key] = js.render(settings[key], row, target=True, lowercase=bool(settings["lowercase"]))
+            row[key] = js.render(settings[key], row, target=True, unity_catalog=unity_catalog)
+        shared = new_job and bool(settings["fan_in"])
         if settings["fan_in"]:
-            row["client_id"] = row.get("client_id") or js.render(settings["client_id"] or "{database}", row)
+            row["client_id"] = row.get("client_id") or js.render(settings["client_id"], row)
+            if shared:
+                problems += key_errors(server, str(row.get("src_database") or ""), row["client_id"])
         elif row.get("client_id"):
             problems.append("client_id must be blank: this job has no fan-in")
+        file_attrs = json.loads(row["client_attrs"]) if row.get("client_attrs") else {}
+        if shared:
+            problems += [f"client_attrs may not set {name}: the job fills it from the server and database"
+                         for name in js.SHARED_IDENTITY if name in file_attrs]
         identity = {name: js.render(template, row) for name, template in settings["identity"].items()}
-        identity.update(json.loads(row["client_attrs"]) if row.get("client_attrs") else {})   # the file's own values win
+        identity.update(file_attrs)                                                           # the file's own values win
         row["client_attrs"] = json.dumps(identity) if identity else None
-        problems += [e for e in q.validate_control_row(row) if e not in problems]
+        problems += [e for e in q.validate_control_row(row)
+                     if e not in problems and not (shared and e.startswith("client_id "))]
         if taken_groups and row["task_collection"] in taken_groups:
             problems.append(f"group {row['task_collection']} is already in use: give the job another name")
         sink = ".".join(str(row.get(k) or "").lower() for k, _ in js.TARGET_SETTINGS)
@@ -211,16 +254,17 @@ def plan(job_name: str, text: str, given: dict, groups_per_server: Optional[int]
 
 # The job's settings a CSV's tables take, from what its tables share (job_settings.read), with the defaults where it has
 # none (no full-reload tables yet, say).
-_JOB_SETTINGS = ("fan_in", "write_mode_changes", "write_mode_full", "sink_catalog", "sink_schema", "sink_table", "lowercase",
+_JOB_SETTINGS = ("fan_in", "write_mode_changes", "write_mode_full", "sink_catalog", "sink_schema", "sink_table",
                  "client_id", "identity", "freshness_sla_minutes")
 
 
-def job_inputs(job_name: str, job_rows: List[dict], groups_per_server: Optional[int] = None) -> dict:
+def job_inputs(job_name: str, job_rows: List[dict], groups_per_server: Optional[int] = None,
+               unity_catalog: bool = False) -> dict:
     """What a job's own rows say about the tables added to it: {"errors": the job's settings differ between its tables
     (nothing is planned while there are any), "given": the settings each table takes, "group_of": where a database
     goes (a database the job has keeps its group, a new one joins its server's groups, a new server gets new groups),
     "have": the (target, client_id) pairs the job already writes, "known": its groups}."""
-    read = js.read(job_rows)
+    read = js.read(job_rows, unity_catalog)
     mixed = [name for name in _JOB_SETTINGS if "mixed" in read.get(name, {})]
     if mixed:
         return {"errors": [f"the job's {name.replace('_', ' ')} differs between its tables: set it in Edit first"
@@ -246,27 +290,30 @@ def job_inputs(job_name: str, job_rows: List[dict], groups_per_server: Optional[
 
 
 def plan_for_job(job_name: str, text: str, load_type: str, job_rows: List[dict],
-                 groups_per_server: Optional[int] = None, taken_groups: Optional[set] = None) -> dict:
+                 groups_per_server: Optional[int] = None, taken_groups: Optional[set] = None,
+                 unity_catalog: bool = False) -> dict:
     """What importing a CSV of tables into an existing job writes, as plan() does for a new one, plus "new_groups".
     Each table takes the job's settings. A database already in the job keeps its group; a new database on one of the
     job's servers joins one of that server's groups by a stable hash of its name, as Add databases does; a new server
     gets groups_per_server new groups. A table the job already writes is left as it is (in_job)."""
-    inputs = job_inputs(job_name, job_rows, groups_per_server)
+    inputs = job_inputs(job_name, job_rows, groups_per_server, unity_catalog)
     if inputs["errors"]:
         return {"errors": inputs["errors"], "lines": [], "groups": [], "new_groups": [], "settings": {}}
     given = {**inputs["given"], "load_type": load_type}
     known = inputs["known"]
     out = plan(job_name, text, given, groups_per_server, (taken_groups or set()) - known, inputs["group_of"],
-               inputs["have"], join=inputs["join"])
+               inputs["have"], join=inputs["join"], unity_catalog=unity_catalog)
     out["new_groups"] = sorted(set(out["groups"]) - known)
     return out
 
 
 def summary(planned: dict) -> dict:
     """What the page shows before Create: tables, databases and groups per server, the invalid lines (a line of the
-    file, or a database that could not be read, named with why), and what the file's database lines came to."""
+    file, or a database that could not be read, named with why), and what the file's database lines came to. Lines
+    left out (tables the job removed, not named again) are not written, so they count in left_out alone."""
     servers: Dict[str, dict] = {}
-    for line in (line for line in planned["lines"] if line["status"] != "in_job"):
+    written = [line for line in planned["lines"] if line["status"] not in ("in_job", table_removal.LEFT_OUT)]
+    for line in written:
         s = servers.setdefault(line["server"], {"server": line["server"], "databases": set(), "tables": 0, "groups": set(),
                                                 "read_through": "UC connection" if line["row"].get("use_remote_query") else "JDBC",
                                                 "load_types": {}})
@@ -276,7 +323,8 @@ def summary(planned: dict) -> dict:
         s["groups"].add(line["group"])
     return {"servers": [{**s, "databases": len(s["databases"]), "groups": sorted(s["groups"])}
                         for s in sorted(servers.values(), key=lambda s: s["server"])],
-            "tables": sum(line["status"] != "in_job" for line in planned["lines"]), "groups": planned["groups"],
+            "tables": len(written), "groups": planned["groups"],
+            "left_out": sum(line["status"] == table_removal.LEFT_OUT for line in planned["lines"]),
             "in_job": sum(line["status"] == "in_job" for line in planned["lines"]), "new_groups": planned.get("new_groups", []),
             "covered": planned.get("covered", 0), "discovered": planned.get("discovered", 0),
             "invalid": [{k: line[k] for k in ("line", "table", "errors")} for line in planned["lines"] if line["status"] == "invalid"]

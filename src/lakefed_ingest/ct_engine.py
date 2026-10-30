@@ -83,6 +83,12 @@ def _split(csv: Optional[str]) -> List[str]:
     return [c.strip() for c in (csv or "").split(",") if c.strip()]
 
 
+def delta_column(name: str) -> str:
+    """A column name quoted for Delta SQL. Always quoted, and any backtick inside the name is doubled,
+    so ``a`b`` reaches Delta as the column it is."""
+    return "`" + str(name).replace("`", "``") + "`"
+
+
 def _without(cols: List[str], names: List[str]) -> List[str]:
     """``cols`` minus ``names``, compared case-insensitively (SQL Server and Delta both resolve
     column names that way, so ``OrderLineID`` in primary_key and ``orderLineID`` in
@@ -144,7 +150,7 @@ def ct_read_query(cfg: dict, from_version: int, to_version: Optional[int] = None
 
 def merge_on(primary_key: str) -> str:
     """MERGE ON clause (Delta backtick-quoted) keyed on the (composite) PK."""
-    return " AND ".join(f"tgt.`{c}` = s.`{c}`" for c in _split(primary_key))
+    return " AND ".join(f"tgt.{delta_column(c)} = s.{delta_column(c)}" for c in _split(primary_key))
 
 
 def merge_set(select_list: str, primary_key: str) -> str:
@@ -154,15 +160,15 @@ def merge_set(select_list: str, primary_key: str) -> str:
     target doesn't have yet only resolves unqualified (``tgt.`c` `` fails on DBR 18)."""
     non_pk = _without(_split(select_list), _split(primary_key))
     cols = non_pk or _split(primary_key)
-    return ", ".join(f"`{c}` = s.`{c}`" for c in cols)
+    return ", ".join(f"{delta_column(c)} = s.{delta_column(c)}" for c in cols)
 
 
 def merge_insert_cols(select_list: str) -> str:
-    return ", ".join(f"`{c}`" for c in _split(select_list))
+    return ", ".join(delta_column(c) for c in _split(select_list))
 
 
 def merge_insert_vals(select_list: str) -> str:
-    return ", ".join(f"s.`{c}`" for c in _split(select_list))
+    return ", ".join(f"s.{delta_column(c)}" for c in _split(select_list))
 
 
 # ======================================================================================
@@ -256,18 +262,59 @@ def _uc_host(conn_name: str):
         return _uc_host_cache[conn_name]
 
 
+# The logins typed into the operations app, as recorded in lakefed_ingest.jdbc_login_write: (the scope they are in,
+# {secret key: the JDBC connection its newest login was typed for, with that connection's host, port and source type}).
+# Set once a run from Lakebase (guard_typed_logins); None until then, so a caller that never sets it reads as before.
+_typed_logins: Optional[Tuple[str, dict]] = None
+
+
+def guard_typed_logins(scope: str, logins: dict) -> None:
+    """Hold this run's reads from ``scope`` to the logins typed there: each goes only to the host, port and source type
+    of the connection its newest login was typed for (state_store.typed_logins reads them)."""
+    global _typed_logins
+    _typed_logins = (scope, dict(logins))
+
+
+def typed_login_refusal(scope: str, key: str, host: str, port: int, src_type: str, typed) -> Optional[str]:
+    """Why the login under (scope, key) may not be sent to this host, or None when it may. Only a key that holds a login
+    typed into the app is checked: it goes to the host of the connection it was typed for and nowhere else, whatever
+    the control row or the discovery spec says. A key no one typed (an admin's secret) is not checked here."""
+    if typed is None or scope != typed[0] or key not in typed[1]:
+        return None
+    login = typed[1][key]
+    if not login.get("src_host"):
+        return (f"the login under {scope}/{key} was typed for the JDBC connection {login.get('connection')}, which is "
+                "not stored, so it is sent nowhere")
+    login_type = str(login.get("src_type") or source_adapters.SQLSERVER).lower()
+    login_port = int(login.get("src_port") or source_adapters.get_adapter(login_type).default_port)
+    if (str(host).strip().lower(), int(port), str(src_type).lower()) != (str(login["src_host"]).strip().lower(),
+                                                                         login_port, login_type):
+        return (f"the login under {scope}/{key} was typed for the JDBC connection {login.get('connection')} "
+                f"({login['src_host']}:{login_port}), so it is not sent to {host}:{port}")
+    return None
+
+
 def _jdbc_config(cfg: dict) -> dict:
-    """Resolve {host, port, user, password} for this control row (cached per host/port/secret)."""
+    """Resolve {host, port, user, password} for this control row (cached per host/port/secret). A login typed into the
+    app is refused for any host but its own connection's (typed_login_refusal)."""
     scope, key = secret_ref(cfg)
-    user, pwd, secret_host = _creds(scope, key)
     host, port = cfg.get("src_host"), cfg.get("src_port")
     if not host and cfg.get("src_connection"):
         host, uc_port = _uc_host(cfg["src_connection"])
         port = port or uc_port
+    port = int(port or source_adapters.for_cfg(cfg).default_port)
+    typed = _typed_logins
+    if typed is not None and host and scope == typed[0] and key in typed[1]:
+        refusal = typed_login_refusal(scope, key, host, port, source_adapters.for_cfg(cfg).src_type, typed)
+        if refusal:
+            raise ValueError(f"control row {cfg.get('id')}: {refusal}")
+    user, pwd, secret_host = _creds(scope, key)
+    if typed is not None and not host and scope == typed[0] and key in typed[1]:
+        raise ValueError(f"control row {cfg.get('id')}: a login typed into the app goes only to its connection's host, "
+                         "and this row names none")
     host = host or secret_host or os.environ.get("LAKEFED_SQL_HOST")
     if not host:
         raise ValueError(f"control row {cfg.get('id')}: no src_host could be resolved")
-    port = int(port or source_adapters.for_cfg(cfg).default_port)
     ck = config_cache_key(host, port, scope, key)
     with _lock:
         if ck not in _config_cache:
@@ -353,7 +400,7 @@ def quote_delta_ident(name: str) -> str:
     name = str(name)
     if len(name) >= 2 and name[0] == name[-1] == "`" and "`" not in name[1:-1].replace("``", ""):
         return name
-    return "`" + name.replace("`", "``") + "`"
+    return delta_column(name)
 
 
 def sink_fqn(cfg: dict) -> str:
@@ -874,7 +921,7 @@ def insert_sql(mode: str, target: str, cols: List[str], source: str, evolve: boo
     BY NAME maps columns by name, so a reordered/edited select_list can never shift values into the
     wrong columns; with ``evolve`` the target gains any select_list column it lacks (spike-validated
     on DBR 18 — an explicit column list instead would require the columns to already exist)."""
-    collist = ", ".join(f"`{c}`" for c in cols)
+    collist = ", ".join(delta_column(c) for c in cols)
     evo = "WITH SCHEMA EVOLUTION " if evolve else ""
     return f"INSERT {evo}{mode} {target} BY NAME SELECT {collist} FROM {source}"
 
@@ -885,7 +932,7 @@ def insert_overwrite_sql(sink_fqn: str, cols: List[str], source: str, cfg: Optio
     __client_id__ = '<id>' SELECT ...``; validated on DBR: other clients untouched, BY NAME mapping,
     new columns added. BY NAME must precede REPLACE WHERE)."""
     if cfg is not None and client_id(cfg):
-        collist = ", ".join(f"`{c}`" for c in cols)
+        collist = ", ".join(delta_column(c) for c in cols)
         return (f"INSERT WITH SCHEMA EVOLUTION INTO {sink_fqn} BY NAME REPLACE WHERE {client_predicate(cfg)} "
                 f"SELECT {collist} FROM {source}")
     return insert_sql("OVERWRITE", sink_fqn, cols, source, evolve=True)

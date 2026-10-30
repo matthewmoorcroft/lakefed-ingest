@@ -179,9 +179,26 @@ def test_a_database_that_cannot_be_opened_is_named_as_an_invalid_line_and_blocks
     body = {"name": "Ref", "settings": FAN_IN, "source": {"upload_id": "u1"}, "dry_run": False, "request_id": "r2"}
     client.post("/api/ingestion-jobs", json=body)
     client.tasks.run()
-    result = client.tasks.rows[1]["result"]
-    assert result["created"] is False and result["summary"]["invalid"] == [
-        {"line": 4, "table": "eng_002", "errors": ["login failed"]}]
+    task = client.tasks.rows[1]
+    assert task["status"] == "failed" and task["error"] == "line 4 (eng_002): login failed"
+    assert not any(sql == q.insert_schedule_sql() for sql, _ in client.tasks.executed)
+
+
+def test_a_background_create_whose_lines_are_all_invalid_ends_failed_and_names_them(client, monkeypatch):
+    # A kept deleted job of the same name still holds the groups this job's tables would go to, so every line is
+    # refused. The task must end failed with those lines, not succeed with no job.
+    taken = {q.collections_sql(): [{"task_collection": name} for name in nj.group_names("Ref", "sql_a", 99)]}
+    _patch_discovery(monkeypatch, statuses=OK_BOTH, rows=ROWS_BOTH, answers={**_UPLOAD, **taken},
+                     fallback=client.tasks.query, ended={"result": "SUCCESS"})
+    body = {"name": "Ref", "settings": FAN_IN, "source": {"upload_id": "u1"}, "dry_run": False, "request_id": "r3"}
+    client.post("/api/ingestion-jobs", json=body)
+    client.tasks.run()
+    task = client.tasks.rows[1]
+    assert task["status"] == "failed" and task["job_id"] is None and task["result"] is None
+    named = task["error"].split("; ")
+    assert len(named) == 3 and all("is already in use: give the job another name" in line for line in named)
+    assert [line.split(" ")[1] for line in named] == ["2", "3", "3"]
+    assert not any(sql == q.insert_schedule_sql() for sql, _ in client.tasks.executed)
 
 
 # ---- helpers ---------------------------------------------------------------------------------------------------------

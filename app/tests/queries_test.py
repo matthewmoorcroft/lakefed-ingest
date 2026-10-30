@@ -131,6 +131,15 @@ def test_identifier_and_insert_if_absent():
     assert q.insert_control_if_absent_sql().endswith("on conflict do nothing returning id")
 
 
+def test_unity_catalog_identifier_only_replaces_what_unity_catalog_refuses():
+    assert q.unity_catalog_identifier("Order-Lines") == "order-lines"
+    assert q.unity_catalog_identifier("Sales (2024)") == "sales_(2024)"
+    assert q.unity_catalog_identifier("a--b") == "a--b"
+    assert q.unity_catalog_identifier("a`b") == "a`b"
+    assert q.unity_catalog_identifier("Order Lines") == "order_lines"
+    assert q.unity_catalog_identifier("a.b/c\td\x7fe") == "a_b_c_d_e"
+
+
 def test_parse_databases():
     assert q.parse_databases(" a, b\nc,,a ") == ["a", "b", "c"] and q.parse_databases(None) == []
 
@@ -353,3 +362,14 @@ def test_a_jobs_table_lists_count_the_database_check_stamp_in_each_tables_last_s
     for sql in (q.job_tables_sql(), q.job_target_sources_sql()):
         assert f"max({q.LAST_SUCCESS}) as last_success_at" in sql and "cp.phase, cp.last_success_at" not in sql
         assert "database_check dc" in sql
+
+
+def test_run_time_medians_and_percentiles_leave_out_cancelled_runs():
+    """A cancelled run didn't finish, so how long it ran is no run time for the baselines."""
+    for sql in (q.running_progress_sql(), q.running_runs_sql(), q.collection_run_stats_sql()):
+        assert "status not in ('skipped', 'cancelled')" in sql
+
+
+def test_cancel_requested_runs_are_read_by_run_id_and_the_request_column():
+    sql = q.cancel_requested_runs_sql()
+    assert "run_id = any(%s)" in sql and "cancel_requested_at is not null" in sql

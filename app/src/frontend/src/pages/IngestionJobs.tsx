@@ -1,16 +1,20 @@
 import { useState } from "react";
-import { useQuery } from "@tanstack/react-query";
-import { useNavigate, useSearchParams } from "react-router-dom";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { Link, useNavigate, useSearchParams } from "react-router-dom";
 import { api, qs, type Row } from "../api";
-import { ErrorBox, Info, OutLink, PageHead, Pager, RunStatus, Section, Twisty, fmtInt, fmtShort, fmtTime, usePageStamp,
-         type Outcome } from "../components";
+import { ErrorBox, Info, Notice, OutLink, PageHead, Pager, RunStatus, Section, Twisty, fmtInt, fmtShort, fmtTime, toast, useConfirm,
+         usePageStamp, type Outcome } from "../components";
+import { daysLeftText } from "../pending";
+import { deleteNowRequest } from "./IngestionJob";
 import { JobsTable, type JobSort } from "./Overview";
 
-const FILTERS = [["all", "All"], ["running", "Running"], ["failing", "Failing"], ["late", "Late"], ["paused", "Paused"]] as const;
+const FILTERS = [["all", "All"], ["running", "Running"], ["failing", "Failing"], ["late", "Late"], ["paused", "Paused"], ["attention", "Needs attention"]] as const;
 const PAGE = 25;
 
 interface JobsPage { jobs: Row[]; total: number; offset: number; limit: number; not_in_job: Row | null; counts: Record<string, number>;
                    read_at: string }
+
+interface DeletionsPage { deleted: Row[]; total: number; offset: number; limit: number; configured: boolean; retention_days: number }
 
 /** Every ingestion job, failing first, filtered and searched, in a table that fills the page. */
 export default function IngestionJobs() {
@@ -56,56 +60,82 @@ export default function IngestionJobs() {
 
 const DELETED_PAGE = 10;
 
-/** The deleted jobs whose Delete finished: history only, closed until opened, its count in the header, a page at a time.
- * A job whose Delete is still pending, or failed, stays in the jobs list (with its Deleting or Delete failed state and
- * Run again on its own page). Shown only when there is one. */
+/** The deleted jobs kept for a Restore (not yet purged): closed until opened, its count in the header, a page at a time,
+ * each with Restore and Delete now. Shown only when there is one. */
 function Deletions() {
   const [open, setOpen] = useState(false);
   const [offset, setOffset] = useState(0);
-  const page = useQuery({ queryKey: ["ingestion-job-deletions", open, offset],
-    queryFn: () => api.get<Row>(`/ingestion-jobs/deletions${qs({ offset, limit: DELETED_PAGE, rows: open })}`),
-    refetchInterval: 60_000 });
+  const qc = useQueryClient();
+  const confirm = useConfirm();
+  const page = useQuery({
+    queryKey: ["ingestion-job-deletions", open, offset],
+    queryFn: () => api.get<DeletionsPage>(`/ingestion-jobs/deletions${qs({ offset, limit: DELETED_PAGE, rows: open })}`),
+    refetchInterval: 60_000,
+  });
   const total = Number(page.data?.total ?? 0);
-  const rows: Row[] = page.data?.deletions ?? [];
+  const rows: Row[] = page.data?.deleted ?? [];
+  // A restored or purged job leaves this list, and it changes the jobs list and the job's own page.
+  const refresh = () => ["ingestion-job-deletions", "schedules", "ingestion-jobs", "ingestion-job"]
+    .forEach((key) => qc.invalidateQueries({ queryKey: [key] }));
+  const restore = useMutation({
+    mutationFn: (id: string) => api.post<Row>(`/schedules/${encodeURIComponent(id)}/restore`),
+    onSuccess: () => { toast("Restored paused"); setOffset(0); refresh(); },
+  });
+  const purge = useMutation({
+    mutationFn: (id: string) => api.post<Row>(`/schedules/${encodeURIComponent(id)}/purge`),
+    onSuccess: () => refresh(),
+  });
   if (!total && !page.error) return null;
+  const deleteNow = (d: Row) => confirm.ask(deleteNowRequest(d.name)).then((ok) => { if (ok) purge.mutate(d.id); });
   const title = <span className="section-toggle"><Twisty open={open} onToggle={() => setOpen(!open)}
     label={open ? "Close the deleted jobs" : "Open the deleted jobs"}>Deleted jobs ({fmtInt(total)})</Twisty>
-    <Info label="About deleted jobs">Jobs whose Delete has finished: their tables and their state are gone, and the target
-      tables too when ticked. Run history stays.</Info></span>;
+    <Info label="About deleted jobs">Jobs you deleted are kept until their retention runs out, so Restore can bring them back.
+      Delete now deletes one at once.</Info></span>;
   return (
     <Section title={title}>
       <ErrorBox error={page.error} />
       {open && <>
+        {page.data && <p className="muted small">Kept for {page.data.retention_days} days after Delete, then deleted for good.
+          Restore brings a job back paused, with its state, so nothing reloads.</p>}
+        <ErrorBox error={restore.error} />
+        <ErrorBox error={purge.error} />
+        {purge.data?.delete_run?.error && <Notice tone="warn">The delete job did not start: {purge.data.delete_run.error}</Notice>}
         <div className="table-wrap"><table className="data">
-          <thead><tr><th>Ingestion job</th><th>Deleted</th><th>Target tables</th><th>Delete job</th><th className="num">Tables left</th></tr></thead>
+          <thead><tr><th>Ingestion job</th><th>Deleted</th><th>Days left</th><th>State</th><th className="num">Tables left</th><th /></tr></thead>
           <tbody>
             {rows.map((d) => {
               const outcome = deletionOutcome(d);
+              const refusal = d.delete_refusal ?? undefined;
               return (
                 <tr key={d.id}>
-                  <td className="name"><b>{d.name}</b></td>
+                  <td className="name"><Link to={`/ingestion-jobs/${encodeURIComponent(d.id)}`}>{d.name}</Link></td>
                   <td title={fmtTime(d.deleted_at)}>{fmtShort(d.deleted_at)}</td>
-                  <td>{d.drop_targets ? "Dropped" : "Kept"}</td>
-                  <td><OutLink href={d.run?.url}><RunStatus status={null} outcome={outcome} /></OutLink>
-                    {outcome.note && outcome.tone === "bad" && <span className="sub">{outcome.note}</span>}</td>
+                  <td>{daysLeftText(d.delete?.days_left ?? 0)}</td>
+                  <td><OutLink href={d.delete?.run?.url}><RunStatus status={null} outcome={outcome} /></OutLink>
+                    {outcome.note && <span className="sub">{outcome.note}</span>}</td>
                   <td className="num">{fmtInt(d.tables_left)}</td>
+                  <td>
+                    <button disabled={!!refusal || restore.isPending} title={refusal}
+                      onClick={() => restore.mutate(d.id)}>{restore.isPending && restore.variables === d.id ? "Restoring…" : "Restore"}</button>{" "}
+                    <button className="danger" disabled={!!refusal || purge.isPending} title={refusal}
+                      onClick={() => deleteNow(d)}>Delete now</button>
+                    {refusal && <span className="sub">{refusal}</span>}
+                  </td>
                 </tr>
               );
             })}
           </tbody>
         </table></div>
         <Pager offset={offset} limit={DELETED_PAGE} total={total} noun="deleted job" onPage={setOffset} />
+        {confirm.dialog}
       </>}
     </Section>
   );
 }
 
-/** A deleted job's delete job run as a status: not started, deleting, deleted, or failed with its message. */
+/** A deleted job's state as a status: kept until the purge, its purge running, or its purge failed, with the reason. */
 export function deletionOutcome(d: Row): Outcome {
-  const run = d.run;
-  if (!run) return { label: "Not started", tone: "bad", note: "The delete job didn't start: Run again starts it" };
-  if (!run.result && ["QUEUED", "PENDING", "RUNNING", "TERMINATING", "BLOCKED", "WAITING_FOR_RETRY"].includes(run.state))
-    return { label: "Deleting", tone: "run", note: null };
-  if (run.result === "SUCCESS") return { label: "Deleted", tone: "ok", note: null };
-  return { label: run.result ? "Failed" : "Unknown", tone: "bad", note: run.message || null };
+  if (d.delete?.state === "deleting") return { label: "Deleting", tone: "run", note: null };
+  if (d.delete?.state === "failed") return { label: "Delete failed", tone: "bad", note: d.delete.reason || null };
+  return { label: "Deleted", tone: "neutral", note: null };
 }

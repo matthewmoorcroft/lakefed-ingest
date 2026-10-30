@@ -185,7 +185,8 @@ def test_a_new_tables_per_group_regroups_by_size_and_is_kept_on_the_job(monkeypa
 def test_a_job_keeps_the_tables_per_group_create_names_and_its_later_adds_use_it():
     body = main.NewJobRequest(name="n", csv="x", tables_per_group=20_000)
     assert main._create_options(body)[main.TABLES_PER_GROUP_OPTION] == 20_000
-    assert main._create_options(main.NewJobRequest(name="n", csv="x")) == {}
+    assert main._create_options(main.NewJobRequest(name="n", csv="x")) == {
+        main.js.TARGET_NAMES_OPTION: main.js.UNITY_CATALOG_NAMES}
     tables = main.JobTablesRequest(csv="x")
     job = {"options": {main.TABLES_PER_GROUP_OPTION: 20_000}}
     assert main._sizing(tables, job) == main.placement.TablesPerGroup(20_000)

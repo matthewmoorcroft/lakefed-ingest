@@ -2,10 +2,14 @@
 (POST /api/ingestion-jobs) with a fake database. The SQL itself runs against a real Postgres in new_job_pg_test.py."""
 import contextlib
 import json
+import re
 
 import pytest
 
+import job_settings as js
 import new_job as nj
+import queries as q
+import table_removal
 
 CSV = ("src_connection,src_database,src_schema,src_table,select_list,primary_key\n"
        "sql_a,eng_001,gen,t0001,\"id, amount\",id\n"
@@ -15,6 +19,9 @@ FAN_IN = {"fan_in": True, "sink_catalog": "main", "sink_schema": "engagements", 
           "identity": {"engagement": "{database}"}}
 HEAD = "src_connection,src_database,src_schema,src_table,select_list,primary_key\n"
 PLAIN = {"sink_catalog": "main", "sink_schema": "s", "sink_table": "{database}_{table}"}
+TABLE_ONLY = {"sink_catalog": "main", "sink_schema": "s", "sink_table": "{table}"}
+NAMED = (HEAD + 'sql_a,eng_001,gen,Order-Lines,"id",id\n' + 'sql_a,eng_001,gen,"Sales (2024)","id",id\n'
+         + "sql_a,eng_001,gen,a--b,\"id\",id\n")
 # A few files with problems of every kind, planned as the pre-check version planned them: each line's status, errors
 # (in order) and group, and the plan's errors and groups.
 VALIDATION_CASES = {
@@ -66,9 +73,10 @@ VALIDATION_EXPECTED = {
             (3, 'eng_002.gen.', 'invalid',
              [
                  'src_table is required',
+                 'sink_table is required',
                  'client_id may only use letters, digits and _ . : - (1-128 characters)',
              ],
-             'job_sql_a_c02', 'main.engagements.t'),
+             'job_sql_a_c02', 'main.engagements.'),
             (4, 'eng_003.gen.t3', 'invalid',
              [
                  'primary_key is required for load_type ct',
@@ -154,13 +162,113 @@ def test_each_line_becomes_a_row_with_the_jobs_settings_and_a_group_per_server()
     assert all(g.startswith("engagement_extraction_sql_a_c0") for g in plan["groups"])
 
 
+def test_the_shared_and_legacy_keys_are_each_one_pinned_template():
+    assert js.SHARED_CLIENT_ID == "{server}_{database}"
+    assert js.LEGACY_CLIENT_ID == "{database}"
+
+
+def test_a_new_fan_in_job_keys_each_row_by_its_server_and_database():
+    plan = nj.plan("Engagement extraction", CSV, FAN_IN, groups_per_server=4, new_job=True)
+    assert plan["errors"] == []
+    assert [line["row"]["client_id"] for line in plan["lines"]] == ["sql_a_eng_001", "sql_a_eng_002", "sql_a_eng_002"]
+    assert nj.settings_of({}, new_job=True)["client_id"] == "{server}_{database}"
+    assert nj.settings_of({"client_id": " "}, new_job=True)["client_id"] == "{server}_{database}"
+
+
+def test_a_job_made_before_keeps_the_database_as_its_key():
+    plan = nj.plan("Engagement extraction", CSV, FAN_IN, groups_per_server=4)
+    assert [line["row"]["client_id"] for line in plan["lines"]] == ["eng_001", "eng_002", "eng_002"]
+    assert nj.settings_of({})["client_id"] == "{database}"
+
+
+def test_a_new_key_the_rules_refuse_names_the_server_and_database():
+    spaced = nj.plan("Engagement extraction", CSV.replace("eng_001", "eng 001", 1), FAN_IN, 4, new_job=True)
+    assert spaced["lines"][0]["status"] == "invalid"
+    assert spaced["lines"][0]["errors"] == [
+        "server sql_a and database eng 001 would get the client_id 'sql_a_eng 001': letters, digits and _ . : - only, "
+        "1 to 128 characters"]
+    too_long = nj.plan("Engagement extraction", CSV.replace("eng_002", "x" * 123, 1), FAN_IN, 4, new_job=True)
+    assert too_long["lines"][1]["status"] == "invalid" and "1 to 128 characters" in too_long["lines"][1]["errors"][0]
+
+
+def test_a_named_instance_is_refused_with_its_reason_and_a_host_and_port_is_not():
+    assert nj.key_errors("sql_a:1433", "eng_001", "sql_a:1433_eng_001") == []
+    [message] = nj.key_errors("sql\\inst:1433", "eng_001", "sql\\inst:1433_eng_001")
+    assert "sql\\inst:1433" in message and "named instance" in message
+
+
+def test_a_client_id_the_file_gives_is_kept_as_typed_and_checked():
+    text = ("src_connection,src_database,src_schema,src_table,select_list,primary_key,client_id\n"
+            'sql_a,eng_001,gen,t0001,"id, amount",id,custom_1\n'
+            'sql_a,eng_002,gen,t0001,"id, amount",id,my key\n')
+    plan = nj.plan("Engagement extraction", text, FAN_IN, 4, new_job=True)
+    assert [line["row"]["client_id"] for line in plan["lines"]] == ["custom_1", "my key"]
+    assert plan["lines"][0]["status"] == "valid"
+    assert plan["lines"][1]["errors"] == [
+        "server sql_a and database eng_002 would get the client_id 'my key': letters, digits and _ . : - only, "
+        "1 to 128 characters"]
+
+
+def test_the_readable_identity_columns_are_one_pinned_mapping():
+    assert js.SHARED_IDENTITY == {"source_server": "{server}", "source_database": "{database}"}
+
+
+def test_a_new_fan_in_job_gives_each_row_its_source_server_and_database_unless_they_are_removed():
+    no_identity = {k: v for k, v in FAN_IN.items() if k != "identity"}
+    plan = nj.plan("Engagement extraction", CSV, no_identity, 4, new_job=True)
+    assert [json.loads(line["row"]["client_attrs"]) for line in plan["lines"]] == [
+        {"source_server": "sql_a", "source_database": "eng_001"}, {"source_server": "sql_a", "source_database": "eng_002"},
+        {"source_server": "sql_a", "source_database": "eng_002"}]
+    removed = nj.plan("Engagement extraction", CSV, {**no_identity, "identity": {}}, 4, new_job=True)
+    assert [line["row"]["client_attrs"] for line in removed["lines"]] == [None, None, None]
+    assert nj.settings_of({"fan_in": True}, new_job=True)["identity"] == js.SHARED_IDENTITY
+    assert nj.settings_of({"fan_in": True})["identity"] == {}
+
+
+def test_a_new_jobs_file_may_not_set_the_readable_columns_it_fills():
+    text = ("src_connection,src_database,src_schema,src_table,select_list,primary_key,attr:source_server\n"
+            'sql_a,eng_001,gen,t0001,"id, amount",id,other\n')
+    plan = nj.plan("Engagement extraction", text, {k: v for k, v in FAN_IN.items() if k != "identity"}, 4, new_job=True)
+    assert plan["lines"][0]["status"] == "invalid"
+    assert plan["lines"][0]["errors"] == ["client_attrs may not set source_server: the job fills it from the server and database"]
+
+
+def test_add_tables_gives_a_new_jobs_rows_the_readable_columns_and_an_old_jobs_none():
+    more = HEAD + 'sql_a,eng_009,gen,t0001,"id, amount",id\n'
+    no_identity = {k: v for k, v in FAN_IN.items() if k != "identity"}
+    new_rows = [dict(line["row"], id=i + 1, task_enabled=True)
+                for i, line in enumerate(nj.plan("Engagement extraction", CSV, no_identity, 4, new_job=True)["lines"])]
+    added = nj.plan_for_job("Engagement extraction", more, "ct", new_rows, 4)["lines"][0]["row"]
+    assert json.loads(added["client_attrs"]) == {"source_server": "sql_a", "source_database": "eng_009"}
+    old_rows = [dict(r, client_attrs=None) for r in _job_rows()]
+    assert nj.plan_for_job("Engagement extraction", more, "ct", old_rows, 4)["lines"][0]["row"]["client_attrs"] is None
+
+
+def test_tables_added_to_a_new_job_take_its_key_and_an_old_job_keeps_its_own():
+    more = HEAD + 'sql_a,eng_009,gen,t0001,"id, amount",id\n'
+    new_rows = [dict(line["row"], id=i + 1, task_enabled=True)
+                for i, line in enumerate(nj.plan("Engagement extraction", CSV, FAN_IN, 4, new_job=True)["lines"])]
+    assert nj.plan_for_job("Engagement extraction", more, "ct", new_rows, 4)["lines"][0]["row"]["client_id"] == "sql_a_eng_009"
+    assert nj.plan_for_job("Engagement extraction", more, "ct", _job_rows(), 4)["lines"][0]["row"]["client_id"] == "eng_009"
+
+
 def test_a_mistyped_setting_is_refused_and_the_words_for_yes_and_no_are_read():
     assert nj.plan("Job", CSV, {**FAN_IN, "sink_shema": "x"}, 4)["errors"] == ["unknown setting sink_shema"]
     assert nj.plan("Job", CSV, {**FAN_IN, "fan_in": "sometimes"}, 4)["errors"] == ["fan_in: 'sometimes' is not true or false"]
     off = nj.plan("Job", CSV, {**FAN_IN, "fan_in": "false", "sink_table": "{database}_{table}"}, 4)
     assert off["errors"] == [] and off["settings"]["fan_in"] is False
     assert all(line["row"]["client_id"] is None for line in off["lines"])
-    assert nj.plan("Job", CSV, {**FAN_IN, "lowercase": "no"}, 4)["settings"]["lowercase"] is False
+    assert nj.given_errors({"lowercase": "no", "sink_shema": "x"}) == ["unknown setting sink_shema"]
+
+
+def test_a_retired_lowercase_setting_is_ignored_and_a_new_job_takes_the_unity_catalog_name():
+    named = HEAD + 'sql_a,eng_001,gen,"Sales (2024)","id",id\n'
+    sink = {"sink_catalog": "main", "sink_schema": "s", "sink_table": "{table}"}
+    plain = nj.plan("Job", named, sink, 4, new_job=True)
+    retired = nj.plan("Job", named, {**sink, "lowercase": "no"}, 4, new_job=True)
+    assert retired["errors"] == [] and "lowercase" not in retired["settings"]
+    assert [line["row"] for line in retired["lines"]] == [line["row"] for line in plain["lines"]]
+    assert retired["lines"][0]["row"]["sink_table"] == q.unity_catalog_identifier("Sales (2024)")
 
 
 def _server(databases: int, tables: int) -> str:
@@ -282,6 +390,14 @@ def test_the_summary_counts_tables_databases_and_groups_per_server():
     assert summary["servers"][0]["load_types"] == {"ct": 3}
 
 
+def test_the_summary_leaves_out_of_its_counts_the_tables_the_job_removed_and_counts_them_apart():
+    plan = nj.plan("Job", CSV, FAN_IN, 4)
+    plan["lines"][1]["status"] = table_removal.LEFT_OUT
+    summary = nj.summary(plan)
+    assert (summary["tables"], summary["left_out"], summary["in_job"]) == (2, 1, 0)
+    assert sum(s["tables"] for s in summary["servers"]) == 2
+
+
 # ---- the endpoint (needs FastAPI and httpx) -----------------------------------------------------
 
 @pytest.fixture
@@ -317,6 +433,10 @@ def _create(client, dry_run=True, **extra):
                                                     "dry_run": dry_run, **extra})
 
 
+def _inserted_rows(client):
+    return [dict(zip(client.q.CONTROL_INSERT_COLUMNS, p)) for p in client.db.of("insert into lakefed_ingest.control (")]
+
+
 def test_a_preview_writes_nothing(client):
     body = _create(client).json()
     assert body["created"] is False and body["summary"]["tables"] == 3
@@ -330,9 +450,26 @@ def test_create_writes_the_job_its_tables_and_groups_in_one_go_then_syncs(client
     assert len(schedule) == 1 and schedule[0][0] == "Engagement extraction" and schedule[0][6] is True   # paused
     inserted = [dict(zip(client.q.CONTROL_INSERT_COLUMNS, p)) for p in client.db.of("insert into lakefed_ingest.control (")]
     assert [r["src_database"] for r in inserted] == ["eng_001", "eng_002", "eng_002"]
+    assert [r["client_id"] for r in inserted] == ["sql_a_eng_001", "sql_a_eng_002", "sql_a_eng_002"]
     members = client.db.of("insert into lakefed_ingest.schedule_member")
     assert sorted(m[1] for m in members) == body["summary"]["groups"] and all(m[0] == 7 for m in members)
     assert client.db.of("select pg_try_advisory_xact_lock")
+
+
+def test_a_csv_create_stores_unity_catalog_names_and_names_its_tables_by_them(client):
+    assert _create(client, dry_run=False, csv=NAMED).json()["created"] is True
+    [schedule] = client.db.of("insert into lakefed_ingest.schedule (")
+    assert json.loads(schedule[8])["target_names"] == "unity_catalog"
+    assert [r["sink_table"] for r in _inserted_rows(client)] == ["order-lines", "sales_(2024)", "a--b"]
+
+
+def test_a_csv_create_keeps_a_typed_target_name_and_refuses_one_unity_catalog_refuses(client):
+    one = HEAD + 'sql_a,eng_001,gen,Order-Lines,"id",id\n'
+    assert _create(client, dry_run=False, csv=one, settings={**FAN_IN, "sink_table": "Sales-Orders"}).json()["created"]
+    assert [r["sink_table"] for r in _inserted_rows(client)] == ["Sales-Orders"]
+    refused = _create(client, dry_run=False, csv=one, settings={**FAN_IN, "sink_table": "Sales Orders"})
+    assert refused.status_code == 422 and "Unity Catalog refuses" in refused.text
+    assert len(_inserted_rows(client)) == 1
 
 
 def test_create_is_refused_while_a_line_is_invalid(client):
@@ -393,6 +530,65 @@ def test_a_job_whose_tables_differ_on_a_setting_must_set_it_first():
     rows[0]["sink_schema"] = "elsewhere"
     plan = nj.plan_for_job("Engagement extraction", CSV, "ct", rows, 4)
     assert plan["lines"] == [] and "target schema" in plan["errors"][0].replace("sink", "target").replace("_", " ")
+
+
+def test_new_jobs_name_their_tables_by_unity_catalog_rules():
+    lines = nj.plan("Job", NAMED, FAN_IN, 4)["lines"]
+    assert [line["row"]["sink_table"] for line in lines] == ["order-lines", "sales_(2024)", "a--b"]
+
+
+def test_an_existing_job_keeps_the_older_names_when_tables_are_added():
+    rows = [dict(line["row"], id=i + 1, task_enabled=True)
+            for i, line in enumerate(nj.plan("Engagement extraction", NAMED, FAN_IN, 4, unity_catalog=False)["lines"])]
+    more = HEAD + ('sql_a,eng_009,gen,Order-Lines,"id",id\n' + 'sql_a,eng_009,gen,"Sales (2024)","id",id\n'
+                   + "sql_a,eng_009,gen,a--b,\"id\",id\n")
+    plan = nj.plan_for_job("Engagement extraction", more, "ct", rows, 4, unity_catalog=False)
+    assert plan["errors"] == []
+    assert [line["row"]["sink_table"] for line in plan["lines"]] == ["order_lines", "sales_2024", "a_b"]
+
+
+def _older_job_rows():
+    """A job made under the older naming rule (no target_names option), as its control rows read back."""
+    rule = js.unity_catalog_of({})
+    return [dict(line["row"], id=i + 1, task_enabled=True)
+            for i, line in enumerate(nj.plan("Engagement extraction", CSV, FAN_IN, 4, unity_catalog=rule)["lines"])]
+
+
+def test_an_older_job_with_only_safe_names_takes_the_older_rule_when_tables_are_added():
+    rows = _older_job_rows()
+    assert all(re.fullmatch(r"[a-z0-9_]+", r["sink_table"]) for r in rows)
+    more = HEAD + 'sql_a,eng_009,gen,Order-Lines,"id",id\n'
+    plan = nj.plan_for_job("Engagement extraction", more, "ct", rows, 4, unity_catalog=js.unity_catalog_of({}))
+    assert plan["errors"] == [] and [line["row"]["sink_table"] for line in plan["lines"]] == ["order_lines"]
+
+
+def test_an_older_job_with_only_safe_names_rediscovers_under_the_older_rule():
+    rows = _older_job_rows()
+    more = HEAD + 'sql_a,eng_009,gen,Order-Lines,"id",id\n'
+    plan = nj.plan_for_job("Engagement extraction", more, "ct", rows, None, set(), js.unity_catalog_of({}))
+    assert plan["errors"] == [] and [line["row"]["sink_table"] for line in plan["lines"]] == ["order_lines"]
+
+
+def test_a_typed_target_name_keeps_its_text_and_is_refused_under_unity_catalog():
+    one = HEAD + 'sql_a,eng_001,gen,t0001,"id",id\n'
+    refused = nj.plan("Job", one, {**FAN_IN, "sink_table": "Sales 2024"}, 4)
+    assert refused["errors"] == [
+        "target table 'Sales 2024' has a character Unity Catalog refuses (a space, period, slash or control character): "
+        "take it out"]
+    kept = nj.plan("Job", one, {**FAN_IN, "sink_table": "Sales 2024"}, 4, unity_catalog=False)
+    assert kept["errors"] == [] and kept["lines"][0]["row"]["sink_table"] == "Sales 2024"
+
+
+def test_two_tables_landing_on_one_target_are_refused_under_the_rule_the_job_uses():
+    under_uc = nj.plan("Job", HEAD + 'sql_a,eng_001,gen,Order-Lines,"id",id\nsql_a,eng_001,gen,order_lines,"id",id\n',
+                       TABLE_ONLY, 4)
+    assert [line["status"] for line in under_uc["lines"]] == ["valid", "valid"]
+    same = HEAD + 'sql_a,eng_001,gen,Order-Lines,"id",id\nsql_a,eng_001,gen,order_lines,"id",id\n'
+    under_older = nj.plan("Job", same, TABLE_ONLY, 4, unity_catalog=False)
+    assert [line["status"] for line in under_older["lines"]] == ["valid", "invalid"]
+    dashed = nj.plan("Job", HEAD + 'sql_a,eng_001,gen,Order-Lines,"id",id\nsql_a,eng_001,gen,order-lines,"id",id\n',
+                     TABLE_ONLY, 4)
+    assert [line["status"] for line in dashed["lines"]] == ["valid", "invalid"]
 
 
 @pytest.fixture
@@ -463,6 +659,18 @@ def test_a_line_may_give_its_own_load_type_as_discovery_recommends_it():
         ("cursor", "merge"), ("full", "append"), ("ct", "merge")]
     assert lines[0]["row"]["cursor_column"] == "rv" and lines[3]["status"] == "invalid"
     assert "load_type must be one of" in " ".join(lines[3]["errors"])
+
+
+@pytest.mark.parametrize("gap", ["\n", ",,,,,,,\n", ",,,,,,,full\n", "\n\n,,,,,,,\n"])
+def test_a_blank_or_empty_line_shifts_no_table_onto_another_tables_load_type(gap):
+    text = ("src_connection,src_database,src_schema,src_table,select_list,primary_key,cursor_column,load_type\n"
+            "sql_a,eng_001,gen,t0001,\"id, a\",id,,full\n"
+            + gap +
+            "sql_a,eng_001,gen,t0002,\"id, rv\",id,rv,cursor\n"
+            "sql_a,eng_001,gen,t0003,\"id, a\",id,,\n")
+    lines = nj.plan("Job", text, FAN_IN, 4)["lines"]
+    assert [(line["row"]["src_table"], line["row"]["load_type"]) for line in lines] == [
+        ("t0001", "full"), ("t0002", "cursor"), ("t0003", "ct")]
 
 
 def test_the_target_is_needed_to_create_but_not_to_preview_the_lines():

@@ -679,3 +679,24 @@ def test_the_sink_lookup_covers_the_incremental_rows_only():
     cursor = dict(_cfg(2, "d1", "b"), load_type="cursor")
     full = dict(_cfg(3, "d1", "c"), load_type="full")
     assert [c["id"] for c in planner.sink_checked_configs([ct, cursor, full])] == [1, 2]
+
+
+def _failed_row(database, table, error):
+    return ({"src_database": database, "src_schema": "dbo", "src_table": table}, error)
+
+
+def test_a_failure_message_names_up_to_five_tables_with_their_errors_and_the_job_page():
+    failed = [_failed_row("db", f"t{i}", f"boom {i}") for i in range(7)]
+    message = planner.failure_message(42, "cohort", failed, link="https://host/jobs/1/runs/2")
+    assert message.splitlines() == [
+        "7 table(s) failed in run 42 of cohort:",
+        "db.dbo.t0: boom 0", "db.dbo.t1: boom 1", "db.dbo.t2: boom 2", "db.dbo.t3: boom 3", "db.dbo.t4: boom 4",
+        "and 2 more",
+        "Job page: https://host/jobs/1/runs/2",
+    ]
+
+
+def test_a_failure_message_cuts_a_long_error_and_says_where_to_look_without_a_link():
+    message = planner.failure_message(7, "cohort", [_failed_row("db", "orders", "x" * 900)])
+    assert message.splitlines()[1] == "db.dbo.orders: " + "x" * 200
+    assert message.splitlines()[-1] == "See the run in the operations app or lakefed_ingest.ingest_event."

@@ -6,16 +6,20 @@ import re
 from pathlib import Path
 
 import discovery
+import table_retry
 
 ROOT = Path(__file__).resolve().parents[1]
 OWN_DEFAULTS = {"task_collection", "work_id", "db_instance", "db_name"}
 
 
-def _widgets(notebook_path="src/lakefed_ingest/ingest.ipynb"):
+def _code(notebook_path="src/lakefed_ingest/ingest.ipynb"):
     notebook = json.loads((ROOT / notebook_path).read_text())
-    code = "\n".join(c["source"] if isinstance(c["source"], str) else "".join(c["source"])
+    return "\n".join(c["source"] if isinstance(c["source"], str) else "".join(c["source"])
                      for c in notebook["cells"] if c["cell_type"] == "code")
-    return set(re.findall(r'widget\("([a-z_]+)"', code))
+
+
+def _widgets(notebook_path="src/lakefed_ingest/ingest.ipynb"):
+    return set(re.findall(r'widget\("([a-z_]+)"', _code(notebook_path)))
 
 
 def test_every_notebook_widget_is_a_job_parameter_with_a_bundle_variable():
@@ -37,7 +41,13 @@ def test_every_notebook_widget_is_a_job_parameter_with_a_bundle_variable():
 def test_table_retries_default_to_two():
     bundle = (ROOT / "databricks.yml").read_text()
     assert re.search(r'^  table_retries:\n    description: .*\n    default: "2"$', bundle, re.M)
-    assert re.search(r'^  table_retry_budget:\n    description: .*\n    default: "20"$', bundle, re.M)
+
+
+def test_table_retry_budget_defaults_to_zero_in_the_bundle_and_the_engine():
+    bundle = (ROOT / "databricks.yml").read_text()
+    assert re.search(r'^  table_retry_budget:\n    description: .*\n    default: "0"$', bundle, re.M)
+    assert table_retry.DEFAULT_BUDGET == 0
+    assert 'widget("table_retry_budget", str(table_retry.DEFAULT_BUDGET))' in _code()
 
 
 def test_every_discover_widget_is_a_job_parameter_and_the_workers_and_cap_take_bundle_variables():

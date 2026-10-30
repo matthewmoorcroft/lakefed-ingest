@@ -94,31 +94,42 @@ the ingestion job can't change its cluster, so a job with its own cluster runs i
 Changing the cluster needs Can Manage on the job's Databricks job, like any change.
 
 **Deleting a job.** A group always belongs to a job, so a job's Delete leaves no groups behind. The app has no
-`DELETE` privilege on the Lakebase tables, so the deletion is finished by the `lakefed_ingest_delete_job` job,
-which runs as the deployer:
-- the dialog (from `GET /api/ingestion-jobs/{id}/delete-preview`) says how many groups and tables go, the groups
+`DELETE` privilege on the Lakebase tables, so the rows are removed by the `lakefed_ingest_delete_job` job, which
+runs as the deployer. A Delete takes two steps: the app marks the job deleted, and the purge comes later.
+- The dialog (from `GET /api/ingestion-jobs/{id}/delete-preview`) says how many groups and tables go, the groups
   another job also runs (they stay), and has the tick box **Also delete the target tables**, with how many target
-  tables only this job writes and the names of those another job's rows also write (kept);
-- Delete is refused while a run of the job is going (Lakebase or the Jobs API sees one), and when the groups have
-  tables but no delete job is configured;
-- otherwise the app marks the job deleted and its groups removed, syncs (its wrapper jobs and any cluster copy go),
-  and starts the delete job with `schedule_id` and `drop_targets`, recording the run in the schedule's options;
-- the delete job deletes the groups' control, checkpoint, reseed_queue, database_check and check_work rows in one
-  transaction under their run locks, and keeps run history and the change log. Ticked, it then drops the target
-  tables only those groups write (`DROP TABLE IF EXISTS`, never a schema);
-- the job stays listed on Ingestion jobs as **Deleting** until its delete job has finished and its groups are gone
-  (the app reads the delete job's run, and marks the job `delete_finished` on the list read that sees both); the job
-  page is read only meanwhile. A delete that failed, or whose delete job never started, shows **Delete failed** with
-  the reason and **Run again** on the job page (with the same tick box);
-- **Deleted jobs** on Ingestion jobs is history only: the finished deletes.
+  tables only this job writes and the names of those another job's rows also write (kept).
+- Delete is refused while a run of the job is going, and when the groups have tables but no delete job is configured
+  (`DELETE_JOB_ID`). Otherwise the app marks the job deleted (`deleted_at`), removes its members (its wrapper jobs and
+  any cluster copy go in the sync) and records the tick box. Nothing is purged yet, and no delete job starts.
+- The job is **kept** under **Deleted jobs** for `DELETED_JOB_RETENTION_DAYS` (default 7; the bundle variable
+  `deleted_job_retention_days`, which the engine bundle's purge reads too, so both must match), with the days left.
+- **Restore** brings it back paused, with the members its Delete removed (members removed earlier stay removed). It is
+  refused (409) when its name is taken, when one of its groups is now in another live job, when a live job reads or
+  writes the same database or target table, or when its purge has started or finished. Its tables and state are as
+  they were, since nothing was purged.
+- **Delete now** (`POST /api/schedules/{id}/purge`) starts the delete job at once. The daily run (03:00 UTC) purges
+  every deleted job whose retention has run out. Each purge deletes the groups' control, checkpoint, reseed_queue,
+  database_check, check_work and rollup rows, and the job's job_selection rows, in one transaction under their run
+  locks, then marks the job `delete_finished`. It keeps run history and the change log. Ticked, it then drops the
+  target tables only those groups write (`DROP TABLE IF EXISTS`, never a schema).
+- Until its purge finishes the job reads **Deleting** while the delete job runs, or **Delete failed** with the reason;
+  **Delete now** runs it again. Once purged, the job leaves the list.
+- While a kept job still reads a database, a new job or new tables in that database are refused (409) until the job
+  is restored or purged.
+- Deploy order: the engine bundle (root `databricks.yml`) first, so the daily purge exists, then the app.
 
 The same job purges New job's drafts (below) with `purge_drafts`: the app's poller starts it at most once an hour,
 and only when a draft is due.
 
 **Run now and Cancel run.** Neither shows an end state before Databricks confirms it. **Run now** reads **Starting…**
-until the poller records a run going, and **Cancel run** reads **Cancelling…** until every run of the job has ended.
-Both read the `databricks_run` table the poller keeps, with no timer on the page. After 15 minutes without a start, or
-10 minutes without a cancel being confirmed, the page says Databricks has not confirmed it and keeps Run now off.
+until the poller records a run going. **Cancel run** reads **Cancelling…** until Databricks ends the run, then
+**Cancelled**: the poller closes the group run as cancelled at Databricks' end time, and closes its running or waiting
+tables as cancelled too, so a table that fails while the cancel is going is recorded as cancelled, not failed. If
+Databricks has not ended the run two minutes after the cancel, the poller closes it as cancelled anyway, without an
+end time from Databricks. Both read the `databricks_run` table the poller keeps, with no timer on the page. After 15
+minutes without a start, or 10 minutes without a cancel being confirmed, the page says Databricks has not confirmed it
+and keeps Run now off.
 
 **The other actions wait the same way.** Add databases, Add tables and Create show done only once their tables are written and the
 job's Databricks jobs are synced; a wrapper job that did not sync is named. Edit's Save shows saved only once the
@@ -145,6 +156,12 @@ databases it starts, so two pages or app instances never start the same one twic
 
 The step's top line counts the choice: databases chosen of those listed and their tables (counting while some aren't
 checked yet); the same numbers end the step's last line and the job's Chosen summary.
+
+**Keys and identity columns of a new fan-in job.** Each row's `__client_id__` is the server and database joined by an
+underscore (`{server}_{database}`): the UC connection name, or host and port, in lower case, then the database name.
+Each row also gets `source_server` and `source_database`, which the New job form shows and lets you remove. Add tables
+and Add databases on a job made before keep its `{database}` key and add no columns. Create refuses a key the rules
+don't allow and names the server and database.
 
 **New job reads the tables as they are chosen (drafts).** Ticking a whole database, or the whole server under its
 filter, starts the read of its tables at once, while the rest of the job is filled in. The read is a draft: its rows
@@ -178,6 +195,82 @@ what is left when it is pressed. Without a warehouse set (`WAREHOUSE_ID` empty),
 **What stays on the discovery job:** listing an Azure SQL server's databases through Azure (it takes a service
 credential only Databricks compute holds; the tables are then read through the warehouse), and sources read by host
 and password (no connection to send through). The job stays in the bundle for those.
+
+## JDBC connections entered by hand
+
+Discover's **Create a connection** offers two ways. **Through Unity Catalog** is as before. **JDBC connection entered by
+hand** takes a name, a source type (SQL Server, Oracle, PostgreSQL or MySQL), a host, a port (blank for the type's
+default), a secret scope, a secret key, and the server certificate choice: verify it (the default) or trust it.
+
+Before a connection is made, an admin creates the work outside the app: the secret scope, and in it a JSON secret
+`{"user": ..., "password": ...}` under the key. A key holding `{database}` (say `creds-{database}`) takes one secret per
+database, named by each database's name. The app never reads a secret value. It stores the names only, in
+`lakefed_ingest.jdbc_connection`, which comes with schema version 16: the schema upgrade (Manage, and the setup job it
+starts) adds it to a database that is behind. Its one write to a secret is a login typed into the form, described under
+Logins below, and that goes only into the dedicated login scope.
+
+- **Who makes one:** any signed-in user, in the dedicated login scope, once they have typed a login under the
+  connection's name for a key it makes (see Logins below). Only an app manager may make one that names any other scope,
+  since that scope holds secrets an admin wrote. Making one writes no secret. Anyone may list them, by name, with their
+  scope and key names; none shows a secret.
+- **Checked at each read:** a discovery, a new job, Add tables, Add databases, a re-discovery and every other write of
+  control rows through a connection is checked again when it is made, so a connection made before these rules is held
+  to them too. Its maker must still be allowed its scope. In the login scope, each key it reads (one per database it
+  names) must hold the newest login typed under this connection's name, so a login typed for one connection never goes
+  to another connection's host. A whole server can't be read through a login-scope connection with `{database}` in its
+  key, since the databases it lists are named by the source and can't be checked first: name the databases. The
+  engine holds the same line on its own: the discover, check and ingestion jobs read the typed logins' records at the
+  start of a run, and a login typed for a connection is sent only to that connection's host, port and source type,
+  whatever a control row or a discovery spec names (a run started outside the app included).
+- **A job's tables keep the connection's source:** every table written into a job that reads through a connection
+  takes its host, port, source type and a key its key template makes, and an edit of `secret_key`, `src_host`,
+  `src_port`, `src_type`, `use_remote_query` or `src_connection` on such a table is refused (Tables, Import and Edit).
+- **Key names:** letters, digits and dashes, as Azure Key Vault names must be, so a key works on a Key Vault-backed scope
+  too; `{database}` may appear once for each database's name. Filled in, the key follows Databricks' secret key rule
+  (letters, digits, dashes, underscores and dots, up to 128 characters), so a login typed for `Sales_DB` or `sales.eu`
+  goes under `creds-Sales_DB` or `creds-sales.eu`, the key discovery reads. A database whose name has a space or any
+  other character can't have a login of its own: the form refuses it, and a read of it through the login scope is
+  refused as having no login.
+- **Discovery:** a discovery through a connection takes the host, port, source type and key from the connection, and the
+  secret scope and certificate choice as job parameters (`secret_scope`, `trust_server_certificate`). The request names
+  only the connection and the databases. The discover job reads the source over Spark JDBC (`src_host`, `src_port`,
+  `secret_key`, `use_remote_query` off), so the warehouse is not used for it.
+- **Jobs:** a job made from such a discovery runs with the connection's scope and certificate choice; a request's own
+  values for them are replaced. Its re-discovery reads through the same connection.
+- **One source per job:** a selection can't mix a JDBC connection with another source, and tables from a JDBC connection
+  can't be added to an existing job or registered into one. Make a new ingestion job from them.
+- **Shown:** Discover, the job's tree (on its page and in Edit) show the connection's type, host, port, scope and key
+  names and its certificate choice. No secret value is shown anywhere.
+- **Logins:** under a connection's secret key the form has a user name and a password field. The fields show only when
+  the connection's secret scope is the dedicated login scope, since that is where the login is written, and a key with
+  `{database}` in it asks which database the login is for. Save the login writes
+  `{"user": ..., "password": ...}` as one JSON secret into the dedicated login scope (`JDBC_LOGIN_SCOPE`, by default
+  `lakefed_ingest_jdbc_logins`, set by the app bundle's `jdbc_login_scope` variable). The write goes through the Secrets
+  API as the app's service principal, so it shows under the app's identity and never the user's token. The grant job
+  (under Deploy) gives that principal `WRITE` on this one scope and nothing else: not `MANAGE`, which would let it change
+  who reads the scope, and not `READ`, which a write doesn't need. The scope has `prevent_destroy`, so destroying the
+  bundle can't delete the logins.
+  - **Who may save one:** whoever may change the ingestion groups that read the key through the login scope (their
+    job's `secret_scope`), the same check the Edit path makes; a job reading the same key name from another scope
+    doesn't count. A key no such group reads but that already holds a login is saved again only by someone who typed
+    a login under it, or who made a connection one was typed for. A key with no login yet is open to any signed-in
+    user, as a new job is.
+  - **Replacing:** "Replace the login" saves a new one under the same key. It is recorded as `rotated`. A key used by a
+    job needs `CAN_MANAGE` on that job to rotate it. A key whose newest login was typed for another connection takes
+    one under a new connection only from someone who may change that connection's jobs (or, while it has none, who
+    typed that login or made the connection).
+  - **One save at a time:** a save takes the key's lock, records the login, writes the secret and then commits, in one
+    transaction, so a refused write leaves no record and two saves of one key take turns. The newest record always
+    names the connection the key's login was typed for, which the reads above rely on.
+  - **Recorded:** `lakefed_ingest.jdbc_login_write` gets one row per save: who entered it, when, the connection, the scope
+    and key, and whether it was `saved` or `rotated`. There is no password column.
+  - **Never kept:** the password is not stored in Lakebase, not logged, and not returned. The form clears it after a save and
+    never prefills it. Error text and the 422 for this route keep the password out.
+  - **Who reads it:** the ingestion jobs read the login as the identity they run as, normally the deployer, which must be
+    the person who deployed the app bundle, since that person is the scope's creator. See the grant bullet below.
+  - **Audit log:** checked on 30 Oct 2026 by writing a throwaway secret with a marker value: the audit log's
+    `putSecret` record (`system.access.audit`, service `secrets`) shows `string_value` as `REDACTED`, and the marker
+    appears nowhere in the record. Its `user_identity` and `identity_metadata` name the identity that wrote it.
 
 ## Re-discovery
 
@@ -276,7 +369,11 @@ The app runs as its own service principal (created with the app):
 - **Lakebase:** granted by the `lakefed_ingest_app_grants` job:
   - `CAN_USE` on the instance (to mint its own short-lived credential);
   - a Postgres role;
-  - `SELECT`, `INSERT` and `UPDATE` on the `lakefed_ingest` tables, with no `DELETE`.
+  - `SELECT`, `INSERT` and `UPDATE` on the `lakefed_ingest` tables, with no `DELETE`; except the two JDBC record tables,
+    `jdbc_login_write` and `jdbc_connection`, which get `SELECT` and `INSERT` only (the app never updates a login or
+    connection row, and the grant job revokes `UPDATE` on them right after the blanket grant).
+- **JDBC login scope:** `WRITE` on the dedicated login scope and nothing else, set through the Secrets API by the same
+  job (the bundle declares no permission on the scope). See [JDBC connections](#jdbc-connections-entered-by-hand).
 - **Source connections:** `USE CONNECTION` on each Unity Catalog connection named in the bundle's
   `source_connections` variable (comma-separated), granted by the same job as whoever runs it, who needs to own
   or manage those connections. The app lists connections as its own identity, so Discover shows only those it
@@ -291,6 +388,11 @@ The app runs as its own service principal (created with the app):
   whose managed identity has Reader on the server, `ACCESS` on that credential for whoever runs the discovery job,
   and the server's resource id, both typed under Azure SQL on the connection step. The app never calls Azure;
   each listed database is then read through the connection, and one the login can't open fails on its own.
+- **JDBC secret scopes:** `READ` on each scope a JDBC connection names, for the identity its jobs run as (normally the
+  deployer). The app never holds it and its grant job doesn't give it, so a job reading a scope it can't read fails on
+  its first run. The app bundle creates the dedicated login scope with no permission on it, and the grant job gives the
+  app `WRITE` there and nothing else (see Lakebase above). The app makes no other scope and writes no other secret.
+  See [JDBC connections](#jdbc-connections-entered-by-hand).
 - **Who can act:** every action on an existing ingestion job follows the signed-in user's own Databricks
   permission on the job its runs execute as (the check job on a check schedule, else the ingestion job), as the
   Jobs UI does:
@@ -299,6 +401,12 @@ The app runs as its own service principal (created with the app):
     Add table, Import CSV, Bulk import's register), or deleting it: `CAN_MANAGE` or owner;
   - a change to tables needs `CAN_MANAGE` on every ingestion job that runs one of their groups, since a group
     can be in more than one job and its tables change for all of them;
+  - a read by host and password outside a JDBC connection is an app manager's: a discovery by host, a New job, Add
+    table, Import or Add tables with tables read by host, an edit that points a table at a host or a key, a job's
+    `secret_scope` set or changed, and a re-discovery by host of a job a manager didn't make. Such a read takes its
+    login from a scope an admin wrote (the job's `secret_scope`, by default the bundle's scope) and sends it to the
+    host the request names. Anyone else reads through a Unity Catalog connection, or a JDBC connection in the login
+    scope;
   - workspace admins may do all of these.
 
   Who the user is comes from the `X-Forwarded-Email` header the Databricks Apps proxy adds. Without it the app
@@ -337,19 +445,25 @@ Prerequisites: the ingestion bundle is deployed and its setup job has run (Lakeb
      who deploys.
    - `app_version`: what Manage shows as the version, by default the git commit deployed from. It is blank when the
      bundle is deployed from a folder that isn't a git checkout: pass `--var app_version=<commit>` there.
-2. Deploy and start the app, then grant it Lakebase access. Run these from `app/`, as the user who
-   manages the Lakebase instance and owns the tables (whoever ran the ingestion setup):
+2. Deploy and start the app, then run the grant job. Run these from `app/`, as the user who manages the Lakebase
+   instance and owns the tables (whoever ran the ingestion setup). On a first deploy the order matters: the grant job
+   needs the app's service principal, which exists only once the app is deployed.
 
    ```bash
    cd app
    databricks bundle deploy -t <target>
    databricks bundle run lakefed_ingest_app -t <target>          # deploys the code and starts the app
-   databricks bundle run lakefed_ingest_app_grants -t <target>   # Lakebase access, and USE CONNECTION on source_connections
+   databricks bundle run lakefed_ingest_app_grants -t <target>   # Lakebase access, USE CONNECTION on source_connections, WRITE on the login scope
    ```
-3. Grant `CAN_USE` on the app to your operators, then open the URL printed by `bundle run`.
+3. Check the login scope's access list. The grant job sets the app's `WRITE` there (the bundle declares no permission on
+   the scope), so the list should show the app's service principal with `WRITE`, the deployer with `MANAGE`, and nothing
+   else: `databricks secrets list-acls lakefed_ingest_jdbc_logins -p <profile>`.
+4. Grant `CAN_USE` on the app to your operators, then open the URL printed by `bundle run`.
 
-Re-run the grant job if the app is recreated (new service principal). Default privileges cover
-tables the same owner adds later, so schema upgrades don't need it.
+Re-run the grant job if the app is recreated (new service principal). It also sets the new principal's `WRITE` on the
+login scope; the old principal's entry stays until you remove it (`databricks secrets delete-acl
+lakefed_ingest_jdbc_logins <old service principal>`). Default privileges cover tables the same owner adds later, so
+schema upgrades don't need it.
 
 **Schema upgrades.** When the app starts and finds the state database behind the schema version its code expects
 (`schema_upgrade.SCHEMA_VERSION`), it starts the setup job once, under an advisory lock and only if no setup run is
@@ -400,6 +514,8 @@ Locally the app connects as you. Tests:
 
 - Per-user authorization: everyone with `CAN_USE` acts as the app's service principal.
 - Discovery for sources other than SQL Server: add their control rows with Add table or SQL.
+- Logins for a JDBC connection in a scope other than the dedicated login scope: an admin creates that scope and its
+  secret beforehand. The form writes only into the dedicated scope.
 
 ## License
 

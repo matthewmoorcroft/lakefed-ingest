@@ -1,4 +1,4 @@
-"""Cancel run against a real Postgres: the app marks the run TERMINATING (queries.mark_terminating_sql), and the poller's
+"""Cancel run against a real Postgres: the app marks the run TERMINATING (queries.mark_cancel_requested_sql), and the poller's
 next upsert (queries.databricks_run_upsert_sql) must keep that while the Jobs API still says the run is going, as it
 does right after jobs.cancel, and take any ended state the API reports after. A throwaway database with the Lakebase
 schema.
@@ -54,7 +54,7 @@ def _state(conn, run_id):
 
 def test_a_cancelled_run_stays_terminating_while_the_api_still_says_it_is_going(pg):
     _seen(pg, 7, "RUNNING")
-    pg.execute(q.mark_terminating_sql(), ([7], ACTIVE))
+    pg.execute(q.mark_cancel_requested_sql(), ([7], ACTIVE))
     for still_going in ("RUNNING", "PENDING", "QUEUED", "BLOCKED", "WAITING_FOR_RETRY"):
         _seen(pg, 7, still_going)
         assert _state(pg, 7) == ("TERMINATING", None), still_going
@@ -62,7 +62,7 @@ def test_a_cancelled_run_stays_terminating_while_the_api_still_says_it_is_going(
 
 def test_an_ended_state_replaces_terminating_and_a_run_not_cancelled_takes_the_api_state(pg):
     _seen(pg, 8, "RUNNING")
-    pg.execute(q.mark_terminating_sql(), ([8], ACTIVE))
+    pg.execute(q.mark_cancel_requested_sql(), ([8], ACTIVE))
     _seen(pg, 8, "TERMINATED", result="CANCELED", ended="2026-10-30T10:05:00+00:00")
     assert _state(pg, 8) == ("TERMINATED", "CANCELED")
     _seen(pg, 9, "PENDING")

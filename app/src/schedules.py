@@ -480,11 +480,17 @@ def job_name(schedule_name: str, collection: str) -> str:
     return f"{JOB_NAME_PREFIX}: {schedule_name} / {collection}"
 
 
+def run_parameters(schedule: dict, collection: str) -> dict:
+    """The ingestion job parameters a run of one collection takes from its schedule: the collection and every
+    tuning value the schedule stores. A value it doesn't store is left out, so the ingestion job's default applies."""
+    return {"task_collection": collection,
+            **{k: str(v) for k, v in sorted((schedule.get("parameters") or {}).items())}}
+
+
 def job_settings(schedule: dict, collection: str, offset: int, ingest_job_id: int,
                  view_group: Optional[str] = None, owner: Optional[str] = None) -> dict:
     """Jobs API 2.2 settings of a member's wrapper job."""
-    params = {"task_collection": collection,
-              **{k: str(v) for k, v in sorted((schedule.get("parameters") or {}).items())}}
+    params = run_parameters(schedule, collection)
     s = {
         "name": job_name(schedule["name"], collection),
         "description": (f"Managed by the lakefed_ingest operations app (schedule '{schedule['name']}'). "

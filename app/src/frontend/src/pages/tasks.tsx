@@ -31,8 +31,13 @@ export async function finished(answer: Row, onTask: (task: Row) => void): Promis
  *  jobs did not sync (its task keeps its result). */
 export const resumableWrite = (error: unknown): boolean => {
   const task = (error as { task?: Row } | null)?.task;
+  if (isClashRefusal((error as Error | null)?.message)) return false;
   return Boolean(task?.progress || task?.result);
 };
+
+/** The refusal when databases would have tables in more than one ingestion group (main.py _split_message). Nothing was
+ *  written and sending it again changes nothing, so it offers no Finish. */
+export const isClashRefusal = (message: unknown): boolean => /tables in more than one ingestion group/.test(String(message ?? ""));
 
 const KINDS: Record<string, string> = { create: "Creating the job", tables: "Adding tables", databases: "Adding databases" };
 
@@ -45,7 +50,8 @@ export function TaskProgress({ task, onResume }: { task: Row | null; onResume?: 
   const progress: Row | null = task.progress ?? null;
   // A database-only file's size is unknown until its databases are discovered, so its task has no database count.
   const byDatabase = progress?.databases_total != null;
-  if (task.status === "failed" && progress && byDatabase && !task.result) {
+  const clash = task.status === "failed" && isClashRefusal(task.error);
+  if (task.status === "failed" && progress && byDatabase && !task.result && !clash) {
     const total = Number(progress.databases_total);
     return (
       <Notice tone="bad">Stopped with {fmtInt(progress.databases_written)} of {fmtInt(total)} {plural(total, "database")} written
@@ -55,8 +61,8 @@ export function TaskProgress({ task, onResume }: { task: Row | null; onResume?: 
     );
   }
   if (task.status === "failed") return (
-    <Notice tone="bad">{task.result ? "Not done: " : "Nothing was written: "}{task.error}
-      {task.result && onResume && <div className="toolbar"><button onClick={onResume}>Finish the write</button>
+    <Notice tone="bad">{clash ? "" : task.result ? "Not done: " : "Nothing was written: "}{task.error}
+      {task.result && !clash && onResume && <div className="toolbar"><button onClick={onResume}>Finish the write</button>
         <span className="sub">Sending the same write again syncs its Databricks jobs and writes nothing twice.</span></div>}</Notice>
   );
   if (task.status === "succeeded") return null;

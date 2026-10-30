@@ -43,12 +43,16 @@ resources:
             value_from: cluster-copies-job
           - name: DELETE_JOB_ID
             value_from: delete-job
+          - name: DELETED_JOB_RETENTION_DAYS
+            value: ${var.deleted_job_retention_days}
           - name: WAREHOUSE_ID
             value_from: discovery-warehouse
           - name: APP_VERSION
             value: ${var.app_version}
           - name: APP_MANAGERS
             value: ${var.app_managers}
+          - name: JDBC_LOGIN_SCOPE
+            value: ${var.jdbc_login_scope}
       resources:
         - name: ingest-job
           description: The lakefed_ingest ingestion job.
@@ -102,10 +106,21 @@ resources:
           - key: project
             value: lakefed_ingest
 
+  # The dedicated scope for JDBC logins that users type into the app (app/src/jdbc_logins.py). This bundle creates it,
+  # so the deployer is its creator and holds MANAGE, and the ingestion jobs, which run as the deployer, read the logins
+  # with it. The app's service principal gets WRITE on it from the lakefed_ingest_app_grants job, and nothing else: a
+  # permission here that names the app's service principal fails at deploy, so it can't be declared in this bundle.
+  # prevent_destroy: destroying this bundle would delete every login in the scope.
+  secret_scopes:
+    jdbc_logins:
+      name: ${var.jdbc_login_scope}
+      lifecycle:
+        prevent_destroy: true
+
   jobs:
     lakefed_ingest_app_grants:
       name: "lakefed_ingest_app_grants"
-      description: "Grant the operations app's service principal access to the lakefed_ingest Lakebase tables, and USE CONNECTION on the source_connections. Run as the tables' owner; idempotent."
+      description: "Grant the operations app's service principal access to the lakefed_ingest Lakebase tables, USE CONNECTION on the source_connections, and WRITE on the JDBC login scope. Run as the deployer, who owns the tables and created the scope; idempotent."
       # Serverless: the task only talks to the Lakebase instance and the workspace APIs.
       tasks:
         - task_key: grant_app_access
@@ -117,6 +132,7 @@ resources:
               db_instance: ${var.lakebase_instance}
               db_name: ${var.lakebase_database}
               source_connections: ${var.source_connections}
+              jdbc_login_scope: ${var.jdbc_login_scope}
       environments:
         - environment_key: lakebase_client
           spec:

@@ -120,8 +120,10 @@ class FakeDB:
 def client(monkeypatch):
     import contextlib
     fake = FakeDB()
-    # These tests are about the writes; that every group belongs to a job is tested in group_rule_test.py.
+    # These tests are about the writes; that every group belongs to a job is tested in group_rule_test.py, and that
+    # only an app manager reads by host outside a connection in host_reads_test.py.
     monkeypatch.setattr(main, "_refuse_groups_outside_jobs", lambda groups: None)
+    monkeypatch.setattr(main, "_manage_refusal", lambda user: None)
     monkeypatch.setattr(main.db, "query", lambda sql, params=(): DISCOVERED if "discovered_table" in sql else [])
     monkeypatch.setattr(main.db, "transaction", contextlib.contextmanager(lambda: (yield FakeCursor(fake))))
     c = TestClient(main.app, headers={"X-Forwarded-Email": "op@example.com"})
@@ -202,7 +204,9 @@ def test_bulk_move_takes_both_collection_locks_and_does_not_reseed(client):
 def test_edit_refused_while_collection_runs(client):
     client.db.running = {"lakefed_ingest:c2"}
     r = _edit(client, [7], {"task_collection": "c2"})
-    assert r.status_code == 409 and "its ingestion job is running (group 'c2')" in r.json()["detail"]
+    detail = r.json()["detail"]
+    assert r.status_code == 409 and "its ingestion job is running (group 'c2')" in detail["message"]
+    assert detail["reason"] == "running" and detail["group"] == "c2"
 
 
 def test_bulk_edit_rejects_single_row_fields_and_invalid_rows(client):
@@ -478,20 +482,20 @@ def test_adding_a_table_that_would_put_its_database_in_a_second_collection_is_re
     assert client.db.of(q.split_databases_sql()) == [([q.database_key(ROW)],)]
     client.db.split = {q.database_key(ROW)}
     r = client.post("/api/tables", json=ROW)
-    assert r.status_code == 409 and "db1" in r.json()["detail"] and "c1, c2" in r.json()["detail"]
+    assert r.status_code == 409 and "db1" in r.json()["detail"]["message"] and "c1, c2" in r.json()["detail"]["message"]
 
 
 def test_moving_some_of_a_databases_tables_to_another_collection_is_refused(client):
     client.db.split = {q.database_key(CONTROL[7])}
     r = client.post("/api/tables/edit", json={"ids": [7], "changes": {"task_collection": "c2"}, "dry_run": False})
-    assert r.status_code == 409 and "more than one ingestion group" in r.json()["detail"]
+    assert r.status_code == 409 and "more than one ingestion group" in r.json()["detail"]["message"]
 
 
 def test_registering_tables_into_another_collection_than_their_database_is_refused(client):
     body = {"task_collection": "c9", "shared": {"sink_schema": "bronze"}}
     client.db.split = {q.database_key(dict(DISCOVERED[0], task_collection="c9"))}
     r = client.post("/api/discoveries/d1/register", json=body)
-    assert r.status_code == 409 and "db1" in r.json()["detail"]
+    assert r.status_code == 409 and "db1" in r.json()["detail"]["message"]
 
 
 

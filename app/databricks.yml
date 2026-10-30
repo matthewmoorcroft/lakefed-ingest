@@ -57,6 +57,10 @@ variables:
       (looked up by name, like ingest_job_id).
     lookup:
       job: lakefed_ingest_delete_job
+  deleted_job_retention_days:
+    description: Days a deleted job is kept, so it can be restored, before the delete job's daily run purges it. Must
+      equal deleted_job_retention_days in the engine bundle (the root databricks.yml), which the purge reads.
+    default: 7
   discovery_warehouse_size:
     description: Size of the serverless SQL warehouse discovery runs on (the connection test, the database list and the
       tables of the chosen databases). Catalog queries only, so the smallest size; more clusters, not a bigger size, if
@@ -68,6 +72,12 @@ variables:
   discovery_warehouse_auto_stop_mins:
     description: Idle minutes before the discovery warehouse stops. It is used only while someone chooses tables.
     default: 5
+  jdbc_login_scope:
+    description: Secret scope for the JDBC logins users type into the operations app. This bundle creates it, so its
+      deployer holds MANAGE; the lakefed_ingest_app_grants job gives the app's service principal WRITE on it and nothing
+      more. Deploy this bundle as the user who runs the ingestion jobs, since that user is the scope's creator (MANAGE)
+      and the jobs read the logins as their run-as identity.
+    default: lakefed_ingest_jdbc_logins
 
 targets:
   dev:

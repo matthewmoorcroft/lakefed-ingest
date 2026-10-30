@@ -1,11 +1,12 @@
 import { Fragment, useEffect, useMemo, useRef, useState } from "react";
+import { JdbcSourceNotice } from "./JdbcConnectionForm";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate, useParams } from "react-router-dom";
 import { api, qs, type Row } from "../api";
 import { Crumbs, ConfirmButton, ErrorBox, Info, Menu, Notice, PageHead, Pager, Section, StateBar, fmtInt, plural, useConfirm, Twisty,
          Busy, Chevron, OutLink, Required, StatusLine, toast } from "../components";
 import { usePermissions } from "../permissions";
-import { CADENCES, IdentityFields, ParameterFields, RunFields, WritesFields } from "./jobForm";
+import { CADENCES, IdentityFields, ParameterField, ParameterFields, RunFields, WritesFields } from "./jobForm";
 import { ImportCsvDialog } from "./NewJob";
 import { TaskProgress, finished, newRequestId, resumableWrite } from "./tasks";
 import { DiscoverDialog } from "./Discover";
@@ -153,6 +154,7 @@ export function Tree({ jobId, locked, readOnly }: { jobId: string; locked: Locke
   const servers = useQuery({ queryKey: ["job-tree", jobId], queryFn: () => api.get<Row>(`/ingestion-jobs/${jobId}/tree${qs({ limit: 200 })}`) });
   return (
     <div className="table-wrap">
+      {servers.data?.jdbc && <JdbcSourceNotice jdbc={servers.data.jdbc} />}
       <table className="data tree">
         <thead><tr><th>Server › database › table</th><th>Read through · load type</th><th>Key</th>
           <th className="num">Databases · tables</th><th>Target table</th><th>Enabled</th><th>State now</th></tr></thead>
@@ -343,8 +345,9 @@ export default function JobEdit() {
     if (!s) return;
     const form = { fan_in: value(s.fan_in), write_mode_changes: value(s.write_mode_changes), write_mode_full: value(s.write_mode_full),
       freshness_sla_minutes: value(s.freshness_sla_minutes) ?? "", sink_catalog: value(s.sink_catalog) ?? "",
-      sink_schema: value(s.sink_schema) ?? "", sink_table: value(s.sink_table) ?? "", lowercase: value(s.lowercase) ?? true,
-      client_id: value(s.client_id) ?? "{database}" };
+      sink_schema: value(s.sink_schema) ?? "", sink_table: value(s.sink_table) ?? "",
+      // A job turning fan-in on takes the key new fan-in jobs get (job_settings.SHARED_CLIENT_ID), with its server.
+      client_id: value(s.client_id) ?? "{server}_{database}" };
     const ident = Object.entries((value(s.identity) as Record<string, string>) ?? {});
     const differs = Object.fromEntries((settings.data?.identity_differs ?? []).map((name: string) => [name, ""]));
     setW(form); setIdentity(ident); setDiffering(differs);
@@ -360,7 +363,7 @@ export default function JobEdit() {
   const changed = (): Row => {
     if (!s) return {};
     const out: Row = {};
-    for (const k of ["fan_in", "write_mode_changes", "write_mode_full", "sink_catalog", "sink_schema", "sink_table", "lowercase", "client_id"])
+    for (const k of ["fan_in", "write_mode_changes", "write_mode_full", "sink_catalog", "sink_schema", "sink_table", "client_id"])
       if (w[k] !== undefined && w[k] !== value(s[k]) && !(w[k] === "" && value(s[k]) == null)) out[k] = w[k];
     if (String(w.freshness_sla_minutes ?? "") !== String(value(s.freshness_sla_minutes) ?? ""))
       out.freshness_sla_minutes = w.freshness_sla_minutes === "" ? null : Number(w.freshness_sla_minutes);
@@ -511,6 +514,7 @@ export default function JobEdit() {
 
       {s && <Section title="How it writes">
         <WritesFields w={w} setW={setW} stored={s}
+          reseed={<ParameterField name="reseed_on_new_columns" params={params} setParams={setParams} options={options.data} />}
           modeNote={writeModeMoves && <p className={targetsChanged ? "help" : "impact"}>A new write mode makes new target tables and loads every
             table again{targetsChanged ? "." : ": change the target names below too."}</p>}
           targetsNote={targetsChanged && <p className="impact">New target names make new tables and load their tables again. The old tables are left in place.</p>} />
@@ -545,7 +549,7 @@ export default function JobEdit() {
         <Compute jobId={id} />
         <Groups jobId={id} locked={locked} saved={Number(schedule.options?.tables_per_group) || null} />
         <h3>Tuning</h3>
-        <ParameterFields params={params} setParams={setParams} options={options.data} />
+        <ParameterFields params={params} setParams={setParams} options={options.data} hostReads={!!settings.data?.reads_by_host} />
       </details>}
     </>
   );

@@ -18,6 +18,12 @@ test("a card counts every state, its zeros muted, and a rollup's late databases"
     ["loaded:64,010 loaded", "late:3 late databases", "waiting:9,400 waiting", "zero:0 failing"]);
 });
 
+test("a jobs list counts an all-loaded job as N of N, and says All N loaded only where it may", () => {
+  const job = { state_loaded: 1002, state_first_load: 0, state_failing: 0, late_databases: 0 };
+  assert.deepEqual(stateSummary(job), { allDone: "All 1,002 loaded", items: [] });
+  assert.deepEqual(stateSummary(job, false, false), { allDone: null, items: [{ text: "1,002 of 1,002 loaded", tone: "loaded" }] });
+});
+
 test("a rollup with late databases is not all done, even with every table loaded", () => {
   const group = { state_loaded: 9000, state_first_load: 0, state_failing: 0, late_databases: 1 };
   const summary = stateSummary(group);

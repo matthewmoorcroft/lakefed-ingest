@@ -122,7 +122,8 @@ def test_an_edit_is_refused_while_a_group_of_the_job_is_running(client):
         holder.execute("select pg_advisory_lock(hashtextextended(%s, 0))", ("lakefed_ingest:cust_c02",))
         r = client.post(f"/api/ingestion-jobs/{client.sid}/settings",
                         json={"settings": {"freshness_sla_minutes": 90}, "dry_run": False})
-    assert r.status_code == 409 and "cust_c02" in r.json()["detail"]
+    assert r.status_code == 409 and r.json()["detail"]["group"] == "cust_c02"
+    assert r.json()["detail"]["reason"] == "running" and "cust_c02" in r.json()["detail"]["message"]
 
 
 def test_the_tree_opens_at_servers_then_a_servers_databases_then_a_databases_tables(client):

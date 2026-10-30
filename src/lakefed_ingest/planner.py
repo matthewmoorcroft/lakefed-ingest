@@ -25,7 +25,7 @@ from __future__ import annotations
 
 from collections import Counter
 from datetime import datetime, timezone
-from typing import Optional, Callable, Dict, List, Tuple
+from typing import Optional, Callable, Dict, Iterable, List, Tuple
 
 import ct_engine
 import cursor_engine
@@ -137,6 +137,55 @@ def locked_run_status(work_id: str) -> str:
     """How a run that finds its collection locked by another sweep ends. A run with a work list was started
     for databases that only it would ingest, so it fails; a run without one is a plain skip."""
     return "failed" if str(work_id or "").strip() else "skipped"
+
+
+def work_database_keys(task_collection: str, work: Iterable[tuple]) -> Dict[str, tuple]:
+    """{lock key: (source, src_database)} for a work list's databases (``state_store.database_lock_key``)."""
+    return {ss.database_lock_key(task_collection, source, database): (source, database)
+            for source, database in sorted({(str(s), str(d)) for s, d in work})}
+
+
+def work_after_locks(work: Iterable[tuple], keys: Dict[str, tuple], held: set) -> Tuple[set, List[tuple]]:
+    """A work-list run's databases once it has tried their locks: (the ones it keeps, the ones another run holds).
+    A database another run holds (two overlapping checks gave it to both) is skipped, not failed: the run that holds
+    it ingests it, and if not, the next cycle's check finds it again (it was never stamped)."""
+    kept = {keys[key] for key in held if key in keys}
+    return {tuple(item) for item in work if tuple(item) in kept}, sorted(set(keys.values()) - kept)
+
+
+def cycle_parts(work_all: Iterable[tuple]) -> List[str]:
+    """The collections a run of a cycle's share takes, in turn and in name order, from its whole work list
+    ({(task_collection, source, src_database)}, ``StateStore.get_check_work_all``)."""
+    return sorted({str(collection) for collection, _, _ in work_all})
+
+
+def cycle_summary(work_id: str, parts: Dict[str, dict]) -> dict:
+    """How a run of a cycle's share ended, from each part's own answer (its notebook exit, or the error that
+    stopped it): the parts that failed fail the run; skipped ones (locked, or nothing of theirs left) don't. A part
+    with failed tables ends as failed (its run raises, see ``failure_message``), so it fails the cycle too."""
+    status = {name: str(answer.get("status") or "completed") for name, answer in parts.items()}
+    return {"work_id": work_id, "parts": len(parts),
+            "failed": sorted(name for name, s in status.items() if s == "failed"),
+            "skipped": sorted(name for name, s in status.items() if s in ("skipped", "migration_waiting")),
+            "tables": sum(int(a.get("total") or 0) for a in parts.values()),
+            "ok": sum(int(a.get("ok") or 0) for a in parts.values()),
+            "run_ids": {name: a.get("run_id") for name, a in parts.items()}}
+
+
+FAILURE_TABLES_NAMED = 5
+
+
+def failure_message(run_id, task_collection: str, failed: List[tuple], link: str = "") -> str:
+    """The error a run ends with when tables failed: how many, the first few with their errors, and where to
+    look for the rest. ``failed`` is (control row, error) pairs in the order they failed."""
+    lines = [f"{len(failed)} table(s) failed in run {run_id} of {task_collection}:"]
+    for cfg, error in failed[:FAILURE_TABLES_NAMED]:
+        lines.append(f"{cfg['src_database']}.{cfg['src_schema']}.{cfg['src_table']}: {str(error)[:200]}")
+    if len(failed) > FAILURE_TABLES_NAMED:
+        lines.append(f"and {len(failed) - FAILURE_TABLES_NAMED} more")
+    lines.append(f"Job page: {link}" if link else
+                 "See the run in the operations app or lakefed_ingest.ingest_event.")
+    return "\n".join(lines)
 
 
 def sink_checked_configs(configs: List[dict]) -> List[dict]:

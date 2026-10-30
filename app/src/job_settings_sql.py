@@ -18,7 +18,9 @@ TAG_SQL = {"{server}": f"({q.SERVER})", "{database}": "coalesce(t.src_database, 
            "{schema}": "coalesce(t.src_schema, '')", "{table}": "coalesce(t.src_table, '')"}
 # queries.identifier in SQL: lower case, runs of other characters to one _, trimmed, "t" when nothing is left.
 IDENT = "coalesce(nullif(btrim(regexp_replace(lower({x}), '[^a-z0-9_]+', '_', 'g'), '_'), ''), 't')"
-CLIENT_ID_RE = "^[A-Za-z0-9_.:-]{1,128}$"
+# queries.unity_catalog_identifier in SQL: each character Unity Catalog refuses becomes _, then lower case.
+IDENT_UC = r"lower(regexp_replace({x}, '[. /\x01-\x1f\x7f]', '_', 'g'))"
+CLIENT_ID_RE = q.CLIENT_ID_PATTERN
 HAS_ID = "nullif(btrim(t.client_id), '') is not null"
 CANDIDATES_PER_SCAN = 16
 
@@ -31,15 +33,16 @@ class Params(dict):
         return f"%({name})s"
 
 
-def render_sql(template: Optional[str], p: Params, target: bool = False, lowercase: bool = True) -> str:
+def render_sql(template: Optional[str], p: Params, target: bool = False, unity_catalog: bool = False) -> str:
     """SQL filling a template from alias t, as job_settings.render does. A blank template is NULL."""
     text = str(template or "").strip()
     if not text:
         return "null::text"
+    name_rule = IDENT_UC if target and unity_catalog else IDENT if target else None
     parts = []
     for piece in re.split(r"(\{server\}|\{database\}|\{schema\}|\{table\})", text):
         if piece in TAG_SQL:
-            parts.append(IDENT.format(x=TAG_SQL[piece]) if target and lowercase else TAG_SQL[piece])
+            parts.append(name_rule.format(x=TAG_SQL[piece]) if name_rule else TAG_SQL[piece])
         elif piece:
             parts.append(f"{p.add(piece)}::text")
     return "(" + " || ".join(parts) + ")"
@@ -62,16 +65,14 @@ def _shared_counts(counts: Counter) -> dict:
     return {"mixed": {("" if v is None else str(v)): n for v, n in counts.most_common()}}
 
 
-def read(fetch: Callable, groups: List[str]) -> Dict[str, dict]:
+def read(fetch: Callable, groups: List[str], unity_catalog: bool = False) -> Dict[str, dict]:
     """job_settings.read for a whole job, in SQL. `fetch(sql, params)` returns rows as dicts."""
     base = fetch(f"""select count(*) as n, count(*) filter (where {HAS_ID}) as with_id,
-        coalesce(bool_and(t.sink_catalog = lower(t.sink_catalog) and t.sink_schema = lower(t.sink_schema)
-                          and t.sink_table = lower(t.sink_table)), true) as lower,
         min(t.id) as first_id, min(t.id) filter (where {HAS_ID}) as first_with_id
         from {S}.control t where {WHERE}""", {"groups": groups})[0]
     if not base["n"]:
-        return js.read([])
-    n, with_id, lower = base["n"], base["with_id"], bool(base["lower"])
+        return js.read([], unity_catalog)
+    n, with_id = base["n"], base["with_id"]
     out: Dict[str, dict] = {"fan_in": _shared_counts(Counter({True: with_id, False: n - with_id}) - Counter())}
     mix = fetch(f"""select t.load_type, coalesce(t.write_mode, 'merge') as write_mode, t.freshness_sla_minutes as sla,
         count(*) as n from {S}.control t where {WHERE} group by 1, 2, 3""", {"groups": groups})
@@ -84,7 +85,7 @@ def read(fetch: Callable, groups: List[str]) -> Dict[str, dict]:
         sla[m["sla"]] += m["n"]
     out["write_mode_changes"], out["write_mode_full"] = _shared_counts(changes), _shared_counts(full)
     out["freshness_sla_minutes"] = _shared_counts(sla)
-    out["lowercase"] = {"value": lower}
+    out["unity_catalog"] = {"value": unity_catalog}
     sample = fetch(q.control_row_sql(), (base["first_id"],))[0]
     id_sample = sample if base["first_with_id"] in (None, base["first_id"]) else \
         fetch(q.control_row_sql(), (base["first_with_id"],))[0]
@@ -94,7 +95,7 @@ def read(fetch: Callable, groups: List[str]) -> Dict[str, dict]:
     fields: Dict[str, dict] = {}
     for field, _ in js.TARGET_SETTINGS:
         fields[field] = {"column": f"t.{field}", "only": "true", "target": True,
-                         "candidates": js._ranked(str(sample.get(field) or ""), sample, lower)}
+                         "candidates": js._ranked(str(sample.get(field) or ""), sample, True, unity_catalog)}
     if with_id:
         fields["client_id"] = {"column": "t.client_id", "only": HAS_ID, "target": False,
                                "candidates": js._ranked(str(id_sample["client_id"]), id_sample, False)}
@@ -107,7 +108,8 @@ def read(fetch: Callable, groups: List[str]) -> Dict[str, dict]:
     def check(field: str, candidate: str, p: Params) -> str:
         f = fields[field]
         return (f"coalesce(bool_and(case when {f['only']} then {f['column']} is not distinct from "
-                f"{render_sql(candidate, p, target=f['target'], lowercase=lower)} else true end), true)")
+                f"{render_sql(candidate, p, target=f['target'], unity_catalog=unity_catalog)} "
+                "else true end), true)")
 
     p = Params(groups=groups)
     keys = p.add(list(attrs))
@@ -152,7 +154,8 @@ def read(fetch: Callable, groups: List[str]) -> Dict[str, dict]:
     else:
         out["identity"] = {"value": {name: found[f"attr:{name}"] for name in attrs}}
     return {k: out[k] for k in ("fan_in", "write_mode_changes", "write_mode_full", "freshness_sla_minutes",
-                                "lowercase", "sink_catalog", "sink_schema", "sink_table", "client_id", "identity")}
+                                "unity_catalog", "sink_catalog", "sink_schema", "sink_table", "client_id",
+                                "identity")}
 
 
 def _new_values(settings: dict, now: dict, p: Params) -> Dict[str, str]:
@@ -160,7 +163,8 @@ def _new_values(settings: dict, now: dict, p: Params) -> Dict[str, str]:
     new: Dict[str, str] = {}
     current = lambda name: now.get(name, {}).get("value")
     if "fan_in" in settings or "client_id" in settings:
-        filled = render_sql(settings.get("client_id") or current("client_id") or "{database}", p)
+        filled = render_sql(settings.get("client_id") or current("client_id")
+                            or js.default_client_id(current("fan_in")), p)
         if "fan_in" in settings:
             new["client_id"] = filled if settings["fan_in"] else "null::text"
         else:
@@ -176,11 +180,10 @@ def _new_values(settings: dict, now: dict, p: Params) -> Dict[str, str]:
     if "freshness_sla_minutes" in settings:
         value = settings["freshness_sla_minutes"]
         new["freshness_sla_minutes"] = f"{p.add(None if value in (None, '') else int(value))}::int"
-    lowercase = settings.get("lowercase", current("lowercase") if current("lowercase") is not None else True)
     for field, _ in js.TARGET_SETTINGS:
-        template = settings.get(field) or (current(field) if "lowercase" in settings else None)
+        template = settings.get(field)
         if template:
-            new[field] = render_sql(template, p, target=True, lowercase=lowercase)
+            new[field] = render_sql(template, p, target=True, unity_catalog=bool(current("unity_catalog")))
     if "identity" in settings:
         new["client_attrs"] = _attrs_sql(settings["identity"] or {}, p)
     return new

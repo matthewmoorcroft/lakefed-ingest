@@ -333,7 +333,7 @@ create table if not exists lakefed_ingest.ingest_run (
     parallelism     int,
     started_at      timestamptz not null default now(),
     finished_at     timestamptz,
-    status          text        not null default 'running',   -- running | completed | failed | skipped
+    status          text        not null default 'running',   -- running | completed | failed | skipped | cancelled
     total           int,
     ok              int,
     failed          int,
@@ -365,7 +365,7 @@ create table if not exists lakefed_ingest.ingest_event (
     action          text,                                     -- seed | increment | reseed | full
     phase           text,
     stage           text,                                     -- plan | detect | ensure_sink | read | seed | merge | load | checkpoint
-    status          text        not null default 'running',   -- running | ok | failed | skipped | retried (an attempt tried again)
+    status          text        not null default 'running',   -- running | ok | failed | skipped | retried (an attempt tried again) | cancelled
     started_at      timestamptz not null default now(),
     finished_at     timestamptz,
     duration_ms     bigint,
@@ -383,6 +383,10 @@ alter table lakefed_ingest.ingest_event alter column position_from type text usi
 alter table lakefed_ingest.ingest_event alter column position_to type text using position_to::text;
 -- Phase 'cdc' was renamed 'incremental' (see checkpoint above); keep history consistent.
 update lakefed_ingest.ingest_event set phase = 'incremental' where phase = 'cdc';
+-- How a failed attempt was classified (table_retry.classify: permanent | transient | unknown) and the error class it
+-- was classified by (its Spark error class, else its exception type). The operations app's failing-tables list reads them.
+alter table lakefed_ingest.ingest_event add column if not exists error_kind text;
+alter table lakefed_ingest.ingest_event add column if not exists error_class text;
 
 create index if not exists ingest_event_run_idx
     on lakefed_ingest.ingest_event (run_id);
@@ -400,6 +404,10 @@ create index if not exists ingest_event_failed_time_idx
 create index if not exists ingest_event_first_load_idx
     on lakefed_ingest.ingest_event (task_collection, control_id, finished_at)
     where status = 'ok' and action in ('seed', 'reseed', 'full');
+-- The failing-tables read looks up one table's last ok event and its failures by control_id and started_at. Not partial,
+-- so the ok lookup (status = 'ok') and the failures lookup (status = 'failed') both use it.
+create index if not exists ingest_event_control_started_idx
+    on lakefed_ingest.ingest_event (control_id, started_at);
 
 -- NOTE: the two-level controller/batching was removed — one run ingests a whole task_collection in
 -- one task (see ingest.ipynb), so there is no `task_batch` table. A `task_batch` left over from an
@@ -620,6 +628,10 @@ create table if not exists lakefed_ingest.databricks_run (
 create index if not exists databricks_run_job_started_idx
     on lakefed_ingest.databricks_run (job_id, started_at desc);
 
+-- Cancel (schema 15): when the app's Cancel run asked Databricks to stop this run, and when (null otherwise). The
+-- engine and the poller read it to tell a load stopped by a cancel from a failure, and to close the run as cancelled.
+alter table lakefed_ingest.databricks_run add column if not exists cancel_requested_at timestamptz;
+
 -- Monitoring rollups (the operations app's pages read these, not a scan of control). One row per database and
 -- ingestion group, rewritten from the database's own rows as its work ends (state_store.StateStore.rewrite_rollups)
 -- and by the app's edits, in the same transaction. A database with no rows left is zeroed, not deleted, and the
@@ -666,3 +678,37 @@ create table if not exists lakefed_ingest.rollup_group (
 -- A rollup rewrite reads one database's control rows by (collection, database name) instead of the whole collection.
 create index if not exists control_collection_database_idx
     on lakefed_ingest.control (task_collection, (coalesce(src_database, '')));
+
+-- A JDBC connection the operations app's users entered by hand (app/src/jdbc_connections.py): a host and port, and the
+-- secret scope and key an admin created beforehand, the secret itself never stored here. A discovery and an ingestion
+-- job made through it carry the scope and trust as job parameters, so the engine reads the source over Spark JDBC.
+-- The app writes and reads this table only (INSERT and SELECT, no UPDATE or DELETE).
+create table if not exists lakefed_ingest.jdbc_connection (
+    name                     text        primary key,
+    src_type                 text        not null,              -- sqlserver, oracle, postgresql or mysql
+    src_host                 text        not null,
+    src_port                 int         not null,
+    secret_scope             text        not null,              -- a Databricks secret scope the admin created
+    secret_key               text        not null,              -- the key in that scope; may hold {database}
+    trust_server_certificate text        not null default 'false',
+    created_by               text,
+    created_at               timestamptz not null default now(),
+    constraint jdbc_connection_port_range check (src_port between 1 and 65535),
+    constraint jdbc_connection_trust_values check (trust_server_certificate in ('true', 'false'))
+);
+
+-- One row per time the operations app wrote a JDBC login into the dedicated secret scope (app/src/jdbc_logins.py): who
+-- entered it, when, and whether it replaced an earlier login for the same scope and key ('rotated'). The password is
+-- never here; it lives only in the secret. The app's role inserts and reads this table, and never deletes from it.
+create table if not exists lakefed_ingest.jdbc_login_write (
+    id           text        primary key,
+    connection   text        not null,
+    secret_scope text        not null,
+    secret_key   text        not null,
+    entered_by   text        not null,
+    entered_at   timestamptz not null default now(),
+    outcome      text        not null,
+    constraint jdbc_login_write_outcome_values check (outcome in ('saved', 'rotated'))
+);
+create index if not exists jdbc_login_write_key_idx
+    on lakefed_ingest.jdbc_login_write (secret_scope, secret_key, entered_at desc);

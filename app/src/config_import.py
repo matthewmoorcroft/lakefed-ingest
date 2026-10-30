@@ -12,6 +12,7 @@ from collections import Counter
 from itertools import product
 from typing import Dict, List, Optional
 
+import job_settings as js
 import queries as q
 
 # The CSV's columns, in export order. Per-line attribute columns are "attr:<sink column>".
@@ -113,7 +114,8 @@ def effective_settings(given: dict, group_rows: List[dict]):
     """(settings, errors): each setting as given for this import, else the group's shared value, else its default.
     A required setting nobody gave, or one the group's rows differ on, is an error naming it."""
     shared = group_settings(group_rows)
-    settings, errors = {}, [f"unknown setting {name}" for name in given if name not in SETTINGS]
+    settings = {}
+    errors = [f"unknown setting {name}" for name in given if name not in SETTINGS and name not in js.RETIRED_SETTINGS]
     for name in SETTINGS:
         if name in given and not (_blank(given[name]) and name in REQUIRED_SETTINGS):
             settings[name] = given[name]
@@ -143,7 +145,7 @@ def _header_errors(header: List[str]) -> List[str]:
     return errors
 
 
-def _row(line: dict, group: str, settings: dict) -> dict:
+def _row(line: dict, group: str, settings: dict, unity_catalog: bool = False) -> dict:
     database, schema, table = (line.get(k, "").strip() for k in ("src_database", "src_schema", "src_table"))
     # Identity values are written as given (the sink keeps them as text); a blank one is null, never dropped.
     attrs = {k[len(ATTR_PREFIX):]: (None if v == "" else v) for k, v in line.items() if k.startswith(ATTR_PREFIX)}
@@ -155,7 +157,7 @@ def _row(line: dict, group: str, settings: dict) -> dict:
         "client_attrs": json.dumps(attrs) if attrs else None,
     })
     for name in SINK_SETTINGS:
-        row[name] = q.render(settings[name], database, schema, table)
+        row[name] = q.render(settings[name], database, schema, table, unity_catalog=unity_catalog)
     if row["src_port"] is not None and row["src_port"].isdigit():
         row["src_port"] = int(row["src_port"])
     return row
@@ -186,7 +188,7 @@ def _lines_within(rows, max_lines: int) -> Optional[List[dict]]:
 
 
 def plan_import(text: str, group: str, given: dict, group_rows: List[dict], max_lines: int = MAX_LINES,
-                check_rows: bool = True) -> dict:
+                check_rows: bool = True, unity_catalog: bool = False) -> dict:
     """What importing this CSV into the group would write: {"errors": the file's own problems, "lines": one per
     line, with its file line number, the control row it makes, its status (valid, invalid or registered, for a
     table the group already has) and its errors}. Nothing is valid while the file has errors. check_rows=False leaves
@@ -208,13 +210,16 @@ def plan_import(text: str, group: str, given: dict, group_rows: List[dict], max_
     settings, errors = effective_settings(given, group_rows)
     if errors:
         return {"errors": errors, "lines": [], "settings": settings}
+    typed = js.typed_name_errors(settings, unity_catalog)
+    if typed:
+        return {"errors": typed, "lines": [], "settings": settings}
     have = {(".".join(_text(r.get(k)).lower() for k in SINK_SETTINGS), _text(r.get("client_id"))) for r in group_rows}
     seen: Dict[tuple, int] = {}
     out = []
     for number, line in enumerate(lines, start=2):
         surplus = None in line
         line = {k: v or "" for k, v in line.items() if k is not None}
-        row = _row(line, group, settings)
+        row = _row(line, group, settings, unity_catalog)
         problems = ["this line has more cells than the header has columns"] if surplus else []
         pinned = line.get("task_collection", "").strip()
         if pinned and pinned != group:

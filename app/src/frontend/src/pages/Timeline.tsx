@@ -2,7 +2,7 @@ import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { useNavigate } from "react-router-dom";
 import { api, qs, type Row } from "../api";
-import { PageHead, readAt, ErrorBox, Notice, fmtDuration, fmtTime, jobRunName, jobRunPath, plural, statusName, useWidth, usePageStamp } from "../components";
+import { PageHead, readAt, ErrorBox, Notice, fmtDuration, fmtTime, isLiveOutcome, jobRunName, jobRunPath, plural, statusName, useWidth, usePageStamp } from "../components";
 
 // One lane per ingestion job, as the Jobs UI's run timeline: each ingestion run a bar from its first group run's start to
 // its last one's finish, coloured by its outcome, opening the ingestion run; its groups on hover. Planned triggers are
@@ -18,7 +18,7 @@ const GROUP_RUN: Record<string, string> = { completed: TONE.ok, failed: TONE.bad
 const groupsText = (run: Row) => (run.groups ?? []).map((g: Row) => `${g.group}: ${g.status ? statusName(g.status) : "did not run"}`).join("\n");
 
 function runTitle(lane: Lane, run: Row) {
-  const span = run.started_at ? `${fmtTime(run.started_at)} – ${run.outcome.label === "Running" ? "running" : fmtTime(run.ended_at)}` : "did not run";
+  const span = run.started_at ? `${fmtTime(run.started_at)} – ${isLiveOutcome(run.outcome.label) ? "running" : fmtTime(run.ended_at)}` : "did not run";
   return [jobRunName(lane.name, run.slot), `${run.outcome.label}${run.outcome.note ? ` (${run.outcome.note})` : ""}`, span,
     run.took_s != null ? `took ${fmtDuration(run.took_s)}` : "",
     Number(run.failed_tables) > 0 ? `${run.failed_tables} ${plural(run.failed_tables, "table")} failed` : "",
@@ -104,7 +104,7 @@ export default function TimelinePage() {
                     style={{ stroke: "var(--db-border-strong, #9aa5b1)" }} />)}
                   {lane.runs.map((run) => {
                     const open = () => navigate(jobRunPath(lane.job_id, run.slot));
-                    if (!run.started_at && run.outcome.label !== "Running") {
+                    if (!run.started_at && !isLiveOutcome(run.outcome.label)) {
                       return <circle key={run.slot} cx={Math.max(LABEL_W + 4, x(run.slot))} cy={y + ROW_H / 2} r={4} className="hollow-mark"
                         onClick={open}><title>{runTitle(lane, run)}</title></circle>;
                     }

@@ -2,7 +2,7 @@
 // strips the types in pending.ts as it loads it). frontend_pending_test.py runs this file from pytest.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { changeInProgress, connectionFailure, connectionNextBlock, connectionNextLabel, deleteNotice, longWait, readsDone, waitLine, isUnconfirmed, requestWriteNotice, runButton, runTimeoutNotice, rediscoveryBusy, rediscoveryButton, rediscoveryNotice, saveNotice, syncFailureLines }
+import { changeInProgress, connectionFailure, connectionNextBlock, connectionNextLabel, daysLeftText, deleteNotice, longWait, readsDone, waitLine, isUnconfirmed, requestWriteNotice, runButton, runTimeoutNotice, rediscoveryBusy, rediscoveryButton, rediscoveryNotice, saveNotice, syncFailureLines }
   from "../../src/frontend/src/pending.ts";
 
 const IDLE = { phase: "idle", timed_out: false, run_url: null, blocked: null, refused: null };
@@ -115,37 +115,52 @@ test("the button stays off after a timeout until Databricks reports the change",
 });
 
 test("no delete notice for a job that is not deleted", () => {
-  assert.equal(deleteNotice(undefined), null);
-  assert.equal(deleteNotice(null), null);
+  assert.equal(deleteNotice(undefined, "1 Nov"), null);
+  assert.equal(deleteNotice(null, "1 Nov"), null);
 });
 
-test("a deleting job says it is deleting, offers no Run again, and is not a failure", () => {
-  const notice = deleteNotice({ state: "deleting", reason: null, run_again: false, run: null });
+test("a kept job says when it is kept until and how many days are left", () => {
+  const notice = deleteNotice({ state: "kept", days_left: 5, expires_at: "2026-11-05T10:00:00Z" }, "5 Nov, 10:00");
   assert.equal(notice.tone, "info");
-  assert.equal(notice.runAgain, false);
+  assert.equal(notice.text, "Kept until 5 Nov, 10:00, 5 days left.");
+});
+
+test("a kept job with one day left says day in the singular", () => {
+  const notice = deleteNotice({ state: "kept", days_left: 1 }, "5 Nov");
+  assert.equal(notice.text, "Kept until 5 Nov, 1 day left.");
+});
+
+test("a kept job due for purge says the daily purge deletes it next", () => {
+  const notice = deleteNotice({ state: "kept", days_left: 0 }, "5 Nov");
+  assert.equal(notice.text, "Kept until 5 Nov. Due for purge: the daily purge deletes it next.");
+});
+
+test("a deleting job says it is deleting, and is not a failure", () => {
+  const notice = deleteNotice({ state: "deleting", reason: null, run: null }, "5 Nov");
+  assert.equal(notice.tone, "info");
   assert.equal(notice.text, "Deleting");
 });
 
-test("a failed delete shows its reason and offers Run again when the server says so", () => {
-  const notice = deleteNotice({ state: "failed", reason: "table x would not drop", run_again: true });
+test("a failed delete shows its reason and says Delete now runs it again", () => {
+  const notice = deleteNotice({ state: "failed", reason: "table x would not drop" }, "5 Nov");
   assert.equal(notice.tone, "bad");
-  assert.equal(notice.text, "Delete failed. table x would not drop");
-  assert.equal(notice.runAgain, true);
+  assert.equal(notice.text, "Delete failed. table x would not drop Delete now runs it again.");
 });
 
-test("a failed delete with no tables left shows the failure without Run again", () => {
-  const notice = deleteNotice({ state: "failed", reason: "the delete job ended INTERNAL_ERROR", run_again: false });
-  assert.equal(notice.runAgain, false);
-  assert.equal(notice.tone, "bad");
+test("a failed delete with no reason still says it failed, and offers Delete now", () => {
+  const notice = deleteNotice({ state: "failed", reason: null }, "5 Nov");
+  assert.equal(notice.text, "Delete failed. Delete now runs it again.");
 });
 
-test("a failed delete with no reason still says it failed", () => {
-  const notice = deleteNotice({ state: "failed", reason: null, run_again: true });
-  assert.equal(notice.text, "Delete failed.");
+test("a state the page does not know has no notice", () => {
+  assert.equal(deleteNotice({ state: "gone", reason: null }, "5 Nov"), null);
 });
 
-test("a gone delete has no notice: the job has left the list", () => {
-  assert.equal(deleteNotice({ state: "gone", reason: null, run_again: false }), null);
+test("days left reads as a count, or as due for purge at zero", () => {
+  assert.equal(daysLeftText(7), "7 days left");
+  assert.equal(daysLeftText(1), "1 day left");
+  assert.equal(daysLeftText(0), "Due for purge");
+  assert.equal(daysLeftText(-3), "Due for purge");
 });
 
 test("a write sent as one request is pending until its answer, which comes after its jobs are synced", () => {

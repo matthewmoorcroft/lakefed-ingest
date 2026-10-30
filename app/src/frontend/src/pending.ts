@@ -19,9 +19,9 @@ export interface RunNowState {
 export interface DeleteState {
   state: string;
   reason?: string | null;
-  run_again?: boolean;
-  drop_targets?: boolean;
   run?: { url?: string | null } | null;
+  expires_at?: string | null;
+  days_left?: number;
 }
 
 export interface ButtonState {
@@ -68,16 +68,28 @@ export function runTimeoutNotice(runNow: RunNowState | undefined): string | null
   return `Databricks has not confirmed that the run started after ${START_CONFIRM_MINUTES} minutes: it is still listed as starting, so Run now stays off until Databricks reports it running or ended.${open}`;
 }
 
-/** The notice for a deleted job whose Delete is pending or failed, with whether Run again is offered; null when the
- * job is not deleted (or its delete is finished, when it has left the list). */
-export function deleteNotice(deleteState: DeleteState | null | undefined): { tone: "info" | "bad"; text: string; runAgain: boolean } | null {
+/** How many days a deleted job has before the daily purge deletes it, in words for a list row. */
+export function daysLeftText(daysLeft: number): string {
+  return daysLeft <= 0 ? "Due for purge" : `${daysLeft} ${daysLeft === 1 ? "day" : "days"} left`;
+}
+
+/** The notice for a deleted job: kept until the purge, its purge running, or its purge failed. `expiresText` is the
+ * formatted date the job is kept until. Null when the job is not deleted. */
+export function deleteNotice(deleteState: DeleteState | null | undefined,
+                             expiresText: string): { tone: "info" | "bad"; text: string } | null {
   if (!deleteState) return null;
+  if (deleteState.state === "kept") {
+    const daysLeft = deleteState.days_left ?? 0;
+    const dueText = daysLeft <= 0 ? `Kept until ${expiresText}. Due for purge: the daily purge deletes it next.`
+      : `Kept until ${expiresText}, ${daysLeftText(daysLeft)}.`;
+    return { tone: "info", text: dueText };
+  }
   if (deleteState.state === "deleting") {
-    return { tone: "info", text: "Deleting", runAgain: false };
+    return { tone: "info", text: "Deleting" };
   }
   if (deleteState.state === "failed") {
     const why = deleteState.reason ? ` ${deleteState.reason}` : "";
-    return { tone: "bad", text: `Delete failed.${why}`, runAgain: !!deleteState.run_again };
+    return { tone: "bad", text: `Delete failed.${why} Delete now runs it again.` };
   }
   return null;
 }

@@ -37,12 +37,15 @@ export function stateParts(row: StateCounts): { parts: BarPart[]; lateDatabases?
 }
 
 /** A table row's counts: "980 of 1,002 loaded · 12 late · 10 failing", only the states it has. A card's (full):
- * every state, "100,200 loaded · 0 late databases · 0 waiting · 0 failing". All loaded: "All 1,002 loaded". */
-export function stateSummary(row: StateCounts, full = false): BarSummary {
+ * every state, "100,200 loaded · 0 late databases · 0 waiting · 0 failing". All loaded: "All 1,002 loaded", unless
+ * saysAllDone is false (the jobs lists), which counts it as "1,002 of 1,002 loaded". */
+export function stateSummary(row: StateCounts, full = false, saysAllDone = true): BarSummary {
   const { parts, lateDatabases } = stateParts(row);
   const total = parts.reduce((sum, part) => sum + part.count, 0);
   const [loaded, ...rest] = parts;
-  if (total > 0 && loaded.count === total && !lateDatabases) return { allDone: `All ${count(total)} loaded`, items: [] };
+  if (saysAllDone && total > 0 && loaded.count === total && !lateDatabases) {
+    return { allDone: `All ${count(total)} loaded`, items: [] };
+  }
   const late: CountItem[] = lateDatabases === undefined || (!lateDatabases && !full) ? []
     : [{ text: `${count(lateDatabases)} late ${lateDatabases === 1 ? "database" : "databases"}`, tone: lateDatabases ? "late" : "zero" }];
   const head: CountItem = full ? item(loaded)

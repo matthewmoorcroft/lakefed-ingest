@@ -10,7 +10,7 @@ from typing import Dict, Iterable, List, Optional, Tuple, Union
 
 TABLES_PER_GROUP = 10_000
 # A remainder of up to this share of a group joins the other groups instead of making a group of its own: 100,200
-# tables make 8 groups, not 9.
+# tables make 10 groups, not 11, and 101,500 make 11.
 REMAINDER_SHARE = 0.1
 
 

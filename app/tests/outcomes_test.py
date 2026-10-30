@@ -125,3 +125,16 @@ def test_a_member_its_check_found_unchanged_completes_and_a_check_going_keeps_th
     assert (outcome["label"], outcome["note"]) == ("Succeeded", "1 of 2 group runs, 1 unchanged")
     assert q.job_run_outcome([unchanged, _member("unchanged", group="c")])["label"] == "Succeeded"
     assert q.job_run_outcome([done, _member("checking", group="b")])["label"] == "Running"
+
+
+def test_a_job_run_with_a_cancel_not_closed_yet_reads_cancelling_whatever_its_other_members_do():
+    asked = _member("run", dict(status="running", cancelling=True))
+    assert q.job_run_outcome([asked])["label"] == "Cancelling"
+    assert q.job_run_outcome([_member("run", dict(status="running")), asked])["label"] == "Cancelling"
+    assert q.job_run_outcome([_member("waiting"), asked])["label"] == "Cancelling"
+
+
+def test_a_job_run_whose_cancelled_group_run_is_closed_reads_cancelled():
+    closed = _member("run", dict(status="cancelled", job_run_id="8"))
+    assert q.job_run_outcome([_member("run", dict(status="running")), closed])["label"] == "Running"
+    assert q.job_run_outcome([closed])["label"] == "Cancelled"

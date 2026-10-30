@@ -24,13 +24,16 @@ def _open(run_id, collection, job_run_id, started=NOW):
 
 def _reconcile(monkeypatch, open_runs, states):
     """_close_ended_runs over open_runs, with each Databricks run's state from states (an exception is raised);
-    returns how many it closed and the closes it wrote, as (run_id, detail)."""
+    returns how many it closed and the closes it wrote, as (run_id, detail, status)."""
     writes, read = [], []
 
     class Cur:
         def execute(self, sql, params=()):
-            assert sql == q.close_ended_run_sql()
-            writes.append((params[1], json.loads(params[0])))
+            if sql == q.close_cancelled_run_sql():
+                writes.append((params[2], json.loads(params[1]), "cancelled"))
+            else:
+                assert sql == q.close_ended_run_sql()
+                writes.append((params[1], json.loads(params[0]), "failed"))
 
     def run_ended(run_id):
         read.append(run_id)
@@ -45,15 +48,21 @@ def _reconcile(monkeypatch, open_runs, states):
     return main._close_ended_runs(), writes, read
 
 
-def test_a_run_whose_databricks_run_ended_is_closed_with_how_it_ended(monkeypatch):
+def test_a_run_whose_databricks_run_ended_cancelled_is_closed_as_cancelled_with_how_it_ended(monkeypatch):
     ended = {"state": "TERMINATED", "result": "CANCELED", "message": "cancelled by a user", "ended": "2026-10-29T14:30:00+00:00"}
     closed, writes, _ = _reconcile(monkeypatch, [_open(7, "c1", "650")], {"650": ended})
-    assert closed == 1 and [w[0] for w in writes] == [7]
+    assert closed == 1 and [(w[0], w[2]) for w in writes] == [(7, "cancelled")]
     detail = writes[0][1]
     assert detail["closed_by_app"] == "reconcile" and detail["databricks_run"] == 650
     assert detail["databricks_state"] == "TERMINATED" and detail["databricks_result"] == "CANCELED"
-    assert detail["reason"] == ("its Databricks run ended CANCELED at 2026-10-29T14:30:00+00:00 without finishing "
-                                "(cancelled by a user)")
+    assert detail["reason"] == "cancelled, and its Databricks run ended CANCELED at 2026-10-29T14:30:00+00:00"
+
+
+def test_a_run_whose_databricks_run_failed_is_still_closed_as_failed(monkeypatch):
+    ended = {"state": "INTERNAL_ERROR", "result": None, "message": "lost", "ended": None}
+    closed, writes, _ = _reconcile(monkeypatch, [_open(7, "c1", "650")], {"650": ended})
+    assert closed == 1 and [(w[0], w[2]) for w in writes] == [(7, "failed")]
+    assert writes[0][1]["reason"] == "its Databricks run ended INTERNAL_ERROR without finishing (lost)"
 
 
 def test_a_run_still_going_unreadable_or_with_no_job_run_is_left_running(monkeypatch):
@@ -76,7 +85,7 @@ def test_a_run_databricks_does_not_know_is_closed_only_once_it_is_a_day_old(monk
 
 def test_a_failing_reconcile_still_lets_the_pages_read_what_is_running(monkeypatch):
     main._forget_shared_reads()
-    monkeypatch.setattr(main, "_close_ended_runs", lambda user=None: (_ for _ in ()).throw(RuntimeError("db down")))
+    monkeypatch.setattr(main, "_close_ended_runs", lambda: (_ for _ in ()).throw(RuntimeError("db down")))
     monkeypatch.setattr(main.db, "query", lambda sql, params=(): [{"run_id": 1}] if sql == q.running_progress_sql() else [])
     assert main._running() == [{"run_id": 1}]
     main._forget_shared_reads()
@@ -143,8 +152,8 @@ def _stop_setup(api, monkeypatch, recorded=(), states=None):  # noqa: F811
         return [dict(r) for r in recorded] if sql == q.open_runs_sql() else real_query(sql, params)
 
     def run(sql, params):
-        if sql == q.close_ended_run_sql():
-            closes.append((params[1], json.loads(params[0])))
+        if sql in (q.close_ended_run_sql(), q.close_cancelled_run_sql()):
+            closes.append((params[1] if sql == q.close_ended_run_sql() else params[2], sql))
             return [(1, 0)]
         return real_run(sql, params)
     monkeypatch.setattr(main.db, "query", query)
@@ -152,7 +161,7 @@ def _stop_setup(api, monkeypatch, recorded=(), states=None):  # noqa: F811
     return sid, cancelled, closes
 
 
-def test_cancel_run_cancels_the_jobs_wrappers_and_its_groups_runs_and_closes_their_records(api, monkeypatch):  # noqa: F811
+def test_cancel_run_cancels_the_jobs_wrappers_and_its_groups_runs_and_leaves_their_records_for_the_poller(api, monkeypatch):  # noqa: F811
     sid, cancelled, closes = _stop_setup(api, monkeypatch, recorded=[_open(41, "c1", "11"), _open(42, "other", "13")])
     wrapper = int(next(m["job_id"] for m in api.store.members.values() if m["task_collection"] == "c1"))
     api.active_runs[wrapper] = [_going(4)]
@@ -163,14 +172,13 @@ def test_cancel_run_cancels_the_jobs_wrappers_and_its_groups_runs_and_closes_the
     assert sorted(cancelled) == [4, 11, 12]                       # not another job's group, nor a run already over
     body = r.json()
     assert sorted((c["kind"], c["run_id"]) for c in body["cancelled"]) == [("group", 11), ("group", 12), ("wrapper", 4)]
-    assert body["closed"] == 1 and body["errors"] == []
-    assert [c[0] for c in closes] == [41]
-    assert closes[0][1] == {"closed_by_app": "op@example.com", "reason": "stopped from the app by op@example.com"}
+    assert body["errors"] == [] and "closed" not in body
+    assert closes == []                                           # the poller closes each record once Databricks ends it
     stops = [p for p in api.store.log if p[1] == "job_stop"]
     assert sorted(p[3] for p in stops) == ["c1", "c2"] and len({p[-1] for p in stops}) == 1     # one batch
 
 
-def test_cancel_run_while_every_group_loads_closes_each_record_with_a_statement_postgres_can_type(api, monkeypatch):  # noqa: F811
+def test_cancel_run_while_every_group_loads_cancels_each_group_run_and_its_close_statements_postgres_can_type(api, monkeypatch):  # noqa: F811
     # The 29 Oct sequence: every group of the job loading, Cancel run, Databricks then reporting each run cancelled.
     # The store refuses a statement as Postgres does when a parameter can't be typed, so an untyped one fails here.
     from sql_parameter_types_test import untyped_parameters
@@ -185,9 +193,10 @@ def test_cancel_run_while_every_group_loads_closes_each_record_with_a_statement_
     api.active_runs[555] = [_going(21, task_collection="c1"), _going(22, task_collection="c2")]
     r = api.post(f"/api/ingestion-jobs/{sid}/stop")
     assert r.status_code == 200, r.text
-    assert sorted(cancelled) == [21, 22] and r.json()["closed"] == 2 and sorted(c[0] for c in closes) == [65, 66]
-    # The reconcile, once Databricks reports them over, runs the same statement: it must be one Postgres can type too.
-    assert untyped_parameters(q.close_ended_run_sql()) == []
+    assert sorted(cancelled) == [21, 22] and closes == []
+    # The poller closes them once Databricks reports them over, with these statements: each must be one Postgres can type.
+    assert untyped_parameters(q.close_cancelled_run_sql()) == [] and untyped_parameters(q.close_ended_run_sql()) == []
+    assert untyped_parameters(q.mark_cancel_requested_sql()) == []
 
 
 def test_cancel_run_on_a_check_job_cancels_its_check_run_too_but_not_another_jobs(api, monkeypatch):  # noqa: F811
@@ -202,14 +211,13 @@ def test_cancel_run_on_a_check_job_cancels_its_check_run_too_but_not_another_job
     assert sorted(cancelled) == [5, 11] and sorted(c["kind"] for c in body["cancelled"]) == ["check", "group"]
 
 
-def test_cancel_run_also_stops_a_recorded_run_the_list_missed_and_never_closes_one_it_could_not_stop(api, monkeypatch):  # noqa: F811
+def test_cancel_run_also_stops_a_recorded_run_the_list_missed_and_skips_one_already_over(api, monkeypatch):  # noqa: F811
     ended = {"state": "TERMINATED", "result": "CANCELED", "message": None, "ended": None}
     recorded = [_open(51, "c1", "77"), _open(52, "c2", "78"), _open(53, "c2", "79")]
     sid, cancelled, closes = _stop_setup(api, monkeypatch, recorded, {"77": None, "78": ended, "79": RuntimeError("503")})
     body = api.post(f"/api/ingestion-jobs/{sid}/stop").json()
     assert cancelled == [77] and [(c["kind"], c["task_collection"]) for c in body["cancelled"]] == [("group", "c1")]
-    assert sorted(c[0] for c in closes) == [51, 52] and body["closed"] == 2      # not 53: its run may still be going
-    assert body["errors"] == ["run 79: 503"]
+    assert closes == [] and body["errors"] == ["run 79: 503"]
 
 
 def test_cancel_run_reports_a_run_it_could_not_cancel_and_still_stops_the_others(api, monkeypatch):  # noqa: F811
@@ -224,7 +232,7 @@ def test_cancel_run_reports_a_run_it_could_not_cancel_and_still_stops_the_others
     body = api.post(f"/api/ingestion-jobs/{sid}/stop").json()
     assert cancelled == [12] and [c["run_id"] for c in body["cancelled"]] == [12]
     assert body["errors"] == ["run 11: Run 11 is already in a terminal state"]
-    assert [c[0] for c in closes] == [42]                         # 41's run wasn't cancelled: its record stays running
+    assert closes == []                                           # 41's run wasn't cancelled: its record stays running
 
 
 def test_cancel_run_with_nothing_going_is_refused(api, monkeypatch):  # noqa: F811
@@ -266,8 +274,8 @@ def test_run_now_opens_again_once_the_app_has_closed_a_stale_run_and_stays_refus
         return real_query(sql, params)
 
     def run(sql, params):
-        if sql == q.close_ended_run_sql():
-            records[params[1]]["status"] = "failed"
+        if sql == q.close_cancelled_run_sql():
+            records[params[2]]["status"] = "cancelled"
             return [(1, 0)]
         return real_run(sql, params)
     monkeypatch.setattr(main.db, "query", query)
@@ -280,6 +288,6 @@ def test_run_now_opens_again_once_the_app_has_closed_a_stale_run_and_stays_refus
     main._forget_shared_reads()
     r = api.post(f"/api/ingestion-jobs/{sid}/run")
     assert r.status_code == 200, r.text
-    assert records[7]["status"] == "failed" and len(started) == 2
+    assert records[7]["status"] == "cancelled" and len(started) == 2
     main._forget_shared_reads()
 

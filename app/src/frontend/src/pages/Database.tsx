@@ -3,7 +3,7 @@ import { useQuery } from "@tanstack/react-query";
 import { Link, useParams } from "react-router-dom";
 import { api, qs, type Row } from "../api";
 import {
-  Crumbs, ErrorBox, FillBox, PageHead, Pager, Section, Stamp, StateBar, StateKey, Tag, fmtAgo, fmtDuration, fmtInt, plural, type Tone
+  Crumbs, ErrorBox, FillBox, Info, PageHead, Pager, Section, Stamp, StateKey, StateSummary, Tag, fmtAgo, fmtDuration, fmtInt, plural, type Tone
 } from "../components";
 
 const STATE_TONE: Record<string, Tone> = { failing: "bad", "first load": "first", late: "warn", current: "ok", disabled: "" };
@@ -45,7 +45,8 @@ export default function Database() {
       <ErrorBox error={found.error} />
       {d && (
         <div className="metrics">
-          <div className="metric"><div className="metric-label">Tables now</div><StateBar row={d} full /></div>
+          <div className="metric"><div className="metric-label">Tables now <Info>Loaded counts late tables too. A database is late when one of its tables is past its freshness target.</Info></div>
+            <StateSummary row={d} looksGood /></div>
         </div>
       )}
       <Section title="Tables" note={running ? "Failing first, then in flight, then to go, then the rest. Its part in the group run going now." : "Failing first, then by name."}

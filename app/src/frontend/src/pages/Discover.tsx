@@ -1,9 +1,10 @@
 import { Fragment, useEffect, useRef, useState } from "react";
 import { keepPreviousData, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, qs, type Row } from "../api";
-import { Busy, ErrorBox, Info, Modal, Notice, OutLink, Pager, Spinner, Tag, Tip, fmtInt, plural, Twisty, useNow } from "../components";
+import { Busy, ErrorBox, Info, Modal, Notice, Pager, Spinner, Tag, Tip, fmtInt, plural, Twisty, useNow } from "../components";
 import { useSettings } from "../App";
 import { DatabaseTables } from "./SourcePick";
+import { CreateConnectionChoices } from "./CreateConnectionChoices";
 import { accessOf, countsText, likeContaining, readable, selectionCounts, serverRowPick, underFilter, type Pick, type ServerCount } from "./pickState";
 import { connectionFailure, connectionNextBlock, connectionNextLabel, readsDone, waitLine, type ErrorCodes } from "../pending";
 
@@ -239,16 +240,11 @@ function Step1({ chosen, setChosen, tested, setTested, testing, error, setError,
           {error != null && cantList(error) && <TypedDatabases onUse={(names) => { setError(null); setTested({ discovery_id: null, databases: names, typed: true }); }} />}
         </div>
       )}
-      <label className="radio-row"><input type="radio" checked={how === "create"} onChange={() => setHow("create")} /> Create a connection</label>
+      <label className="radio-row"><input type="radio" checked={how === "create"} onChange={() => setHow("create")} /> Create a connection
+        <Info label="What a new connection needs">A connection is made in Catalog Explorer, with its name, type, host, port, user and
+          password. Making it needs CREATE CONNECTION on the metastore, and this app needs USE CONNECTION on it.</Info></label>
       {how === "create" && (
-        <div className="radio-body">
-          <p>A connection is made in Catalog Explorer, with its name, type, host, port, user and password, and needs CREATE
-            CONNECTION on the metastore. Make it there, give this app USE CONNECTION on it, then come back and choose it above.</p>
-          <div className="toolbar">
-            {config?.workspace_url && <OutLink href={`${config.workspace_url}/explore/connections`}>Open Connections in Catalog Explorer</OutLink>}
-            <button className="ghost" disabled={refreshing} onClick={() => { refresh(); setHow("existing"); }}>I made it: refresh the list</button>
-          </div>
-        </div>
+        <CreateConnectionChoices workspaceUrl={config?.workspace_url} refreshing={refreshing} onRefresh={() => { refresh(); setHow("existing"); }} />
       )}
     </>
   );

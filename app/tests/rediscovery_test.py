@@ -115,6 +115,36 @@ def test_a_database_the_discovery_did_not_read_is_not_judged_vanished():
     assert picked["vanished"] == []
 
 
+def test_a_removed_table_is_not_added_back_by_a_whole_server_or_a_whole_database():
+    excluded = {rd.table_key("h1", "eng_001", "dbo", "t2")}
+    picked = rd.wanted([server_part("")], FOUND, STATUSES, [job_row("eng_001", "t1")], excluded)
+    assert [table_of(r) for r in picked["add"]] == [("eng_002", "t1"), ("prod_001", "t1")]
+    picked = rd.wanted([database_part("eng_001")], FOUND, STATUSES, [job_row("eng_001", "t1")], excluded)
+    assert picked["add"] == [] and picked["new_databases"] == []
+
+
+def test_a_database_whose_only_new_tables_were_removed_is_not_new():
+    excluded = {rd.table_key("h1", "eng_002", "dbo", "t1"), rd.table_key("h1", "prod_001", "dbo", "t1")}
+    picked = rd.wanted([server_part("")], FOUND, STATUSES, [job_row("eng_001", "t1"), job_row("eng_001", "t2")],
+                       excluded)
+    assert picked["add"] == [] and picked["new_databases"] == []
+
+
+def test_a_new_database_takes_its_tables_that_were_not_removed():
+    found = FOUND + [found_row("eng_002", "t2")]
+    excluded = {rd.table_key("h1", "eng_002", "dbo", "t1")}
+    picked = rd.wanted([server_part("")], found, STATUSES, [job_row("eng_001", "t1"), job_row("eng_001", "t2")],
+                       excluded)
+    assert [table_of(r) for r in picked["add"]] == [("eng_002", "t2"), ("prod_001", "t1")]
+    assert picked["new_databases"] == ["h1/eng_002", "h1/prod_001"]
+
+
+def test_specific_tables_still_add_nothing_when_a_removed_table_is_among_them():
+    excluded = {rd.table_key("h1", "eng_001", "dbo", "t1")}
+    picked = rd.wanted([tables_part("eng_001", ["t1"])], FOUND, STATUSES, [], excluded)
+    assert picked["add"] == [] and picked["new_databases"] == []
+
+
 # ---- the discovery specs that read each server again ---------------------------------------------------------------
 
 def test_a_connection_server_reads_again_as_a_whole_server_with_its_pattern():
@@ -193,13 +223,33 @@ def test_a_run_that_meets_a_running_group_is_deferred_and_writes_nothing(monkeyp
     _fake_run(monkeypatch, fake, records, syncs)
 
     def running(cur, collections):
-        raise main.HTTPException(409, "ingestion group 'g1' is running; try again after the run finishes")
+        raise main._running_refusal("g1")
 
     monkeypatch.setattr(main, "_lock_collections", running)
     main._run_rediscovery(7, NOW)
     record = json.loads(records[-1][1][0])
     assert record["status"] == "deferred" and "is running" in record["error"]
     assert fake.of("insert into lakefed_ingest.control (") == []
+
+
+def test_a_clash_refusal_naming_a_job_called_running_is_failed_not_deferred(monkeypatch):
+    fake, records, syncs = FakeDB(), [], []
+    _fake_run(monkeypatch, fake, records, syncs)
+
+    def clash(cur, collections):
+        raise main.HTTPException(409, {"message": "database sales is split with the job orders running total",
+                                       "jobs": [{"id": 3, "name": "orders running total"}]})
+
+    monkeypatch.setattr(main, "_lock_collections", clash)
+    main._run_rediscovery(7, NOW)
+    record = json.loads(records[-1][1][0])
+    assert record["status"] == "failed" and "orders running total" in record["error"]
+
+
+def test_only_the_running_reason_reads_as_running():
+    assert main._refused_while_running(main._running_refusal("g1"))
+    assert not main._refused_while_running(main.HTTPException(409, "a job named running is going"))
+    assert not main._refused_while_running(main.HTTPException(422, {"reason": "running"}))
 
 
 # ---- private helpers ---------------------------------------------------------------------------------------------------
@@ -274,7 +324,10 @@ def _fake_run(monkeypatch, fake: FakeDB, records: list, syncs: list) -> None:
     """The whole run with the database faked: the job has eng_001.t1 under a whole server (filter 'eng'), and the
     discovery finds eng_002 as new. The discover job's run is started and reads as succeeded."""
     job = {"id": 7, "name": "lakefed job", "cadence_minutes": 1440, "stagger": False, "options": {}, "paused": False,
-           "job_variant": "default", "timezone": "UTC", "created_at": None, "deleted_at": None}
+           "job_variant": "default", "timezone": "UTC", "created_at": None, "deleted_at": None,
+           "created_by": "ops@example.com"}
+    # The job reads by host, so its maker must be an app manager (host_reads_test.py has the refusals).
+    monkeypatch.setattr(main, "_manage_refusal", lambda user: None if user == "ops@example.com" else "not a manager")
     members = [{"id": 1, "schedule_id": 7, "task_collection": "g1", "offset_minutes": 0, "job_id": 99,
                 "synced_at": None, "sync_error": None, "added_at": None, "removed_at": None, "delete_pending": False}]
     selection = [{"scope": "server", "server": "h1", "src_database": None, "tables": None, "filter": "eng",

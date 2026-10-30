@@ -35,11 +35,16 @@ class FakeCursor:
 
     def execute(self, sql, params=()):
         if sql == q.close_ended_run_sql():
-            self.database.closes.append((params[1], json.loads(params[0])))
-        elif sql == q.mark_terminating_sql():
+            self.database.closes.append((params[1], json.loads(params[0]), "failed"))
+        elif sql == q.close_cancelled_run_sql():
+            self.database.closes.append((params[2], json.loads(params[1]), "cancelled"))
+            self.database.close_times[params[2]] = params[0]
+        elif sql == q.mark_cancel_requested_sql():
             for run_id in params[0]:
                 if self.database.runs[run_id]["life_cycle_state"] in params[1]:
                     self.database.runs[run_id]["life_cycle_state"] = "TERMINATING"
+                    self.database.runs[run_id]["cancel_requested_at"] = self.database.runs[run_id].get(
+                        "cancel_requested_at") or self.database.clock
         else:
             raise AssertionError(f"unexpected write: {sql}")
 
@@ -49,6 +54,7 @@ class FakeDatabase:
 
     def __init__(self):
         self.runs, self.open_runs, self.writes, self.closes = {}, [], [], []
+        self.close_times, self.clock = {}, NOW.isoformat()
         self.schedules, self.members = [], []
 
     def query(self, sql, params=()):
@@ -174,9 +180,9 @@ def test_an_ingest_run_whose_databricks_run_ended_is_closed_and_one_still_going_
     lakebase.open_runs = [{"run_id": 7, "task_collection": "c1", "job_run_id": "104", "started_at": started},
                           {"run_id": 8, "task_collection": "c1", "job_run_id": "105", "started_at": started}]
     assert rp.Poller().poll_once(NOW) == {"recorded": 2, "closed": 1}
-    [(run_id, detail)] = lakebase.closes
+    [(run_id, detail, status)] = lakebase.closes
     assert run_id == 7 and detail["closed_by_app"] == "reconcile" and detail["databricks_run"] == 104
-    assert detail["databricks_result"] == "CANCELED"
+    assert detail["databricks_result"] == "CANCELED" and status == "cancelled"
 
 
 def test_a_missing_run_closes_only_after_a_day(lakebase):
@@ -185,7 +191,7 @@ def test_a_missing_run_closes_only_after_a_day(lakebase):
                           {"run_id": 2, "task_collection": "c1", "job_run_id": "202", "started_at": old}]
     lakebase.by_id = {201: LookupError("gone"), 202: LookupError("gone")}
     assert rp.Poller().poll_once(NOW) == {"recorded": 0, "closed": 1}
-    assert [run_id for run_id, _ in lakebase.closes] == [2]
+    assert [(run_id, status) for run_id, _, status in lakebase.closes] == [(2, "failed")]
 
 
 def test_wrappers_are_listed_newest_first_every_poll_and_others_only_while_active(lakebase):
@@ -199,13 +205,52 @@ def test_wrappers_are_listed_newest_first_every_poll_and_others_only_while_activ
     assert (10, True, rp.GROUP_LIMIT) in lakebase.listed_with
 
 
-def test_a_cancel_marks_the_active_runs_it_asked_to_stop_as_terminating(lakebase):
+def test_a_cancel_marks_the_active_runs_it_asked_to_stop_as_terminating_and_keeps_when_it_was_asked(lakebase):
     lakebase.runs[9] = {"run_id": 9, "job_id": 10, "life_cycle_state": "RUNNING", "result_state": None,
                         "state_message": None, "started_at": None, "ended_at": None, "parameters": "{}",
                         "kind": "group",
                         "schedule_id": None, "task_collection": None, "trigger": None, "run_page_url": None}
     rp.mark_stopping([9, 10])
     assert lakebase.runs[9]["life_cycle_state"] == "TERMINATING"
+    asked = lakebase.runs[9]["cancel_requested_at"]
+    lakebase.clock = "2026-10-29T13:00:00+00:00"
+    rp.mark_stopping([9])
+    assert lakebase.runs[9]["cancel_requested_at"] == asked
+
+
+def test_the_cancel_mark_is_one_statement_that_sets_the_terminating_state_and_the_time_it_was_asked():
+    sql = q.mark_cancel_requested_sql()
+    assert "life_cycle_state = 'TERMINATING'" in sql
+    assert "cancel_requested_at = coalesce(cancel_requested_at, now())" in sql
+    assert "where run_id = any(%s) and life_cycle_state = any(%s)" in sql
+
+
+def test_a_run_the_app_cancelled_closes_as_cancelled_with_databricks_end_time_whatever_the_result():
+    started = "2026-10-29T11:00:00+00:00"
+    requested = (NOW - timedelta(seconds=30)).isoformat()
+    ended = {"life_cycle_state": "TERMINATED", "result_state": "SUCCESS", "state_message": None,
+             "ended_at": "2026-10-29T11:59:00+00:00", "cancel_requested_at": requested}
+    closed = rp.closure(ended, started, 1, NOW)
+    assert closed["status"] == "cancelled" and closed["finished_at"] == "2026-10-29T11:59:00+00:00"
+    assert closed["reason"] == "cancelled, and its Databricks run ended SUCCESS at 2026-10-29T11:59:00+00:00"
+
+
+def test_a_cancelled_run_databricks_has_not_ended_closes_only_two_minutes_after_the_cancel():
+    started = "2026-10-29T11:00:00+00:00"
+    going = {"life_cycle_state": "TERMINATING", "result_state": None, "state_message": None, "ended_at": None,
+             "cancel_requested_at": (NOW - timedelta(minutes=1, seconds=59)).isoformat()}
+    assert rp.closure(going, started, 1, NOW) is None
+    later = dict(going, cancel_requested_at=(NOW - timedelta(minutes=2, seconds=1)).isoformat())
+    closed = rp.closure(later, started, 1, NOW)
+    assert closed["status"] == "cancelled" and closed["finished_at"] is None
+    assert closed["reason"] == "cancelled from the app, and Databricks had not ended its run 2 minutes after the cancel"
+    assert json.loads(closed["detail"])["databricks_state"] == "TERMINATING"
+
+
+def test_a_run_whose_databricks_run_failed_without_a_cancel_closes_as_failed():
+    ended = {"life_cycle_state": "TERMINATED", "result_state": "FAILED", "state_message": None, "ended_at": None,
+             "cancel_requested_at": None}
+    assert rp.closure(ended, "2026-10-29T11:00:00+00:00", 1, NOW)["status"] == "failed"
 
 
 def test_the_poller_keeps_a_cancelled_run_terminating_until_databricks_says_it_ended():

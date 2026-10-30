@@ -31,7 +31,60 @@ def test_a_template_fills_each_tag_and_target_names_are_lower_case_identifiers()
     assert js.render("{server}/{database}", r) == "sql_01/db_000101"
     assert js.render("{schema}.{table}", r) == "dbo.OrderLine"
     assert js.render("{schema}_{table}", r, target=True) == "dbo_orderline"
-    assert js.render("{table}", row(table="Order-Line"), target=True, lowercase=False) == "Order-Line"
+    assert js.render("{table}", row(table="Order-Line"), target=True) == "order_line"
+
+
+def test_an_existing_jobs_names_come_out_as_they_always_have_and_new_jobs_follow_unity_catalog():
+    tables = ("Order-Lines", "Sales (2024)", "a--b")
+    assert [js.render("{table}", row(table=t), target=True) for t in tables] == ["order_lines", "sales_2024", "a_b"]
+    assert [js.render("{table}", row(table=t), target=True, unity_catalog=True) for t in tables] == [
+        "order-lines", "sales_(2024)", "a--b"]
+
+
+def test_a_jobs_naming_rule_is_an_option_and_the_read_reports_it():
+    assert js.unity_catalog_of({js.TARGET_NAMES_OPTION: js.UNITY_CATALOG_NAMES}) is True
+    assert js.unity_catalog_of({}) is False and js.unity_catalog_of(None) is False
+    assert js.read([row()], unity_catalog=True)["unity_catalog"] == {"value": True}
+
+
+def test_two_tables_on_one_target_are_refused_under_the_rule_the_job_uses():
+    rows = [row(1, table="Order-Lines", client_id=None), row(2, table="order_lines", client_id=None)]
+    assert js.check(rows, {"sink_table": "{table}"}, unity_catalog=True) == []
+    (error,) = js.check(rows, {"sink_table": "{table}"})
+    assert error.startswith("1 targets would be written by more than one table (e.g. bronze.extraction.order_lines)")
+
+
+def test_an_existing_jobs_added_databases_take_its_names_and_a_unity_catalog_job_its_own():
+    entries = [{"line": 2, "server": "sql_01", "database": "db_000199", "enabled": True}]
+    older = [row(1, table="Order-Lines", sink_table="order_lines"),
+             row(2, table="Sales (2024)", sink_table="sales_2024"), row(3, table="a--b", sink_table="a_b")]
+    plan = js.plan_databases(older, entries, "Job", 4)
+    assert plan["errors"] == []
+    assert sorted(r["sink_table"] for r in plan["new"]) == ["a_b", "order_lines", "sales_2024"]
+    named = [row(1, table="Order-Lines", sink_table="order-lines"),
+             row(2, table="Sales (2024)", sink_table="sales_(2024)"), row(3, table="a--b", sink_table="a--b")]
+    plan = js.plan_databases(named, entries, "Job", 4, unity_catalog=True)
+    assert plan["errors"] == []
+    assert sorted(r["sink_table"] for r in plan["new"]) == ["a--b", "order-lines", "sales_(2024)"]
+
+
+def test_typed_text_in_a_target_name_must_not_hold_a_character_unity_catalog_refuses():
+    base = {"sink_catalog": "bronze", "sink_schema": "extraction"}
+    refused = ("target table {!r} has a character Unity Catalog refuses (a space, period, slash or control character): "
+               "take it out")
+    assert js.typed_name_errors({**base, "sink_table": "{table}"}, unity_catalog=True) == []
+    assert js.typed_name_errors({**base, "sink_table": "Sales 2024"}, unity_catalog=True) == [
+        refused.format("Sales 2024")]
+    assert js.typed_name_errors({**base, "sink_table": "{table}.raw"}, unity_catalog=True) == [
+        refused.format("{table}.raw")]
+    assert js.typed_name_errors({**base, "sink_table": "Sales 2024"}, unity_catalog=False) == []
+
+
+def test_an_older_job_with_only_safe_names_adds_databases_under_the_older_rule():
+    older = [row(1, table="Order-Lines", sink_table="order_lines")]
+    entries = [{"line": 2, "server": "sql_01", "database": "db_000199", "enabled": True}]
+    plan = js.plan_databases(older, entries, "Job", 4, unity_catalog=js.unity_catalog_of({}))
+    assert plan["errors"] == [] and [r["sink_table"] for r in plan["new"]] == ["order_lines"]
 
 
 def test_unknown_tags_are_named_and_fan_in_refuses_server_and_database_in_target_names():
@@ -49,9 +102,14 @@ def test_a_jobs_settings_are_what_its_rows_share_with_write_modes_apart_for_chan
     assert s["freshness_sla_minutes"] == {"value": 60}
     assert (s["sink_catalog"], s["sink_schema"], s["sink_table"]) == (
         {"value": "bronze"}, {"value": "extraction"}, {"value": "{table}"})
-    assert s["lowercase"] == {"value": True}
     assert s["client_id"] == {"value": "{database}"}
     assert s["identity"] == {"value": {"source_server": "{server}", "source_database": "{database}"}}
+
+
+def test_a_new_jobs_key_reads_back_as_its_server_and_database():
+    keyed = [row(1, client_id="sql_01_db_000101"), row(2, table="Invoice", client_id="sql_01_db_000101"),
+             row(3, database="db_000102", client_id="sql_01_db_000102")]
+    assert js.read(keyed)["client_id"] == {"value": "{server}_{database}"}
 
 
 def test_a_setting_the_rows_differ_on_is_mixed_with_its_counts():
@@ -81,6 +139,36 @@ def test_turning_fan_in_off_clears_client_id_and_on_fills_it_from_its_template()
     assert off[1]["client_id"] is None
     own = [row(1, client_id=None, client_attrs=None)]
     assert js.plan(own, {"fan_in": True, "client_id": "{server}:{database}"})[1]["client_id"] == "sql_01:db_000101"
+
+
+def test_turning_fan_in_on_with_no_client_id_takes_the_server_and_database_key_new_jobs_get():
+    a = row(1, client_id=None, client_attrs=None, src_connection="sql_a", database="sales", table="Orders")
+    b = row(2, client_id=None, client_attrs=None, src_connection="sql_b", database="sales", table="Orders")
+    planned = js.plan([a, b], {"fan_in": True})
+    assert planned[1]["client_id"] == "sql_a_sales" and planned[2]["client_id"] == "sql_b_sales"
+    assert js.default_client_id(False) == js.SHARED_CLIENT_ID
+
+
+def test_edit_offers_the_server_and_database_key_when_the_job_has_none():
+    from pathlib import Path
+    page = (Path(__file__).resolve().parents[1] / "src" / "frontend" / "src" / "pages" / "JobEdit.tsx").read_text()
+    assert f'client_id: value(s.client_id) ?? "{js.SHARED_CLIENT_ID}"' in page
+
+
+def test_a_job_already_sharing_its_tables_keeps_its_database_key():
+    assert js.default_client_id(True) == js.LEGACY_CLIENT_ID
+    assert js.plan(FLEET[:1], {"fan_in": True}) == {}
+
+
+def test_the_sql_edit_turning_fan_in_on_fills_the_server_and_database_key():
+    import job_settings_sql as jss
+    p = jss.Params()
+    off = {"fan_in": {"value": False}, "client_id": {"value": None}}
+    sql = jss._new_values({"fan_in": True}, off, p)["client_id"]
+    assert jss.TAG_SQL["{server}"] in sql and jss.TAG_SQL["{database}"] in sql and "_" in p.values()
+    p = jss.Params()
+    on = {"fan_in": {"value": True}, "client_id": {"value": None}}
+    assert jss.TAG_SQL["{server}"] not in jss._new_values({"fan_in": True}, on, p)["client_id"]
 
 
 def test_an_unchanged_setting_plans_nothing():
@@ -129,6 +217,24 @@ def test_each_new_database_gets_every_table_of_the_job_with_its_settings_filled_
     assert json.loads(order["client_attrs"]) == {"source_server": "sql_01", "source_database": "db_000103"}
     assert new["Child_C_View"]["load_type"] == "full"
     assert order["task_collection"] == "cust_c01"           # the server's existing group
+
+
+def test_a_dotless_host_the_job_reads_is_that_host_not_a_new_connection():
+    hosted = [row(i, src_connection=None, use_remote_query=False, src_host="sqlprod01", src_port=None,
+                  secret_key="creds-db_000101", **({"table": t} if t else {})) for i, t in ((1, None), (2, "Invoice"))]
+    plan = js.plan_databases(hosted, [{"line": 2, "server": "sqlprod01", "database": "newdb", "enabled": True}],
+                             job_name="Customer", groups_per_server=1)
+    assert plan["errors"] == [] and plan["new_groups"] == []
+    new = plan["new"][0]
+    assert (new["src_host"], new["use_remote_query"], new["src_connection"]) == ("sqlprod01", False, None)
+    assert new["secret_key"] == "creds-newdb" and new["task_collection"] == "cust_c01"
+
+
+def test_a_dotless_name_the_job_does_not_read_as_a_host_is_still_a_connection_name():
+    assert js._server_key("sql_02", "sqlserver", {"sql_01": {}}) == "sql_02"
+    assert js._server_key("sqlprod01", "sqlserver", {"sqlprod01": {}, "sqlprod01:1433": {}}) == "sqlprod01"
+    assert js._server_key("sqlprod01", "sqlserver", {"sqlprod01:1433": {}}) == "sqlprod01:1433"
+    assert js._server_key("sql.corp", "sqlserver") == "sql.corp:1433"
 
 
 def test_a_new_server_gets_its_own_groups_its_databases_spread_evenly():
@@ -225,3 +331,14 @@ def test_a_new_database_on_a_server_of_the_job_joins_its_lightest_group():
     plan = js.plan_databases(fleet, entries, job_name="Customer", groups_per_server=1)
     placed = {r["src_database"]: r["task_collection"] for r in plan["new"]}
     assert placed == {"db_000301": "cust_c02", "db_000302": "cust_c01"}
+
+
+def test_an_old_job_opens_and_saves_with_its_names_unchanged_whether_they_were_lower_case_or_not():
+    for sink_schema, sink_table in (("bronze", "orderline"), ("Bronze", "Order-Line")):
+        rows = [row(sink_schema=sink_schema, sink_table=sink_table)]
+        opened = js.read(rows)
+        assert "lowercase" not in opened
+        saved = {name: opened[name]["value"] for name in ("sink_catalog", "sink_schema", "sink_table")}
+        assert js.plan(rows, saved) == {}
+        assert js.plan(rows, {**saved, "lowercase": False}) == {}
+        assert js.plan(rows, {**saved, "lowercase": True}) == {}

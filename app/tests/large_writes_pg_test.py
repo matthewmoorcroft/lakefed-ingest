@@ -93,7 +93,8 @@ def test_a_taken_target_fails_the_task_and_writes_nothing(client):
     assert _create(client, "small", name="First", csv=_csv(1, 3)).status_code == 200
     r = _create(client, "big", name="Second", csv=_csv(3, 300))   # eng_000.t0000..t0002 are First's targets
     task = client.get(f"/api/tasks/{r.json()['task']['id']}").json()
-    assert task["status"] == "failed" and "another table already writes main.eng.t0000 for eng_000" in task["error"]
+    assert task["status"] == "failed" and (
+        "another table already writes main.eng.t0000 for database eng_000 on sql_a" in task["error"])
     assert task["result"] is None
     assert client.sql("select name from lakefed_ingest.schedule") == [("First",)]
     assert client.sql("select count(*) from lakefed_ingest.control") == [(3,)]

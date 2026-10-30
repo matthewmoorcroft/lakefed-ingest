@@ -3,7 +3,7 @@ import { Link, useSearchParams } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
 import { type ColDef } from "ag-grid-community";
 import { api, qs, type Row } from "../api";
-import { ErrorBox, Grid, PageHead, RunStatus, Section, fmtDuration, fmtInt, fmtSpeed, plural } from "../components";
+import { ErrorBox, Grid, PageHead, RunStatus, Section, fmtDuration, fmtInt, fmtSpeed, isLiveOutcome, plural } from "../components";
 import { JobRunsTable, pausedNotRun } from "./IngestionJob";
 
 /** Tables that needed a read: the run's total less those found unchanged. */
@@ -49,7 +49,7 @@ export default function Runs() {
   const jobs = useQuery({ queryKey: ["job-runs-jobs"], queryFn: () => api.get<Row>(`/job-runs${qs({ limit: 1 })}`) });
   const d = runs.data;
   const list: Row[] = d?.job_runs ?? [];
-  const running = list.filter((r) => r.outcome?.label === "Running");
+  const running = list.filter((r) => isLiveOutcome(r.outcome?.label));
   // As the Databricks Runs list: a paused job's triggers that did not run are not finished runs; they show as one line.
   const pausedSlots = list.filter(pausedNotRun);
   const finished = list.filter((r) => r.outcome?.label !== "Running" && (outcome === "Not run" || !pausedNotRun(r)));

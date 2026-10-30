@@ -110,25 +110,40 @@ secret). See `README.md`, `docs/deploy.md`, `docs/monitoring.md`, `docs/lakebase
   `freshness_interval_s` (skip no-op bulk-advance writes newer than this), `max_queries_per_source`
   (cap per source across runs, 0 = none: each run takes cap / runs reading the source, counted from
   shared advisory locks; `parallel.SourceLimiter`), `table_retries` (extra attempts per table after a
-  transient source error, 0 = off; `table_retry.py`), `table_retry_budget` (retries per run),
-  `fail_on_table_errors` (a run with failed tables ends as failed, so its failure email fires),
+  transient source error, 0 = off; used only above a budget of 0; `table_retry.py`), `table_retry_budget` (retries per
+  run, default 0: no table is retried, transient or unknown; the app's Advanced configuration raises it per job),
+  `fail_on_table_errors` (accepted for older jobs and not read: a run with failed tables always ends as failed),
   `db_instance`, `db_name`.
   The tuning parameters' defaults are bundle variables of the same name (`databricks.yml`).
 - `lakefed_ingest_check` → `check_launch.ipynb` (serverless): checks a group of collections
-  (`task_collections`, blank = every collection with enabled rows; or `schedule_id`, an app job's groups read
+  (`task_collections`, blank = every collection with enabled rows except those only a deleted job holds; or `schedule_id`, an app job's groups read
   from Lakebase; `initial_check.run_check`, each collection's errors apart; its source queries count under
   `max_queries_per_source`, `initial_check.SourceCap`), stamps
   unchanged databases, records each collection's databases with work in `check_work`, starts
   `lakefed_ingest` once per collection with work by run-now (`work_id`; `launcher.py`), watches the
-  runs for `confirm_s` (a run Databricks skips fails the check) and ends. No For each. Its own schedule
+  runs until they end (`wait`, default true; `timeout_s` 21600, then the runs still going are cancelled and the check
+  fails; a run that failed or was skipped fails the check, so the wrapper's failure email fires). Locks are let go
+  when each run starts, so the wait holds none. No For each. Its own schedule
   (paused) is the fallback cadence; an app schedule in group mode starts it with its members.
+  With `runs_by` `changes` (`group`, the default until its lab proof, keeps one run per collection with work)
+  the cycle is shared out by its changes (`initial_check.plan_cycle`, `launcher.cycle_requests`): each database's
+  tables with work (`check_collection`'s `weights`), as many runs as those tables over the job's group size (its tables over its
+  groups, `group_size_of`), each database whole on one run, a collection with a first load on a run of its own.
+  The check then holds each collection shared and each database it checks exclusively (`share_locks`), leaving out
+  the databases a run still holds; a database a run going was given waits for it (`deferred`). A run spanning
+  collections gets `task_collection` blank and its `work_id`: `ingest.ipynb` takes its collections in turn on its
+  cluster, each as a run of its own (`dbutils.notebook.run`, `cycle_part`: a part that is locked or has nothing
+  left is skipped, not failed), with its own locks and `ingest_run` record.
 - `lakefed_ingest_cluster_copies` → `cluster_copies.ipynb` (serverless, runs as the deployer): one copy of
   `lakefed_ingest` per app schedule with its own cluster (`options.cluster`), only the cluster's types and workers
   changed (`cluster_copies.py`); records the copy in `options.ingest_copy_job_id`. The check job takes the job to
   start as its `ingest_job_id` job parameter.
 - `lakefed_ingest_delete_job` → `delete_job.ipynb` (serverless, runs as the deployer, queued, one at a time):
-  finishes an app job's Delete (`delete_job.py`). The app marks the job deleted and starts it with `schedule_id` and
-  `drop_targets`. In one transaction, under each group's run lock (a run of any group refuses the lot), it deletes
+  purges an app job's groups (`delete_job.py`). The app marks a job deleted and keeps it for
+  `deleted_job_retention_days` (Restore brings it back); Delete now starts this job with `schedule_id` and
+  `drop_targets`, and the daily run (03:00, its defaults: `purge_expired` with `retention_days`) purges every deleted job whose retention has run out
+  (`expired_jobs_sql`, `purge_expired`, each job in its own transaction). The purge sets `options.delete_finished`,
+  which the app reads as purged. In one transaction, under each group's run lock (a run of any group refuses the lot), it deletes
   the groups no other live job holds: their control, checkpoint, reseed_queue, database_check, check_work and rollup
   rows, and the job's job_selection rows (what it was chosen from; skipped below schema version 9).
   Run history (ingest_run, ingest_event) and control_change stay. With `drop_targets`, after the commit, it drops
@@ -151,7 +166,12 @@ secret). See `README.md`, `docs/deploy.md`, `docs/monitoring.md`, `docs/lakebase
 
 ### Run flow (`ingest.ipynb`)
 1. Per-collection Lakebase advisory lock (duplicate run exits `skipped`; a duplicate with a `work_id` fails,
-   since its databases would not be ingested).
+   since its databases would not be ingested). A run with a `work_id` holds it shared plus an exclusive lock per
+   database of its list (`state_store.database_lock_key`), so runs of one collection on different databases go at
+   once; a database another run holds is skipped (left to it, never stamped), and a list wholly held elsewhere ends
+   `skipped`. A run without one, the check, the app's edits and Delete need it exclusively and are refused meanwhile.
+   A shared holder closes abandoned runs only when no other session holds the lock (`alone_on_collection`); the
+   group rollup recount takes a transaction lock first (`rollup_group_lock_sql`), so two runs can't leave it stale.
 2. Plan (`planner.py`, pure): unsupported (`src_type`, `load_type`) pair → fail per table (stage
    `plan`); `full` → reload; `cursor` → `cursor_seed` / schema_reseed / `cursor` (per-table high
    watermark, `cursor_engine`); CT tables → seed / schema_reseed / detection candidate; group by
@@ -176,7 +196,8 @@ secret). See `README.md`, `docs/deploy.md`, `docs/monitoring.md`, `docs/lakebase
    is no position to protect). A `pending` route (run stopped before the advance) checks the sink
    for that run's rows (`append_committed`) before anything else, unless the row now points at
    another source, sink or key, or its sink is gone: then it reseeds (`enqueue_reseed` clears the pending append).
-   With `table_retries` > 0 (default 2), a transient source failure is retried in the run (`table_retry.with_retries`;
+   With `table_retries` > 0 (default 2) and `table_retry_budget` > 0 (default 0: off), a transient source failure is
+   retried in the run (`table_retry.with_retries`;
    the next attempt from `planner.retry_plan` on the fresh checkpoint). An append-mode retry goes to
    `pending`, or carries `verify_run_id` (stage `verify`): rows of this run in the sink → finish the
    checkpoint (`recovered`), never append again.
@@ -185,7 +206,7 @@ secret). See `README.md`, `docs/deploy.md`, `docs/monitoring.md`, `docs/lakebase
 | File | Purpose |
 |---|---|
 | `src/lakefed_ingest/ct_engine.py` | Source ops (Spark JDBC, or `remote_query` through a UC connection): CT versions, detection, read + MERGE / append, seed, sink DDL, batched appends (`append_batch`) |
-| `src/lakefed_ingest/table_retry.py` | Table retries: classify transient vs permanent errors (deny rules win, unknown = permanent), equal-jitter backoff, per-run budget and per-source stop (`RetryPolicy`), the worker wrapper (`with_retries`); the next attempt comes from `planner.retry_plan` |
+| `src/lakefed_ingest/table_retry.py` | Table retries: classify transient, permanent or unknown errors (deny rules win; unknown gets one retry, then fails; a budget of 0 retries nothing), equal-jitter backoff, per-run budget and per-source stop (`RetryPolicy`), the worker wrapper (`with_retries`); the next attempt comes from `planner.retry_plan` |
 | `src/lakefed_ingest/batch_append.py` | Batched appends (append mode, consolidated sinks): plan batches by (sink, kind), write with bisect on failure, bulk checkpoints + telemetry; per-table fallback |
 | `src/lakefed_ingest/source_adapters.py` | Per-engine dialect (`src_type`): JDBC URL/driver/options, quoting, literals, select/size/bounds SQL |
 | `src/lakefed_ingest/load_strategies.py` | Per-`load_type` strategy, position encoding, `supported()` matrix (+ placeholder pairs); cdc placeholder |

@@ -32,6 +32,8 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Callable, List, Optional
 
+import table_retry
+
 SCHEMA = "lakefed_ingest"
 CONTROL_TABLE = f"{SCHEMA}.control"
 CHECKPOINT_TABLE = f"{SCHEMA}.checkpoint"
@@ -40,6 +42,7 @@ RUN_TABLE = f"{SCHEMA}.ingest_run"        # observability: one row per ingestion
 EVENT_TABLE = f"{SCHEMA}.ingest_event"    # observability: one row per (run, table)
 DATABASE_CHECK_TABLE = f"{SCHEMA}.database_check"   # one check stamp per unchanged source database
 CHECK_WORK_TABLE = f"{SCHEMA}.check_work"           # the check job's work list, per run it starts
+DATABRICKS_RUN_TABLE = f"{SCHEMA}.databricks_run"   # the Databricks runs the operations app tracks (its poller)
 
 SEEDING = "seeding"
 INCREMENTAL = "incremental"  # ct / cursor: seeded, applying increments
@@ -140,7 +143,11 @@ def split_sql_statements(ddl: str) -> List[str]:
 #   11 = discovery.listing (how a discovery listed its databases, for a later re-discovery)
 #   12 = app_task.progress (a by-database write's progress)
 #   13 = rollup_database, rollup_group (the monitoring rollups) and an index on control by group and database
-SCHEMA_VERSION = 13
+#   14 = ingest_event.error_kind and error_class (how a failed attempt was classified, for the failing-tables list)
+#   15 = databricks_run.cancel_requested_at (a Cancel run is recorded as cancelled, not failed)
+#   16 = jdbc_connection (JDBC connections entered by hand in the operations app: a host, port, secret scope and key)
+#   17 = jdbc_login_write (who wrote each JDBC login into the dedicated secret scope, and whether it rotated one)
+SCHEMA_VERSION = 17
 # Advisory lock that serializes migrations (the setup job and ingestion runs of any collection): two
 # int keys, so it can't collide with a collection's one-key lock whatever the collection is named,
 # and a class of its own (not SOURCE_LOCK_CLASS).
@@ -658,28 +665,30 @@ def record_event_start_sql() -> str:
 
 def record_event_finish_sql() -> str:
     """Finalize an ingest_event row: finished_at/duration + outcome + metrics. ``retry_count`` is the
-    number of earlier attempts of the table in this run (``table_retry``)."""
+    number of earlier attempts of the table in this run (``table_retry``). Only a running event is finished: a table
+    the cancel or a sweep marked keeps that status when its engine finishes late."""
     return (
         f"update {EVENT_TABLE} set "
         "finished_at = now(), "
         "duration_ms = (extract(epoch from (now() - started_at)) * 1000)::bigint, "
         "status = %s, stage = %s, rows_read = %s, rows_merged = %s, "
-        "position_from = %s, position_to = %s, error = %s, "
+        "position_from = %s, position_to = %s, error = %s, error_kind = %s, error_class = %s, "
         "action = coalesce(%s, action), pool = coalesce(%s, pool), retry_count = coalesce(%s, retry_count) "
-        "where id = %s"
+        "where id = %s and status = 'running'"
     )
 
 
 def record_event_failed_sql() -> str:
     """Insert an already-FINISHED failed ingest_event row (bulk, via executemany) — used when a whole
-    source database fails change detection, so its tables are visible as failed without per-table
-    work. Params: run_id, task_collection, control_id, src_database, src_schema, src_table,
-    sink_fqn, action, phase, stage, error."""
+    source database fails change detection, or a batched append's member fails, so its tables are
+    visible without per-table work. The status is 'failed', or 'cancelled' for a cancel (failure_status).
+    Params: run_id, task_collection, control_id, src_database, src_schema, src_table,
+    sink_fqn, action, phase, stage, error, status."""
     return (
         f"insert into {EVENT_TABLE} "
         "(run_id, task_collection, control_id, src_database, src_schema, src_table, sink_fqn, "
         "action, phase, stage, error, status, finished_at, duration_ms) "
-        "values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'failed', now(), 0)"
+        "values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, now(), 0)"
     )
 
 
@@ -913,9 +922,30 @@ class RollupQueue:
             raise
 
 
+def deleted_only_collections_sql() -> str:
+    """The groups only deleted operations-app jobs hold: a member of a deleted job and no member of a live one (a
+    removed member counts as none). Their control rows wait for the delete job, or a Restore, so no check takes
+    them. In name order."""
+    return (f"select distinct d.task_collection from {SCHEMA}.schedule_member d "
+            f"join {SCHEMA}.schedule ds on ds.id = d.schedule_id where ds.deleted_at is not null "
+            f"and not exists (select 1 from {SCHEMA}.schedule_member m "
+            f"join {SCHEMA}.schedule s on s.id = m.schedule_id "
+            f"where m.task_collection = d.task_collection and m.removed_at is null and s.deleted_at is null) "
+            f"order by d.task_collection")
+
+
 def enabled_collections_sql() -> str:
-    """The collections with at least one enabled control row, in name order."""
-    return f"select distinct task_collection from {CONTROL_TABLE} where task_enabled order by task_collection"
+    """The collections with at least one enabled control row, except those only deleted operations-app jobs hold, in
+    name order."""
+    return (f"select distinct task_collection from {CONTROL_TABLE} where task_enabled "
+            f"and task_collection not in ({deleted_only_collections_sql()}) order by task_collection")
+
+
+def schedule_tables_per_group_sql() -> str:
+    """An operations-app ingestion job's tables per group (its options), or no row when it has none. Param: schedule
+    id."""
+    return (f"select (options ->> 'tables_per_group')::bigint from {SCHEMA}.schedule "
+            "where id = %s and options ? 'tables_per_group'")
 
 
 def schedule_collections_sql() -> str:
@@ -923,6 +953,15 @@ def schedule_collections_sql() -> str:
     name order. Param: schedule id."""
     return (f"select m.task_collection from {SCHEMA}.schedule_member m join {SCHEMA}.schedule s on s.id = m.schedule_id "
             "where m.schedule_id = %s and m.removed_at is null and s.deleted_at is null order by m.task_collection")
+
+
+def typed_logins_sql() -> str:
+    """For each secret key of one scope with a login typed into the operations app: the JDBC connection its newest
+    login was typed for, and that connection's host, port and source type (null when no such connection is stored).
+    Param: secret_scope."""
+    return (f"select distinct on (w.secret_key) w.secret_key, w.connection, c.src_host, c.src_port, c.src_type "
+            f"from {SCHEMA}.jdbc_login_write w left join {SCHEMA}.jdbc_connection c on c.name = w.connection "
+            "where w.secret_scope = %s order by w.secret_key, w.entered_at desc, w.id desc")
 
 
 def record_check_work_sql() -> str:
@@ -937,36 +976,92 @@ def get_check_work_sql() -> str:
     return f"select source, src_database from {CHECK_WORK_TABLE} where work_id = %s and task_collection = %s"
 
 
+def get_check_work_all_sql() -> str:
+    """Every database of one work list, whatever its collection: a run of a cycle's share can span collections.
+    Param: work_id."""
+    return f"select task_collection, source, src_database from {CHECK_WORK_TABLE} where work_id = %s"
+
+
 def prune_check_work_sql() -> str:
     """Work lists older than a number of days, deleted. Param: days."""
     return f"delete from {CHECK_WORK_TABLE} where created_at < now() - make_interval(days => %s)"
 
 
 def finish_run_sql() -> str:
-    """Finalize an ingest_run row with roll-up counts."""
+    """Finalize an ingest_run row with roll-up counts. Only a running run is finished: one the app cancelled, or a
+    sweep closed, keeps that status when its engine finishes late."""
     return (
         f"update {RUN_TABLE} set "
         "finished_at = now(), status = %s, total = %s, ok = %s, failed = %s, "
         "skipped = %s, reseeded = %s, detail = %s "
-        "where run_id = %s"
+        "where run_id = %s and status = 'running'"
     )
 
 
 ABANDONED_RUN_REASON = "the run ended without finishing (cancelled, or its cluster went away)"
 
+# Cancel: a run or table the user stopped is 'cancelled', never 'failed' (the counts, the failing tables and the
+# failure e-mail read failures only). The rules below are the SQL's too (stopping_run_sql, close_abandoned_runs_sql):
+# a Databricks run is stopping when the app asked for the cancel (cancel_requested_at), when Databricks is
+# terminating it, or when it ended CANCELED; a run is stopping once its own record says cancelled.
+CANCELLED = "cancelled"
+
+
+def run_is_stopping(run_status, databricks_run) -> bool:
+    """Whether a group run is being (or has been) cancelled: its own status is cancelled, or its Databricks run (a
+    dict of databricks_run's columns, or None when the poller has not recorded it) was asked to stop, is terminating,
+    or ended CANCELED. A load that fails while the run is stopping is a cancel, not a failure."""
+    run = databricks_run or {}
+    return (run_status == CANCELLED or run.get("cancel_requested_at") is not None
+            or run.get("life_cycle_state") == "TERMINATING" or run.get("result_state") == "CANCELED")
+
+
+def failure_status(error, stopping) -> str:
+    """The status a table's failed attempt is recorded with: cancelled when its run is stopping or Spark reports a
+    cancelled job (table_retry.is_cancellation), else failed. ``error`` is an exception or its text."""
+    return CANCELLED if stopping or table_retry.is_cancellation(error if error is not None else "") else "failed"
+
+
+def abandoned_run_status(databricks_run) -> str:
+    """The status a run that ended without finishing is closed with: cancelled when its Databricks run ended CANCELED
+    or was asked to stop, else failed (its cluster went away, or it died)."""
+    run = databricks_run or {}
+    cancelled = run.get("result_state") == "CANCELED" or run.get("cancel_requested_at") is not None
+    return CANCELLED if cancelled else "failed"
+
+
+def _databricks_run_of_sql(run: str) -> str:
+    """Matches the databricks_run row of an ingest_run (``run`` is its alias) on job_run_id, when that is a number."""
+    return f"d.run_id = (case when {run}.job_run_id ~ '^[0-9]+$' then {run}.job_run_id::bigint end)"
+
+
+def stopping_run_sql() -> str:
+    """Whether an ingest run is stopping: the same rules as run_is_stopping, in one row. Params: run_id.
+    Returns no row for a run the table doesn't hold."""
+    return (
+        f"select r.status = 'cancelled' or exists (select 1 from {DATABRICKS_RUN_TABLE} d "
+        f"where {_databricks_run_of_sql('r')} "
+        "and (d.cancel_requested_at is not null or d.life_cycle_state = 'TERMINATING' or d.result_state = 'CANCELED')) "
+        f"from {RUN_TABLE} r where r.run_id = %s"
+    )
+
 
 def close_abandoned_runs_sql() -> str:
-    """Close a collection's other runs still 'running', and their events still 'running', as failed.
+    """Close a collection's other runs still 'running', and their events still 'running', as failed, or as
+    cancelled when the run was cancelled (abandoned_run_status): a cancel is not a failure.
     Only a run holding the collection's lock may call it: no other sweep of the collection is then
     alive, so an open run is one that was cancelled or lost its cluster and will never finish its rows.
     A table that was waiting for its retry (table_retries) when the run died has a last attempt
-    'retried' and no later one: it is closed as failed too, keeping its own error and timing.
+    'retried' and no later one: it is closed the same way too, keeping its own error and timing.
     Params: detail, task_collection, run_id, error (appended to a retried attempt's), error.
     Returns (runs closed, events closed)."""
     return (
-        f"with dead as (update {RUN_TABLE} set status = 'failed', finished_at = now(), detail = %s "
-        "where task_collection = %s and status = 'running' and run_id <> %s returning run_id), "
-        f"events as (update {EVENT_TABLE} e set status = 'failed', finished_at = coalesce(e.finished_at, now()), "
+        f"with dead as (update {RUN_TABLE} r set status = case when exists (select 1 from {DATABRICKS_RUN_TABLE} d "
+        f"where {_databricks_run_of_sql('r')} "
+        "and (d.result_state = 'CANCELED' or d.cancel_requested_at is not null)) then 'cancelled' else 'failed' end, "
+        "finished_at = now(), detail = %s "
+        "where r.task_collection = %s and r.status = 'running' and r.run_id <> %s returning r.run_id, r.status), "
+        f"events as (update {EVENT_TABLE} e set status = dead.status, finished_at = coalesce(e.finished_at, now()), "
         "duration_ms = coalesce(e.duration_ms, (extract(epoch from (now() - e.started_at)) * 1000)::bigint), "
         "error = case when e.status = 'retried' then concat(e.error, ' | ', %s::text) else %s end "
         "from dead where e.run_id = dead.run_id and (e.status = 'running' or ("
@@ -1007,6 +1102,54 @@ def try_lock_collection_sql() -> str:
 def unlock_collection_sql() -> str:
     """Release the collection's session-level advisory lock."""
     return "select pg_advisory_unlock(hashtextextended(%s, 0))"
+
+
+# A run given a work list (by the check) holds its collection's lock SHARED, on the same key, plus one exclusive lock
+# per database it was given, so runs of one collection on different databases go at once, and two runs never take
+# one database. Everything that needs the collection to itself (a run without a work list, the check, the app's
+# edits and Delete, which try the same key exclusively) is refused while any of them holds it, and the other way
+# round: a work-list run can't start while one of those holds it.
+DATABASE_LOCK_NAMESPACE = "lakefed_ingest.database:"
+
+
+def database_lock_key(task_collection: str, source: str, src_database: str) -> str:
+    """The key of one database's run lock within a collection (the grain of a check stamp)."""
+    return f"{DATABASE_LOCK_NAMESPACE}{task_collection}|{source}|{src_database}"
+
+
+def try_lock_collection_shared_sql() -> str:
+    """Non-blocking: true iff this session now holds the collection's lock shared."""
+    return "select pg_try_advisory_lock_shared(hashtextextended(%s, 0))"
+
+
+def unlock_collection_shared_sql() -> str:
+    return "select pg_advisory_unlock_shared(hashtextextended(%s, 0))"
+
+
+def try_lock_databases_sql() -> str:
+    """Non-blocking, one statement: each database lock key with whether this session now holds it. Param: keys
+    (text[])."""
+    return ("select k, pg_try_advisory_lock(hashtextextended(k, 0)) "
+            "from unnest(%s::text[]) with ordinality as u(k, n) order by n")
+
+
+def unlock_databases_sql() -> str:
+    """Param: keys (text[])."""
+    return "select pg_advisory_unlock(hashtextextended(k, 0)) from unnest(%s::text[]) as u(k)"
+
+
+# The group rollup is recounted from its database rows by each run that changed them. Two runs of one group may
+# commit at once, and each recount reads the database rows as they were before the other committed, so the later
+# write could leave the group one database stale. A transaction lock on the group's key, taken before the recount,
+# makes the second wait for the first and then read its rows.
+ROLLUP_LOCK_NAMESPACE = "lakefed_ingest.rollup:"
+
+
+def rollup_group_lock_sql() -> str:
+    """Wait for, and hold until commit, the recount locks of some groups, in order. Param: task_collection per group
+    (text[])."""
+    return ("select pg_advisory_xact_lock(hashtextextended(%s || g, 0)) "
+            "from (select distinct g from unnest(%s::text[]) as u(g) order by g) as ordered")
 
 
 # Per-source query caps (job parameter max_queries_per_source): every run holds a session-level SHARED
@@ -1351,9 +1494,23 @@ class StateStore:
         return {(r[0], r[1]): {"version": int(r[2]), "checked_at": r[3]} for r in rows}
 
     def enabled_collections(self) -> list:
-        """The collections with at least one enabled control row (a check over every collection)."""
+        """The collections with at least one enabled control row (a check over every collection), not those only
+        a deleted operations-app job holds."""
         with self._cursor() as cur:
             cur.execute(enabled_collections_sql())
+            return [row[0] for row in cur.fetchall()]
+
+    def schedule_tables_per_group(self, schedule_id: int) -> Optional[int]:
+        """The job's tables per group, the size a cycle's runs are shared out by; None when it has none."""
+        with self._cursor() as cur:
+            cur.execute(schedule_tables_per_group_sql(), (int(schedule_id),))
+            row = cur.fetchone()
+            return int(row[0]) if row and row[0] else None
+
+    def deleted_only_collections(self) -> list:
+        """The groups only deleted operations-app jobs hold: a check named by hand leaves them out."""
+        with self._cursor() as cur:
+            cur.execute(deleted_only_collections_sql())
             return [row[0] for row in cur.fetchall()]
 
     def schedule_collections(self, schedule_id: int) -> list:
@@ -1362,6 +1519,19 @@ class StateStore:
         with self._cursor() as cur:
             cur.execute(schedule_collections_sql(), (int(schedule_id),))
             return [row[0] for row in cur.fetchall()]
+
+    def typed_logins(self, scope: str) -> dict:
+        """The logins typed into the operations app in this scope, by secret key: the connection each key's newest
+        login was typed for, with its host, port and source type (typed_logins_sql). Empty on a database without the
+        app's login tables, which then holds no typed login."""
+        with self._cursor() as cur:
+            cur.execute(f"select to_regclass('{SCHEMA}.jdbc_login_write') is not null "
+                        f"and to_regclass('{SCHEMA}.jdbc_connection') is not null")
+            if not cur.fetchone()[0]:
+                return {}
+            cur.execute(typed_logins_sql(), (scope,))
+            return {key: {"connection": connection, "src_host": host, "src_port": port, "src_type": src_type}
+                    for key, connection, host, port, src_type in cur.fetchall()}
 
     def record_check_work(self, work_id: str, task_collection: str, databases) -> None:
         """Record the databases with work, [(source, src_database)], of the run the check job is about
@@ -1376,6 +1546,12 @@ class StateStore:
         with self._cursor() as cur:
             cur.execute(get_check_work_sql(), (work_id, task_collection))
             return {(source, database) for source, database in cur.fetchall()}
+
+    def get_check_work_all(self, work_id: str) -> set:
+        """{(task_collection, source, src_database)}: every database of a work list, across its collections."""
+        with self._cursor() as cur:
+            cur.execute(get_check_work_all_sql(), (work_id,))
+            return {(collection, source, database) for collection, source, database in cur.fetchall()}
 
     def prune_check_work(self, days: int = 7) -> int:
         """Delete work lists older than ``days``; returns how many rows went."""
@@ -1404,6 +1580,7 @@ class StateStore:
             for at in range(0, len(names), ROLLUP_CHUNK):
                 chunk = names[at:at + ROLLUP_CHUNK]
                 cur.execute(rollup_database_rewrite_sql(), ([task_collection] * len(chunk), chunk))
+            cur.execute(rollup_group_lock_sql(), (ROLLUP_LOCK_NAMESPACE, [task_collection]))
             cur.execute(rollup_group_rewrite_sql(), ([task_collection],))
 
     def record_ct_begin_version(self, cfg: dict, begin_version) -> None:
@@ -1449,41 +1626,55 @@ class StateStore:
 
     def record_event_finish(self, event_id, status, stage=None, rows_read=None, rows_merged=None,
                             position_from=None, position_to=None, error=None,
-                            action=None, pool=None, retry_count=None) -> None:
+                            action=None, pool=None, retry_count=None, error_kind=None, error_class=None) -> None:
         """Finalize an ingest_event row; on 'ok' also stamp checkpoint.last_success_at.
         Positions are stored as text. ``action`` (optional) corrects the provisional action set at
         start (e.g. 'reseed'); ``pool`` (optional) records the FAIR pool(s) the table's units ran in;
         ``retry_count`` (optional) the table's earlier attempts in this run. Status 'retried' is an
-        attempt that failed and is tried again."""
+        attempt that failed and is tried again. ``error_kind`` and ``error_class`` say how a failure was
+        classified (table_retry.classify, table_retry.error_class)."""
         with self._cursor() as cur:
             cur.execute(record_event_finish_sql(), (
                 status, stage, rows_read, rows_merged, position_text(position_from),
                 position_text(position_to),
-                (error[:2000] if isinstance(error, str) else error), action, pool, retry_count, int(event_id),
+                (error[:2000] if isinstance(error, str) else error), error_kind, error_class,
+                action, pool, retry_count, int(event_id),
             ))
             if status == "ok":
                 cur.execute(touch_last_success_sql(), (int(event_id),))
 
+    def stopping_run(self, run_id) -> bool:
+        """Whether the run is being cancelled (stopping_run_sql; run_is_stopping's rules)."""
+        with self._cursor() as cur:
+            cur.execute(stopping_run_sql(), (int(run_id),))
+            row = cur.fetchone()
+        return bool(row and row[0])
+
     def record_failed_tables(self, run_id, items, stage="detect", action=None) -> int:
         """Bulk-record tables that failed before per-table work (their source database was
         unreachable during change detection, or the planner rejected the row: stage 'plan'), or in
-        a batched append: one finished 'failed' ingest_event row each and the checkpoint status set to
-        'failed' (phase/position untouched). items = [(cfg, cp, error)]; ``action`` defaults to
-        'full' / 'increment' by the row's strategy."""
+        a batched append: one finished ingest_event row each. The row is 'failed', or 'cancelled' when the
+        run is stopping or Spark cancelled the job (failure_status); only a failed table gets its checkpoint
+        status set to 'failed' (phase/position untouched), a cancelled one keeps its checkpoint as it was.
+        items = [(cfg, cp, error)]; ``action`` defaults to 'full' / 'increment' by the row's strategy."""
         if not items:
             return 0
+        stopping = self.stopping_run(run_id)
         events, statuses = [], []
         for cfg, cp, err in items:
             sink = _sink_label(cfg)
             e = (err or "")[:2000]
             action_ = action or ("full" if strategy_name(cfg) == "full" else "increment")
+            status = failure_status(err, stopping)
             events.append((int(run_id), cfg.get("task_collection"), cfg.get("id"),
                            cfg.get("src_database"), cfg.get("src_schema"), cfg.get("src_table"),
-                           sink, action_, (cp or {}).get("phase"), stage, e))
-            statuses.append((*task_identity(cfg), strategy_name(cfg), "failed", e[:500]))
+                           sink, action_, (cp or {}).get("phase"), stage, e, status))
+            if status == "failed":
+                statuses.append((*task_identity(cfg), strategy_name(cfg), "failed", e[:500]))
         with self._cursor() as cur:
             cur.executemany(record_event_failed_sql(), events)
-            cur.executemany(set_status_sql(), statuses)
+            if statuses:
+                cur.executemany(set_status_sql(), statuses)
         return len(items)
 
     def finish_run(self, run_id, total, ok, failed, skipped=0, reseeded=0,
@@ -1514,6 +1705,40 @@ class StateStore:
     def unlock_collection(self, task_collection: str) -> None:
         with self._cursor() as cur:
             cur.execute(unlock_collection_sql(), (collection_lock_key(task_collection),))
+
+    def try_lock_collection_shared(self, task_collection: str) -> bool:
+        """True iff this connection now holds the collection's lock shared (non-blocking): a work-list run's."""
+        with self._cursor() as cur:
+            cur.execute(try_lock_collection_shared_sql(), (collection_lock_key(task_collection),))
+            return bool(cur.fetchone()[0])
+
+    def unlock_collection_shared(self, task_collection: str) -> None:
+        with self._cursor() as cur:
+            cur.execute(unlock_collection_shared_sql(), (collection_lock_key(task_collection),))
+
+    def try_lock_databases(self, keys) -> set:
+        """Try each database lock key (non-blocking); returns the keys this connection now holds."""
+        keys = list(dict.fromkeys(keys))
+        if not keys:
+            return set()
+        with self._cursor() as cur:
+            cur.execute(try_lock_databases_sql(), (keys,))
+            return {key for key, taken in cur.fetchall() if taken}
+
+    def unlock_databases(self, keys) -> None:
+        keys = list(dict.fromkeys(keys))
+        if keys:
+            with self._cursor() as cur:
+                cur.execute(unlock_databases_sql(), (keys,))
+
+    def alone_on_collection(self, task_collection: str) -> bool:
+        """For a run holding the collection's lock shared: whether no other session holds it, so the collection's
+        other open runs are dead and may be closed. It tries the lock exclusively (its own shared hold doesn't
+        conflict with itself) and lets go at once if it got it."""
+        if not self.try_lock_collection(task_collection):
+            return False
+        self.unlock_collection(task_collection)
+        return True
 
     def join_sources(self, sources) -> dict:
         """Hold a shared lock per source until this connection closes (see ``SOURCE_LOCK_CLASS``);

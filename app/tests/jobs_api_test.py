@@ -136,7 +136,8 @@ def test_the_ingestion_jobs_list_filters_with_counts_and_ends_with_not_in_any_jo
     body = client.get("/api/ingestion-jobs").json()
     assert [j["name"] for j in body["jobs"]] == ["East hourly", "Nightly"] and body["total"] == 2
     assert body["not_in_job"]["groups"] == ["c4"]
-    assert body["counts"] == {"all": 2, "running": 1, "failing": 1, "late": 1, "paused": 1}
+    assert body["counts"] == {"all": 2, "running": 1, "failing": 1, "late": 1, "paused": 1, "attention": 1}
+    assert [j["name"] for j in client.get("/api/ingestion-jobs?filter=attention").json()["jobs"]] == ["East hourly"]
     assert [j["name"] for j in client.get("/api/ingestion-jobs?filter=late").json()["jobs"]] == ["Nightly"]
     assert [j["name"] for j in client.get("/api/ingestion-jobs?search=c3").json()["jobs"]] == ["Nightly"]
 
@@ -273,6 +274,29 @@ def test_the_job_page_follows_a_run_from_starting_to_running_to_cancelling_and_i
     assert (cancelling["phase"], cancelling["timed_out"]) == ("cancelling", True), cancelling
     going.clear()
     assert (run_now()["phase"], run_now()["going"]) == ("idle", False)
+
+
+def test_a_job_run_whose_cancel_is_not_closed_yet_reads_cancelling_on_the_list_and_its_page(client, monkeypatch):
+    real_query = main.db.query
+    cancelling_run = dict(group_run(701, "c1", datetime(2026, 10, 26, 14, 0, 30, tzinfo=UTC), status="running"),
+                          job_run_id="700")
+
+    def query(sql, params=()):
+        if sql == q.cancel_requested_runs_sql():
+            return [{"run_id": 700}]
+        rows = real_query(sql, params)
+        if sql in (q.group_runs_sql(), q.group_runs_in_windows_sql()):
+            rows = rows + [dict(cancelling_run)]
+        return rows
+
+    monkeypatch.setattr(main.run_poller, "table_ready", lambda: True)
+    monkeypatch.setattr(main.db, "query", query)
+    labels = [(r["job_name"], r["slot"][11:16], r["outcome"]["label"])
+              for r in client.get("/api/job-runs?job=1").json()["job_runs"]]
+    assert ("East hourly", "14:00", "Cancelling") in labels
+    page = client.get("/api/ingestion-jobs/1/runs/2026-10-26T14:00:00+00:00").json()
+    assert page["outcome"]["label"] == "Cancelling"
+    assert "Cancelling" in [r["status"]["label"] for r in page["group_runs"]]
 
 
 def test_the_job_page_says_why_run_now_or_delete_cannot_start(client, monkeypatch):

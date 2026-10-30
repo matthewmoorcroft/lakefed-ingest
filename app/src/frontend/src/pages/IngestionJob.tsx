@@ -7,8 +7,9 @@ import { changeInProgress, deleteNotice, rediscoveryBusy, rediscoveryButton, red
   type RediscoveryProgress } from "../pending";
 import { Tree } from "./JobEdit";
 import { TargetTables } from "./TargetTables";
+import { FailingTables } from "./FailingTables";
 import { RunningTasks } from "./tasks";
-import { Busy, Info, Spinner, OutLink, Crumbs, Badge, ErrorBox, Menu, Modal, Name, Notice, PageHead, StatusLine, toast, ProgressBar, RunStatus, Section, StateBar, fmtClock, fmtDuration, fmtInt, fmtSlot, fmtSpeed, fmtTime, jobRunPath, plural, progressFrom, useConfirm, type ConfirmRequest, Twisty } from "../components";
+import { Busy, Info, Spinner, OutLink, Crumbs, Badge, ErrorBox, Menu, Modal, Name, Notice, PageHead, StatusLine, toast, ProgressBar, RunStatus, Section, StateSummary, fmtClock, fmtDuration, fmtInt, fmtShort, fmtSlot, fmtSpeed, fmtTime, jobRunPath, plural, progressFrom, useConfirm, type ConfirmRequest, Twisty } from "../components";
 
 const PAGE = 25;
 
@@ -192,6 +193,15 @@ export default function IngestionJob() {
     mutationFn: (dropTargets: boolean) => api.post<Row>(`/schedules/${encodeURIComponent(id)}/delete`, { drop_targets: dropTargets }),
     onSuccess: () => { toast("Deleting the job"); qc.invalidateQueries(); },
   });
+  // A deleted job: Restore brings it back paused, and Delete now runs its purge at once.
+  const restore = useMutation({
+    mutationFn: () => api.post<Row>(`/schedules/${encodeURIComponent(id)}/restore`),
+    onSuccess: () => { toast("Restored paused"); qc.invalidateQueries(); },
+  });
+  const purge = useMutation({
+    mutationFn: () => api.post<Row>(`/schedules/${encodeURIComponent(id)}/purge`),
+    onSuccess: () => { qc.invalidateQueries(); },
+  });
   // Run it now for the daily re-discovery: its request, then the server's progress (the discovery run, then the tables).
   const rediscover = useMutation({
     mutationFn: () => api.post<Row>(`/ingestion-jobs/${encodeURIComponent(id)}/rediscover`, {}),
@@ -216,7 +226,7 @@ export default function IngestionJob() {
   const last = j?.last_job_run;
   const button = runButton(j?.run_now, { starting: runNow.isPending, cancelling: stop.isPending });
   const timeout = runTimeoutNotice(j?.run_now);
-  const deletion = deleteNotice(j?.delete);
+  const deletion = deleteNotice(j?.delete, fmtShort(j?.delete?.expires_at));
   return (
     <>
       <PageHead crumb={<Crumbs steps={[["Ingestion jobs", "/ingestion-jobs"]]} />} tab={j?.name}
@@ -232,11 +242,13 @@ export default function IngestionJob() {
         right={j && <span className="card-actions">
           {/* As a Databricks job page: Delete in the more-actions menu, Edit beside Run now, Run now the primary action,
               which becomes Cancel run while a run of the job is going. */}
-          {j.delete ? (deletion?.runAgain
-            ? <button className="danger" disabled={remove.isPending} onClick={() => remove.mutate(!!j.delete.drop_targets)}>
-                {remove.isPending ? "Starting the delete…" : "Run again"}</button>
-            : <button disabled title={deletion?.tone === "bad" ? deletion.text : "The job's delete is pending: this page is read only until it has finished"}>
-                {deletion?.tone === "bad" ? "Delete failed" : "Deleting…"}</button>)
+          {j.delete ? <>
+              <button disabled={!!j.delete_refusal || restore.isPending} title={j.delete_refusal ?? undefined}
+                onClick={() => restore.mutate()}>{restore.isPending ? "Restoring…" : "Restore"}</button>
+              <button className="danger" disabled={!!j.delete_refusal || purge.isPending} title={j.delete_refusal ?? undefined}
+                onClick={() => confirm.ask(deleteNowRequest(j.name)).then((ok) => ok && purge.mutate())}>
+                {purge.isPending ? "Starting the delete…" : "Delete now"}</button>
+            </>
             : <>
                 <Menu label="⋮" title="More actions">
                   <button className="danger-text" disabled={!!j.delete_blocked || remove.isPending} title={j.delete_blocked ?? undefined}
@@ -254,10 +266,14 @@ export default function IngestionJob() {
       {confirm.dialog}
       <RunningTasks jobId={id} />
       {deleting && j && <DeleteJobDialog job={j} onClose={(drop) => { setDeleting(false); if (drop !== null) remove.mutate(drop); }} />}
-      {deletion && (deletion.tone === "info" ? <Busy label={deletion.text} />
-        : <Notice tone={deletion.tone}>{deletion.text}{deletion.runAgain ? " Run again starts the delete again." : ""}
+      {deletion && (j?.delete?.state === "deleting" ? <Busy label={deletion.text} />
+        : <Notice tone={deletion.tone}>{j?.deleted_at && `Deleted on ${fmtShort(j.deleted_at)}. `}{deletion.text}
           {j?.delete?.run?.url && <> <OutLink href={j.delete.run.url}>Open in Databricks</OutLink>.</>}</Notice>)}
       {timeout && <Notice tone="warn">{timeout}</Notice>}
+      {restore.data?.cluster_error && <Notice tone="warn">Its cluster was not set back: {restore.data.cluster_error}</Notice>}
+      {purge.data?.delete_run?.error && <Notice tone="warn">The delete job did not start: {purge.data.delete_run.error}</Notice>}
+      <ErrorBox error={restore.error} />
+      <ErrorBox error={purge.error} />
       <Refused action="Run now" refusal={j?.run_now?.blocked} />
       <Refused action="Edit and Delete" refusal={j?.change_blocked} />
       <ErrorBox error={remove.error} />
@@ -269,25 +285,34 @@ export default function IngestionJob() {
       <ErrorBox error={job.error} />
       {j && (
         <div className="metrics">
-          <div className="metric"><div className="metric-label">Tables now</div><StateBar row={j} full /></div>
+          <div className="metric"><div className="metric-label">Tables now <Info>Loaded counts late tables too. A database is late when one of its tables is past its freshness target.</Info></div>
+            <StateSummary row={j} looksGood lateDatabases /></div>
           <div className="metric"><div className="metric-label">Last ingestion run</div>
             <div className="metric-value small-value">{last ? <Link to={jobRunPath(j.id, last.slot)}><RunStatus status={null} outcome={last.outcome} /></Link> : "Never run"}</div>
-            <div className="metric-sub">{last ? `${fmtSlot(last.slot)}${last.took_s != null ? `, took ${fmtDuration(last.took_s)}` : ""}` : ""}</div></div>
-          <div className="metric"><div className="metric-label">Next trigger</div>
-            <div className="metric-value small-value">{j.paused ? "Paused" : j.next_start ? fmtSlot(j.next_start) : "–"}</div>
-            <div className="metric-sub">{j.paused ? "no trigger fires until it is resumed" : "its first group starts then"}</div></div>
-          <div className="metric"><div className="metric-label">Speed</div>
-            <div className="metric-value">{j.median_speed_tables_per_min != null ? fmtSpeed(j.median_speed_tables_per_min) : "–"}<small>tables/min</small></div>
-            <div className="metric-sub">{Number(j.speed_job_runs) ? `tables loaded, median of the last ${fmtInt(j.speed_job_runs)} job ${plural(j.speed_job_runs, "run")} that loaded any`
-              : "no ingestion run loaded tables in 7 days"}</div></div>
-          <div className="metric"><div className="metric-label">Ingestion run time</div>
-            <div className="metric-value">{j.p95_took_s != null ? fmtDuration(j.p95_took_s) : "–"}</div>
-            <div className="metric-sub">p95 over 7 days</div></div>
+            <div className="metric-sub">{last ? `${fmtSlot(last.slot)}${last.took_s != null ? ` · took ${fmtDuration(last.took_s)}` : ""}` : ""}</div></div>
+          <div className="metric"><div className="metric-label">Next trigger {j.paused ? <Info>No trigger fires until it is resumed.</Info>
+              : j.next_start && <Info>Its first group starts then.</Info>}</div>
+            <div className={`metric-value small-value${j.paused || j.next_start ? "" : " muted"}`}>
+              {j.paused ? "Paused" : j.next_start ? fmtSlot(j.next_start) : "Not scheduled"}</div></div>
+          <div className="metric"><div className="metric-label">Speed {j.median_speed_tables_per_min != null
+              ? <Info>{`Tables a minute: the median of the last ${fmtInt(j.speed_job_runs)} ingestion ${plural(j.speed_job_runs, "run")} that loaded any table, from the last 7 days.`}</Info>
+              : <Info>No ingestion run loaded tables in 7 days.</Info>}</div>
+            {j.median_speed_tables_per_min != null ? <>
+              <div className="metric-value">{fmtSpeed(j.median_speed_tables_per_min)}<small>tables/min</small></div>
+              <div className="metric-sub">Median of the last {fmtInt(j.speed_job_runs)} {plural(j.speed_job_runs, "run")}</div></>
+              : <div className="metric-value small-value muted">Not yet</div>}</div>
+          <div className="metric"><div className="metric-label">Ingestion run time {j.p95_took_s != null
+              ? <Info>95% of ingestion runs took this long or less, over the last 7 days.</Info>
+              : <Info>Shows once an ingestion run has finished.</Info>}</div>
+            {j.p95_took_s != null ? <div className="metric-value">{fmtDuration(j.p95_took_s)}</div>
+              : <div className="metric-value small-value muted">Not yet</div>}</div>
         </div>
       )}
       {live.data?.active && <RunningNow live={live.data} />}
       {j && <RediscoveryRecord rediscovery={j.rediscovery} requesting={rediscover.isPending} error={rediscover.error}
         refused={j.change_blocked} onRunNow={() => rediscover.mutate()} />}
+      {j && <FailingTables jobId={id} runRefused={j.run_now?.refused} changeRefused={j.change_blocked}
+        removeRefused={j.delete_blocked} />}
       <Section title="Ingestion runs" note="Newest first; one row per trigger. Open a run for the groups it ran."
         actions={<span className="pager-buttons">
           <button className="ghost" disabled={!pages.length} onClick={() => setPages(pages.slice(0, -1))}>Newer</button>
@@ -389,6 +414,8 @@ function DeleteJobDialog({ job, onClose }: { job: Row; onClose: (dropTargets: bo
       {!p && !preview.error && <p className="muted">Reading what Delete removes…</p>}
       {p && <>
         {p.blocked && <Notice tone="warn">{p.blocked}</Notice>}
+        {p.retention_days != null && <p>The job is kept for {fmtInt(p.retention_days)} {plural(p.retention_days, "day")}, then deleted
+          for good. Restore brings it back with its state, so nothing reloads.</p>}
         {deleteJobText(p).map((line) => <p key={line}>{line}</p>)}
         {Number(p.targets) + Number(p.kept) > 0 && <>
           <label className="checkbox"><input type="checkbox" checked={drop} onChange={(e) => setDrop(e.target.checked)} />{" "}
@@ -400,13 +427,13 @@ function DeleteJobDialog({ job, onClose }: { job: Row; onClose: (dropTargets: bo
   );
 }
 
-/** What Delete removes and keeps, line by line, from the delete preview. */
+/** What Delete removes now, what the purge deletes later, and what stays, line by line, from the delete preview. */
 export function deleteJobText(p: Row): string[] {
   const groups = Number(p.groups?.length ?? 0), tables = Number(p.tables ?? 0), kept = p.groups_kept ?? [];
   return [
-    "Its schedule and its Databricks jobs are deleted.",
-    ...(groups ? [`Its ${fmtInt(groups)} ${plural(groups, "group")} and their ${fmtInt(tables)} ${plural(tables, "table")} are deleted, `
-      + "with their checkpoints. Run history and the change log stay."] : []),
+    "Its schedule and its Databricks jobs are removed now, and it stops running.",
+    ...(groups ? [`Its ${fmtInt(groups)} ${plural(groups, "group")} and their ${fmtInt(tables)} ${plural(tables, "table")} are deleted for good `
+      + "at the purge, with their checkpoints. Run history and the change log stay."] : []),
     ...(kept.length ? [`${fmtInt(kept.length)} ${plural(kept.length, "group")} another job also runs ${kept.length === 1 ? "stays" : "stay"}, `
       + `with ${kept.length === 1 ? "its" : "their"} tables: ${kept.join(", ")}.`] : []),
   ];
@@ -419,10 +446,18 @@ export function targetTablesText(p: Row, drop: boolean): string {
   const keeps = kept ? ` ${fmtInt(kept)} ${plural(kept, "target table")} another job also writes ${kept === 1 ? "is" : "are"} kept: `
     + `${names.join(", ")}${more}.` : "";
   return (drop
-    ? `${fmtInt(targets)} ${plural(targets, "target table")} only this job writes ${targets === 1 ? "is" : "are"} dropped, with `
-      + "their data, after its tables are deleted. This can't be undone; schemas stay."
+    ? `${fmtInt(targets)} ${plural(targets, "target table")} only this job writes ${targets === 1 ? "is" : "are"} dropped at the purge, `
+      + "with their data, after its tables are deleted. This can't be undone; schemas stay."
     : `Unticked, its ${fmtInt(targets)} ${plural(targets, "target table")} ${targets === 1 ? "stays" : "stay"} in Unity Catalog, with `
       + "their data.") + keeps;
+}
+
+/** Delete now's confirmation: the purge runs at once, so the job's state goes for good, with any target tables it was set
+ * to drop (those no other job writes). */
+export function deleteNowRequest(name: string): ConfirmRequest {
+  return { title: `Delete ${name} now?`, action: "Delete now", danger: true,
+    body: <p>It is deleted for good at once, by the delete job: its state goes, and any target tables it was set to drop that
+      no other job writes go with it. It can't be restored after this.</p> };
 }
 
 // What Cancel run stops, for its dialog, named from the live view: the job's run, its check and its group runs going.

@@ -152,6 +152,13 @@ p.small, .alert, .empty { max-width: 140ch; }
 .key { display: flex; flex-wrap: wrap; gap: var(--db-space-3); font-size: var(--db-font-size-sm); color: var(--muted); margin-top: var(--db-space-2); }
 .key i { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 5px; vertical-align: -1px; }
 .key b { color: var(--text); font-weight: var(--db-font-weight-semibold); }
+/* A card's bar and its legend: the legend on one wrapping line, each count beside its swatch. */
+.summary { display: flex; flex-direction: column; gap: var(--db-space-2); margin-top: var(--db-space-2); min-width: 0; }
+.summary .key { margin-top: 0; align-items: center; gap: var(--db-space-1) var(--db-space-3); }
+.summary .key > span { display: inline-flex; align-items: center; gap: 6px; margin: 0; white-space: nowrap; }
+.summary .bar { min-width: 0; }
+.key .all-done { color: var(--text); }
+.key .all-done svg { color: var(--s-loaded); flex: none; }
 
 /* Running now */
 .run-row { display: grid; grid-template-columns: minmax(200px, 1fr) minmax(0, 2.2fr) minmax(200px, 1fr); gap: var(--db-space-4); align-items: center;
@@ -215,6 +222,7 @@ button { font: inherit; padding: 0 12px; height: 32px; border-radius: var(--db-s
   background: var(--db-surface-base); color: var(--db-color-action-default-text-default); cursor: pointer; }
 button:hover { border-color: var(--db-color-action-default-border-hover); color: var(--db-color-action-default-text-hover); }
 button:disabled { opacity: 0.5; cursor: not-allowed; }
+.create-lock { border: 0; margin: 0; padding: 0; min-width: 0; }
 button.primary { background: var(--accent); color: var(--accent-text); border-color: var(--accent); }
 button.primary:hover { background: var(--accent-hover); border-color: var(--accent-hover); color: var(--accent-text); }
 button.danger { background: var(--db-negative-surface); color: #fff; border-color: var(--db-negative-surface); }
@@ -365,6 +373,9 @@ details.advanced .compute h4 { margin: var(--db-space-3) 0 var(--db-space-2); }
 .tri-box.all, .tri-box.part { background: var(--accent); border-color: var(--accent); }
 .task-progress { display: block; width: 100%; margin: var(--db-space-2) 0; accent-color: var(--accent); }
 .empty-drop { border: 1px dashed var(--border); border-radius: var(--db-shape-container-small); padding: var(--db-space-4); text-align: center; color: var(--muted); margin: 0; }
+.drop-zone { border: 1px dashed var(--border); border-radius: var(--db-shape-container-small); padding: var(--db-space-4); text-align: center; display: grid; justify-items: center; gap: var(--db-space-2); }
+.drop-zone.over { border-color: var(--db-color-action-primary-background-default, #2272b4); }
+.empty-choices { display: flex; flex-wrap: wrap; justify-content: center; gap: var(--db-space-2); margin-top: var(--db-space-3); }
 .menu-note { padding: 6px 12px; overflow-wrap: anywhere; }
 .menu-note + .menu-note { border-top: 1px solid var(--border); }
 button.avatar { width: 32px; height: 32px; padding: 0; border-radius: 50%; border: 0; background: var(--db-color-action-primary-background-default, #2272b4);

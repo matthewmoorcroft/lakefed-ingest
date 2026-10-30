@@ -31,6 +31,9 @@ APP_VERSION = os.environ.get("APP_VERSION") or None
 # the deployer). The app's service principal can't read its own app's access list without Can Manage on the app, which
 # it isn't given, so this list is how Manage knows its managers.
 APP_MANAGERS = {name.strip().lower() for name in os.environ.get("APP_MANAGERS", "").split(",") if name.strip()}
+# How many days a deleted app job is kept for a Restore before the delete job's daily run purges it. Must equal the
+# engine bundle's deleted_job_retention_days (the delete job purges by its own variable).
+DELETED_JOB_RETENTION_DAYS = int(os.environ.get("DELETED_JOB_RETENTION_DAYS") or 7)
 # Group given CAN_VIEW on the wrapper jobs the app creates for schedules (blank = owner and admins only).
 SCHEDULE_JOB_VIEW_GROUP = os.environ.get("SCHEDULE_JOB_VIEW_GROUP", "users") or None
 
@@ -296,6 +299,13 @@ def start_draft_purge(ttl_s: int) -> int:
 def start_delete_job(schedule_id, drop_targets: bool) -> int:
     """Start the delete job for one deleted app job: its groups' rows go, and its target tables too when asked."""
     return run_now(DELETE_JOB_ID, {"schedule_id": str(int(schedule_id)), "drop_targets": "true" if drop_targets else "false"})
+
+
+def start_table_remove(schedule_id, control_ids) -> int:
+    """Start the delete job for some tables of one live job: their control rows and their state go, their target tables
+    stay (delete_job.delete_table_rows). The job runs as the deployer, as the whole-job delete does."""
+    ids = ",".join(str(int(i)) for i in control_ids)
+    return run_now(DELETE_JOB_ID, {"schedule_id": str(int(schedule_id)), "control_ids": ids})
 
 
 _node_types: dict = {}

@@ -1,3 +1,4 @@
+import { isLiveOutcome } from "../components";
 import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { Link, useParams } from "react-router-dom";
@@ -25,10 +26,10 @@ export default function JobRun() {
   const run = useQuery({
     queryKey: ["job-run", id, slot],
     queryFn: () => api.get<Row>(`/ingestion-jobs/${encodeURIComponent(id)}/runs/${encodeURIComponent(slot)}`),
-    refetchInterval: (q) => ((q.state.data as Row | undefined)?.outcome?.label === "Running" ? 15_000 : false),
+    refetchInterval: (q) => (isLiveOutcome((q.state.data as Row | undefined)?.outcome?.label) ? 15_000 : false),
   });
   const r = run.data;
-  const live = r?.outcome?.label === "Running";
+  const live = isLiveOutcome(r?.outcome?.label);
   const p = progressFrom(r?.progress);
   const checkedPct = p.total ? Math.floor((100 * (p.unchanged + p.loaded)) / p.total) : 0;
   const notStarted = (r?.group_runs ?? []).filter((g: Row) => g.state === "waiting" || g.state === "starting")

@@ -93,11 +93,12 @@ CASES = {
 }
 
 
+@pytest.mark.parametrize("unity_catalog", [False, True])
 @pytest.mark.parametrize("case", CASES)
-def test_the_sql_read_agrees_with_the_row_by_row_read(conn, case):
+def test_the_sql_read_agrees_with_the_row_by_row_read(conn, case, unity_catalog):
     _load(conn, CASES[case])
-    expected = js.read(_rows(conn))
-    found = jss.read(_fetch(conn), GROUPS)
+    expected = js.read(_rows(conn), unity_catalog)
+    found = jss.read(_fetch(conn), GROUPS, unity_catalog)
     for name in expected:
         if "mixed" in expected[name]:
             assert "mixed" in found[name], name
@@ -111,20 +112,21 @@ EDITS = {
     "write mode with new targets": {"write_mode_changes": "merge", "write_mode_full": "merge", "sink_schema": "current"},
     "fan-in off with database targets": {"fan_in": False, "sink_schema": "bronze_{database}"},
     "client_id template": {"client_id": "{server}:{database}"},
-    "upper-case names": {"lowercase": False},
     "a blank identity value": {"identity": {"region": "", "source_database": "{database}"}},
     "write mode in capitals with new targets": {"write_mode_full": " Merge ", "sink_schema": "current"},
 }
 
 
+@pytest.mark.parametrize("unity_catalog", [False, True])
 @pytest.mark.parametrize("edit", EDITS)
-def test_an_sql_edit_leaves_the_rows_as_the_row_by_row_plan_would(conn, edit):
+def test_an_sql_edit_leaves_the_rows_as_the_row_by_row_plan_would(conn, edit, unity_catalog):
     _load(conn, FLEET)
     before = _rows(conn)
-    planned = js.plan(before, EDITS[edit])
+    planned = js.plan(before, EDITS[edit], unity_catalog)
     expected = [{**r, **planned.get(r["id"], {})} for r in before]
-    now = jss.read(_fetch(conn), GROUPS)
+    now = jss.read(_fetch(conn), GROUPS, unity_catalog)
     check = jss.preview(_fetch(conn), GROUPS, EDITS[edit], now)
+
     assert check["errors"] == [] and check["summary"]["changed"] == len(planned)
     with conn.transaction():
         result = jss.apply(conn.cursor(), GROUPS, EDITS[edit], now, "op@example.com", "b1")

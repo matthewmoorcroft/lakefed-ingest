@@ -63,3 +63,8 @@ def test_fewer_groups_empty_the_extra_ones_and_keep_the_names_with_the_most_tabl
     assert plan["groups"] == ["job_s_c01", "job_s_c02"] and plan["emptied"] == ["job_s_c03", "job_s_c04"]
     assert plan["group_of"]["a"] == "job_s_c01" and plan["group_of"]["b"] == "job_s_c02"
     assert set(plan["moves"]) == {"c", "d"}
+
+
+def test_the_remainder_example_in_the_comment_holds():
+    assert placement.groups_for_tables(100_200) == 10
+    assert placement.groups_for_tables(101_500) == 11

@@ -7,6 +7,7 @@ import time
 import pytest
 
 import queries as q
+import table_removal as tr
 
 pytest.importorskip("fastapi")
 pytest.importorskip("httpx")
@@ -68,6 +69,15 @@ def test_a_taken_target_refuses_the_lot_or_is_skipped():
     assert refused.value.status_code == 409 and "another table already writes main.s.t2" in refused.value.detail
     written = main._insert_controls(FakeCursor(FakeDB()), rows, "op", "b", skip_taken=True)
     assert [row["src_table"] for row, _ in written] == ["t1", "t3"]
+
+
+def test_a_taken_target_of_a_consolidated_row_names_its_database_and_server_not_its_client_id():
+    row = {"sink_catalog": "main", "sink_schema": "eng", "sink_table": "t0000", "client_id": "sql_a_eng_000",
+           "src_database": "eng_000", "src_connection": "sql_a"}
+    assert main._taken_target(row) == "another table already writes main.eng.t0000 for database eng_000 on sql_a"
+    assert main._taken_target({**row, "src_connection": None, "src_host": "db.example.net"}) == (
+        "another table already writes main.eng.t0000 for database eng_000 on db.example.net")
+    assert main._taken_target({**row, "client_id": None}) == "another table already writes main.eng.t0000"
 
 
 # ---- the background task -------------------------------------------------------------------------------------------
@@ -394,8 +404,34 @@ def test_a_committed_write_whose_sync_failed_is_finished_by_sending_its_request_
     assert synced == [7, 7]
 
 
+def test_only_a_csv_or_a_selection_of_tables_names_its_tables_one_by_one():
+    table_part = ("tables", "sql_b", "ops_01", ["t0001"], None)
+    assert main._explicit_tables(None)
+    assert main._explicit_tables({"database_lines": [], "parts": [table_part]})
+    assert not main._explicit_tables({"database_lines": [], "parts": [("server", "sql_b", None, None, "")]})
+    database_part = ("database", "sql_b", "ops_01", None, None)
+    assert not main._explicit_tables({"database_lines": [], "parts": [table_part, database_part]})
+    assert not main._explicit_tables({"database_lines": [{"line": 2}], "parts": [table_part]})
+
+
+def test_naming_a_removed_table_in_an_add_takes_it_back_in_and_clears_its_exclusion(job_client, monkeypatch):
+    _removed(monkeypatch, "sql_b", "ops_01", "gen", "t0001")
+    text = HEAD + "sql_b,ops_01,gen,t0001,\"id, a\",id\n"
+    r = job_client.post("/api/ingestion-jobs/7/tables", json={"csv": text, "dry_run": False, "request_id": "add-back"})
+    assert r.status_code == 200 and r.json()["applied"] is True
+    assert job_client.db.of(q.clear_exclusions_sql()) == [([tr.exclusion_key("sql_b", "ops_01", "gen", "t0001")], 7)]
+    assert len(job_client.db.of("insert into lakefed_ingest.control (")) == 1
+
+
 def _sync_error(collection, detail):
     return {"task_collection": collection, "action": "error", "detail": detail, "job_id": None, "member_id": 1}
+
+
+def _removed(monkeypatch, server, database, schema, table):
+    """The job removed this table: its exclusion is on the job's options."""
+    key = tr.exclusion_key(server, database, schema, table)
+    removal = {key: {"removed_at": "2026-10-30T00:00:00+00:00", "removed_by": None}}
+    monkeypatch.setattr(main.sch, "options_of", lambda job: {tr.EXCLUDED: removal})
 
 
 def test_the_job_page_reads_its_tasks_after_ending_stale_ones(job_client):

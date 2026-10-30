@@ -1,5 +1,6 @@
 """Schedule endpoints (main.py) with a fake Lakebase and a fake Jobs API: create, edit, pause, delete."""
 import contextlib
+import json
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -8,11 +9,20 @@ pytest.importorskip("fastapi")
 pytest.importorskip("httpx")
 from fastapi.testclient import TestClient  # noqa: E402
 
+import jdbc_connections as jc  # noqa: E402
+import jdbc_logins as jl  # noqa: E402
 import main  # noqa: E402
 import queries as q  # noqa: E402
 import schedules as sch  # noqa: E402
 
 from schedules_test import FakeJobs  # noqa: E402
+
+
+RESTORE_CLEARS = ("delete_drop_targets", "delete_run_id", "delete_start_error", "delete_finished")
+LOGIN_SCOPE = "lakefed_ingest_jdbc_logins"
+CONNECTION_ROW = {"name": "orders jdbc", "src_type": "sqlserver", "src_host": "orders.internal.example",
+                  "src_port": 1433, "secret_scope": "lakefed", "secret_key": "orders-login",
+                  "trust_server_certificate": "false", "created_by": "ann", "created_at": None}
 
 
 class Store:
@@ -22,15 +32,24 @@ class Store:
         self.schedules, self.members, self.log, self.unique, self.locks = {}, {}, [], False, []
         self.with_tables = {"c1", "c2", "c3"}           # groups with control rows
         self.targets = {}                               # group: its rows' target tables (default: one of its own)
+        # What the restore and the database checks answer; a test sets them.
+        self.owners, self.conflicts = [], []
+        self.rowcount, self.clock = -1, self.stamp()
 
-    def now(self):
+    def stamp(self):
         return datetime.now(timezone.utc).isoformat()
 
-    def delete_pending(self, row):
-        """A deleted job the list shows: its delete failed to start, or its delete job hasn't marked it finished."""
-        options = sch.options_of(row)
-        return row["deleted_at"] is not None and ("delete_start_error" in options
-                                                  or ("delete_drop_targets" in options and "delete_finished" not in options))
+    def begin(self):
+        """A transaction's timestamps are one instant, as now() is in Postgres: a delete's deleted_at and the members it
+        removes match, which a Restore relies on."""
+        self.clock = self.stamp()
+
+    def now(self):
+        return self.clock
+
+    def kept(self, row):
+        """A deleted job the Deleted jobs list shows: not yet purged (its delete job hasn't marked it finished)."""
+        return row["deleted_at"] is not None and "delete_finished" not in sch.options_of(row)
 
     def tables_left(self, schedule_id):
         """Whether a deleted job's groups still have tables a Delete would remove (groups no live job holds)."""
@@ -41,6 +60,21 @@ class Store:
         return bool((groups - held) & self.with_tables)
 
     def run(self, sql, params):
+        self.rowcount = -1
+        if sql == q.restore_schedule_sql():
+            row = self.schedules.get(params[0])
+            self.rowcount = 1 if row and self.kept(row) else 0
+            if self.rowcount:
+                import json
+                options = {k: v for k, v in sch.options_of(row).items() if k not in RESTORE_CLEARS}
+                row.update(deleted_at=None, paused=True, options=json.dumps(options))
+            return []
+        if sql == q.restore_members_sql():
+            deleted_at = self.schedules[params[1]]["deleted_at"]
+            for m in self.members.values():
+                if m["schedule_id"] == params[0] and m["removed_at"] is not None and m["removed_at"] == deleted_at:
+                    m["removed_at"] = None
+            return []
         if sql in (q.touch_jobs_sql(), q.touch_group_jobs_sql()):
             import json
             user, keys = params
@@ -97,13 +131,27 @@ class Store:
             self.locks.append(params)
         elif "control_change" in sql:
             self.log.append(params)
-        return []
+        return self.query(sql, params)
 
     def query(self, sql, params=()):
         if "from lakefed_ingest.control" in sql and "distinct task_collection" in sql:
             return [{"task_collection": c} for c in sorted(self.with_tables)]
         if sql == q.schedules_sql():
-            return [dict(s) for s in self.schedules.values() if s["deleted_at"] is None or self.delete_pending(s)]
+            return [dict(s) for s in self.schedules.values() if s["deleted_at"] is None or self.kept(s)]
+        if sql == q.live_name_taken_sql():
+            name, sid = params
+            return [(i,) for i, x in self.schedules.items()
+                    if x["deleted_at"] is None and x["name"].lower() == name.lower() and i != sid]
+        if sql == q.groups_held_elsewhere_sql():
+            groups, sid = params
+            live = {i for i, x in self.schedules.items() if x["deleted_at"] is None}
+            return [(m["task_collection"], self.schedules[m["schedule_id"]]["name"]) for m in self.members.values()
+                    if m["task_collection"] in groups and m["removed_at"] is None and m["schedule_id"] in live
+                    and m["schedule_id"] != sid]
+        if sql == q.restore_conflicts_sql():
+            return list(self.conflicts)
+        if sql == q.deleted_database_owners_sql():
+            return list(self.owners)
         if sql == q.deleted_tables_left_sql():
             return [{"schedule_id": sid} for sid in params[0] if self.tables_left(sid)]
         if sql == q.schedule_sql():
@@ -123,13 +171,12 @@ class Store:
             kept = sorted(t for t in mine if t.lower() in theirs)
             return [{"tables": sum(len(sinks(g)) for g in groups), "targets": len(mine) - len(kept), "kept": len(kept),
                      "kept_names": kept[:q.DELETE_KEPT_LISTED]}]
-        if sql == q.deletions_sql():
-            rows = [dict(x) for x in self.schedules.values()
-                    if x["deleted_at"] is not None and "delete_finished" in sch.options_of(x)]
-            return sorted(rows, key=lambda x: x["deleted_at"], reverse=True)[params[1]:params[1] + params[0]]
-        if sql == q.deletions_count_sql():
-            return [{"total": sum(1 for x in self.schedules.values()
-                                  if x["deleted_at"] is not None and "delete_finished" in sch.options_of(x))}]
+        if sql == q.deleted_jobs_count_sql():
+            return [{"total": sum(1 for x in self.schedules.values() if self.kept(x))}]
+        if sql == q.deleted_jobs_sql():
+            rows = sorted((dict(x) for x in self.schedules.values() if self.kept(x)), key=lambda x: x["deleted_at"],
+                          reverse=True)
+            return rows[params[1]:params[1] + params[0]]
         if sql == q.schedule_members_sql():
             pending = lambda m: bool(m["removed_at"] and m["job_id"] and (m["synced_at"] is None or m["synced_at"] < m["removed_at"]))
             return [dict(m, delete_pending=pending(m)) for m in self.members.values() if m["schedule_id"] in params[0]]
@@ -139,12 +186,18 @@ class Store:
 class Cur:
     def __init__(self, store):
         self.store, self._rows = store, []
+        self.store.begin()
+        self.rowcount = -1
 
     def execute(self, sql, params=()):
         self._rows = self.store.run(sql, params)
+        self.rowcount = self.store.rowcount
 
     def fetchone(self):
         return self._rows[0] if self._rows else None
+
+    def fetchall(self):
+        return list(self._rows)
 
 
 @pytest.fixture
@@ -182,6 +235,65 @@ BODY = dict(name="Prod 15", cadence_minutes=15, timezone="UTC", parameters={"par
             stagger=True, paused=False, members=["c1", "c2"])
 
 
+def test_a_job_not_read_through_a_connection_may_not_name_the_login_scope(api, monkeypatch):
+    monkeypatch.setenv(jl.SCOPE_ENV, LOGIN_SCOPE)
+    r = api.post("/api/schedules", json=dict(BODY, parameters={"secret_scope": LOGIN_SCOPE}))
+    assert r.status_code == 422 and LOGIN_SCOPE in r.json()["detail"]["errors"][0]
+    assert api.store.schedules == {}
+
+
+def test_an_edit_may_not_move_a_job_onto_the_login_scope(api, monkeypatch):
+    monkeypatch.setenv(jl.SCOPE_ENV, LOGIN_SCOPE)
+    sid = api.post("/api/schedules", json=BODY).json()["id"]
+    r = api.post(f"/api/schedules/{sid}", json=dict(BODY, parameters={"secret_scope": LOGIN_SCOPE}))
+    assert r.status_code == 422 and LOGIN_SCOPE in r.json()["detail"]["errors"][0]
+    assert LOGIN_SCOPE not in json.dumps(api.store.schedules[sid])
+
+
+def test_an_edit_of_a_job_that_reads_through_a_connection_keeps_the_connections_scope_and_trust(api, monkeypatch):
+    sid = api.post("/api/schedules", json=BODY).json()["id"]
+    _reads_through(monkeypatch, api, {**CONNECTION_ROW, "trust_server_certificate": "true"})
+    body = dict(BODY, parameters={"parallelism": "16", "secret_scope": "elsewhere",
+                                  "trust_server_certificate": "false"})
+    assert api.post(f"/api/schedules/{sid}", json=body).status_code == 200
+    members = [m for m in api.store.members.values() if m["schedule_id"] == sid]
+    assert len(members) == 2
+    for member in members:
+        params = api.jobs.jobs[member["job_id"]]["tasks"][0]["run_job_task"]["job_parameters"]
+        assert (params["secret_scope"], params["trust_server_certificate"], params["parallelism"]) == (
+            "lakefed", "true", "16")
+
+
+def test_an_edit_may_not_move_a_job_whose_connection_is_gone_onto_the_login_scope(api, monkeypatch):
+    monkeypatch.setenv(jl.SCOPE_ENV, LOGIN_SCOPE)
+    sid = api.post("/api/schedules", json=BODY).json()["id"]
+    _reads_through(monkeypatch, api, None)
+    r = api.post(f"/api/schedules/{sid}", json=dict(BODY, parameters={"secret_scope": LOGIN_SCOPE}))
+    assert r.status_code == 422 and LOGIN_SCOPE in r.json()["detail"]["errors"][0]
+    assert LOGIN_SCOPE not in json.dumps(api.store.schedules[sid])
+
+
+def test_an_app_manager_may_name_any_other_scope_and_no_one_else_may(api, monkeypatch):
+    monkeypatch.setenv(jl.SCOPE_ENV, LOGIN_SCOPE)
+    monkeypatch.setattr(main, "_manage_refusal", lambda user: "not an app manager")
+    r = api.post("/api/schedules", json=dict(BODY, parameters={"secret_scope": "lakefed"}))
+    assert r.status_code == 403 and "only an app manager" in r.json()["detail"]
+    assert api.post("/api/schedules", json=BODY).status_code == 200
+    monkeypatch.setattr(main, "_manage_refusal", lambda user: None)
+    assert api.post("/api/schedules", json=dict(BODY, name="Other", parameters={"secret_scope": "lakefed"})).status_code == 200
+
+
+def test_an_edit_that_keeps_the_stored_scope_passes_and_one_that_changes_it_is_a_managers(api, monkeypatch):
+    monkeypatch.setattr(main, "_manage_refusal", lambda user: None)
+    sid = api.post("/api/schedules", json=dict(BODY, parameters={"secret_scope": "lakefed"})).json()["id"]
+    monkeypatch.setattr(main, "_manage_refusal", lambda user: "not an app manager")
+    kept = dict(BODY, cadence_minutes=30, parameters={"secret_scope": "lakefed"})
+    assert api.post(f"/api/schedules/{sid}", json=kept).status_code == 200
+    moved = dict(BODY, parameters={"secret_scope": "other_admin_scope"})
+    r = api.post(f"/api/schedules/{sid}", json=moved)
+    assert r.status_code == 403 and "only an app manager" in r.json()["detail"]
+
+
 def test_create_writes_rows_creates_one_job_per_member_and_logs(api):
     r = api.post("/api/schedules", json=BODY)
     assert r.status_code == 200, r.text
@@ -199,6 +311,37 @@ def test_create_writes_rows_creates_one_job_per_member_and_logs(api):
     assert listed[0]["name"] == "Prod 15" and len(listed[0]["members"]) == 2
     m = {x["task_collection"]: x for x in listed[0]["members"]}
     assert m["c2"]["when"] == "Every 15 minutes, starting at 7 minutes past the hour (UTC)" and m["c2"]["next_run"] and m["c2"]["job_url"].startswith("https://h/jobs/")
+
+
+def test_a_job_made_here_stores_unity_catalog_names_and_keeps_them_on_edit(api):
+    r = api.post("/api/schedules", json=dict(BODY, options={"target_names": "legacy"}))
+    assert r.status_code == 200, r.text
+    sid = r.json()["id"]
+    assert sch.options_of(api.store.schedules[sid])["target_names"] == "unity_catalog"
+    assert main._unity_catalog(api.store.schedules[sid]) is True
+    assert api.post(f"/api/schedules/{sid}", json=BODY).status_code == 200
+    assert main._unity_catalog(api.store.schedules[sid]) is True
+
+
+def test_an_edit_after_a_table_removal_is_saved_and_keeps_the_removals(api):
+    import table_removal
+    sid = api.post("/api/schedules", json=BODY).json()["id"]
+    removals = {table_removal.EXCLUDED: [["h1:1433", "sales", "dbo", "orders"]],
+                table_removal.OPTION: {"run_id": 12, "tables": 1}}
+    stored = api.store.schedules[sid]
+    stored["options"] = json.dumps({**sch.options_of(stored), **removals})
+    sent = sch.options_of(stored)                                   # Edit sends every stored option it doesn't own
+    r = api.post(f"/api/schedules/{sid}", json=dict(BODY, cadence_minutes=30, options=sent))
+    assert r.status_code == 200, r.text
+    options = sch.options_of(api.store.schedules[sid])
+    assert options[table_removal.EXCLUDED] == removals[table_removal.EXCLUDED]
+    assert options[table_removal.OPTION] == removals[table_removal.OPTION]
+    r = api.post(f"/api/schedules/{sid}", json=dict(BODY, options={}))
+    assert r.status_code == 200, r.text
+    assert sch.options_of(api.store.schedules[sid])[table_removal.EXCLUDED] == removals[table_removal.EXCLUDED]
+    tampered = {table_removal.EXCLUDED: []}
+    assert api.post(f"/api/schedules/{sid}", json=dict(BODY, options=tampered)).status_code == 200
+    assert sch.options_of(api.store.schedules[sid])[table_removal.EXCLUDED] == removals[table_removal.EXCLUDED]
 
 
 def test_validation_and_duplicate_name(api):
@@ -224,6 +367,7 @@ def test_edit_adds_and_removes_members_restaggers_and_resets_jobs(api):
     assert {x["action"] for x in again} == {"unchanged"}
 
 
+
 def test_pause_resume_and_delete(api):
     sid = api.post("/api/schedules", json=BODY).json()["id"]
     api.post(f"/api/schedules/{sid}/pause")
@@ -233,8 +377,8 @@ def test_pause_resume_and_delete(api):
     assert all(j["schedule"]["pause_status"] == "UNPAUSED" for j in api.jobs.jobs.values())
     r = api.post(f"/api/schedules/{sid}/delete").json()
     assert sorted(x["action"] for x in r["sync"]) == ["deleted", "deleted"] and api.jobs.jobs == {}
-    listed = api.get("/api/schedules").json()     # its delete is pending: listed as deleting until its delete job ends
-    assert [(x["id"], x["delete"]["state"]) for x in listed] == [(sid, "deleting")]
+    listed = api.get("/api/schedules").json()     # kept until its purge: listed as deleted, with its state
+    assert [(x["id"], x["delete"]["state"]) for x in listed] == [(sid, "kept")]
     assert api.post(f"/api/schedules/{sid}/pause").status_code == 409
 
 
@@ -314,6 +458,8 @@ def test_ingest_runs_started_by_a_wrapper_show_their_schedule(api, monkeypatch):
     opts = api.get("/api/schedules/options").json()
     assert opts["defaults"] == {"parallelism": "32"} and "table_retries" in opts["parameters"]
     assert opts["scheduled"] == {"c1": ["Prod 15"], "c2": ["Prod 15"]}
+    assert opts["shared_client_id"] == "{server}_{database}"
+    assert opts["shared_identity"] == {"source_server": "{server}", "source_database": "{database}"}
 
 
 def test_a_schedule_body_keeps_minute_schedules_in_utc():
@@ -364,6 +510,17 @@ def test_a_jobs_compute_says_so_when_a_job_cannot_be_read(api, monkeypatch):
     sid = api.post("/api/schedules", json=BODY).json()["id"]
     [job] = api.get(f"/api/ingestion-jobs/{sid}/compute").json()["jobs"]
     assert (job["compute"], job["error"]) == ([], "can't read job 555: no access")
+
+
+def _reads_through(monkeypatch, api, connection_row):
+    """Makes the schedule's job read through the JDBC connection its discovery names, whose stored row is connection_row
+    (None: the connection is gone)."""
+    answers = {q.job_selection_sql(): [{"source_kind": "discovery", "source_id": "d1"}],
+               q.selection_discoveries_sql(): [{"listing": {"jdbc_connection": "orders jdbc"}}],
+               jc.get_sql(): [connection_row] if connection_row else []}
+    served = main.db.query
+    monkeypatch.setattr(main.db, "query",
+                        lambda sql, params=(): answers[sql] if sql in answers else served(sql, params))
 
 
 def _run_now_setup(api, monkeypatch, body):
@@ -522,7 +679,8 @@ def test_a_cluster_of_its_own_starts_the_copies_job_and_a_forged_copy_id_is_igno
     assert r.status_code == 200 and r.json()["cluster_error"] is None and started == [sid]
     assert r.json()["cluster_started"] is True
     options = sch.options_of(api.store.schedules[sid])
-    assert options == {"cluster": BIG, "cluster_copy_run_id": 8001, "updated_by": "op@example.com"}
+    assert options == {"cluster": BIG, "cluster_copy_run_id": 8001, "target_names": "unity_catalog",
+                       "updated_by": "op@example.com"}
     # Saving again with the same cluster starts nothing; the wrappers keep the bundle's job until the copy exists.
     assert api.post(f"/api/schedules/{sid}", json=body).status_code == 200 and started == [sid]
     assert main._wrapper_target(api.store.schedules[sid]) == 555
@@ -618,20 +776,20 @@ def test_a_malformed_or_zoneless_date_in_a_request_is_a_bad_request_not_a_server
         assert "UTC offset" in r.text or "date and time" in r.text
 
 
-def test_delete_marks_the_job_deleted_and_starts_the_delete_job_with_the_tick_box(api):
+
+def test_delete_is_soft_it_keeps_the_job_and_starts_no_delete_job(api):
     sid = api.post("/api/schedules", json=BODY).json()["id"]
     r = api.post(f"/api/schedules/{sid}/delete", json={"drop_targets": True})
     assert r.status_code == 200, r.text
-    run = r.json()["delete_run"]
-    assert run == {"run_id": 9001, "url": "https://h/jobs/900/runs/9001", "error": None}
-    assert api.delete_runs[9001]["schedule_id"] == sid and api.delete_runs[9001]["drop_targets"] is True
+    assert r.json()["delete_run"] is None and r.json()["retention_days"] == 7
+    assert api.delete_runs == {}
     row = api.store.schedules[sid]
-    assert row["deleted_at"] and sch.options_of(row)["delete_run_id"] == 9001
-    assert sch.options_of(row)["delete_drop_targets"] is True
+    assert row["deleted_at"] and sch.options_of(row)["delete_drop_targets"] is True
+    assert "delete_run_id" not in sch.options_of(row)
     assert all(m["removed_at"] for m in api.store.members.values()) and api.jobs.jobs == {}
     other = api.post("/api/schedules", json=dict(BODY, name="Other")).json()["id"]
     api.post(f"/api/schedules/{other}/delete")                                 # no body: the target tables stay
-    assert api.delete_runs[9002]["drop_targets"] is False
+    assert sch.options_of(api.store.schedules[other])["delete_drop_targets"] is False
 
 
 def test_delete_is_refused_while_a_run_of_the_job_is_going(api, monkeypatch):
@@ -667,7 +825,7 @@ def test_delete_needs_the_delete_job_when_the_groups_have_tables(api, monkeypatc
     api.store.with_tables -= {"c1", "c2"}                  # nothing would stay behind: no delete job is needed
     r = api.post(f"/api/schedules/{sid}/delete").json()
     assert r["deleted"] is True and r["delete_run"] is None
-    assert "delete_drop_targets" not in sch.options_of(api.store.schedules[sid])
+    assert sch.options_of(api.store.schedules[sid])["delete_drop_targets"] is False
 
 
 def test_the_preview_counts_the_tables_and_names_the_targets_another_job_also_writes(api):
@@ -688,26 +846,171 @@ def test_a_group_another_live_job_also_holds_stays_with_its_tables(api):
     assert api.get(f"/api/ingestion-jobs/{sid}/delete-preview").json()["groups"] == ["c1", "c2"]
 
 
-def test_a_delete_job_that_did_not_start_is_listed_as_failed_and_run_again_with_its_tick_box(api, monkeypatch):
+
+def test_a_purge_that_did_not_start_is_listed_as_failed_and_can_be_purged_again(api, monkeypatch):
     sid = api.post("/api/schedules", json=BODY).json()["id"]
+    api.post(f"/api/schedules/{sid}/delete", json={"drop_targets": True})
     real = main.jobs.start_delete_job
     monkeypatch.setattr(main.jobs, "start_delete_job", lambda sid, drop: (_ for _ in ()).throw(RuntimeError("403 forbidden. more")))
-    r = api.post(f"/api/schedules/{sid}/delete", json={"drop_targets": True}).json()
-    assert r["deleted"] is True and r["delete_run"]["error"] == "the delete job didn't start: 403 forbidden"
-    job = _listed(api, sid)
-    assert (job["status"]["label"], job["status"]["detail"]) == ("Delete failed", ["the delete job didn't start: 403 forbidden"])
-    assert api.get(f"/api/ingestion-jobs/{sid}").json()["delete"]["run_again"] is True
+    assert _listed(api, sid) is None                                             # a deleted job is in Deleted jobs, not the list
+    r = api.post(f"/api/schedules/{sid}/purge").json()
+    assert r["delete_run"]["error"] == "the delete job didn't start: 403 forbidden"
+    job = _deleted(api, sid)
+    assert (job["delete"]["state"], job["delete"]["reason"]) == ("failed", "the delete job didn't start: 403 forbidden")
     monkeypatch.setattr(main.jobs, "start_delete_job", real)
-    again = api.post(f"/api/schedules/{sid}/delete")                           # Run again: the stored tick box
+    again = api.post(f"/api/schedules/{sid}/purge")                            # Purge again: the stored tick box
     assert again.status_code == 200 and api.delete_runs[9001]["drop_targets"] is True
-    assert api.post(f"/api/schedules/{sid}/delete").status_code == 409            # its delete is still running
-    assert _listed(api, sid)["status"]["label"] == "Deleting"
+    assert api.post(f"/api/schedules/{sid}/purge").status_code == 409          # its purge is still running
+    assert _deleted(api, sid)["delete"]["state"] == "deleting"
     api.delete_runs[9001].update(state="TERMINATED", result="SUCCESS")
-    api.store.with_tables -= {"c1", "c2"}
-    assert _listed(api, sid) is None                                              # gone: it leaves the list
-    done = api.get("/api/ingestion-jobs/deletions").json()["deletions"][0]
-    assert (done["run"]["result"], done["tables_left"]) == ("SUCCESS", 0)
-    assert api.post(f"/api/schedules/{sid}/delete").json()["delete_run"] is None    # nothing is left to delete
+    row = api.store.schedules[sid]
+    row["options"] = json.dumps({**sch.options_of(row), "delete_finished": True})   # the purge marked it finished
+    assert _deleted(api, sid) is None                                            # purged: it leaves the list
+    assert api.post(f"/api/schedules/{sid}/purge").status_code == 409
+
+
+def _delete_job(api, sid, drop_targets=False):
+    return api.post(f"/api/schedules/{sid}/delete", json={"drop_targets": drop_targets})
+
+
+def test_restore_brings_the_job_back_paused_with_only_the_members_its_delete_removed(api):
+    sid = api.post("/api/schedules", json=BODY).json()["id"]
+    # A group with no tables may leave the job.
+    api.store.with_tables.discard("c2")
+    assert api.post(f"/api/schedules/{sid}", json=dict(BODY, members=["c1"])).status_code == 200
+    _delete_job(api, sid)
+    r = api.post(f"/api/schedules/{sid}/restore")
+    assert r.status_code == 200, r.text
+    assert r.json() == {"id": sid, "restored": True, "sync": r.json()["sync"], "cluster_error": None}
+    row = api.store.schedules[sid]
+    assert row["deleted_at"] is None and row["paused"] is True
+    assert sch.options_of(row).get("delete_drop_targets") is None and "delete_run_id" not in sch.options_of(row)
+    live = {m["task_collection"] for m in api.store.members.values() if m["removed_at"] is None}
+    assert live == {"c1"}
+    assert [m["task_collection"] for m in api.store.members.values() if m["removed_at"] is not None] == ["c2"]
+    assert len(api.jobs.jobs) == 1
+
+
+def test_restore_is_refused_when_a_live_job_has_the_name(api):
+    sid = api.post("/api/schedules", json=BODY).json()["id"]
+    _delete_job(api, sid)
+    api.post("/api/schedules", json=dict(BODY, members=["c3"]))                  # the same name, now live
+    r = api.post(f"/api/schedules/{sid}/restore")
+    assert r.status_code == 409 and "already named Prod 15" in r.json()["detail"]
+    assert api.store.schedules[sid]["deleted_at"] is not None
+
+
+def test_restore_is_refused_when_one_of_its_groups_is_now_in_another_live_job(api):
+    sid = api.post("/api/schedules", json=BODY).json()["id"]
+    _delete_job(api, sid)
+    api.post("/api/schedules", json=dict(BODY, name="Other", members=["c1"]))
+    r = api.post(f"/api/schedules/{sid}/restore")
+    assert r.status_code == 409 and "ingestion group c1 is now in the ingestion job Other" in r.json()["detail"]
+    assert api.store.schedules[sid]["deleted_at"] is not None
+
+
+def test_restore_is_refused_when_a_live_job_shares_a_database_or_a_target_table(api):
+    sid = api.post("/api/schedules", json=BODY).json()["id"]
+    _delete_job(api, sid)
+    api.store.conflicts = [("database", "sales_db", "Other")]
+    r = api.post(f"/api/schedules/{sid}/restore")
+    assert r.status_code == 409
+    assert "database sales_db is also read or written by the live ingestion job Other" in r.json()["detail"]
+    api.store.conflicts = [("target", "main.sales.fan_in", "Other")]
+    r = api.post(f"/api/schedules/{sid}/restore")
+    assert r.status_code == 409 and "target table main.sales.fan_in" in r.json()["detail"]
+    assert api.store.schedules[sid]["deleted_at"] is not None
+
+
+def test_new_tables_in_a_database_a_kept_deleted_job_reads_are_refused_before_anything_is_written():
+    row = _control_row("East")
+    cur = _OwnersCursor([("East", "Hourly", 7)])
+    with pytest.raises(main.HTTPException) as refused:
+        main._refuse_deleted_databases(cur, [row])
+    assert refused.value.status_code == 409
+    assert refused.value.detail == ("database East is in the deleted ingestion job Hourly, which is kept until it is "
+                                    "purged: Restore Hourly, or Delete now to purge it, then add these tables")
+    assert cur.executed == [(q.deleted_database_owners_sql(), ([q.database_key(row)],))]
+
+
+def test_a_database_no_kept_deleted_job_reads_is_not_refused_and_no_rows_asks_nothing():
+    cur = _OwnersCursor([])
+    main._refuse_deleted_databases(cur, [_control_row("East")])
+    assert len(cur.executed) == 1
+    main._refuse_deleted_databases(cur, [])
+    assert len(cur.executed) == 1
+
+
+def _control_row(database):
+    return {"src_type": "sqlserver", "src_host": "sql.example", "src_port": 1433, "src_connection": None,
+            "secret_key": "scope/key", "src_database": database}
+
+
+class _OwnersCursor:
+    """Answers the deleted-database owners query with the rows given, and records each statement."""
+
+    def __init__(self, owners):
+        self.owners, self.executed, self._result = owners, [], []
+
+    def execute(self, sql, params=()):
+        self.executed.append((sql, params))
+        self._result = list(self.owners) if sql == q.deleted_database_owners_sql() else []
+
+    def fetchall(self):
+        return self._result
+
+
+def test_restore_is_refused_once_the_purge_has_finished_and_a_live_job_cannot_be_restored(api):
+    sid = api.post("/api/schedules", json=BODY).json()["id"]
+    assert api.post(f"/api/schedules/{sid}/restore").status_code == 409         # not deleted
+    _delete_job(api, sid)
+    row = api.store.schedules[sid]
+    row["options"] = json.dumps({**sch.options_of(row), "delete_finished": True})
+    r = api.post(f"/api/schedules/{sid}/restore")
+    assert r.status_code == 409 and "was purged" in r.json()["detail"]
+
+
+def test_restore_needs_the_delete_permission(api, monkeypatch):
+    sid = api.post("/api/schedules", json=BODY).json()["id"]
+    _delete_job(api, sid)
+    monkeypatch.setattr(main.jobs, "user_job_permission", lambda job_id, user: "CAN_MANAGE_RUN")
+    assert api.post(f"/api/schedules/{sid}/restore").status_code == 403
+    assert api.store.schedules[sid]["deleted_at"] is not None
+
+
+def test_the_deleted_jobs_list_is_paged_and_says_the_days_left_and_what_refuses(api, monkeypatch):
+    sids = [api.post("/api/schedules", json=dict(BODY, name=f"Job {i}", members=[c])).json()["id"]
+            for i, c in enumerate(["c1", "c2", "c3"])]
+    for sid in sids:
+        _delete_job(api, sid)
+    page = api.get("/api/ingestion-jobs/deletions?limit=2").json()
+    assert (page["total"], page["offset"], page["limit"], page["retention_days"]) == (3, 0, 2, 7)
+    assert len(page["deleted"]) == 2 and page["deleted"][0]["delete"]["state"] == "kept"
+    assert page["deleted"][0]["delete"]["days_left"] == 7 and page["deleted"][0]["delete_refusal"] is None
+    last = api.get("/api/ingestion-jobs/deletions?offset=2&limit=2").json()
+    assert len(last["deleted"]) == 1 and last["total"] == 3
+    monkeypatch.setattr(main.jobs, "user_job_permission", lambda job_id, user: "CAN_MANAGE_RUN")
+    assert api.get("/api/ingestion-jobs/deletions?limit=1").json()["deleted"][0]["delete_refusal"]
+
+
+def test_a_purge_running_is_the_refusal_on_its_row_and_the_job_page(api):
+    sid = api.post("/api/schedules", json=BODY).json()["id"]
+    _delete_job(api, sid)
+    api.post(f"/api/schedules/{sid}/purge")
+    row = api.get("/api/ingestion-jobs/deletions").json()["deleted"][0]
+    assert row["delete"]["state"] == "deleting" and row["delete_refusal"] == "this job's delete is still running"
+    assert api.get(f"/api/ingestion-jobs/{sid}").json()["delete_refusal"] == "this job's delete is still running"
+
+
+def test_purge_is_refused_for_a_job_that_is_live_or_already_purged(api):
+    sid = api.post("/api/schedules", json=BODY).json()["id"]
+    assert api.post(f"/api/schedules/{sid}/purge").status_code == 409
+    _delete_job(api, sid)
+    row = api.store.schedules[sid]
+    row["options"] = json.dumps({**sch.options_of(row), "delete_finished": True})
+    assert api.post(f"/api/schedules/{sid}/purge").status_code == 409
+    assert api.delete_runs == {}
+
 
 
 def _listed(api, sid):
@@ -715,6 +1018,13 @@ def _listed(api, sid):
     main._shared_reads.clear()      # the schedules are a shared read, kept for a few seconds
     jobs_listed = api.get("/api/ingestion-jobs?filter=all&limit=100").json()["jobs"]
     return next((j for j in jobs_listed if j["id"] == sid), None)
+
+
+def _deleted(api, sid):
+    """The Deleted jobs list's row for a job (its delete state), or None when it is not kept (not deleted, or purged)."""
+    main._shared_reads.clear()
+    kept = api.get("/api/ingestion-jobs/deletions?limit=100").json()["deleted"]
+    return next((d for d in kept if d["id"] == sid), None)
 
 
 def test_delete_refused_by_permission_starts_nothing(api, monkeypatch):

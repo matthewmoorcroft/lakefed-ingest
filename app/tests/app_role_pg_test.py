@@ -19,6 +19,8 @@ pytest.importorskip("fastapi")
 from fastapi.testclient import TestClient  # noqa: E402
 
 import main  # noqa: E402
+import table_removal as tr  # noqa: E402
+from delete_job_pg_test import _row  # noqa: E402
 
 URI = os.environ.get("LAKEFED_APP_TEST_PG")
 pytestmark = pytest.mark.skipif(not URI, reason="LAKEFED_APP_TEST_PG not set")
@@ -27,10 +29,15 @@ SETTINGS = {"fan_in": True, "sink_catalog": "main", "sink_schema": "eng", "sink_
 # The grants of grant_app_access.ipynb, on the schema's tables and sequences.
 GRANTS = ("grant usage on schema lakefed_ingest to {role}",
           "grant select, insert, update on all tables in schema lakefed_ingest to {role}",
+          "revoke update on lakefed_ingest.jdbc_login_write, lakefed_ingest.jdbc_connection from {role}",
           "grant usage, select on all sequences in schema lakefed_ingest to {role}")
 SUMMARY = {"sch": "dbo", "row_count": "12", "ct_enabled": "1", "select_cols": "id, amount", "excluded_cols": None,
            "pk_cols": "id", "pk_unreadable": "0", "pk_first_type": "int", "rowversion_col": None, "identity_col": None,
            "identity_type": None}
+
+
+SOURCE_ROW = {"src_type": "sqlserver", "src_host": "h", "src_port": 1433, "src_connection": None, "secret_key": "k1",
+              "src_database": "db"}      # the source database _row writes its control rows on
 
 
 class _Warehouse:
@@ -87,6 +94,7 @@ def client(monkeypatch):
             return conn
         monkeypatch.setattr(main.db, "connect", as_app)
         monkeypatch.setattr(main.jobs, "schedule_variants", lambda: {"default": "1", "check": "2"})
+        monkeypatch.setattr(main.jobs, "ingest_variants", lambda: {"default": "555"})
         monkeypatch.setattr(main.jobs, "user_job_permission", lambda job_id, user: "CAN_MANAGE")
         monkeypatch.setattr(main, "_sync", lambda sid, user: [])
         monkeypatch.setattr(main, "_refuse_job_tables", lambda job, groups, request: None)
@@ -141,6 +149,19 @@ def test_the_role_really_has_no_delete(client):
     try:
         with pytest.raises(Exception, match="permission denied"):
             conn.execute("delete from lakefed_ingest.discovered_table")
+    finally:
+        conn.close()
+
+
+def test_the_role_cannot_update_the_two_jdbc_record_tables(client):
+    """The app only reads and inserts into the JDBC record tables, so grant_app_access revokes UPDATE on them: an update
+    the app's role makes is refused, as it would rewrite who typed a login or where a connection points."""
+    conn = main.db.connect()
+    try:
+        with pytest.raises(Exception, match="permission denied"):
+            conn.execute("update lakefed_ingest.jdbc_login_write set entered_by = entered_by")
+        with pytest.raises(Exception, match="permission denied"):
+            conn.execute("update lakefed_ingest.jdbc_connection set src_host = src_host")
     finally:
         conn.close()
 
@@ -280,3 +301,131 @@ def test_the_schema_upgrade_reads_the_version_and_takes_its_lock_as_the_apps_rol
     schema = client.get("/api/manage/version").json()["schema"]
     assert (schema["database"], schema["app"], schema["run"], schema["error"]) == (
         behind, schema_upgrade.SCHEMA_VERSION, {"run_id": 41, "url": "u"}, None)
+
+
+def test_removing_a_table_records_the_request_and_starts_the_delete_job_with_no_delete_as_the_apps_role(client,
+                                                                                                        monkeypatch):
+    started = []
+
+    def start(schedule_id, control_ids):
+        started.append((schedule_id, sorted(control_ids)))
+        return 91
+
+    monkeypatch.setattr(main.jobs, "start_table_remove", start)
+    monkeypatch.setattr(main.jobs, "workspace_url", lambda: "https://ws.example")
+    monkeypatch.setattr(main.jobs, "DELETE_JOB_ID", "99")
+    did = _discover(client, ["eng_001", "eng_002"])
+    selection = {"discovery_id": did, "databases": [{"server": "sql_a", "database": d} for d in ("eng_001", "eng_002")]}
+    made = client.post("/api/ingestion-jobs", json={"name": "Remove", "settings": SETTINGS, "dry_run": False,
+                                                    "request_id": "remove-1", "source": selection})
+    assert made.status_code in (200, 202), made.text
+    job_id = made.json().get("id") or client.get(f"/api/tasks/{made.json()['task']['id']}").json()["job_id"]
+    [(control_id,)] = client.sql("select id from lakefed_ingest.control where src_database = 'eng_001' "
+                                 "and src_table = 'orders'")
+
+    removed = client.post(f"/api/ingestion-jobs/{job_id}/tables/remove",
+                          json={"control_ids": [control_id], "confirmed": True})
+    assert removed.status_code == 200, removed.text
+    assert removed.json()["run"]["run_id"] == 91 and removed.json()["error"] is None
+    assert started == [(job_id, [control_id])]
+
+    assert client.sql("select count(*) from lakefed_ingest.control where id = %s", (control_id,)) == [(1,)], \
+        "the app records and starts the removal; the delete job deletes the row, not the app"
+    [(removal,)] = client.sql("select options -> 'table_remove' from lakefed_ingest.schedule where id = %s", (job_id,))
+    assert removal[str(control_id)]["run_id"] == 91 and removal[str(control_id)]["requested_by"] == "op@example.com"
+    assert client.sql("select count(*) from lakefed_ingest.control_change where action = 'remove' "
+                      "and control_id = %s", (control_id,)) == [(1,)]
+    assert client.sql("select deleted_at is null from lakefed_ingest.schedule where id = %s", (job_id,)) == [(True,)]
+
+
+def test_a_removed_table_stays_out_of_a_database_add_until_it_is_named_again_as_the_apps_role(client, monkeypatch):
+    monkeypatch.setattr(main.jobs, "start_table_remove", lambda schedule_id, control_ids: 91)
+    monkeypatch.setattr(main.jobs, "workspace_url", lambda: "https://ws.example")
+    monkeypatch.setattr(main.jobs, "DELETE_JOB_ID", "99")
+    did = _discover(client, ["eng_001", "eng_002"])
+    selection = {"discovery_id": did, "databases": [{"server": "sql_a", "database": d} for d in ("eng_001", "eng_002")]}
+    made = client.post("/api/ingestion-jobs", json={"name": "Excluded", "settings": SETTINGS, "dry_run": False,
+                                                    "request_id": "excluded-1", "source": selection})
+    assert made.status_code in (200, 202), made.text
+    job_id = made.json().get("id") or client.get(f"/api/tasks/{made.json()['task']['id']}").json()["job_id"]
+    [(control_id,)] = client.sql("select id from lakefed_ingest.control where src_database = 'eng_001' "
+                                 "and src_table = 'orders'")
+    removed = client.post(f"/api/ingestion-jobs/{job_id}/tables/remove",
+                          json={"control_ids": [control_id], "confirmed": True})
+    assert removed.status_code == 200, removed.text
+    excluded = tr.exclusion_key("sql_a", "eng_001", "dbo", "orders")
+    assert client.sql("select options -> 'table_exclude' ? %s from lakefed_ingest.schedule where id = %s",
+                      (excluded, job_id)) == [(True,)]
+
+    client.owner.execute("delete from lakefed_ingest.control where id = %s", (control_id,))
+    again = client.post(f"/api/ingestion-jobs/{job_id}/tables", json={
+        "source": {"discovery_id": did, "databases": [{"server": "sql_a", "database": "eng_001"}]},
+        "dry_run": False, "request_id": "excluded-2"})
+    assert again.status_code in (200, 202), again.text
+    assert client.sql("select count(*) from lakefed_ingest.control where src_database = 'eng_001' "
+                      "and src_table = 'orders'") == [(0,)], "a whole-database add must not take the removed table back"
+
+    named = client.post(f"/api/ingestion-jobs/{job_id}/tables", json={
+        "source": {"discovery_id": did,
+                   "tables": [{"server": "sql_a", "database": "eng_001", "tables": ["dbo.orders"]}]},
+        "dry_run": False, "request_id": "excluded-3"})
+    assert named.status_code in (200, 202), named.text
+    assert client.sql("select count(*) from lakefed_ingest.control where src_database = 'eng_001' "
+                      "and src_table = 'orders'") == [(1,)]
+    assert client.sql("select options -> 'table_exclude' from lakefed_ingest.schedule where id = %s",
+                      (job_id,)) == [({},)]
+
+
+def test_a_delete_a_refused_new_table_and_a_restore_run_as_the_apps_role(client, monkeypatch):
+    """Delete, the Deleted jobs list, a new table refused by the database it is in, and Restore: none of them needs
+    DELETE, and the refusal reads the owner as the role does."""
+    monkeypatch.setattr(main.jobs, "DELETE_JOB_ID", "99")
+    sid = _seed_job(client.owner, "Role kept", "role_g1")
+    _row(client.owner, "role_g1", "a")
+    deleted = client.post(f"/api/schedules/{sid}/delete", json={"drop_targets": True})
+    assert deleted.status_code == 200, deleted.text
+    assert client.sql("select deleted_at is not null from lakefed_ingest.schedule where id = %s", (sid,)) == [(True,)]
+    kept = client.get("/api/ingestion-jobs/deletions")
+    assert kept.status_code == 200 and [row["id"] for row in kept.json()["deleted"]] == [sid], kept.text
+    conn = main.db.connect()
+    try:
+        with pytest.raises(main.HTTPException) as refused:
+            main._refuse_deleted_databases(conn.cursor(), [SOURCE_ROW])
+    finally:
+        conn.close()
+    assert refused.value.status_code == 409 and "in the deleted ingestion job Role kept" in refused.value.detail
+    restored = client.post(f"/api/schedules/{sid}/restore")
+    assert restored.status_code == 200, restored.text
+    assert client.sql("select deleted_at from lakefed_ingest.schedule where id = %s", (sid,)) == [(None,)]
+    members = client.sql("select count(*) from lakefed_ingest.schedule_member where schedule_id = %s "
+                         "and removed_at is null", (sid,))
+    assert members == [(1,)]
+
+
+def test_a_groups_naming_rule_is_read_in_one_query_as_the_apps_role(client):
+    """_group_unity_catalog reads the job holding a group with group_job_options_sql: a removed member doesn't hold
+    it, a purged job doesn't either, and a group no job holds takes Unity Catalog's rule."""
+    owner = client.owner
+    older = _seed_job(owner, "A older", "eng_c02")
+    newer = _seed_job(owner, "B newer", "eng_c01")
+    purged = _seed_job(owner, "C purged", "eng_c03")
+    owner.execute("update lakefed_ingest.schedule set options = '{\"target_names\": \"unity_catalog\"}'::jsonb "
+                  "where id = %s", (newer,))
+    owner.execute("insert into lakefed_ingest.schedule_member (schedule_id, task_collection, removed_at) "
+                  "values (%s, 'eng_c01', now())", (older,))
+    owner.execute("update lakefed_ingest.schedule set deleted_at = now(), options = '{\"delete_finished\": true}'::jsonb "
+                  "where id = %s", (purged,))
+    assert main._group_unity_catalog("eng_c01") is True
+    assert main._group_unity_catalog("eng_c02") is False
+    assert main._group_unity_catalog("eng_c03") is True
+    assert main._group_unity_catalog("nobody") is True
+
+
+def _seed_job(conn, name, group):
+    """A live job with one group, inserted as the owner for the test's setup."""
+    with conn.transaction():
+        sid = conn.execute("insert into lakefed_ingest.schedule (name, cadence_minutes) values (%s, 60) returning id",
+                           (name,)).fetchone()[0]
+        conn.execute("insert into lakefed_ingest.schedule_member (schedule_id, task_collection) values (%s, %s)",
+                     (sid, group))
+    return sid

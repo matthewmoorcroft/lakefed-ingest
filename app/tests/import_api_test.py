@@ -36,6 +36,10 @@ GROUP_ROWS = [dict(id=1, task_collection="g1", src_type="sqlserver", src_host=No
                    client_id=None, client_attrs=None, freshness_sla_minutes=60, jdbc_options=None)]
 
 
+ORDER_CSV = ("src_connection,src_database,src_schema,src_table,select_list,primary_key\n"
+             "sql_a,Sales,dbo,Order-Lines,\"id,amount\",id\n")
+
+
 @pytest.fixture
 def client(monkeypatch):
     fake = FakeDB()
@@ -56,6 +60,27 @@ def client(monkeypatch):
 def _import(client, csv_text=CSV, group="g9", settings=SETTINGS, dry_run=True):
     return client.post("/api/import", json={"task_collection": group, "settings": settings, "csv": csv_text,
                                             "dry_run": dry_run})
+
+
+def _held_by(monkeypatch, options):
+    """Makes job 1 hold group g9, with the stored options given (None: an older job with none), and lets an apply
+    past the Databricks permission check."""
+    query = main.db.query
+
+    def held(sql, params=()):
+        if sql == q.schedules_sql():
+            return [{"id": 1, "name": "Hr", "options": options}]
+        if sql == q.schedule_members_sql():
+            return [{"schedule_id": 1, "task_collection": "g9", "removed_at": None}]
+        if sql == q.group_job_options_sql():
+            return [{"id": 1, "options": options}] if params[0] == "g9" else []
+        return query(sql, params)
+    monkeypatch.setattr(main.db, "query", held)
+    monkeypatch.setattr(main, "_refuse_groups", lambda groups, request: None)
+
+
+def _inserted_rows(client):
+    return [dict(zip(q.CONTROL_INSERT_COLUMNS, p)) for p in client.db.of("insert into lakefed_ingest.control (")]
 
 
 def test_a_preview_writes_nothing_and_counts_each_lines_status(client):
@@ -91,6 +116,31 @@ def test_an_existing_group_lends_its_settings_and_its_tables_show_as_registered(
     assert body["settings"]["sink_schema"] == "bronze_{database}" and body["settings"]["freshness_sla_minutes"] == 60
 
 
+def test_a_group_no_job_holds_names_its_tables_by_unity_catalog_rules(client):
+    assert [line["sink"] for line in _import(client, ORDER_CSV).json()["lines"]] == ["main.bronze_sales.order-lines"]
+
+
+def test_a_group_an_older_job_holds_keeps_the_older_names(client, monkeypatch):
+    _held_by(monkeypatch, None)
+    assert [line["sink"] for line in _import(client, ORDER_CSV).json()["lines"]] == ["main.bronze_sales.order_lines"]
+
+
+def test_a_group_a_unity_catalog_job_holds_names_its_tables_by_unity_catalog_rules(client, monkeypatch):
+    _held_by(monkeypatch, {"target_names": "unity_catalog"})
+    assert [line["sink"] for line in _import(client, ORDER_CSV).json()["lines"]] == ["main.bronze_sales.order-lines"]
+    assert _import(client, ORDER_CSV, dry_run=False).status_code == 200
+    assert [row["sink_table"] for row in _inserted_rows(client)] == ["order-lines"]
+
+
+def test_a_typed_sink_name_is_kept_as_typed_and_checked_under_its_groups_rule(client, monkeypatch):
+    _held_by(monkeypatch, {"target_names": "unity_catalog"})
+    typed = dict(SETTINGS, sink_table="Sales-Orders")
+    assert _import(client, ORDER_CSV, settings=typed, dry_run=False).status_code == 200
+    assert [row["sink_table"] for row in _inserted_rows(client)] == ["Sales-Orders"]
+    r = _import(client, ORDER_CSV, settings=dict(SETTINGS, sink_table="Sales Orders"))
+    assert r.status_code == 422 and "Unity Catalog refuses" in r.text
+
+
 def test_a_groups_settings_and_its_export(client):
     settings = client.get("/api/collections/g1/settings").json()
     assert {s["setting"]: s.get("value") for s in settings["settings"]}["sink_table"] == "{table}"
@@ -123,7 +173,8 @@ def test_an_import_that_would_split_a_database_across_two_groups_is_refused(clie
     client.db.split = {q.database_key(dict(src_connection="sql_a", use_remote_query=True, src_database="Sales",
                                            task_collection="g9"))}
     r = _import(client, dry_run=False)
-    assert r.status_code == 409 and "Sales" in r.json()["detail"] and "move all of its tables together" in r.text
+    assert r.status_code == 409 and "Sales" in r.json()["detail"]["message"]
+    assert "Move all of its tables into one group. Nothing was written." in r.text
 
 
 def test_a_mistyped_setting_is_refused_and_false_reads_as_false(client):

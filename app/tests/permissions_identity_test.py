@@ -35,6 +35,32 @@ def test_no_user_is_refused_every_action_without_asking_databricks(monkeypatch):
     assert main._groups_refusal(["c1"], "") == main.NO_IDENTITY
 
 
+def test_a_job_with_its_ingestion_job_is_checked_with_databricks_and_an_orphan_only_by_admins(monkeypatch):
+    monkeypatch.setattr(main.jobs, "user_job_permission", lambda job_id, user: "CAN_MANAGE")
+    monkeypatch.setattr(main.jobs, "user_groups", lambda user: [])
+    monkeypatch.setattr(main.jobs, "ingest_variants", lambda: {"default": "555"})
+    assert main._permission_refusals({"job_variant": "default"}, "op@example.com")["delete"] is None
+    monkeypatch.setattr(main.jobs, "ingest_variants", lambda: {})
+    orphan = main._permission_refusals({"job_variant": "default"}, "op@example.com")
+    assert "only a workspace admin can change or delete it" in orphan["delete"]
+    monkeypatch.setattr(main.jobs, "user_groups", lambda user: ["admins"])
+    assert main._permission_refusals({"job_variant": "default"}, "op@example.com")["delete"] is None
+
+
+@pytest.mark.parametrize("action", ["restore", "purge"])
+def test_restore_and_delete_now_ask_for_the_same_right_as_delete(monkeypatch, action):
+    deleted_job = {"id": 7, "name": "Kept", "job_variant": "default", "deleted_at": "2026-10-30T12:00:00+00:00",
+                   "options": {}}
+    monkeypatch.setattr(main, "_load_schedule", lambda sid, cur=None: (deleted_job, []))
+    monkeypatch.setattr(main.jobs, "user_job_permission", lambda job_id, user: "CAN_MANAGE")
+    monkeypatch.setattr(main.jobs, "user_groups", lambda user: [])
+    monkeypatch.setattr(main.db, "transaction", lambda: pytest.fail("opened a transaction"))
+    monkeypatch.setattr(main.jobs, "ingest_variants", lambda: {})
+    operator = TestClient(main.app, headers={"X-Forwarded-Email": "op@example.com"})
+    refused = operator.post(f"/api/schedules/7/{action}")
+    assert refused.status_code == 403 and "only a workspace admin can change or delete it" in refused.json()["detail"]
+
+
 def test_a_write_without_a_user_is_refused_before_it_runs(monkeypatch):
     monkeypatch.setattr(main.db, "transaction", lambda: pytest.fail("opened a transaction"))
     anonymous = TestClient(main.app)
@@ -128,9 +154,9 @@ def test_every_job_edit_write_checks_the_groups_it_touches_before_any_lock(monke
     monkeypatch.setattr(main, "_load_schedule", lambda job_id, cur=None: ({"id": 1, "name": "Hourly", "job_variant": "default",
                                                                          "cadence_minutes": 60, "stagger": True}, []))
     monkeypatch.setattr(main.db, "query", lambda sql, params=(): [])
-    monkeypatch.setattr(main.js, "plan_databases", lambda *a: {"errors": [], "new": [], "enable": [], "disable": [],
+    monkeypatch.setattr(main.js, "plan_databases", lambda *a, **k: {"errors": [], "new": [], "enable": [], "disable": [],
                                                                "new_groups": []})
-    monkeypatch.setattr(main.nj, "plan_for_job", lambda *a: {"errors": [], "groups": ["c1"], "new_groups": [], "lines": []})
+    monkeypatch.setattr(main.nj, "plan_for_job", lambda *a, **k: {"errors": [], "groups": ["c1"], "new_groups": [], "lines": []})
 
     def refuse(job, groups, request):
         checked.append(sorted(groups))
@@ -147,7 +173,7 @@ def test_new_groups_from_add_databases_are_checked_too(monkeypatch):
     monkeypatch.setattr(main, "_load_schedule", lambda job_id, cur=None: ({"id": 1, "name": "Hourly", "job_variant": "default",
                                                                          "cadence_minutes": 60, "stagger": True}, []))
     monkeypatch.setattr(main.db, "query", lambda sql, params=(): [])
-    monkeypatch.setattr(main.js, "plan_databases", lambda *a: {"errors": [], "new": [], "enable": [], "disable": [],
+    monkeypatch.setattr(main.js, "plan_databases", lambda *a, **k: {"errors": [], "new": [], "enable": [], "disable": [],
                                                                "new_groups": ["hourly_s_c02"]})
 
     def refuse(job, groups, request):

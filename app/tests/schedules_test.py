@@ -250,6 +250,32 @@ def test_new_job_parameters_validate_like_the_notebook_parses_them():
                              "fail_on_table_errors"}
 
 
+def test_a_table_retry_budget_of_zero_is_valid_and_is_sent_to_the_job():
+    schedule = dict(SCHED, members=["c1"], parameters={"table_retry_budget": "0"})
+    assert sch.validate(schedule, ["c1"], ["default"]) == []
+    job_parameters = sch.job_settings(schedule, "c1", 0, 555)["tasks"][0]["run_job_task"]["job_parameters"]
+    assert job_parameters["table_retry_budget"] == "0"
+
+
+def test_an_unset_table_retry_budget_is_left_out_so_the_job_default_applies():
+    job = sch.job_settings(dict(SCHED, parameters={}), "c1", 0, 555)
+    assert job["tasks"][0]["run_job_task"]["job_parameters"] == {"task_collection": "c1"}
+
+
+def test_a_retry_run_gets_the_stored_budget_and_table_retries_and_none_when_none_are_stored():
+    stored = sch.run_parameters(dict(SCHED, parameters={"table_retry_budget": "5", "table_retries": "3"}), "c1")
+    assert stored == {"task_collection": "c1", "table_retries": "3", "table_retry_budget": "5"}
+    unstored = sch.run_parameters(dict(SCHED, parameters={}), "c1")
+    assert unstored == {"task_collection": "c1"}
+    assert "table_retry_budget" not in unstored and "table_retries" not in unstored
+
+
+def test_a_retry_run_takes_the_same_parameters_as_the_wrapper_job_it_retries_for():
+    schedule = dict(SCHED, parameters={"table_retry_budget": "5", "table_retries": "3", "parallelism": "8"})
+    wrapper = sch.job_settings(schedule, "c1", 0, 555)["tasks"][0]["run_job_task"]["job_parameters"]
+    assert sch.run_parameters(schedule, "c1") == wrapper
+
+
 # ---- job runs: group runs placed by cadence slot ------------------------------------------------
 
 def _run(group, started, minutes=10, run_id=None, status="completed"):

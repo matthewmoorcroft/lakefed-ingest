@@ -16,8 +16,22 @@ import queries as q
 TAGS = ("{server}", "{database}", "{schema}", "{table}")
 VALID_TAGS = ", ".join(TAGS)
 TARGET_SETTINGS = (("sink_catalog", "target catalog"), ("sink_schema", "target schema"), ("sink_table", "target table"))
+# Settings the app no longer takes: a target name follows its naming rule alone. A request or file that still names one
+# (an older client, a saved request) is read and ignored, so it is neither refused nor written.
+RETIRED_SETTINGS = ("lowercase",)
 CHANGE_LOAD_TYPES = ("ct",)     # append mode is for ct and full only; cursor and cdc tables always merge
 IDENTITY_COLUMN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,127}$")
+# The client_id of a job's shared rows when its settings don't say: the database name alone, as every job had before
+# new jobs built theirs from the server too (new_job.py).
+LEGACY_CLIENT_ID = "{database}"
+# The client_id of a new fan-in job's rows. Two servers can hold a database of the same name, so the server goes in
+# too; the underscore keeps the key to the characters queries.CLIENT_ID_PATTERN allows.
+SHARED_CLIENT_ID = "{server}_{database}"
+# The readable identity columns a new fan-in job's rows get, so a shared table's rows say which server and database
+# they came from. The New job form shows them and the user may remove them.
+SHARED_IDENTITY = {"source_server": "{server}", "source_database": "{database}"}
+TARGET_NAMES_OPTION = "target_names"      # a schedule option: how a job's target names are made
+UNITY_CATALOG_NAMES = "unity_catalog"     # what Create stores from now on; a job without the option keeps the old rule
 
 
 def server_of(row: dict) -> str:
@@ -32,12 +46,14 @@ def server_of(row: dict) -> str:
     return f"{str(host).lower()}:{int(port)}"
 
 
-def _server_key(name: str, src_type: str = "sqlserver") -> str:
+def _server_key(name: str, src_type: str = "sqlserver", known=()) -> str:
     """A server as typed in a file or by hand, named as server_of names it: a host without a port gets the
-    engine's default one."""
+    engine's default one. A name with no dot reads as a Unity Catalog connection's, unless it is a host the job already
+    reads (in known, the job's servers) at its default port: a dotless host name such as sqlprod01 is one too."""
     name = name.strip().lower()
-    if re.search(r"[.]", name) and ":" not in name:
-        return f"{name}:{q.DEFAULT_PORTS.get(src_type, 1433)}"
+    with_port = f"{name}:{q.DEFAULT_PORTS.get(src_type, 1433)}"
+    if ":" not in name and (re.search(r"[.]", name) or (name not in known and with_port in known)):
+        return with_port
     return name
 
 
@@ -46,15 +62,41 @@ def _values(row: dict) -> Dict[str, str]:
             "{schema}": str(row.get("src_schema") or ""), "{table}": str(row.get("src_table") or "")}
 
 
-def render(template: Optional[str], row: dict, target: bool = False, lowercase: bool = True) -> Optional[str]:
-    """A template filled from one row. Target names fill each tag as a lower-case identifier unless lowercase is
-    off; client_id and identity values take the names as they are."""
+def unity_catalog_of(options: Optional[dict]) -> bool:
+    """Whether a job's target names follow Unity Catalog's rules. A job made before they did has no setting for it and
+    keeps the older identifier rule, so its names come out as they always have."""
+    return (options or {}).get(TARGET_NAMES_OPTION) == UNITY_CATALOG_NAMES
+
+
+def _fill(value: str, target: bool, unity_catalog: bool = False) -> str:
+    """A tag's value as it goes into a name. A target name is lower case: by Unity Catalog's rules for a job with the
+    setting, else by the older identifier rule. Other templates keep the value as it is."""
+    if not target:
+        return value
+    if unity_catalog:
+        return q.unity_catalog_identifier(value)
+    return q.identifier(value)
+
+
+def render(template: Optional[str], row: dict, target: bool = False, unity_catalog: bool = False) -> Optional[str]:
+    """A template filled from one row, each tag's value as _fill gives it for a target name or as it is otherwise."""
     if template is None or not str(template).strip():
         return None
     out = str(template).strip()
     for tag, value in _values(row).items():
-        out = out.replace(tag, q.identifier(value) if target and lowercase else value)
+        out = out.replace(tag, _fill(value, target, unity_catalog))
     return out
+
+
+def typed_name_errors(settings: dict, unity_catalog: bool) -> List[str]:
+    """Text typed into a target name, outside its tags, is kept as typed. Under Unity Catalog's rules it must not hold a
+    character Unity Catalog refuses, since no table could be made with that name."""
+    if not unity_catalog:
+        return []
+    return [f"{label} {settings.get(field)!r} has a character Unity Catalog refuses (a space, period, slash or control "
+            "character): take it out"
+            for field, label in TARGET_SETTINGS
+            if q.UNITY_CATALOG_REJECTED.search(re.sub(r"\{[^{}]*\}", "", str(settings.get(field) or "")))]
 
 
 def template_errors(template: Optional[str], label: str, fan_in: bool = False) -> List[str]:
@@ -67,9 +109,9 @@ def template_errors(template: Optional[str], label: str, fan_in: bool = False) -
     return errors
 
 
-def _templates(value: str, row: dict, target: bool, limit: int = 512) -> set:
+def _templates(value: str, row: dict, target: bool, limit: int = 512, unity_catalog: bool = False) -> set:
     """Every template over the four tags that fills to this value for this row, the literal value included."""
-    parts = [(q.identifier(v) if target else v, tag) for tag, v in _values(row).items()]
+    parts = [(_fill(v, target, unity_catalog=unity_catalog), tag) for tag, v in _values(row).items()]
     found: set = set()
 
     def walk(i: int, built: str):
@@ -83,30 +125,32 @@ def _templates(value: str, row: dict, target: bool, limit: int = 512) -> set:
                 walk(i + len(part), built + tag)
         walk(i + 1, built + value[i])
     walk(0, "")
-    return {t for t in found if render(t, row, target=target) == value} | {value}
+    return {t for t in found if render(t, row, target=target, unity_catalog=unity_catalog) == value} | {value}
 
 
 def _preference(template: str) -> tuple:
     return (sum(template.count(t) for t in TAGS), sum(t in template for t in TAGS), template)
 
 
-def _shared_template(values_and_rows, target: bool) -> Optional[str]:
+def _shared_template(values_and_rows, target: bool, unity_catalog: bool = False) -> Optional[str]:
     """The template every row's value fits, most tags first. The first row's candidates are tried in that order
     against every row, so a job of millions of rows is checked with one fill per row, not one search."""
     pairs = list(values_and_rows)
     if not pairs:
         return None
     first_value, first_row = pairs[0]
-    for candidate in sorted(_templates(str(first_value), first_row, target), key=_preference, reverse=True):
-        if all(render(candidate, row, target=target) == str(value) or (candidate == str(value) == "")
+    for candidate in sorted(_templates(str(first_value), first_row, target, unity_catalog=unity_catalog),
+                            key=_preference, reverse=True):
+        if all(render(candidate, row, target=target, unity_catalog=unity_catalog) == str(value)
+               or (candidate == str(value) == "")
                for value, row in pairs):
             return candidate
     return None
 
 
-def _ranked(value: str, row: dict, target: bool) -> List[str]:
+def _ranked(value: str, row: dict, target: bool, unity_catalog: bool = False) -> List[str]:
     """Every template that fills to this value for this row, most tags first: the order to try them in."""
-    return sorted(_templates(value, row, target), key=_preference, reverse=True)
+    return sorted(_templates(value, row, target, unity_catalog=unity_catalog), key=_preference, reverse=True)
 
 
 def _shared(values) -> dict:
@@ -134,8 +178,9 @@ def differing_identity_columns(identity: dict, tables: int) -> List[str]:
     return [name] if count == tables and ", " not in name else []
 
 
-def read(rows: List[dict]) -> Dict[str, dict]:
-    """Each setting of a job, from its rows: {"value": v} when they share it, else {"mixed": {value: rows}}."""
+def read(rows: List[dict], unity_catalog: bool = False) -> Dict[str, dict]:
+    """Each setting of a job, from its rows: {"value": v} when they share it, else {"mixed": {value: rows}}. Target
+    names are read by the job's naming rule: Unity Catalog's when unity_catalog, else the older identifier rule."""
     out: Dict[str, dict] = {}
     fan = [bool(str(r.get("client_id") or "").strip()) for r in rows]
     out["fan_in"] = _shared(fan)
@@ -144,10 +189,10 @@ def read(rows: List[dict]) -> Dict[str, dict]:
     out["write_mode_changes"] = _shared(str(r.get("write_mode") or "merge") for r in changes)
     out["write_mode_full"] = _shared(str(r.get("write_mode") or "merge") for r in full)
     out["freshness_sla_minutes"] = _shared(r.get("freshness_sla_minutes") for r in rows)
-    lower = all(str(r.get(f) or "") == str(r.get(f) or "").lower() for r in rows for f, _ in TARGET_SETTINGS)
-    out["lowercase"] = {"value": lower if rows else None}
+    out["unity_catalog"] = {"value": unity_catalog}
     for field, _ in TARGET_SETTINGS:
-        shared = _shared_template(((r.get(field) or "", r) for r in rows), target=lower) if rows else None
+        shared = _shared_template(((r.get(field) or "", r) for r in rows), target=True,
+                                  unity_catalog=unity_catalog) if rows else None
         out[field] = {"value": shared} if shared is not None or not rows else _shared(r.get(field) for r in rows)
     with_id = [r for r in rows if str(r.get("client_id") or "").strip()]
     shared_id = _shared_template(((r["client_id"], r) for r in with_id), target=False) if with_id else None
@@ -175,11 +220,19 @@ def _current(read_settings: dict, name: str):
     return read_settings.get(name, {}).get("value")
 
 
+def default_client_id(fan_in_now) -> str:
+    """The client_id template a settings edit fills when it names none and the rows share none: a job turning fan-in
+    on takes the server-and-database key new fan-in jobs get, so two servers' databases of one name keep apart; a job
+    already sharing its tables keeps the database-only key it has always had."""
+    return LEGACY_CLIENT_ID if fan_in_now else SHARED_CLIENT_ID
+
+
 def _desired(row: dict, settings: dict, now: dict) -> dict:
     want: Dict[str, object] = {}
     fan_in = settings.get("fan_in", bool(str(row.get("client_id") or "").strip()))
     if "fan_in" in settings or "client_id" in settings:
-        template = settings.get("client_id") or _current(now, "client_id") or "{database}"
+        template = (settings.get("client_id") or _current(now, "client_id")
+                    or default_client_id(_current(now, "fan_in")))
         want["client_id"] = render(template, row) if fan_in else None
     load_type = row.get("load_type")
     if "write_mode_changes" in settings and load_type in CHANGE_LOAD_TYPES:
@@ -188,21 +241,21 @@ def _desired(row: dict, settings: dict, now: dict) -> dict:
         want["write_mode"] = settings["write_mode_full"]
     if "freshness_sla_minutes" in settings:
         want["freshness_sla_minutes"] = settings["freshness_sla_minutes"]
-    lowercase = settings.get("lowercase", _current(now, "lowercase") if _current(now, "lowercase") is not None else True)
+    unity_catalog = bool(_current(now, "unity_catalog"))
     for field, _ in TARGET_SETTINGS:
-        template = settings.get(field) or (_current(now, field) if "lowercase" in settings else None)
+        template = settings.get(field)
         if template:
-            want[field] = render(template, row, target=True, lowercase=lowercase)
+            want[field] = render(template, row, target=True, unity_catalog=unity_catalog)
     if "identity" in settings:
         filled = {name: render(t, row) for name, t in (settings["identity"] or {}).items()}
         want["client_attrs"] = json.dumps(filled) if filled else None
     return want
 
 
-def plan(rows: List[dict], settings: dict) -> Dict[int, dict]:
+def plan(rows: List[dict], settings: dict, unity_catalog: bool = False) -> Dict[int, dict]:
     """{row id: {field: new value}} for every row a settings edit changes; rows it leaves as they are are left out.
-    A setting not given keeps each row's value."""
-    now = read(rows)
+    A setting not given keeps each row's value. unity_catalog is the job's naming rule (unity_catalog_of)."""
+    now = read(rows, unity_catalog)
     out: Dict[int, dict] = {}
     for row in rows:
         changes = {}
@@ -241,15 +294,15 @@ def check_templates(settings: dict, fan_in: bool) -> List[str]:
     return errors
 
 
-def check(rows: List[dict], settings: dict) -> List[str]:
+def check(rows: List[dict], settings: dict, unity_catalog: bool = False) -> List[str]:
     """What is wrong with a settings edit before any row is planned: bad tags, bad column names, and, without
     fan-in, two tables writing one target."""
-    now = read(rows)
+    now = read(rows, unity_catalog)
     fan_in = settings.get("fan_in", _current(now, "fan_in"))
     errors = check_templates(settings, fan_in=bool(fan_in))
     if errors or fan_in:
         return errors
-    changes = plan(rows, settings)
+    changes = plan(rows, settings, unity_catalog)
     targets: Dict[str, int] = {}
     for row in rows:
         merged = {**row, **changes.get(row["id"], {})}
@@ -301,7 +354,7 @@ def _bucket(database: str, count: int) -> int:
 
 
 def plan_databases(job_rows: List[dict], entries: List[dict], job_name: str, groups_per_server: int,
-                   full_list: bool = False) -> dict:
+                   full_list: bool = False, unity_catalog: bool = False) -> dict:
     """What adding these databases does to a job: {new: control rows to insert, enable / disable: row ids,
     new_groups, errors}. A new database gets every table of the job, each copied from the table's first row (load
     type, key, columns, write mode) and given the job's target names, client_id and identity columns, filled for
@@ -312,8 +365,8 @@ def plan_databases(job_rows: List[dict], entries: List[dict], job_name: str, gro
     if not job_rows:
         out["errors"].append("the job has no tables yet: import one database's tables first (Import CSV)")
         return out
-    now = read(job_rows)
-    for name in ("sink_catalog", "sink_schema", "sink_table", "lowercase", "identity"):
+    now = read(job_rows, unity_catalog)
+    for name in ("sink_catalog", "sink_schema", "sink_table", "identity"):
         if "mixed" in now[name]:
             out["errors"].append(f"the job's {name} differs between its tables: set it on the job first")
     if "mixed" in now["fan_in"] or "mixed" in now["client_id"]:
@@ -336,7 +389,7 @@ def plan_databases(job_rows: List[dict], entries: List[dict], job_name: str, gro
     lightest = placement.Lightest(loads)
     # A server new to the job: its new databases, each taking the job's tables, spread evenly over its new groups.
     src_type = str(next(iter(models.values())).get("src_type") or "sqlserver").lower()
-    new_entries = [(_server_key(e["server"], src_type), e["database"]) for e in entries]
+    new_entries = [(_server_key(e["server"], src_type, servers), e["database"]) for e in entries]
     new_entries = [(server, database) for server, database in new_entries if server not in groups]
     new_tables: Dict[str, int] = {}
     for server, _ in new_entries:
@@ -349,7 +402,8 @@ def plan_databases(job_rows: List[dict], entries: List[dict], job_name: str, gro
     secret_templates: Dict[str, Optional[str]] = {}
     new_groups: set = set()
     for e in entries:
-        key = (_server_key(e["server"], str(next(iter(models.values())).get("src_type") or "sqlserver").lower()), e["database"].lower())
+        key = (_server_key(e["server"], str(next(iter(models.values())).get("src_type") or "sqlserver").lower(), servers),
+               e["database"].lower())
         if key in listed:
             if listed[key] != e["enabled"]:
                 out["errors"].append(f"line {e['line']}: {key[0]} / {key[1]} is listed again with another "
@@ -393,8 +447,8 @@ def plan_databases(job_rows: List[dict], entries: List[dict], job_name: str, gro
             if not row.get("src_type"):
                 row["src_type"] = model.get("src_type")
             for field, _ in TARGET_SETTINGS:
-                row[field] = render(now[field]["value"], row, target=True, lowercase=bool(now["lowercase"]["value"]))
-            row["client_id"] = render(now["client_id"]["value"] or "{database}", row) if now["fan_in"]["value"] else None
+                row[field] = render(now[field]["value"], row, target=True, unity_catalog=unity_catalog)
+            row["client_id"] = render(now["client_id"]["value"] or LEGACY_CLIENT_ID, row) if now["fan_in"]["value"] else None
             identity = {name: render(t, row) for name, t in (now["identity"]["value"] or {}).items()}
             row["client_attrs"] = json.dumps(identity) if identity else None
             planned.append(row)

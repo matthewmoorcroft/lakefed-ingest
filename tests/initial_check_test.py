@@ -360,3 +360,117 @@ def test_a_database_check_stamp_names_the_check_run_that_wrote_it():
     store.stamp_databases = lambda collection, stamps, run_id: stamped_by.append(run_id)
     ic.run_check(store, store, ["c1"], _detector({"quiet": 10}), existing_sinks_of=_sinks)
     assert stamped_by == [1]        # the check's own ingest_run row, so database_check.run_id is filled in
+
+
+def test_weights_count_the_changed_tables_and_the_first_loads_of_each_database():
+    configs = [_cfg(1, "busy", "a"), _cfg(2, "busy", "b"), _cfg(3, "busy", "c"),
+               _cfg(4, "new", "a"), _cfg(5, "new", "b"),
+               _cfg(6, "forced", "a"), _cfg(7, "forced", "b"), _cfg(8, "quiet", "a")]
+    cps = _recorded(configs, {1: _cp(20), 2: _cp(20), 3: _cp(20), 6: _cp(5), 7: _cp(5), 8: _cp(10)})
+    detect = _detector({"busy": 21, "quiet": 10, "forced": 5}, changed={1, 3})
+    result = ic.check_collection(configs, cps, detect, existing_sinks=_sinks(configs), force={"forced"}, now=NOW)
+    # busy: 2 of its 3 tables changed; new: both never loaded; forced: sent whole, every table counts.
+    assert result["weights"] == [[SOURCE, "busy", 2, 0], [SOURCE, "forced", 2, 0], [SOURCE, "new", 2, 2]]
+
+
+def _work(collection, *databases):
+    """A collection's check result with these (database, changed tables[, first loads]) as its work."""
+    return {"collection": collection,
+            "weights": [[SOURCE, name, tables, rest[0] if rest else 0] for name, tables, *rest in databases]}
+
+
+def _placed(runs):
+    return [tuple(d) for run in runs for d in run["databases"]]
+
+
+def test_changes_in_one_group_are_shared_over_as_many_runs_as_their_tables_need():
+    work = [_work("g1", *[(f"db{i:02d}", 250) for i in range(12)])]           # 3,000 changed tables, one group
+    runs = ic.plan_cycle(work, group_size=1000)
+    assert [run["tables"] for run in runs] == [1000, 1000, 1000]
+    assert all(run["collections"] == ["g1"] and not run["first_loads"] for run in runs)
+    placed = _placed(runs)
+    assert len(placed) == 12 and len(set(placed)) == 12                       # each database whole, on one run
+
+
+def test_small_changes_in_many_groups_share_one_run():
+    work = [_work(f"g{n}", (f"db{n}", 5)) for n in range(1, 9)]
+    runs = ic.plan_cycle(work, group_size=12500)
+    assert len(runs) == 1 and runs[0]["tables"] == 40
+    assert runs[0]["collections"] == [f"g{n}" for n in range(1, 9)]
+
+
+def test_a_group_with_a_first_load_keeps_a_run_of_its_own():
+    work = [_work("g1", ("new_db", 1000, 1000), ("db_b", 3)), _work("g2", ("db_c", 4)), _work("g3", ("db_d", 2))]
+    runs = ic.plan_cycle(work, group_size=1000)
+    assert runs[0] == {"databases": [["g1", SOURCE, "new_db"], ["g1", SOURCE, "db_b"]], "collections": ["g1"],
+                       "tables": 1003, "first_loads": True}
+    assert runs[1:] == [{"databases": [["g2", SOURCE, "db_c"], ["g3", SOURCE, "db_d"]], "collections": ["g2", "g3"],
+                         "tables": 6, "first_loads": False}]
+
+
+def test_a_database_bigger_than_a_share_runs_alone_so_a_cycle_can_take_one_run_more():
+    work = [_work("g1", ("huge", 1500), ("a", 200), ("b", 200), ("c", 100))]     # 2,000 tables: two runs by size
+    runs = ic.plan_cycle(work, group_size=1000)
+    assert [[d[2] for d in run["databases"]] for run in runs] == [["huge"], ["a", "b", "c"]]
+    work = [_work("g1", ("huge", 1800), ("big", 1100), ("a", 50), ("b", 50))]      # 3,000 tables, share 1,000
+    runs = ic.plan_cycle(work, group_size=1000)
+    assert [[d[2] for d in run["databases"]] for run in runs] == [["huge"], ["big"], ["a", "b"]]
+
+
+def test_the_same_work_always_makes_the_same_runs():
+    work = [_work("g2", ("x", 7), ("y", 7)), _work("g1", ("z", 7), ("w", 7))]
+    assert ic.plan_cycle(work, 14) == ic.plan_cycle(list(reversed(work)), 14)
+    assert ic.plan_cycle([], 14) == [] and ic.plan_cycle([_work("g1")], 14) == []
+
+
+def test_a_jobs_group_size_is_its_tables_over_its_groups():
+    assert ic.group_size_of({"g1": 12500, "g2": 12400, "g3": 100}) == 8334
+    assert ic.group_size_of({}) == 1 and ic.group_size_of({"g1": 0}) == 1
+
+
+class _SharedStore(_Store):
+    """The check's Lakebase calls with the shared and per-database locks of groups B: ``busy`` are the databases a
+    run of an earlier cycle holds, ``others`` the collections another session holds shared."""
+
+    def __init__(self, configs, checkpoints, busy=(), others=()):
+        super().__init__(configs, checkpoints)
+        self.busy, self.others, self.calls = set(busy), set(others), []
+
+    def try_lock_collection_shared(self, collection):
+        self.calls.append(("shared", collection))
+        return True
+
+    def unlock_collection_shared(self, collection):
+        self.calls.append(("unshared", collection))
+
+    def alone_on_collection(self, collection):
+        return collection not in self.others
+
+    def try_lock_databases(self, keys):
+        return {k for k in keys if k.rsplit("|", 1)[1] not in self.busy}
+
+    def unlock_databases(self, keys):
+        self.calls.append(("unlock", tuple(sorted(keys))))
+
+
+def test_with_shared_locks_the_check_leaves_out_the_databases_a_run_holds_and_lets_every_lock_go():
+    configs = [_cfg(1, "quiet", "a"), _cfg(2, "busy", "a"), _cfg(3, "new", "a")]
+    store = _SharedStore(configs, _recorded(configs, {1: _cp(10), 2: _cp(10)}), busy={"busy"}, others={"c1"})
+    summary = ic.run_check(store, store, ["c1"], _detector({"quiet": 10, "busy": 11}), existing_sinks_of=_sinks,
+                           job_run_id="77", share_locks=True, hold_work_locks=True)
+    result = summary["per_collection"][0]
+    assert result["work"] == [[SOURCE, "new"]] and result["busy_databases"] == 1 and result["tables"] == 3
+    assert store.stamped == {"c1": ["quiet"]}                         # busy is neither checked nor stamped
+    assert store.closed == []                                         # another run holds c1: no abandoned-run close
+    assert store.calls[0] == ("shared", "c1") and store.calls[-1] == ("unshared", "c1")
+    assert ("unlock", tuple(sorted(ss.database_lock_key("c1", SOURCE, d) for d in ("new", "quiet")))) in store.calls
+    assert summary["held"] == [] and store.unlocked == []              # nothing held for the runs: they lock their own
+
+
+def test_a_run_of_a_share_takes_its_collections_in_turn_and_fails_only_for_a_part_that_failed():
+    assert planner.cycle_parts({("g2", "s", "a"), ("g1", "s", "b"), ("g2", "s", "c")}) == ["g1", "g2"]
+    summary = planner.cycle_summary("w1", {"g1": {"run_id": 5, "total": 3, "ok": 2, "failed": 1},
+                                           "g2": {"run_id": 6, "status": "skipped"},
+                                           "g3": {"status": "failed", "error": "boom"}})
+    assert summary["failed"] == ["g3"] and summary["skipped"] == ["g2"]   # g1's failed table isn't a failed part
+    assert summary["tables"] == 3 and summary["ok"] == 2 and summary["run_ids"] == {"g1": 5, "g2": 6, "g3": None}

@@ -231,11 +231,14 @@ def test_record_event_finish_sql_updates_event_by_id():
     assert sql.startswith(f"update {ss.EVENT_TABLE} set")
     assert "finished_at = now()" in sql and "duration_ms" in sql
     assert "where id = %s" in sql
-    # status, stage, rows_read, rows_merged, position_from, position_to, error, action, pool, retry_count, id
-    assert sql.count("%s") == 11
+    # status, stage, rows_read, rows_merged, position_from, position_to, error, error_kind, error_class,
+    # action, pool, retry_count, id
+    assert sql.count("%s") == 13
+    assert "error_kind = %s, error_class = %s" in sql
     assert "position_from = %s, position_to = %s" in sql
     assert "action = coalesce(%s, action)" in sql and "pool = coalesce(%s, pool)" in sql
     assert "retry_count = coalesce(%s, retry_count)" in sql
+    assert sql.endswith("where id = %s and status = 'running'")
 
 
 def test_touch_last_success_sql_stamps_checkpoint_from_event():
@@ -249,7 +252,7 @@ def test_finish_run_sql_updates_run_by_id():
     sql = ss.finish_run_sql()
     assert sql.startswith(f"update {ss.RUN_TABLE} set")
     assert "finished_at = now()" in sql
-    assert "where run_id = %s" in sql
+    assert sql.endswith("where run_id = %s and status = 'running'")
     # status, total, ok, failed, skipped, reseeded, detail, run_id
     assert sql.count("%s") == 8
 
@@ -260,9 +263,11 @@ def test_close_abandoned_runs_sql_closes_the_collections_other_open_runs_and_the
     # collection is dead: close it as failed, with its events, in one statement.
     sql = ss.close_abandoned_runs_sql()
     run_update, event_update = sql.split("), events as (")
-    assert f"update {ss.RUN_TABLE} set status = 'failed'" in run_update
-    assert "where task_collection = %s and status = 'running' and run_id <> %s" in run_update
-    assert f"update {ss.EVENT_TABLE} e set status = 'failed'" in event_update
+    assert f"update {ss.RUN_TABLE} r set status = case when exists" in run_update
+    assert ("and (d.result_state = 'CANCELED' or d.cancel_requested_at is not null)) "
+            "then 'cancelled' else 'failed' end") in run_update
+    assert "where r.task_collection = %s and r.status = 'running' and r.run_id <> %s" in run_update
+    assert f"update {ss.EVENT_TABLE} e set status = dead.status" in event_update
     assert "e.run_id = dead.run_id and (e.status = 'running'" in event_update
     # A table waiting for its retry when the run died: its last attempt is 'retried' and no later one
     # exists, so it is closed as failed too, keeping its error and timing.
@@ -273,6 +278,61 @@ def test_close_abandoned_runs_sql_closes_the_collections_other_open_runs_and_the
     assert sql.rstrip().endswith("select (select count(*) from dead), (select count(*) from events)")
     # detail, task_collection, run_id, error (twice: a running event's, appended to a retried one's)
     assert sql.count("%s") == 5
+
+
+def test_close_abandoned_runs_sql_closes_a_cancelled_run_as_cancelled_and_leaves_others_failed():
+    # Only a run whose Databricks run was cancelled (ended CANCELED, or asked to stop) closes as cancelled; its events
+    # follow their run (dead.status). Any other dead run closes as failed, as before.
+    sql = ss.close_abandoned_runs_sql()
+    assert sql.count("'cancelled'") == 1 and sql.count("'failed'") == 1
+    assert f"{ss.DATABRICKS_RUN_TABLE} d" in sql
+    assert "d.run_id = (case when r.job_run_id ~ '^[0-9]+$' then r.job_run_id::bigint end)" in sql
+
+
+def test_stopping_run_sql_reads_the_run_and_its_databricks_run_by_job_run_id():
+    sql = ss.stopping_run_sql()
+    assert sql.count("%s") == 1 and sql.rstrip().endswith(f"from {ss.RUN_TABLE} r where r.run_id = %s")
+    assert "r.status = 'cancelled'" in sql
+    assert f"from {ss.DATABRICKS_RUN_TABLE} d" in sql
+    assert "d.run_id = (case when r.job_run_id ~ '^[0-9]+$' then r.job_run_id::bigint end)" in sql
+    for condition in ("d.cancel_requested_at is not null", "d.life_cycle_state = 'TERMINATING'",
+                      "d.result_state = 'CANCELED'"):
+        assert condition in sql
+
+
+def test_stopping_run_binds_the_run_id_and_reads_the_flag():
+    for got, stopping in ((True, True), (False, False), (None, False)):
+        conn = FakeConn(fetch=[(got,)] if got is not None else [])
+        assert ss.StateStore(conn).stopping_run(9) is stopping
+        assert conn.calls == [(ss.stopping_run_sql(), (9,))]
+
+
+def test_record_event_failed_takes_its_status_as_a_twelfth_parameter():
+    sql = ss.record_event_failed_sql()
+    assert "'failed'" not in sql and "'cancelled'" not in sql
+    assert sql.count("%s") == 12 and "error, status, finished_at, duration_ms" in sql
+
+
+def test_record_failed_tables_a_cancelled_run_records_cancelled_events_and_leaves_checkpoints_alone():
+    conn = FakeConn(fetch=[(True,)])
+    cfg = dict(CFG, task_collection="tc", sink_catalog="c", sink_schema="s", sink_table="t")
+    ss.StateStore(conn).record_failed_tables(3, [(cfg, {"phase": "incremental"}, "connection reset")])
+    stopping_sql, (ev_sql, ev_rows) = conn.calls
+    assert stopping_sql[0] == ss.stopping_run_sql()
+    assert ev_sql == ss.record_event_failed_sql()
+    assert [row[-1] for row in ev_rows] == ["cancelled"]
+    assert all(sql != ss.set_status_sql() for sql, _ in conn.calls)
+
+
+def test_record_failed_tables_a_spark_cancel_in_a_live_run_is_cancelled_and_a_real_error_is_failed():
+    conn = FakeConn()
+    cfg = dict(CFG, task_collection="tc", sink_catalog="c", sink_schema="s", sink_table="t")
+    items = [(cfg, None, "[SPARK_JOB_CANCELLED] Job 4 cancelled"), (dict(cfg, id=8), None, "login failed")]
+    ss.StateStore(conn).record_failed_tables(3, items)
+    _, (_, ev_rows), (st_sql, st_rows) = conn.calls
+    assert [row[-1] for row in ev_rows] == ["cancelled", "failed"]
+    assert st_sql == ss.set_status_sql() and [row[0] for row in st_rows] == [8]
+    assert st_rows[0][5:] == ("failed", "login failed")
 
 
 # ---- per-collection run lock --------------------------------------------------------------
@@ -438,7 +498,7 @@ def test_record_event_finish_ok_stamps_last_success():
     ss.StateStore(conn).record_event_finish(9, "ok", stage="merge", rows_merged=3,
                                             position_from=1, position_to=2, action="increment")
     assert conn.calls == [
-        (ss.record_event_finish_sql(), ("ok", "merge", None, 3, "1", "2", None, "increment", None, None, 9)),
+        (ss.record_event_finish_sql(), ("ok", "merge", None, 3, "1", "2", None, None, None, "increment", None, None, 9)),
         (ss.touch_last_success_sql(), (9,)),
     ]
 
@@ -453,19 +513,26 @@ def test_record_event_finish_failed_truncates_error_and_skips_stamp():
 def test_record_event_finish_skipped_reseed_does_not_stamp():
     conn = FakeConn()
     ss.StateStore(conn).record_event_finish(9, "skipped", stage="checkpoint", action="reseed")
-    assert len(conn.calls) == 1 and conn.calls[0][1][7] == "reseed"
+    assert len(conn.calls) == 1 and conn.calls[0][1][9] == "reseed"
 
 
 def test_record_event_finish_records_pool():
     conn = FakeConn()
     ss.StateStore(conn).record_event_finish(9, "ok", stage="merge", pool="pool3,pool17")
-    assert conn.calls[0][1][8] == "pool3,pool17" and conn.calls[0][1][10] == 9
+    assert conn.calls[0][1][10] == "pool3,pool17" and conn.calls[0][1][12] == 9
 
 
 def test_record_event_finish_records_a_retried_attempt_without_stamping():
     conn = FakeConn()
     ss.StateStore(conn).record_event_finish(9, "retried", stage="seed", error="x", retry_count=1)
-    assert len(conn.calls) == 1 and conn.calls[0][1][0] == "retried" and conn.calls[0][1][9] == 1
+    assert len(conn.calls) == 1 and conn.calls[0][1][0] == "retried" and conn.calls[0][1][11] == 1
+
+
+def test_record_event_finish_records_how_a_failure_was_classified():
+    conn = FakeConn()
+    ss.StateStore(conn).record_event_finish(9, "failed", stage="read", error="x", error_kind="transient",
+                                            error_class="FAILED_JDBC.CONNECTION")
+    assert conn.calls[0][1][7:9] == ("transient", "FAILED_JDBC.CONNECTION")
 
 
 # ---- skip-no-change: bulk checkpoint load, select_list recording, bulk advance -------------
@@ -526,9 +593,10 @@ def test_record_failed_tables_bulk_events_and_status():
     cfg = dict(CFG, task_collection="tc", sink_catalog="c", sink_schema="s", sink_table="t")
     n = ss.StateStore(conn).record_failed_tables(3, [(cfg, {"phase": "incremental"}, "db unreachable")])
     assert n == 1
-    (ev_sql, ev_rows), (st_sql, st_rows) = conn.calls
-    assert ev_sql == ss.record_event_failed_sql() and "'failed'" in ev_sql
-    assert ev_rows == [(3, "tc", 7, "d", "s", "t", "c.s.t", "increment", "incremental", "detect", "db unreachable")]
+    _, (ev_sql, ev_rows), (st_sql, st_rows) = conn.calls
+    assert ev_sql == ss.record_event_failed_sql()
+    assert ev_rows == [(3, "tc", 7, "d", "s", "t", "c.s.t", "increment", "incremental", "detect", "db unreachable",
+                        "failed")]
     assert st_sql == ss.set_status_sql() and st_rows == [(7, "d", "s", "t", "ct", "failed", "db unreachable")]
 
 
@@ -536,7 +604,7 @@ def test_record_failed_tables_full_rows_and_plan_stage():
     conn = FakeConn()
     cfg = dict(CFG, load_type="full", task_collection="tc", sink_catalog="c", sink_schema="s", sink_table="t")
     ss.StateStore(conn).record_failed_tables(3, [(cfg, None, "unsupported")], stage="plan")
-    (_, ev_rows), (_, st_rows) = conn.calls
+    _, (_, ev_rows), (_, st_rows) = conn.calls
     assert ev_rows[0][7:10] == ("full", None, "plan") and st_rows[0][4] == "full"
 
 
@@ -606,6 +674,10 @@ SCHEMA_FINGERPRINTS = {
     11: "557b634c85d1a753d82c7e0ca145209f3b56e1a957d833ad38469e0c97f65999",
     12: "3c4da8d33b1512088b091acb8548088962d3220648a7d497ff4378c043f269f8",
     13: "02ab6eceb01e8c75509c88f496d08f187e6cbf746cc0019f3477977968854cc0",
+    14: "f125d8ae5701120edba627816947a339119e6d8d6d1c4690632b975e52f6ddf7",
+    15: "9ee71a536e5e38ff4c1222cc650c8eb2f1cab4dc6fbbfaebd49473c24640ab40",
+    16: "7ce59a107931d2ee279e1b52c60746fe7feab54cb3bd70cb504b6d898e01835b",
+    17: "15076f535e703623034842daa101fc7d70b2af8b356451abec6515b6e75de287",
 }
 
 
@@ -620,6 +692,15 @@ def test_schema_version_is_bumped_with_every_ddl_change():
 def test_schema_fingerprint_ignores_comments_and_whitespace():
     assert ss.schema_fingerprint("create table a (x int); -- note\n") == ss.schema_fingerprint("create  table a\n(x int);")
     assert ss.schema_fingerprint("create table a (x int);") != ss.schema_fingerprint("create table a (x bigint);")
+
+
+def test_the_failing_tables_index_is_a_plain_non_partial_index_on_control_and_started_at():
+    statements = [" ".join(s.split()) for s in ss.split_sql_statements(_DDL)]
+    index_statements = [s for s in statements if "ingest_event_control_started_idx" in s]
+    assert index_statements == [
+        "create index if not exists ingest_event_control_started_idx "
+        "on lakefed_ingest.ingest_event (control_id, started_at)"
+    ]
 
 
 def test_ddl_creates_the_schema_version_table_and_runs_in_a_transaction():
@@ -1259,7 +1340,7 @@ def test_record_failed_tables_action_override():
     conn = FakeConn()
     cfg = dict(CFG, task_collection="tc", sink_catalog="c", sink_schema="s", sink_table="t")
     ss.StateStore(conn).record_failed_tables(3, [(cfg, None, "x")], stage="checkpoint", action="seed")
-    (_, ev_rows), _ = conn.calls
+    _, (_, ev_rows), _ = conn.calls
     assert ev_rows[0][7:10] == ("seed", None, "checkpoint")
 
 
@@ -1414,6 +1495,20 @@ def test_a_check_without_a_group_takes_every_collection_with_an_enabled_row():
     assert ss.StateStore(conn).enabled_collections() == ["c1", "c2"]
     assert conn.calls == [(ss.enabled_collections_sql(), None)]
     assert "where task_enabled" in ss.enabled_collections_sql() and "order by" in ss.enabled_collections_sql()
+
+
+def test_a_check_without_a_group_leaves_out_the_groups_only_a_deleted_job_holds():
+    sql = ss.enabled_collections_sql()
+    assert f"task_collection not in ({ss.deleted_only_collections_sql()})" in sql
+    deleted_only = ss.deleted_only_collections_sql()
+    assert "ds.deleted_at is not null" in deleted_only and "s.deleted_at is null" in deleted_only
+    assert "m.removed_at is null" in deleted_only and "not exists" in deleted_only
+
+
+def test_the_deleted_only_groups_are_read_on_their_own():
+    conn = FakeConn(fetch=[("g2",)])
+    assert ss.StateStore(conn).deleted_only_collections() == ["g2"]
+    assert conn.calls == [(ss.deleted_only_collections_sql(), None)]
 
 
 def test_the_check_reads_an_ingestion_jobs_groups_by_its_id_and_none_of_a_deleted_one():
@@ -1587,3 +1682,31 @@ def _start(name, target, *args, done=None):
 def _wait_all(events):
     for event in events:
         event.wait(WAIT_S)
+
+
+# ---- cancel: a stopped run is cancelled, not failed --------------------------------------------
+
+def test_a_run_is_stopping_when_its_own_status_or_its_databricks_run_says_so():
+    assert ss.run_is_stopping("cancelled", None)
+    assert not ss.run_is_stopping("running", None)
+    assert not ss.run_is_stopping("running", {"life_cycle_state": "RUNNING", "result_state": None,
+                                              "cancel_requested_at": None})
+    assert ss.run_is_stopping("running", {"life_cycle_state": "RUNNING", "cancel_requested_at": "2026-10-30T15:00"})
+    assert ss.run_is_stopping("running", {"life_cycle_state": "TERMINATING", "cancel_requested_at": None})
+    assert ss.run_is_stopping("running", {"life_cycle_state": "TERMINATED", "result_state": "CANCELED"})
+    assert not ss.run_is_stopping("running", {"life_cycle_state": "TERMINATED", "result_state": "FAILED"})
+
+
+def test_a_failed_attempt_is_cancelled_when_its_run_is_stopping_or_spark_cancelled_the_job():
+    assert ss.failure_status(RuntimeError("Connection reset"), stopping=True) == "cancelled"
+    assert ss.failure_status("[SPARK_JOB_CANCELLED] cancelled", stopping=False) == "cancelled"
+    assert ss.failure_status(RuntimeError("Login failed for user"), stopping=False) == "failed"
+    assert ss.failure_status(None, stopping=False) == "failed"
+
+
+def test_an_abandoned_run_is_cancelled_only_when_databricks_ended_it_cancelled_or_was_asked_to_stop():
+    assert ss.abandoned_run_status({"life_cycle_state": "TERMINATED", "result_state": "CANCELED"}) == "cancelled"
+    assert ss.abandoned_run_status({"life_cycle_state": "RUNNING", "cancel_requested_at": "2026-10-30"}) == "cancelled"
+    assert ss.abandoned_run_status({"life_cycle_state": "TERMINATED", "result_state": "FAILED"}) == "failed"
+    assert ss.abandoned_run_status(None) == "failed"
+
