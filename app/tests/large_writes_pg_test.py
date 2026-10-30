@@ -222,10 +222,11 @@ def test_a_create_by_reference_spreads_its_databases_evenly_by_tables(client):
     assert split == []                                         # a database is never split
 
 
-def test_a_new_number_of_groups_moves_whole_databases_and_their_stamps_and_members(client):
+def test_a_new_number_of_groups_moves_whole_databases_and_their_stamps_and_members(client, monkeypatch):
     """POST /groups against a real schema: the moved control rows, their databases' check stamps, both groups'
     rollups and the job's members, in one transaction; nothing moves on a preview."""
     import queries as q
+    monkeypatch.setattr(main, "_job_active_runs", lambda job, members: [])     # asks Databricks: no run is going
     up = client.post("/api/uploads", json={"csv": _csv(12, 10), "connection": "sql_a"}).json()["upload_id"]
     r = _create(client, "regroup-1", name="Re", source={"upload_id": up, "whole_server": True}, groups_per_server=2)
     job_id = r.json().get("id") or r.json()["task"]["job_id"]
