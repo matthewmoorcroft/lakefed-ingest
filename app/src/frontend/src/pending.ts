@@ -265,14 +265,15 @@ function elapsed(since: Date, now: Date): string {
 }
 
 /** What a discovery run waits for, in plain words with how long so far and the time it began, so a button it holds
- *  off never just says no: "Waiting for compute" while Databricks queues the run or starts its serverless compute,
- *  then `reading` once the run is going. `asked` is when the page started the run, for before its first state. */
+ *  off never just says no: "Waiting for compute" while Databricks queues the discovery job's run or starts its
+ *  compute, then `reading` once the run is going. `asked` is when the page started the run, for before its first
+ *  state: the route isn't known yet then (most go through the SQL warehouse), so it says only `reading`. A statement
+ *  pending on a running warehouse is `reading` too: a moment's pending is normal and proves no queue. */
 export function discoveryWait(wait: RunWait | null, asked: Date, reading: string, now: Date = new Date()): string {
   const since = wait?.since ?? asked;
   const time = `${elapsed(since, now)} so far, since ${clock(since)}`;
-  if (!wait) return `Starting the discovery job: ${time}`;
+  if (!wait || wait.state === "WAREHOUSE_QUEUED") return `${reading}: ${time}`;
   if (wait.state === "WAREHOUSE_STARTING") return `The SQL warehouse is starting: ${time}. It usually takes a few seconds`;
-  if (wait.state === "WAREHOUSE_QUEUED") return `Waiting for the SQL warehouse: ${time}. Other statements are ahead of this one`;
   if (COMPUTE_WAIT.has(wait.state)) {
     return `Waiting for compute: ${time}. The discovery job's compute is starting (its cluster stops after an hour unused), `
            + "which can take a few minutes";

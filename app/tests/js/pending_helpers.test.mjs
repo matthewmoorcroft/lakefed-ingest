@@ -363,8 +363,9 @@ const RUNNING_FROM = new Date(2026, 9, 29, 20, 45, 31);
 const LATER = new Date(2026, 9, 29, 20, 45, 30);
 
 test("a discovery run says what it waits for, for how long and since when, from its state", () => {
+  // Before the first answer the route isn't known, so no job or warehouse is named.
   assert.equal(discoveryWait(null, ASKED, "Reading the server's databases", ASKED),
-               "Starting the discovery job: 0 s so far, since 20:42");
+               "Reading the server's databases: 0 s so far, since 20:42");
   for (const state of ["QUEUED", "PENDING", "BLOCKED", "WAITING_FOR_RETRY"]) {
     assert.equal(discoveryWait({ state, since: ASKED }, ASKED, "Reading the server's databases", LATER),
                  "Waiting for compute: 2 min 44 s so far, since 20:42. The discovery job's compute is starting (its cluster "
@@ -434,8 +435,9 @@ test("a statement on the SQL warehouse says whether the warehouse is starting or
   assert.equal(warehouseRunState({ state: "RUNNING", warehouse: "RUNNING" }), "RUNNING");
   assert.equal(discoveryWait({ state: "WAREHOUSE_STARTING", since: ASKED }, ASKED, "Reading the server's databases", LATER),
                "The SQL warehouse is starting: 2 min 44 s so far, since 20:42. It usually takes a few seconds");
+  // Pending on a running warehouse is normal for a moment, and proves no queue: it just says what it reads.
   assert.equal(discoveryWait({ state: "WAREHOUSE_QUEUED", since: ASKED }, ASKED, "Reading the server's databases", LATER),
-               "Waiting for the SQL warehouse: 2 min 44 s so far, since 20:42. Other statements are ahead of this one");
+               "Reading the server's databases: 2 min 44 s so far, since 20:42");
   assert.equal(connectionNextBlock(true, false, discoveryWait({ state: "WAREHOUSE_STARTING", since: ASKED }, ASKED, "Reading", LATER)),
                "Testing the connection: The SQL warehouse is starting: 2 min 44 s so far, since 20:42. "
                + "It usually takes a few seconds");
