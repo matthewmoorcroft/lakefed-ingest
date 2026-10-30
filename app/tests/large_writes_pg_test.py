@@ -220,3 +220,36 @@ def test_a_create_by_reference_spreads_its_databases_evenly_by_tables(client):
     split = client.sql("select src_database from lakefed_ingest.control group by src_database "
                        "having count(distinct task_collection) > 1")
     assert split == []                                         # a database is never split
+
+
+def test_a_new_number_of_groups_moves_whole_databases_and_their_stamps_and_members(client):
+    """POST /groups against a real schema: the moved control rows, their databases' check stamps, both groups'
+    rollups and the job's members, in one transaction; nothing moves on a preview."""
+    import queries as q
+    up = client.post("/api/uploads", json={"csv": _csv(12, 10), "connection": "sql_a"}).json()["upload_id"]
+    r = _create(client, "regroup-1", name="Re", source={"upload_id": up, "whole_server": True}, groups_per_server=2)
+    job_id = r.json().get("id") or r.json()["task"]["job_id"]
+    group_of = dict(client.sql("select distinct lower(src_database), task_collection from lakefed_ingest.control"))
+    stamped = next(iter(sorted(group_of)))
+    client.sql("insert into lakefed_ingest.database_check (task_collection, source, src_database, checked_version, "
+               "tables) select task_collection, 'sql_a', src_database, 5, 10 from lakefed_ingest.control "
+               "where lower(src_database) = %s limit 1 returning 1", (stamped,))
+    preview = client.post(f"/api/ingestion-jobs/{job_id}/groups", json={"groups_per_server": 3}).json()
+    assert preview["blocked"] is None and preview["summary"]["new_groups"] == ["re_sql_a_c03"]
+    assert dict(client.sql("select distinct lower(src_database), task_collection from lakefed_ingest.control")) == group_of
+    done = client.post(f"/api/ingestion-jobs/{job_id}/groups", json={"groups_per_server": 3, "dry_run": False,
+                                                                     "request_id": "regroup-2"})
+    assert done.status_code == 200
+    per_group = client.sql("select task_collection, count(distinct src_database), count(*) from lakefed_ingest.control "
+                           "group by task_collection order by task_collection")
+    assert [(g, d, t) for g, d, t in per_group] == [("re_sql_a_c01", 4, 40), ("re_sql_a_c02", 4, 40), ("re_sql_a_c03", 4, 40)]
+    after = dict(client.sql("select distinct lower(src_database), task_collection from lakefed_ingest.control"))
+    assert client.sql("select task_collection from lakefed_ingest.database_check where lower(src_database) = %s",
+                      (stamped,)) == [(after[stamped],)]
+    members = client.sql("select task_collection from lakefed_ingest.schedule_member where schedule_id = %s "
+                         "and removed_at is null order by task_collection", (job_id,))
+    assert [m for (m,) in members] == ["re_sql_a_c01", "re_sql_a_c02", "re_sql_a_c03"]
+    rollups = dict(client.sql("select task_collection, tables from lakefed_ingest.rollup_group"))
+    assert rollups == {"re_sql_a_c01": 40, "re_sql_a_c02": 40, "re_sql_a_c03": 40}
+    moved = client.sql("select count(*) from lakefed_ingest.control_change where action = 'regroup'")
+    assert moved == [(40,)]

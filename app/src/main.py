@@ -22,7 +22,7 @@ import time
 import uuid
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
-from typing import Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response
@@ -2126,6 +2126,130 @@ def add_job_databases(job_id: int, body: JobDatabasesRequest, request: Request):
         return {**result, "new_groups": plan["new_groups"]}
 
     return _write_now_or_later("databases", body.request_id, job_id, len(plan["new"]), user, write, after)
+
+
+class JobGroupsRequest(BaseModel):
+    # Blank: each server's default for its tables (placement.groups_for_tables); a number: that many per server.
+    groups_per_server: Optional[int] = Field(None, ge=1, le=nj.MAX_GROUPS_PER_SERVER)
+    dry_run: bool = True
+    request_id: Optional[str] = Field(None, max_length=80)
+
+
+def _regroup_plan(job_name: str, rows: List[dict], groups_per_server: Optional[int]) -> dict:
+    """What a new number of groups per server does to a job, server by server (placement.regroup): a server whose
+    number is unchanged is left alone. Returns {"servers": a line per server, "moves": [(control id, group before,
+    group after, src_database)], "new": groups made, "emptied": groups left with no table, "summary"}."""
+    by_server: Dict[str, Dict[str, Tuple[str, int]]] = {}
+    for r in rows:
+        databases = by_server.setdefault(js.server_of(r), {})
+        key = str(r.get("src_database") or "").lower()
+        group, tables = databases.get(key, (r["task_collection"], 0))
+        databases[key] = (group, tables + 1)
+    servers, target, new, emptied = [], {}, [], []
+    for server in sorted(by_server):
+        databases = by_server[server]
+        now = sorted({group for group, _ in databases.values()})
+        tables = sum(n for _, n in databases.values())
+        count = int(groups_per_server) if groups_per_server else placement.groups_for_tables(tables)
+        line = {"server": server, "databases": len(databases), "tables": tables, "groups_before": len(now),
+                "groups_after": count, "databases_moving": 0, "tables_moving": 0}
+        if count != len(now):
+            plan = placement.regroup(f"{q.identifier(job_name)}_{q.identifier(server)}", databases, count)
+            target.update({(server, name): group for name, group in plan["group_of"].items()})
+            new += plan["new"]
+            emptied += plan["emptied"]
+            line.update(databases_moving=len(plan["moves"]),
+                        tables_moving=sum(databases[name][1] for name in plan["moves"]))
+        servers.append(line)
+    moves = []
+    for r in rows:
+        after = target.get((js.server_of(r), str(r.get("src_database") or "").lower()))
+        if after and after != r["task_collection"]:
+            moves.append((r["id"], r["task_collection"], after, r.get("src_database") or ""))
+    summary = {"servers": servers, "databases_moving": sum(line["databases_moving"] for line in servers),
+               "tables_moving": len(moves), "new_groups": sorted(new), "emptied_groups": sorted(emptied),
+               "unchanged": not moves and not new and not emptied, "applied": False}
+    return {"servers": servers, "moves": moves, "new": sorted(new), "emptied": sorted(emptied), "summary": summary}
+
+
+def _regroup_blocker(job: dict, members: List[dict]) -> Optional[str]:
+    """Why a job's groups can't be changed now: a run of it is going (its wrapper, its check or a group run, queued or
+    starting included, which hold no lock yet), or one of its writes still is. The groups' run locks are taken when it
+    applies, too, so a run that starts in between refuses it then."""
+    if _job_active_runs(job, _active(members)):
+        return "a run of this job is going: change its groups once it has ended (or cancel it)"
+    if any(t.get("status") == "running" for t in db.query(q.job_tasks_sql(), (int(job["id"]),))):
+        return "a write to this job's tables is still going: change its groups once it has finished"
+    return None
+
+
+@app.post("/api/ingestion-jobs/{job_id}/groups")
+def regroup_job(job_id: int, body: JobGroupsRequest, request: Request):
+    """Preview (dry_run, the default) or apply a new number of groups per server for a job. Each server's databases are
+    spread again over its new number of groups, moving as few as can be (placement.regroup); a database is never
+    split. Applying is one transaction under the job's schedule lock and every group's run lock: the moved tables'
+    control rows, their databases' check stamps, the rollups of both groups, the job's members (new groups added,
+    emptied ones removed) and a change log line per table; then the job's Databricks jobs are synced. Each table keeps
+    its checkpoint (by control id), so nothing reloads. Refused while a run or a write of the job is going."""
+    user = _user(request)
+
+    def after(result):
+        _synced(_sync(job_id, user))
+        return result
+
+    if (made := _made_already(body, after)) is not None:
+        return made
+    job, members = _load_schedule(job_id)
+    groups = _job_groups(job_id)
+    plan = _regroup_plan(job["name"], db.query(q.groups_control_rows_sql(), (groups,)) if groups else [],
+                         body.groups_per_server)
+    blocker = _regroup_blocker(job, members)
+    if body.dry_run:
+        return {"summary": plan["summary"], "blocked": blocker}
+    if blocker:
+        raise HTTPException(409, blocker)
+    if plan["summary"]["unchanged"]:
+        return {"summary": {**plan["summary"], "applied": True}, "blocked": None}
+    _refuse_job_tables(job, groups + plan["new"], request)
+    batch = uuid.uuid4().hex[:12]
+
+    def write(progress, task_id):
+        with _write() as cur:
+            groups = _lock_job(cur, job_id)
+            rows = db.fetch(cur, q.groups_control_rows_sql(for_update=True), (groups,)) if groups else []
+            plan = _regroup_plan(job["name"], rows, body.groups_per_server)
+            _lock_collections_together(cur, groups + plan["new"])
+            by_target: Dict[str, List[int]] = {}
+            stamps: Dict[Tuple[str, str], set] = {}
+            for control_id, before, after_group, database in plan["moves"]:
+                by_target.setdefault(after_group, []).append(control_id)
+                stamps.setdefault((before, after_group), set()).add(database)
+            for group, ids in sorted(by_target.items()):
+                for at in range(0, len(ids), q.CONTROL_BATCH):
+                    cur.execute(q.move_controls_sql(), (group, ids[at:at + q.CONTROL_BATCH]))
+            for (before, after_group), names in sorted(stamps.items()):
+                cur.execute(q.move_database_checks_sql(), (after_group, before, sorted(names), after_group))
+            _log_lines(cur, [(user, "regroup", control_id, after_group, "task_collection", before, after_group, None, batch)
+                             for control_id, before, after_group, _ in plan["moves"]])
+            _rewrite_rollups(cur, [(before, database) for _, before, _, database in plan["moves"]]
+                             + [(after_group, database) for _, _, after_group, database in plan["moves"]])
+            _, now_members = _load_schedule(job_id, cur)
+            active = [m for m in now_members if m["removed_at"] is None]
+            gone = [m["id"] for m in active if m["task_collection"] in set(plan["emptied"])]
+            if gone:
+                cur.execute(q.remove_members_sql(), (gone,))
+            if plan["new"]:
+                kept = [m["task_collection"] for m in active if m["id"] not in set(gone)]
+                offs = sch.offsets(kept + plan["new"], int(job["cadence_minutes"]), bool(job.get("stagger")),
+                                   sch.start_minute(job))
+                for group in plan["new"]:
+                    cur.execute(q.insert_member_sql(), (job_id, group, offs[group]))
+            _touch(cur, user, [job_id])
+            result = {"summary": {**plan["summary"], "applied": True}, "blocked": None}
+            _task_written(cur, task_id, result, job_id, len(plan["moves"]))
+        return result
+
+    return _write_now_or_later("regroup", body.request_id, job_id, len(plan["moves"]), user, write, after)
 
 
 class _TablesFrom(BaseModel):

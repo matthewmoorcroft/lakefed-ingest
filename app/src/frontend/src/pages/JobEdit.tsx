@@ -545,6 +545,7 @@ export default function JobEdit() {
         <h3>Compute</h3>
         <ClusterFields info={clusterInfo.data} error={clusterInfo.error} cluster={cluster} setCluster={setCluster} locked={locked} />
         <Compute jobId={id} />
+        <Groups jobId={id} locked={locked} />
         <h3>Tuning</h3>
         <ParameterFields params={params} setParams={setParams} options={options.data} />
       </details>}
@@ -618,6 +619,71 @@ export function ClusterFields({ info, error, cluster, setCluster, locked, after 
 // What the job's runs execute on, read live from the Jobs API.
 // The job cluster's own settings, shown once: in Job cluster above, not again in the bundle's table.
 const CLUSTER_FIELDS = ["Driver node type", "Worker node type", "Workers"];
+
+/** The job's number of groups per server: set a new one (blank for the default by tables), preview what moves, then
+ * change it. Each server's databases are spread again, as few moving as can be and none split; it waits for any run
+ * or write of the job to end. */
+function Groups({ jobId, locked }: { jobId: string; locked: Locked }) {
+  const qc = useQueryClient();
+  const [value, setValue] = useState("");
+  const [preview, setPreview] = useState<Row | null>(null);
+  const [error, setError] = useState<unknown>(null);
+  const [done, setDone] = useState<string | null>(null);
+  const number = value.trim() ? Math.min(64, Math.max(1, Math.round(Number(value)) || 1)) : null;
+  const ask = (dry_run: boolean) => api.post<Row>(`/ingestion-jobs/${jobId}/groups`,
+    { groups_per_server: number, dry_run, ...(dry_run ? {} : { request_id: newRequestId() }) });
+  const look = async () => {
+    setError(null); setDone(null);
+    try { setPreview(await ask(true)); } catch (e) { setError(e); }
+  };
+  const change = async () => {
+    setError(null);
+    try {
+      await ask(false);
+      setDone("The groups are changed; the job's Databricks jobs are synced.");
+      setPreview(null);
+      await qc.invalidateQueries();
+    } catch (e) { setError(e); }
+  };
+  const summary: Row | undefined = preview?.summary;
+  return (
+    <div className="compute">
+      <h3>Groups</h3>
+      <p className="muted">How many groups each server's databases are split between. Each database goes whole to the group
+        with the fewest tables, so the groups come out about even; changing the number spreads them again, moving as few
+        databases as it can. Each table keeps its progress, so nothing reloads.</p>
+      <div className="form-grid">
+        <label>Groups per server<input type="number" min={1} max={64} value={value} placeholder="by tables"
+          onChange={(e) => { setValue(e.target.value); setPreview(null); }} />
+          <span className="help">Blank: one group for about every 12,500 of a server's tables, a small remainder joining
+            the others (100,200 tables make 8).</span></label>
+      </div>
+      <button className="ghost" onClick={look} disabled={!!locked} title={locked ?? undefined}>Preview the groups</button>
+      <ErrorBox error={error} />
+      {done && <Notice tone="ok">{done}</Notice>}
+      {summary && (
+        <>
+          <table className="data dense">
+            <thead><tr><th>Server</th><th className="num">Databases · tables</th><th className="num">Groups now</th>
+              <th className="num">Groups after</th><th className="num">Databases that move</th></tr></thead>
+            <tbody>{(summary.servers ?? []).map((line: Row) => (
+              <tr key={line.server}><td><b>{line.server}</b></td><td className="num">{fmtInt(line.databases)} · {fmtInt(line.tables)}</td>
+                <td className="num">{fmtInt(line.groups_before)}</td><td className="num">{fmtInt(line.groups_after)}</td>
+                <td className="num">{line.groups_after === line.groups_before ? "none" : `${fmtInt(line.databases_moving)} (${fmtInt(line.tables_moving)} ${plural(line.tables_moving, "table")})`}</td></tr>
+            ))}</tbody>
+          </table>
+          {summary.unchanged ? <p className="muted">Nothing changes: every server already has that many groups.</p>
+            : preview?.blocked ? <Notice tone="warn">Not now: {preview.blocked}.</Notice>
+            : <ConfirmButton label="Change the groups" title="Change the job's groups?" onConfirm={change} disabled={!!locked}
+                message={<>{fmtInt(summary.databases_moving)} {plural(summary.databases_moving, "database")} ({fmtInt(summary.tables_moving)} {plural(summary.tables_moving, "table")}) move
+                  {summary.new_groups?.length ? `; new groups: ${summary.new_groups.join(", ")}` : ""}
+                  {summary.emptied_groups?.length ? `; groups removed: ${summary.emptied_groups.join(", ")}` : ""}.
+</>} />}
+        </>
+      )}
+    </div>
+  );
+}
 
 function Compute({ jobId }: { jobId: string }) {
   const compute = useQuery({ queryKey: ["job-compute", jobId], queryFn: () => api.get<Row>(`/ingestion-jobs/${jobId}/compute`) });

@@ -69,3 +69,51 @@ class Lightest:
             self._placed[key] = group
         loads[group] += tables
         return group
+
+
+def _group_number(name: str) -> Optional[int]:
+    tail = str(name).rsplit("_c", 1)
+    return int(tail[1]) if len(tail) == 2 and tail[1].isdigit() else None
+
+
+def regroup(prefix: str, databases: Dict[str, Tuple[str, int]], groups: int) -> Dict[str, object]:
+    """A server's databases spread again over a new number of groups, for a job whose number of groups changes, moving
+    as few as it can. databases is {database, lower case: (its group now, its tables)}; prefix names a new group
+    (prefix + "_c03"). With more groups, every group stays and new ones are added; with fewer, the groups with the most
+    tables stay. A group that stays keeps its databases, biggest first, while it holds no more than an even share of
+    the tables; the rest, and every database of a group that goes, are placed biggest first into the group with the
+    fewest tables. A new group takes the lowest number no group uses. Returns {"group_of": {database: its group after},
+    "moves": {database: (before, after)}, "groups": the groups after, "new": the groups made, "emptied": the groups
+    left with no database}."""
+    count = max(1, int(groups))
+    loads_now: Dict[str, int] = {}
+    members: Dict[str, List[Tuple[str, int]]] = {}
+    for name, (group, tables) in databases.items():
+        loads_now[group] = loads_now.get(group, 0) + int(tables)
+        members.setdefault(group, []).append((name, int(tables)))
+    stay = sorted(sorted(loads_now, key=lambda g: (-loads_now[g], g))[:count])
+    used = {number for number in (_group_number(g) for g in loads_now) if number is not None}
+    made, number = [], 1
+    while len(stay) + len(made) < count:
+        while number in used:
+            number += 1
+        made.append(f"{prefix}_c{number:02d}")
+        used.add(number)
+    after = sorted(stay + made)
+    share = sum(loads_now.values()) / count
+    loads = {group: 0 for group in after}
+    group_of: Dict[str, str] = {}
+    pool: List[Tuple[str, int]] = []
+    for group in loads_now:
+        for name, tables in sorted(members[group], key=lambda item: (-item[1], item[0])):
+            if group in loads and (loads[group] == 0 or loads[group] + tables <= share):
+                group_of[name] = group
+                loads[group] += tables
+            else:
+                pool.append((name, tables))
+    for name, tables in sorted(pool, key=lambda item: (-item[1], item[0])):
+        group = min(after, key=lambda g: (loads[g], g))
+        group_of[name] = group
+        loads[group] += tables
+    return {"group_of": group_of, "groups": after, "new": made, "emptied": sorted(set(loads_now) - set(after)),
+            "moves": {name: (databases[name][0], group) for name, group in group_of.items() if group != databases[name][0]}}

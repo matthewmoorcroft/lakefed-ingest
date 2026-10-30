@@ -1941,6 +1941,22 @@ def collection_control_rows_sql() -> str:
     return f"select {cols} from {SCHEMA}.control where task_collection = %s order by id"
 
 
+def move_controls_sql() -> str:
+    """Move control rows into another ingestion group, as a job's groups are spread again. Each table keeps its
+    checkpoint, which is by control id, so nothing reloads. Params: the group, list of control ids."""
+    return f"update {SCHEMA}.control set task_collection = %s where id = any(%s)"
+
+
+def move_database_checks_sql() -> str:
+    """Move some databases' check stamps with them into another group: a stamp stays true of its database whatever
+    group it is in, so a moved database isn't read as unchecked until the next check. A stamp the new group already
+    has for one (left from when the database was there before) is kept, and the old group's stays unused.
+    Params: new group, old group, list of database names as the control rows name them, new group."""
+    return (f"update {SCHEMA}.database_check d set task_collection = %s where d.task_collection = %s "
+            f"and d.src_database = any(%s) and not exists (select 1 from {SCHEMA}.database_check e "
+            f"where e.task_collection = %s and e.source = d.source and e.src_database = d.src_database)")
+
+
 def groups_control_rows_sql(for_update: bool = False) -> str:
     """Every control row of the given ingestion groups, enabled or not, oldest first: an ingestion job's rows, which
     its settings are read from (job_settings.read). Locked for update when an edit applies. Param: list of groups."""

@@ -33,3 +33,22 @@ def test_later_databases_join_the_lightest_group_and_nothing_moves():
     assert join.place("sql_a", "new_3", 1) == "g1"            # 10 against 14
     assert join.place("sql_a", "NEW_1") == "g2"               # placed already: it keeps its group
     assert join.place("sql_b", "x") is None and not join.knows("sql_b")
+
+
+def test_a_new_number_of_groups_spreads_the_databases_again_moving_as_few_as_it_can():
+    now = {f"db{i}": ("job_s_c01" if i < 6 else "job_s_c02", 10) for i in range(12)}
+    plan = placement.regroup("job_s", now, 3)
+    assert plan["groups"] == ["job_s_c01", "job_s_c02", "job_s_c03"] and plan["new"] == ["job_s_c03"]
+    per_group = {}
+    for name, group in plan["group_of"].items():
+        per_group[group] = per_group.get(group, 0) + 1
+    assert sorted(per_group.values()) == [4, 4, 4]
+    assert len(plan["moves"]) == 4 and plan["emptied"] == []   # only the four the new group takes move
+
+
+def test_fewer_groups_empty_the_extra_ones_and_keep_the_names_with_the_most_tables():
+    now = {"a": ("job_s_c01", 50), "b": ("job_s_c02", 40), "c": ("job_s_c03", 5), "d": ("job_s_c04", 5)}
+    plan = placement.regroup("job_s", now, 2)
+    assert plan["groups"] == ["job_s_c01", "job_s_c02"] and plan["emptied"] == ["job_s_c03", "job_s_c04"]
+    assert plan["group_of"]["a"] == "job_s_c01" and plan["group_of"]["b"] == "job_s_c02"
+    assert set(plan["moves"]) == {"c", "d"}
