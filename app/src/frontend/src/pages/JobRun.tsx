@@ -16,7 +16,7 @@ function Figure({ label, value, sub }: { label: string; value: string; sub?: str
     {sub && <div className="metric-sub">{sub}</div>}</div>;
 }
 
-/** One job run: progress over all the job's tables, its group runs (waiting ones with their start), its databases
+/** One ingestion run: progress over all the job's tables, its group runs (waiting ones with their start), its databases
  * failing first, and its failures by cause. */
 export default function JobRun() {
   const { config } = useSettings();
@@ -45,17 +45,17 @@ export default function JobRun() {
   const manyServers = new Set(dbs.map((d) => d.server)).size > 1;
   return (
     <>
-      <PageHead crumb={<Crumbs steps={[["Ingestion jobs", "/ingestion-jobs"], [r?.job_name ?? "Ingestion job", `/ingestion-jobs/${id}`], ["Job run"]]} />}
-        tab={r ? jobRunName(r.job_name, r.slot) : "Job run"}
+      <PageHead crumb={<Crumbs steps={[["Ingestion jobs", "/ingestion-jobs"], [r?.job_name ?? "Ingestion job", `/ingestion-jobs/${id}`], ["Ingestion run"]]} />}
+        tab={r ? jobRunName(r.job_name, r.slot) : "Ingestion run"}
         title={r ? <>{jobRunName(r.job_name, r.slot)}{live ? `: ${checkedPct}% checked${r.expected_end ? `, ends about ${fmtClock(r.expected_end)}` : ""}` : ""}{" "}
-          <RunStatus status={null} outcome={r.outcome} /></> : "Job run"}
+          <RunStatus status={null} outcome={r.outcome} /></> : "Ingestion run"}
         lead={r && <>{r.outcome?.note ?? `${fmtInt(r.ran)} of ${fmtInt(r.members)} group ${plural(r.members, "run")}`}
-          {live && <>; {fmtInt(r.running_group_runs)} running, {fmtInt(r.waiting)} waiting to start</>}. Group runs the check job started together are one job run; others are placed by the job's current schedule.</>}
+          {live && <>; {fmtInt(r.running_group_runs)} running, {fmtInt(r.waiting)} waiting to start</>}. Group runs the check job started together are one ingestion run; others are placed by the job's current schedule.</>}
         right={live || run.error ? <Stamp at={r?.read_at} every={15} error={run.error} /> : undefined} />
       <ErrorBox error={run.error} />
       {r && (
         <>
-          <Section title={live ? "Progress now" : "What the job run did"}
+          <Section title={live ? "Progress now" : "What the ingestion run did"}
             note={notStarted ? `${fmtInt(notStarted)} of the tables to go belong to groups that have not started yet.` : undefined}>
             <div className="count">{live ? progressText(p) : finishedText}</div>
             <ProgressBar p={p} big /><ProgressKey p={p} finished={!live} />
@@ -104,7 +104,7 @@ export default function JobRun() {
               </tbody>
             </table></div>
           </Section>
-          <Section title={`Databases: ${fmtInt(dbs.length)}`} note="Every database with table events in this job run: failed first, then in flight, then done.">
+          <Section title={`Databases: ${fmtInt(dbs.length)}`} note="Every database with table events in this ingestion run: failed first, then in flight, then done.">
             <div className="table-wrap"><table className="data">
               <thead><tr><th>Database</th><th>Ingestion group</th><th className="num">Loaded</th><th className="num">In flight</th>
                 <th className="num">Failed</th><th className="num">Rows written</th></tr></thead>

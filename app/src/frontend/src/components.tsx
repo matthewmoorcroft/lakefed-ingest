@@ -501,7 +501,7 @@ export function useTabTitle(title?: string) {
   useEffect(() => { document.title = title ? `${title} · Lakefed Ingest` : "Lakefed Ingest"; }, [title]);
 }
 
-/** The steps above a page, as the workspace shows them: "Ingestion jobs › East hourly › Job run". */
+/** The steps above a page, as the workspace shows them: "Ingestion jobs › East hourly › Ingestion run". */
 export function Crumbs({ steps }: { steps: [ReactNode, string?][] }) {
   return <span className="eyebrow">{steps.map(([label, to], i) => <Fragment key={i}>{i > 0 && " › "}
     {to ? <Link to={to}>{label}</Link> : label}</Fragment>)}</span>;
@@ -640,7 +640,7 @@ export function progressFrom(p?: Row | null): Progress {
            inFlight: Number(p?.in_flight || 0), failed: Number(p?.failed || 0), notRun: Number(p?.not_run || 0) };
 }
 
-/** A job run's name: its job and its slot's start, "East hourly, 14:00 job run" (with the day when not today). */
+/** An ingestion run's name: its job and its slot's start, "East hourly, 14:00 ingestion run" (with the day when not today). */
 /** A time as a clock reading today, and with its day otherwise ("23 Oct, 21:00"). */
 export function fmtSlot(slot: unknown): string {
   if (!slot) return "";
@@ -651,7 +651,7 @@ export function fmtSlot(slot: unknown): string {
 }
 
 export function jobRunName(jobName: unknown, slot: unknown): string {
-  return `${jobName}, ${fmtSlot(slot)} job run`;
+  return `${jobName}, ${fmtSlot(slot)} ingestion run`;
 }
 
 export const jobRunPath = (jobId: unknown, slot: unknown) =>

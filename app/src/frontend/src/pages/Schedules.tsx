@@ -3,10 +3,10 @@ import { Link } from "react-router-dom";
 import { api, type Row } from "../api";
 import { Badge, ErrorBox, Menu, Notice, PageHead, Section, fmtTime, readAt, statusName, usePageStamp } from "../components";
 import { usePermissions } from "../permissions";
-import Jobs from "./Jobs";
+import SchemaSetup from "./SchemaSetup";
 
-// Schedules and jobs: when each ingestion job runs, as set in its Edit view (When it runs), one row per job and no
-// groups; then the Databricks jobs the app runs them with. A schedule is changed in the job's Edit view.
+// Schedules: when each ingestion job runs, as set in its Edit view (When it runs), one row per job and no groups, as
+// the Databricks Jobs list shows them. Run history is on Runs. A schedule is changed in the job's Edit view.
 
 function next(job: Row): string {
   if (job.paused) return "paused";
@@ -50,12 +50,12 @@ function JobRow({ job }: { job: Row }) {
   );
 }
 
-export default function SchedulesAndJobs() {
+export default function Schedules() {
   const list = useQuery({ queryKey: ["schedules"], queryFn: () => api.get<Row[]>("/schedules"), refetchInterval: 15_000 });
   usePageStamp(readAt(list), 30, list.error);
   return (
     <>
-      <PageHead title="Schedules and jobs" lead="When each ingestion job runs, as set in its Edit view; then the Databricks jobs the app runs them with." />
+      <PageHead title="Schedules" lead="When each ingestion job runs, as set in its Edit view." />
       <ErrorBox error={list.error} />
       <Section title="Ingestion jobs" note="Each one's schedule, as set in its Edit view (When it runs).">
         {list.data && list.data.length === 0 ? <Notice>No ingestion jobs yet: New ingestion job, on Ingestion jobs, makes one.</Notice> : (
@@ -65,8 +65,7 @@ export default function SchedulesAndJobs() {
           </table></div>
         )}
       </Section>
-      <h2 className="page-sub">The Databricks jobs the app runs them with</h2>
-      <Jobs embedded />
+      <SchemaSetup />
     </>
   );
 }

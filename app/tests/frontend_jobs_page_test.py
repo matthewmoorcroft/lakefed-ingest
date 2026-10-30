@@ -41,7 +41,7 @@ def test_updated_and_refresh_data_are_at_the_bottom_of_the_menu():
     top = APP.index('<div className="topbar">')
     assert "Refresh data" not in APP[top:APP.index("</div>", top)]
     assert "margin-top: auto" in _rule(".sidebar-foot")
-    for page in ("IngestionJobs", "Overview", "Sources", "SchedulesAndJobs", "Changes", "Timeline"):
+    for page in ("IngestionJobs", "Overview", "Sources", "Schedules", "Changes", "Timeline"):
         text = (SOURCE / "pages" / f"{page}.tsx").read_text()
         assert "usePageStamp(" in text and "right={<Stamp" not in text, page
 

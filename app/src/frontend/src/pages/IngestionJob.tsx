@@ -12,7 +12,7 @@ import { OutLink, Crumbs, Badge, ErrorBox, Menu, Modal, Name, Notice, PageHead, 
 
 const PAGE = 25;
 
-/** A job run's rows written: "at least" when some loads recorded no count. */
+/** An ingestion run's rows written: "at least" when some loads recorded no count. */
 export const rowsText = (r: Row) => (r.rows_partial ? `at least ${fmtInt(r.rows_written)}` : fmtInt(r.rows_written));
 
 /** A trigger that did not run because its job is paused: the Databricks Runs list shows no row for it. */
@@ -29,13 +29,13 @@ function foldPaused(runs: Row[]): (Row | { folded: Row[] })[] {
   return out;
 }
 
-/** One row per job run: outcome, group runs, took, tables loaded, speed, rows written, parallelism, clusters, failed. */
+/** One row per ingestion run: outcome, group runs, took, tables loaded, speed, rows written, parallelism, clusters, failed. */
 export function JobRunsTable({ runs, showJob }: { runs: Row[]; showJob?: boolean }) {
   const columns = showJob ? 11 : 10;
   const [open, setOpen] = useState<string | null>(null);
   return (
     <div className="table-wrap"><table className="data dense fit wrap-head">
-      <thead><tr><th>Job run</th>{showJob && <th>Ingestion job</th>}<th>Outcome</th><th className="num">Group runs</th>
+      <thead><tr><th>Ingestion run</th>{showJob && <th>Ingestion job</th>}<th>Outcome</th><th className="num">Group runs</th>
         <th className="num">Took</th><th className="num">Tables loaded</th><th className="num">Tables/min</th>
         <th className="num">Rows written</th><th className="num">Parallelism</th><th className="num">Clusters</th>
         <th className="num">Failed</th></tr></thead>
@@ -65,13 +65,13 @@ export function JobRunsTable({ runs, showJob }: { runs: Row[]; showJob?: boolean
           {open === `${r.job_id}-${r.slot}` && <tr className="l2"><td colSpan={columns}><RunGroups jobId={r.job_id} slot={r.slot} /></td></tr>}
           </Fragment>
         ))}
-        {!runs.length && <tr><td colSpan={columns} className="muted">No job runs in this window.</td></tr>}
+        {!runs.length && <tr><td colSpan={columns} className="muted">No ingestion runs in this window.</td></tr>}
       </tbody>
     </table></div>
   );
 }
 
-/** A job run's group runs, as a Databricks job run lists its tasks (a for-each task's iterations): the groups its
+/** An ingestion run's group runs, as a Databricks job run lists its tasks (a for-each task's iterations): the groups its
  * check started this run, each with its outcome, start, time, tables and its run. */
 function RunGroups({ jobId, slot }: { jobId: unknown; slot: string }) {
   const run = useQuery({ queryKey: ["job-run", String(jobId), slot],
@@ -97,14 +97,14 @@ function RunGroups({ jobId, slot }: { jobId: unknown; slot: string }) {
               <td className="num" style={{ color: Number(g.failed) ? "var(--bad)" : undefined }}>{g.check ? "" : fmtInt(g.failed)}</td>
             </tr>
           ))}
-          {!lines.some((g) => g.check || g.run_id) && <tr><td colSpan={6} className="muted">No group run started in this job run.</td></tr>}
+          {!lines.some((g) => g.check || g.run_id) && <tr><td colSpan={6} className="muted">No group run started in this ingestion run.</td></tr>}
         </tbody>
       </table>
     </div>
   );
 }
 
-/** The job run going now, read from its Databricks runs every few seconds, in the order it runs, as a Databricks job
+/** The ingestion run going now, read from its Databricks runs every few seconds, in the order it runs, as a Databricks job
  * run's page lists its tasks: the job's run as the heading, then step 1 the check and what it found, then step 2 the
  * group runs the check starts (a job without the check has only the group runs). Shown only while something is going. */
 function RunningNow({ live }: { live: Row }) {
@@ -274,7 +274,7 @@ export default function IngestionJob() {
       {j && (
         <div className="metrics">
           <div className="metric"><div className="metric-label">Tables now</div><StateBar row={j} full /></div>
-          <div className="metric"><div className="metric-label">Last job run</div>
+          <div className="metric"><div className="metric-label">Last ingestion run</div>
             <div className="metric-value small-value">{last ? <Link to={jobRunPath(j.id, last.slot)}><RunStatus status={null} outcome={last.outcome} /></Link> : "Never run"}</div>
             <div className="metric-sub">{last ? `${fmtSlot(last.slot)}${last.took_s != null ? `, took ${fmtDuration(last.took_s)}` : ""}` : ""}</div></div>
           <div className="metric"><div className="metric-label">Next trigger</div>
@@ -283,8 +283,8 @@ export default function IngestionJob() {
           <div className="metric"><div className="metric-label">Speed</div>
             <div className="metric-value">{j.median_speed_tables_per_min != null ? fmtSpeed(j.median_speed_tables_per_min) : "–"}<small>tables/min</small></div>
             <div className="metric-sub">{Number(j.speed_job_runs) ? `tables loaded, median of the last ${fmtInt(j.speed_job_runs)} job ${plural(j.speed_job_runs, "run")} that loaded any`
-              : "no job run loaded tables in 7 days"}</div></div>
-          <div className="metric"><div className="metric-label">Job run time</div>
+              : "no ingestion run loaded tables in 7 days"}</div></div>
+          <div className="metric"><div className="metric-label">Ingestion run time</div>
             <div className="metric-value">{j.p95_took_s != null ? fmtDuration(j.p95_took_s) : "–"}</div>
             <div className="metric-sub">p95 over 7 days</div></div>
         </div>
@@ -292,7 +292,7 @@ export default function IngestionJob() {
       {live.data?.active && <RunningNow live={live.data} />}
       {j && <RediscoveryRecord rediscovery={j.rediscovery} requesting={rediscover.isPending} error={rediscover.error}
         refused={j.change_blocked} onRunNow={() => rediscover.mutate()} />}
-      <Section title="Job runs" note="Newest first; one row per trigger. Open a run for the groups it ran."
+      <Section title="Ingestion runs" note="Newest first; one row per trigger. Open a run for the groups it ran."
         actions={<span className="pager-buttons">
           <button className="ghost" disabled={!pages.length} onClick={() => setPages(pages.slice(0, -1))}>Newer</button>
           <button className="ghost" disabled={!runs.data?.next_before} onClick={() => setPages([...pages, runs.data!.next_before])}>Older</button>
@@ -302,7 +302,7 @@ export default function IngestionJob() {
       </Section>
       {j && <Section title={`What it ingests: ${fmtInt(j.enabled_tables)} ${plural(j.enabled_tables, "table")}`}
         note={<>From each server, its databases and their tables, for information. Edit changes them. Split into{" "}
-          <b>{fmtInt(j.groups?.length)}</b> {plural(j.groups?.length, "ingestion group")}, which run side by side; each job run lists the groups it started.</>}>
+          <b>{fmtInt(j.groups?.length)}</b> {plural(j.groups?.length, "ingestion group")}, which run side by side; each ingestion run lists the groups it started.</>}>
         <Tree jobId={id} locked={null} readOnly />
       </Section>}
       {j && <TargetTables jobId={id} />}

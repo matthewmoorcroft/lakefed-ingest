@@ -4,8 +4,8 @@ import { useNavigate } from "react-router-dom";
 import { api, qs, type Row } from "../api";
 import { PageHead, readAt, ErrorBox, Notice, fmtDuration, fmtTime, jobRunName, jobRunPath, plural, statusName, useWidth, usePageStamp } from "../components";
 
-// One lane per ingestion job, as the Jobs UI's run timeline: each job run a bar from its first group run's start to
-// its last one's finish, coloured by its outcome, opening the job run; its groups on hover. Planned triggers are
+// One lane per ingestion job, as the Jobs UI's run timeline: each ingestion run a bar from its first group run's start to
+// its last one's finish, coloured by its outcome, opening the ingestion run; its groups on hover. Planned triggers are
 // ticks, and triggers Databricks skipped (the previous run still going) red markers. Groups in no job get one lane.
 
 interface Lane { job_id: number; name: string; description: string; paused: boolean; runs: Row[]; planned: string[]; skipped: string[] }
@@ -22,7 +22,7 @@ function runTitle(lane: Lane, run: Row) {
   return [jobRunName(lane.name, run.slot), `${run.outcome.label}${run.outcome.note ? ` (${run.outcome.note})` : ""}`, span,
     run.took_s != null ? `took ${fmtDuration(run.took_s)}` : "",
     Number(run.failed_tables) > 0 ? `${run.failed_tables} ${plural(run.failed_tables, "table")} failed` : "",
-    `${run.ran} of ${run.members} ${plural(run.members, "group")} ran`, groupsText(run), "Click to open the job run"].filter(Boolean).join("\n");
+    `${run.ran} of ${run.members} ${plural(run.members, "group")} ran`, groupsText(run), "Click to open the ingestion run"].filter(Boolean).join("\n");
 }
 
 export default function TimelinePage() {
@@ -60,7 +60,7 @@ export default function TimelinePage() {
   usePageStamp(readAt(t), 60, t.error);
   return (
     <>
-      <PageHead title="Timeline" lead="The job runs of every ingestion job in the window, one lane per job. Click a job run to open it." />
+      <PageHead title="Timeline" lead="The ingestion runs of every ingestion job in the window, one lane per job. Click an ingestion run to open it." />
       <div className="toolbar">
         <label>Window
           <select value={hours} onChange={(e) => setHours(Number(e.target.value))}>
@@ -74,13 +74,13 @@ export default function TimelinePage() {
         </span>
       </div>
       <ErrorBox error={t.error} />
-      {d && <p className="muted small">{runs.length} {plural(runs.length, "job run")}, {failed} failed, {skipped} skipped {plural(skipped, "trigger")},
-        {" "}{fmtTime(d.start)} – {fmtTime(d.end)}. Hover a job run for its groups.</p>}
+      {d && <p className="muted small">{runs.length} {plural(runs.length, "ingestion run")}, {failed} failed, {skipped} skipped {plural(skipped, "trigger")},
+        {" "}{fmtTime(d.start)} – {fmtTime(d.end)}. Hover an ingestion run for its groups.</p>}
       {d && rows === 0 && <Notice>No ingestion jobs yet.</Notice>}
       {d && rows > 0 && (
         <div className="card timeline" ref={box}>
           <svg viewBox={`0 0 ${LABEL_W + CHART_W + 10} ${height}`} width={LABEL_W + CHART_W + 10} height={height} role="img"
-            aria-label="Job runs per ingestion job over time">
+            aria-label="Ingestion runs per ingestion job over time">
             {ticks.map((ms) => (
               <g key={ms}>
                 <line x1={x(ms)} x2={x(ms)} y1={AXIS_H - 4} y2={height} style={{ stroke: "var(--border)" }} />

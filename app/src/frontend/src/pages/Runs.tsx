@@ -33,7 +33,7 @@ const PAGE = 25;
 
 const fmtWhen = (v: unknown) => new Date(String(v)).toLocaleString([], { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" });
 
-/** Job runs of every job (or one), running first, then newest first, with outcome counts. "Not in any job" lists
+/** Ingestion runs of every job (or one), running first, then newest first, with outcome counts. "Not in any job" lists
  * those groups' group runs with the run columns. */
 export default function Runs() {
   const [params, setParams] = useSearchParams();
@@ -61,8 +61,8 @@ export default function Runs() {
       <PageHead title="Runs"
         lead={job === "none" ? "Group runs of the ingestion groups in no job."
           : d ? `${fmtInt(running.length)} running; ${fmtInt(withFailed.length)} finished with failed tables${oldest ? ` since ${fmtWhen(oldest)}` : ""}. `
-            + "A job run is one trigger of an ingestion job, with one group run per ingestion group."
-          : "A job run is one trigger of an ingestion job, with one group run per ingestion group."}
+            + "An ingestion run is one trigger of an ingestion job, with one group run per ingestion group."
+          : "An ingestion run is one trigger of an ingestion job, with one group run per ingestion group."}
         right={<label className="toolbar" style={{ margin: 0 }}>Ingestion job
           <select value={job} onChange={(e) => choose(e.target.value)}>
             <option value="">(all jobs)</option>
@@ -91,7 +91,7 @@ export default function Runs() {
               <JobRunsTable runs={running} showJob />
             </Section>
           )}
-          <Section title="Finished, newest first" note="Tables/min: tables loaded a minute over the job run's work span, so planning and change detection are left out; failed tables are not counted, and show under Failed."
+          <Section title="Finished, newest first" note="Tables/min: tables loaded a minute over the ingestion run's work span, so planning and change detection are left out; failed tables are not counted, and show under Failed."
             actions={<span className="pager-buttons">
               <button className="ghost" disabled={!pages.length} onClick={() => setPages(pages.slice(0, -1))}>Newer</button>
               <button className="ghost" disabled={!d?.next_before} onClick={() => setPages([...pages, d!.next_before])}>Older</button>

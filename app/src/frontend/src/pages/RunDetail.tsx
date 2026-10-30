@@ -122,7 +122,7 @@ export default function RunDetail() {
     <>
       <PageHead crumb={<Crumbs steps={r?.job_runs?.length === 1
           ? [["Ingestion jobs", "/ingestion-jobs"], [r.job_runs[0].job_name, `/ingestion-jobs/${r.job_runs[0].job_id}`],
-             [`${fmtSlot(r.job_runs[0].slot)} job run`, jobRunPath(r.job_runs[0].job_id, r.job_runs[0].slot)], [r.check ? "Check" : "Group run"]]
+             [`${fmtSlot(r.job_runs[0].slot)} ingestion run`, jobRunPath(r.job_runs[0].job_id, r.job_runs[0].slot)], [r.check ? "Check" : "Group run"]]
           : [["Runs", r?.job_runs?.length ? "/runs" : "/runs?job=none"], [r?.check ? "Check" : "Group run"]]} />}
         title={title(id, r, p, live)}
         lead={r && <>Ingestion group <Link to={`/collections/${encodeURIComponent(r.task_collection)}`}><strong>{r.task_collection}</strong></Link>

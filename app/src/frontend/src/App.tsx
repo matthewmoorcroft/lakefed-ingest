@@ -11,7 +11,7 @@ import Tables from "./pages/Tables";
 import AddTable from "./pages/AddTable";
 import BulkImport from "./pages/BulkImport";
 import Changes from "./pages/Changes";
-import SchedulesAndJobs from "./pages/SchedulesAndJobs";
+import Schedules from "./pages/Schedules";
 import Timeline from "./pages/Timeline";
 import Collection from "./pages/Collection";
 import IngestionJobs from "./pages/IngestionJobs";
@@ -33,7 +33,7 @@ export const useSettings = () => useContext(SettingsContext);
 // groups in no job, reached from a group's page and from Sources.
 const NAV: [string, string][] = [
   ["/overview", "Overview"], ["/ingestion-jobs", "Ingestion jobs"], ["/runs", "Runs"], ["/sources", "Sources"],
-  ["/timeline", "Timeline"], ["/tables", "Tables"], ["/schedules-and-jobs", "Schedules and jobs"], ["/changes", "Changes"],
+  ["/timeline", "Timeline"], ["/tables", "Tables"], ["/schedules", "Schedules"], ["/changes", "Changes"],
 ];
 
 // Pages under an ingestion job keep Ingestion jobs selected, as the workspace keeps a job's section selected on its pages.
@@ -82,10 +82,10 @@ export default function App() {
             <Route path="/runs" element={<Runs />} />
             <Route path="/runs/:id" element={<RunDetail />} />
             <Route path="/tables" element={<Tables />} />
-            <Route path="/schedules-and-jobs" element={<SchedulesAndJobs />} />
+            <Route path="/schedules" element={<Schedules />} />
             {/* The two pages it replaces, for old links and bookmarks. */}
-            <Route path="/jobs" element={<Navigate to="/schedules-and-jobs" replace />} />
-            <Route path="/schedules" element={<Navigate to="/schedules-and-jobs" replace />} />
+            <Route path="/jobs" element={<Navigate to="/schedules" replace />} />
+            <Route path="/schedules-and-jobs" element={<Navigate to="/schedules" replace />} />
             <Route path="/timeline" element={<Timeline />} />
             <Route path="/collections/:name" element={<Collection />} />
             <Route path="/collections/:name/databases/:server/:database" element={<Database />} />

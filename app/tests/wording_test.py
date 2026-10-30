@@ -64,11 +64,25 @@ def test_no_page_calls_the_databricks_job_an_ingestion_job():
     assert not offenders, "say 'the Databricks job' for the bundle-deployed job:\n" + "\n".join(offenders)
 
 
-def test_the_nav_says_schedules_and_jobs_and_its_page_names_the_databricks_jobs():
+def test_the_nav_says_schedules_and_its_page_shows_only_the_schedules():
     app = (FRONTEND / "App.tsx").read_text()
-    assert '["/schedules-and-jobs", "Schedules and jobs"]' in app and '["/jobs", "Jobs"]' not in app
-    page = (FRONTEND / "pages" / "SchedulesAndJobs.tsx").read_text()
-    assert "<h1>Jobs</h1>" not in page and re.search(r"The Databricks jobs the app runs them with", page)
+    assert '["/schedules", "Schedules"]' in app and '["/jobs", "Jobs"]' not in app
+    assert '<Route path="/schedules-and-jobs" element={<Navigate to="/schedules" replace />} />' in app
+    page = (FRONTEND / "pages" / "Schedules.tsx").read_text()
+    assert '<PageHead title="Schedules"' in page and "<SchemaSetup />" in page
+    for gone in ("The Databricks jobs the app runs them with", "Active runs", "Recent runs", "<Jobs"):
+        assert gone not in page, gone
+    assert not (FRONTEND / "pages" / "Jobs.tsx").exists()
+
+
+def test_one_trigger_of_an_ingestion_job_is_an_ingestion_run():
+    # "a Databricks job run" stays, and "each ingestion job runs" is the verb.
+    offenders = []
+    for path in sorted(FRONTEND.rglob("*.tsx")):
+        for text in visible_text(path.read_text()):
+            if re.search(r"(?<!Databricks )(?<!discovery )(?<!ingestion )\b[Jj]ob runs?\b", text):
+                offenders.append(f"{path.name}: {text.strip()[:80]}")
+    assert not offenders, "say 'ingestion run' for one trigger of an ingestion job:\n" + "\n".join(offenders)
 
 
 def test_the_backend_names_the_databricks_job():

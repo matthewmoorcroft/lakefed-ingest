@@ -13,7 +13,7 @@ interface Overview {
 
 const jobPath = (id: unknown) => `/ingestion-jobs/${encodeURIComponent(String(id))}`;
 
-/** A job's last job run that ran, however long ago: its outcome, when, failed tables and how long it took. A
+/** A job's last ingestion run that ran, however long ago: its outcome, when, failed tables and how long it took. A
  * trigger that did not run is never shown here; the job's own page lists every trigger. */
 function LastJobRun({ job }: { job: Row }) {
   const last = job.last_job_run;
@@ -48,7 +48,7 @@ export function JobsTable({ jobs, notInJob, total, offset, limit, onPage, link, 
       <div className="table-wrap"><table className={audit ? "data fit" : "data"}>
         <thead><tr><th>Ingestion job</th><th className="num">Groups</th>{!audit && <th className="num">Databases</th>}
           <th className="num">Tables</th><th>State now</th><th className="num">Failing</th><th className="num">Late databases</th>
-          <th>Last job run</th><th>Status</th>
+          <th>Last ingestion run</th><th>Status</th>
           {audit && <>{sortHead("created_at", "Created")}{sortHead("updated_at", "Last updated")}</>}</tr></thead>
         <tbody>
           {jobs.map((j) => (
@@ -92,11 +92,11 @@ export function JobsTable({ jobs, notInJob, total, offset, limit, onPage, link, 
   );
 }
 
-/** The job runs going now, longest running first: group runs, one bar over all the job's tables, speed now,
+/** The ingestion runs going now, longest running first: group runs, one bar over all the job's tables, speed now,
  * expected end, and running for against typical. Groups in no job list their group runs apart. */
 export function RunningNow({ runs, total, notInJob }: { runs: Row[]; total: number; notInJob: Row[] }) {
   return (
-    <Section title={`Running now: ${fmtInt(total)} ${plural(total, "job run")}`}
+    <Section title={`Running now: ${fmtInt(total)} ${plural(total, "ingestion run")}`}
       note="Each bar covers all of the job's tables, its groups that have not started yet included."
       actions={<Link to="/runs">All runs</Link>}>
       {!runs.length && !notInJob.length && <p className="muted">Nothing is running.</p>}
@@ -129,25 +129,25 @@ export function RunningNow({ runs, total, notInJob }: { runs: Row[]; total: numb
   );
 }
 
-/** Jobs with tables failing now, or whose last job run ended without finishing, worst first, with their causes.
+/** Jobs with tables failing now, or whose last ingestion run ended without finishing, worst first, with their causes.
  * Late data is not listed here: it is a count on the job, with its reason. */
 export function NeedsAttention({ jobs, total }: { jobs: Row[]; total: number }) {
   return (
     <Section title={`Needs attention: ${fmtInt(total)} ${plural(total, "job")}`}
-      note="Jobs with tables failing now, or whose last job run ended without finishing. Late data is counted on each job instead."
+      note="Jobs with tables failing now, or whose last ingestion run ended without finishing. Late data is counted on each job instead."
       actions={total > jobs.length ? <Link to="/ingestion-jobs?filter=failing">All {fmtInt(total)}</Link> : undefined}>
       {!jobs.length && <p className="muted">No job has failing tables.</p>}
       {jobs.map((j) => (
         <div key={j.id} className="attention-row">
           <div className="title"><Link to={jobPath(j.id)}>{j.name}</Link>{" "}
             <span className="muted">{fmtInt(j.state_failing)} {plural(j.state_failing, "table")} failing
-              {Number(j.failed_in_a_row) > 1 && `, in each of the last ${fmtInt(j.failed_in_a_row)} job runs`}</span></div>
+              {Number(j.failed_in_a_row) > 1 && `, in each of the last ${fmtInt(j.failed_in_a_row)} ingestion runs`}</span></div>
           {(j.causes ?? []).map((c: Row) => (
             <div key={c.signature ?? c.label} className="kv"><span><b>{c.label}</b>: {fmtInt(c.tables)} {plural(c.tables, "table")}</span>
               {c.first_at && <span>first {fmtClock(c.first_at)}</span>}</div>
           ))}
           {j.last_job_run && j.last_job_run.outcome.label === "Ended without finishing" && <div className="kv">
-            <span>Its last job run ended without finishing: <Link to={jobRunPath(j.id, j.last_job_run.slot)}>{jobRunName(j.name, j.last_job_run.slot)}</Link></span></div>}
+            <span>Its last ingestion run ended without finishing: <Link to={jobRunPath(j.id, j.last_job_run.slot)}>{jobRunName(j.name, j.last_job_run.slot)}</Link></span></div>}
         </div>
       ))}
     </Section>
@@ -176,7 +176,7 @@ function Freshness({ totals }: { totals: Row }) {
 /** The next scheduled triggers across every job, soonest first; paused jobs have none. */
 function NextScheduled({ triggers, paused }: { triggers: Row[]; paused: number }) {
   return (
-    <Section title="Next scheduled" actions={<Link to="/schedules-and-jobs">Schedules and jobs</Link>}>
+    <Section title="Next scheduled" actions={<Link to="/schedules">Schedules</Link>}>
       {!triggers.length && <p className="muted">No trigger is scheduled{paused ? `: ${fmtInt(paused)} ${paused === 1 ? "job is" : "jobs are"} paused` : ""}.</p>}
       {triggers.map((t) => (
         <div key={t.id} className="attention-row">
@@ -189,14 +189,14 @@ function NextScheduled({ triggers, paused }: { triggers: Row[]; paused: number }
   );
 }
 
-/** Each job's last job run that ran, however long ago, newest first, each opening its job run, as the Jobs list
+/** Each job's last ingestion run that ran, however long ago, newest first, each opening its ingestion run, as the Jobs list
  * shows each job's last run. A trigger that did not run is never shown here; the job's own page lists every trigger. */
 function RecentRuns({ jobs }: { jobs: Row[] }) {
   const last = jobs.filter((j) => j.last_job_run).sort((a, b) => String(b.last_job_run.slot).localeCompare(String(a.last_job_run.slot)))
     .slice(0, 6);
   return (
-    <Section title="Recent runs" note="Each job's last job run." actions={<Link to="/runs">All runs</Link>}>
-      {!last.length && <p className="muted">No job run has finished yet.</p>}
+    <Section title="Recent runs" note="Each job's last ingestion run." actions={<Link to="/runs">All runs</Link>}>
+      {!last.length && <p className="muted">No ingestion run has finished yet.</p>}
       {last.map((j) => {
         const r = j.last_job_run;
         return (
