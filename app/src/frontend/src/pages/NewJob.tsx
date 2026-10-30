@@ -10,6 +10,7 @@ import { ClusterFields, clusterSummary, ownCluster } from "./JobEdit";
 import { SourcePick, nothingPicked, pickedAny, pickedText, type Picked } from "./SourcePick";
 import { TaskProgress, finished, newRequestId, resumableWrite } from "./tasks";
 import { draftCreateBlock, draftReadingNote, isUnconfirmed, requestWriteNotice } from "../pending";
+import { defaultJobName, nameTaken } from "../jobName";
 
 // New ingestion job: the Edit view, empty, with Create in place of Save. Its tables are added in What it ingests
 // (Add tables: a CSV uploaded once, or a discovery), the rest is set as in Edit, and nothing is written until Create,
@@ -40,7 +41,9 @@ export default function NewJob() {
   const navigate = useNavigate();
   const qc = useQueryClient();
   const options = useQuery({ queryKey: ["schedule-options"], queryFn: () => api.get<Row>("/schedules/options") });
-  const [name, setName] = useState("");
+  // As the Databricks Jobs editor starts a new job: a default name with the time, typed over in the title if wanted.
+  const [defaultName, setDefaultName] = useState(defaultJobName);
+  const [name, setName] = useState(defaultName);
   const [chosen, setChosenNow] = useState<Chosen | null>(null);
   // The drafts of the tables chosen, discarded when they are replaced or the page is left, unless a Create took them.
   const created = useRef(false);
@@ -121,6 +124,11 @@ export default function NewJob() {
   const discoveringDatabases: number | null = preview.data?.discovering ? Number(preview.data.databases) : null;
   const reading = preview.data?.reading ?? null;
   const readingNote = draftReadingNote(reading);
+  // A default name another job's groups already use (made the same second) is made again; a typed one is said taken.
+  const taken = nameTaken(summary?.invalid);
+  useEffect(() => {
+    if (taken && name === defaultName) { const next = defaultJobName(); setDefaultName(next); setName(next); }
+  }, [taken, name, defaultName]);
   const blocked = !name.trim() ? "Name the job first" : !chosen ? "Add its tables first"
     : discoveringDatabases !== null ? `Discovering the tables of ${fmtInt(discoveringDatabases)} ${plural(discoveringDatabases, "database")}`
     : (preview.isFetching && preview.data === undefined) || settled !== current ? "Checking the tables"
@@ -128,14 +136,18 @@ export default function NewJob() {
     ?? (summary?.invalid?.length ? "Fix the invalid lines first" : targetBlock(w));
   const confirm = useConfirm();
   const cancel = () => {
-    if (!name && !chosen) return navigate("/ingestion-jobs");
+    if ((!name || name === defaultName) && !chosen) return navigate("/ingestion-jobs");
     confirm.ask({ title: "Leave without creating the job?", action: "Leave", danger: true, body: "Nothing of it is saved." })
       .then((ok) => ok && navigate("/ingestion-jobs"));
   };
 
   return (
     <>
-      <PageHead crumb={<Crumbs steps={[["Ingestion jobs", "/ingestion-jobs"], ["New"]]} />} title="New ingestion job"
+      <PageHead crumb={<Crumbs steps={[["Ingestion jobs", "/ingestion-jobs"], ["New"]]} />} tab="New ingestion job"
+        title={<span className="title-edit-row">
+          <input className="title-edit" aria-label="Job name" value={name} onChange={(e) => setName(e.target.value)}
+            onBlur={() => { if (!name.trim()) setName(defaultName); }} />
+          {taken && name !== defaultName && <span className="title-note">Another job uses this name</span>}</span>}
         lead={summary ? <><strong>{fmtInt(summary.tables)}</strong> {plural(summary.tables, "table")} in{" "}
           <strong>{fmtInt(summary.groups.length)}</strong> {plural(summary.groups.length, "group")}.</>
           : discoveringDatabases !== null ? `Discovering the tables of ${fmtInt(discoveringDatabases)} ${plural(discoveringDatabases, "database")}…`
@@ -151,13 +163,6 @@ export default function NewJob() {
         ? <TaskProgress task={task} onResume={() => create.mutate(create.variables as Row)} />
         : <ErrorBox error={isUnconfirmed(create.error) ? null : create.error} />}
       {create.data && !create.data.created && <Notice tone="warn">Not created: fix the invalid lines below first.</Notice>}
-
-      <Section title="Name">
-        <div className="form-grid"><label>Job name<input value={name} placeholder="e.g. Engagement extraction" onChange={(e) => setName(e.target.value)} />
-          <span className="help">Its Databricks jobs and its groups are named after it.</span>
-          {!name.trim() && <span className="help needed">Needed to create the job; until then the preview names its groups
-            "new job", and checks the names are free once you give one</span>}</label></div>
-      </Section>
 
       <Section title="What it ingests" note="The servers, databases and tables this job ingests."
         actions={<Menu label={<>Add tables <Chevron open /></>} buttonClass="ghost" title="Add tables">

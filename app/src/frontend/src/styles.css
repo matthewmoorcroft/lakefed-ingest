@@ -65,6 +65,13 @@ a:hover { text-decoration: underline; }
   .page-head > div + div { flex: none; }
 }
 .page-head h1 { margin: 0; overflow-wrap: anywhere; }
+/* A title edited in place, as the Databricks Jobs editor's job name: it reads as the heading until hovered or focused. */
+.title-edit-row { display: flex; align-items: baseline; gap: var(--db-space-3); flex-wrap: wrap; }
+.page-head h1 input.title-edit { font: inherit; color: inherit; border: 1px solid transparent; border-radius: var(--db-shape-control);
+  background: transparent; padding: 0 var(--db-space-1); margin-left: calc(-1 * var(--db-space-1)); width: min(100%, 36ch); }
+.page-head h1 input.title-edit:hover { border-color: var(--border); }
+.page-head h1 input.title-edit:focus { border-color: var(--accent); outline: none; background: var(--card); }
+.title-note { font-size: var(--db-font-size-sm); font-weight: var(--db-font-weight-normal); color: var(--bad); }
 .page-head .crumb, .page-head .lead { overflow-wrap: anywhere; }
 .crumb { font-size: var(--db-font-size-sm); color: var(--muted); margin-bottom: var(--db-space-1); }
 .eyebrow { font-size: var(--db-font-size-sm); color: var(--muted); }

@@ -44,3 +44,10 @@ def test_updated_and_refresh_data_are_at_the_bottom_of_the_menu():
     for page in ("IngestionJobs", "Overview", "Sources", "SchedulesAndJobs", "Changes", "Timeline"):
         text = (SOURCE / "pages" / f"{page}.tsx").read_text()
         assert "usePageStamp(" in text and "right={<Stamp" not in text, page
+
+
+def test_a_new_jobs_name_is_its_title_edited_in_place_with_a_default():
+    page = (SOURCE / "pages" / "NewJob.tsx").read_text()
+    assert 'useState(defaultJobName)' in page and 'className="title-edit" aria-label="Job name"' in page
+    assert '<Section title="Name">' not in page and "e.g. Engagement extraction" not in page
+    assert "named after it" not in page                     # the groups are, behind the scenes, with no word of it
