@@ -450,3 +450,23 @@ test("reading tables through the warehouse waits for it to start, then counts th
                "Reading (12 of 100 databases read, 3,400 tables)");
   assert.equal(readsProgress("Reading", { databases: 1, done: 0 }), "Reading (0 of 1 database read, 0 tables)");
 });
+
+test("a draft still being read says how far, and that Create waits for the rest", async () => {
+  const { draftReadingNote } = await import("../../src/frontend/src/pending.ts");
+  const note = draftReadingNote({ databases: 100, pending: 60, done: 38, failed: 2, tables: 38200 });
+  assert.match(note, /^Reading the chosen databases' tables: 40 of 100 databases read, 38,200 tables so far\./);
+  assert.match(note, /Create waits for the rest/);
+  assert.equal(draftReadingNote({ databases: 1, pending: 0, done: 1 }), null);
+  assert.equal(draftReadingNote(null), null);
+});
+
+test("a draft with databases that couldn't be read, or discarded, holds Create back by name", async () => {
+  const { draftCreateBlock } = await import("../../src/frontend/src/pending.ts");
+  assert.equal(draftCreateBlock({ failed: 1, failed_databases: [["eng_009", "Login failed"]] }),
+               "1 database couldn't be read (eng_009): choose without them, or add them again");
+  assert.equal(draftCreateBlock({ failed: 5, failed_databases: [["a", ""], ["b", ""], ["c", ""], ["d", ""], ["e", ""]] }),
+               "5 databases couldn't be read (a, b, c and 2 more): choose without them, or add them again");
+  assert.match(draftCreateBlock({ discarded: 3 }), /discarded/);
+  assert.equal(draftCreateBlock({ pending: 4, failed: 0, left_out: 2 }), null);
+  assert.equal(draftCreateBlock(undefined), null);
+});

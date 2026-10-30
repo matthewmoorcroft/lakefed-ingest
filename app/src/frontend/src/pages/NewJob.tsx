@@ -1,15 +1,15 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "react-router-dom";
 import { api, type Row } from "../api";
 import { Crumbs, ErrorBox, Menu, Modal, Notice, PageHead, Section, fmtInt, plural, useConfirm, Chevron } from "../components";
 import { CADENCES, IdentityFields, ParameterFields, RunFields, WritesFields, paramsSummary } from "./jobForm";
-import { DiscoverDialog } from "./Discover";
+import { DiscoverDialog, discardDrafts } from "./Discover";
 import { serverRowCells, targetBlock } from "./previewRows";
 import { ClusterFields, clusterSummary, ownCluster } from "./JobEdit";
 import { SourcePick, nothingPicked, pickedAny, pickedText, type Picked } from "./SourcePick";
 import { TaskProgress, finished, newRequestId, resumableWrite } from "./tasks";
-import { isUnconfirmed, requestWriteNotice } from "../pending";
+import { draftCreateBlock, draftReadingNote, isUnconfirmed, requestWriteNotice } from "../pending";
 
 // New ingestion job: the Edit view, empty, with Create in place of Save. Its tables are added in What it ingests
 // (Add tables: a CSV uploaded once, or a discovery), the rest is set as in Edit, and nothing is written until Create,
@@ -24,8 +24,10 @@ const CSV_EXAMPLE = "src_database,src_schema,src_table,select_list,primary_key\n
 const CSV_TEMPLATE = "src_database,src_schema,src_table,select_list,primary_key,cursor_column,client_id,load_type\n"
   + "sales_01,dbo,orders,\"id, amount\",id,,,ct\n" + "sales_02,,,,,,,\n";
 
-/** Tables chosen by reference: what Create sends as its source, and how the page names it. */
-export type Chosen = { source: Row; label: string };
+/** Tables chosen by reference: what Create sends as its source, and how the page names it. Chosen by Discover through
+ *  the SQL warehouse, their reads may still be going (drafts): the preview keeps them going, Create waits for them, and
+ *  leaving the page (or choosing again) before Create discards them. */
+export type Chosen = { source: Row; label: string; drafts?: string[] };
 
 /** The value once it has stayed the same for `ms`, so typing in a field doesn't ask for a preview per key. */
 function useSettled<T>(value: T, ms: number): T {
@@ -39,7 +41,20 @@ export default function NewJob() {
   const qc = useQueryClient();
   const options = useQuery({ queryKey: ["schedule-options"], queryFn: () => api.get<Row>("/schedules/options") });
   const [name, setName] = useState("");
-  const [chosen, setChosen] = useState<Chosen | null>(null);
+  const [chosen, setChosenNow] = useState<Chosen | null>(null);
+  // The drafts of the tables chosen, discarded when they are replaced or the page is left, unless a Create took them.
+  const created = useRef(false);
+  const drafts = useRef<string[]>([]);
+  drafts.current = chosen?.drafts ?? [];
+  const setChosen = (next: Chosen | null) => {
+    if (!created.current) discardDrafts(drafts.current);
+    setChosenNow(next);
+  };
+  useEffect(() => {
+    const leave = () => { if (!created.current) discardDrafts(drafts.current, true); };
+    window.addEventListener("pagehide", leave);
+    return () => { window.removeEventListener("pagehide", leave); leave(); };
+  }, []);
   // Made when the page opens; a Create sent again (a retry after a timeout) finds the task the first one made.
   const [requestId, setRequestId] = useState(newRequestId);
   const [task, setTask] = useState<Row | null>(null);
@@ -85,27 +100,32 @@ export default function NewJob() {
     // Shown as soon as tables are chosen: a blank name or target only holds Create back, never the preview.
     queryKey: ["new-job-preview", settled], enabled: !!chosen, retry: false,
     queryFn: () => api.post<Row>("/ingestion-jobs", previewBody),
-    // A file's database-only lines are discovered by name before the preview can count them: asked again until they are.
-    refetchInterval: (query) => (query.state.data?.discovering ? 3000 : false),
+    // A file's database-only lines are discovered by name before the preview can count them, and a draft's tables are
+    // read as they were chosen: asked again until they are (each preview also does a step of the draft's read).
+    refetchInterval: (query) => (query.state.data?.discovering ? 3000 : query.state.data?.reading?.pending ? 2000 : false),
   });
   // The body is the variables, so a Create that stopped part way is finished by sending the same body again.
   const create = useMutation({
-    mutationFn: async (sent: Row) => { setTask(null); return finished(await api.post<Row>("/ingestion-jobs", sent), setTask); },
+    // Once sent, the Create takes the drafts (it waits for their reads, on the server), so leaving no longer discards them.
+    mutationFn: async (sent: Row) => { created.current = true; setTask(null); return finished(await api.post<Row>("/ingestion-jobs", sent), setTask); },
     onSuccess: (r) => {
       qc.invalidateQueries({ queryKey: ["ingestion-jobs"] }); qc.invalidateQueries({ queryKey: ["schedules"] });
       if (r.created) navigate(`/ingestion-jobs/${r.id}`);
     },
     // A Create that failed is a new request when it is sent again, unless it stopped part way: its databases are kept
     // and the same request finishes it.
-    onError: (error) => { if (!resumableWrite(error)) setRequestId(newRequestId()); },
+    onError: (error) => { if (!resumableWrite(error)) { created.current = false; setRequestId(newRequestId()); } },
   });
   const note = requestWriteNotice("Creating the job", { pending: create.isPending && !task, error: create.error });
   const summary: Row | undefined = preview.data?.summary;
   const discoveringDatabases: number | null = preview.data?.discovering ? Number(preview.data.databases) : null;
+  const reading = preview.data?.reading ?? null;
+  const readingNote = draftReadingNote(reading);
   const blocked = !name.trim() ? "Name the job first" : !chosen ? "Add its tables first"
     : discoveringDatabases !== null ? `Discovering the tables of ${fmtInt(discoveringDatabases)} ${plural(discoveringDatabases, "database")}`
-    : preview.isFetching || settled !== current ? "Checking the tables" : preview.error ? "Fix what the check found first"
-    : summary?.invalid?.length ? "Fix the invalid lines first" : targetBlock(w);
+    : (preview.isFetching && preview.data === undefined) || settled !== current ? "Checking the tables"
+    : preview.error ? "Fix what the check found first" : draftCreateBlock(reading)
+    ?? (summary?.invalid?.length ? "Fix the invalid lines first" : targetBlock(w));
   const confirm = useConfirm();
   const cancel = () => {
     if (!name && !chosen) return navigate("/ingestion-jobs");
@@ -148,6 +168,11 @@ export default function NewJob() {
           of where each table or database is, the fallback.</p> : (
           <>
             <p className="muted">From {chosen.label}.</p>
+            {readingNote && <Notice>{readingNote}</Notice>}
+            {draftCreateBlock(reading) && <Notice tone="bad">{draftCreateBlock(reading)}:<ul>
+              {(reading?.failed_databases ?? []).slice(0, 20).map(([d, why]: [string, string]) => <li key={d}><b>{d}</b>: {why}</li>)}</ul></Notice>}
+            {Number(reading?.left_out) > 0 && <p className="muted">The whole server leaves out {fmtInt(reading.left_out)}{" "}
+              {plural(reading.left_out, "database")} the connection's login can't open.</p>}
             {discoveringDatabases !== null && <Notice>Discovering the tables of {fmtInt(discoveringDatabases)} {plural(discoveringDatabases, "database")} by name through
               the connection. This page checks again every few seconds, and Create is ready when it ends.</Notice>}
             <div className="table-wrap"><table className="data">
@@ -173,7 +198,7 @@ export default function NewJob() {
           </>
         )}
       </Section>
-      {discovering && <DiscoverDialog onClose={(pick) => { setDiscovering(false); if (pick) setChosen(pick); }} />}
+      {discovering && <DiscoverDialog drafts onClose={(pick) => { setDiscovering(false); if (pick) setChosen(pick); }} />}
       {importing && <ImportCsvDialog loadType={loadType} onClose={(next) => {
         setImporting(false); if (next) { setChosen(next); setLoadType(next.loadType); } }} />}
 

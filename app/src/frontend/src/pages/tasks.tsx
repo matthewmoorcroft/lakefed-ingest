@@ -61,6 +61,17 @@ export function TaskProgress({ task, onResume }: { task: Row | null; onResume?: 
     const tables = task.result?.summary?.tables ?? task.total;
     return <Notice tone="ok">Written: {fmtInt(tables)} {plural(tables, "table")}.</Notice>;
   }
+  if (progress?.stage === "reading") {
+    const databases = Number(progress.databases ?? 0);
+    return (
+      <Notice>
+        {KINDS[task.kind] ?? "Writing"}: reading the chosen databases' tables first, {fmtInt(progress.read ?? 0)} of {fmtInt(databases)}{" "}
+        {plural(databases, "database")} read, {fmtInt(progress.tables ?? 0)} {plural(Number(progress.tables ?? 0), "table")} so far
+        <progress className="task-progress" max={databases || 1} value={Number(progress.read) || 0} />
+        <span className="sub">Through the SQL warehouse, as they were chosen; then the job is written. Leaving this page doesn't stop it.</span>
+      </Notice>
+    );
+  }
   if (progress?.stage === "discovering") {
     return (
       <Notice>

@@ -1,4 +1,4 @@
-import { Fragment, useEffect, useState } from "react";
+import { Fragment, useEffect, useRef, useState } from "react";
 import { keepPreviousData, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, qs, type Row } from "../api";
 import { ErrorBox, Modal, Notice, OutLink, Pager, Tag, Tip, fmtInt, plural, Twisty } from "../components";
@@ -98,6 +98,43 @@ async function readTables(connection: string, request: Row, onWait?: (wait: RunW
   const rows = await api.get<Row[]>(`/discoveries/${id}/databases`);
   return { id, leftOut,
            failed: rows.filter((r) => r.status === "failed").map((r) => [r.src_database, String(r.error ?? "").split("\n")[0]]) };
+}
+
+/** Discard drafts (reads started for a choice no job took): nothing more is read for them, and the delete job purges
+ *  their rows. On leaving the page it goes by sendBeacon, which still goes out as the page closes. */
+export function discardDrafts(ids: string[], beacon = false) {
+  for (const id of ids) {
+    const path = `/discoveries/${encodeURIComponent(id)}/discard`;
+    if (beacon && typeof navigator !== "undefined" && navigator.sendBeacon) navigator.sendBeacon(`/api${path}`);
+    else api.post(path, {}).catch(() => undefined);
+  }
+}
+
+/** Keep drafts' reads going while the page is open: each one's last step (/reads, which also does the next) until it
+ *  has ended. ``generation`` starts the asking again when a draft takes more databases. */
+export function useDraftReads(connection: string, ids: string[], generation = 0): Record<string, Row> {
+  const [steps, setSteps] = useState<Record<string, Row>>({});
+  const key = ids.join(",");
+  useEffect(() => {
+    if (!ids.length) return;
+    let stopped = false;
+    (async () => {
+      const ended = new Set<string>();
+      while (!stopped && ended.size < ids.length) {
+        for (const id of ids.filter((i) => !ended.has(i))) {
+          try {
+            const step = await api.get<Row>(`/discoveries/${encodeURIComponent(id)}/reads${qs({ connection })}`);
+            if (stopped) return;
+            setSteps((now) => ({ ...now, [id]: step }));
+            if (step.state === "SUCCEEDED") ended.add(id);
+          } catch { /* asked again on the next round */ }
+        }
+        if (ended.size < ids.length) await wait(1500);
+      }
+    })();
+    return () => { stopped = true; };
+  }, [connection, key, generation]);
+  return steps;
 }
 
 /** The databases that couldn't be read, and why: often that the login can see the name but not open the database. */
@@ -430,10 +467,13 @@ const testFailedNote = (error: unknown) => {
 };
 
 /** What Discover hands to New and Edit: the discoveries the tables are in, and what of them was chosen (main.Selection). */
-export type DiscoveredPick = { source: Row; label: string };
+export type DiscoveredPick = { source: Row; label: string; connection?: string; drafts?: string[] };
 
-/** Discover on a source: the two steps, then what was chosen by reference (onClose(pick)), or nothing on Cancel. */
-export function DiscoverDialog({ onClose }: { onClose: (pick: DiscoveredPick | null) => void }) {
+/** Discover on a source: the two steps, then what was chosen by reference (onClose(pick)), or nothing on Cancel. With
+ *  ``drafts`` (New job), through the SQL warehouse, the tables of what is chosen whole start being read as it is
+ *  chosen, and Add hands the reads over still going (pick.drafts): New job keeps them going, and Create waits for what
+ *  is left. Without it (Edit's Add tables), Add waits for the reads, as before. */
+export function DiscoverDialog({ onClose, drafts = false }: { onClose: (pick: DiscoveredPick | null) => void; drafts?: boolean }) {
   const [step, setStep] = useState<1 | 2 | 3>(1);
   const [connection, setConnection] = useState("");
   const [tested, setTested] = useState<Row | null>(null);
@@ -483,7 +523,70 @@ export function DiscoverDialog({ onClose }: { onClose: (pick: DiscoveredPick | n
   // Databases chosen whole whose tables aren't read yet are discovered on Add. The whole server is read once, only the
   // databases its filter keeps (likeContaining), and the filter also goes with the job's selection. The databases picked
   // one by one outside that filter are read by name.
+  // The drafts of this choice: one for the databases chosen whole (it grows as more are chosen), one for the whole
+  // server under its filter (made again when the filter changes). Their ids are kept in a ref, so the calls that make
+  // them run one after another on the choice as it is when each runs.
+  const drafting = drafts && throughWarehouse && discoveryId != null;
+  const latest = useRef({ whole, read, wholeServer });
+  latest.current = { whole, read, wholeServer };
+  const draftState = useRef<{ named: string | null; names: Set<string>; server: { id: string; filter: string } | null }>(
+    { named: null, names: new Set(), server: null });
+  const syncing = useRef<Promise<void>>(Promise.resolve());
+  const handed = useRef(false);
+  const [draftIds, setDraftIds] = useState<string[]>([]);
+  const [draftGeneration, setDraftGeneration] = useState(0);
+  const syncDrafts = () => {
+    syncing.current = syncing.current.then(async () => {
+      const d = draftState.current;
+      const { whole: wholeNow, read: readNow, wholeServer: serverNow } = latest.current;
+      const fresh = wholeNow.filter((name) => !d.names.has(name) && !readNow[name]);
+      if (fresh.length) {
+        const got = await api.post<Row>("/discoveries/source", { src_connection: connection, kind: "tables", databases: fresh,
+                                                                  ...(d.named ? { draft_id: d.named } : { draft: true }) });
+        d.named = String(got.discovery_id);
+        fresh.forEach((name) => d.names.add(name));
+      }
+      const want = serverNow.on ? serverNow.filter : null;
+      if (d.server && d.server.filter !== want) { discardDrafts([d.server.id]); d.server = null; }
+      if (want !== null && !d.server) {
+        const got = await api.post<Row>("/discoveries/source", { src_connection: connection, kind: "tables", whole_server: true,
+                                                                  listing_id: discoveryId, filter: want, draft: true });
+        d.server = { id: String(got.discovery_id), filter: want };
+      }
+      setDraftIds([d.server?.id, d.named].filter((id): id is string => Boolean(id)));
+      setDraftGeneration((g) => g + 1);
+    }).catch((e) => setError(e));
+    return syncing.current;
+  };
+  const wholeKey = whole.join("\n");
+  useEffect(() => { if (drafting) syncDrafts(); }, [drafting, wholeKey, wholeServer.on, wholeServer.filter]);
+  const draftSteps = useDraftReads(connection, draftIds, draftGeneration);
+  const allDrafts = () => [draftState.current.server?.id, draftState.current.named].filter((id): id is string => Boolean(id));
+  // Leaving the page with the dialog open, or closing it any way but Add, discards what it started reading.
+  useEffect(() => {
+    const leave = () => { if (!handed.current) discardDrafts(allDrafts(), true); };
+    window.addEventListener("pagehide", leave);
+    return () => { window.removeEventListener("pagehide", leave); leave(); };
+  }, []);
+  const draftProgress = Object.values(draftSteps).reduce((sum: Row, step: Row) => ({
+    databases: sum.databases + Number(step.databases ?? 0), done: sum.done + Number(step.done ?? 0),
+    failed: sum.failed + Number(step.failed ?? 0), tables: sum.tables + Number(step.tables ?? 0),
+    pending: sum.pending + Number(step.pending ?? 0) }), { databases: 0, done: 0, failed: 0, tables: 0, pending: 0 });
+  const label = () => (wholeServer.on ? `${connection}, ${chosenWords}` : `${chosenWords} on ${connection}`)
+    + (counts ? ` (${countsLine.replace(/^Chosen: /, "")})` : "");
   const finish = async () => {
+    if (drafting) {
+      // The reads go on from New job's page; what isn't read yet is waited for at Create.
+      setError(null);
+      await syncDrafts();
+      const ids = new Set([...allDrafts(), ...Object.values(read)]);
+      const tables = handPicked.map(([d, keys]) => ({ server: connection, database: d, tables: keys }));
+      const source = { discovery_ids: [...ids], whole_server: wholeServer.on, filter: wholeServer.on ? wholeServer.filter : "",
+                       databases: whole.map((d) => ({ server: connection, database: d })), tables };
+      handed.current = true;
+      onClose({ source, label: label(), connection, drafts: allDrafts() });
+      return;
+    }
     setStep(3); setError(null);
     const asked = new Date();
     const reading = "Reading the chosen databases' tables";
@@ -519,9 +622,7 @@ export function DiscoverDialog({ onClose }: { onClose: (pick: DiscoveredPick | n
       const tables = handPicked.map(([d, keys]) => ({ server: connection, database: d, tables: keys }));
       const source = { discovery_ids: [...ids], whole_server: wholeServer.on, filter: wholeServer.on ? wholeServer.filter : "",
                        databases: whole.map((d) => ({ server: connection, database: d })), tables };
-      const label = (wholeServer.on ? `${connection}, ${chosenWords}` : `${chosenWords} on ${connection}`)
-        + (counts ? ` (${countsLine.replace(/^Chosen: /, "")})` : "");
-      onClose({ source, label });
+      onClose({ source, label: label() });
     } catch (e) { setError(e); setStep(2); } finally { setWaiting(null); }
   };
   const title = step === 1 ? "Add tables · Step 1 of 2: the connection" : `Add tables · Step 2 of 2: choose on ${connection}`;
@@ -545,6 +646,8 @@ export function DiscoverDialog({ onClose }: { onClose: (pick: DiscoveredPick | n
           failed={failed} setFailed={setFailed} onCounts={setCounts} />}
         {step === 3 && <p className="muted">The tables are added to the job's page when the reading ends.</p>}
         {step === 2 && chosen > 0 && <p className="muted">{chosenWords} chosen. {countsLine}.</p>}
+        {step === 2 && drafting && draftProgress.databases > 0 && <p className="muted">
+          {readsProgress("Reading their tables now", draftProgress)}{draftProgress.pending ? ": Add doesn't wait for it, Create does" : ""}.</p>}
         <ErrorBox error={error} />
       </div>
     </Modal>

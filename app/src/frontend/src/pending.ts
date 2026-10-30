@@ -350,3 +350,34 @@ export function readsProgress(reading: string, answer: { databases?: number; don
   return `${reading} (${ended.toLocaleString("en-US")} of ${databases.toLocaleString("en-US")} `
     + `${databases === 1 ? "database" : "databases"} read, ${tables.toLocaleString("en-US")} ${tables === 1 ? "table" : "tables"})`;
 }
+
+/** Where a draft's read stands, as a preview answers it (main._draft_reading): its databases, those still to read,
+ *  read, failed and discarded, the tables read so far, those a whole-server read left out, and the failures by name. */
+export interface DraftReading {
+  databases?: number; pending?: number; done?: number; failed?: number; discarded?: number; tables?: number;
+  left_out?: number; failed_databases?: [string, string][];
+}
+
+const count = (value: unknown) => Number(value ?? 0).toLocaleString("en-US");
+const word = (n: unknown, one: string) => `${one}${Number(n ?? 0) === 1 ? "" : "s"}`;
+
+/** New job's line while the tables chosen are still being read: how far, and that Create waits for the rest. */
+export function draftReadingNote(reading: DraftReading | null | undefined): string | null {
+  if (!reading || !Number(reading.pending)) return null;
+  const read = Number(reading.done ?? 0) + Number(reading.failed ?? 0);
+  return `Reading the chosen databases' tables: ${count(read)} of ${count(reading.databases)} ${word(reading.databases, "database")} read, `
+    + `${count(reading.tables)} ${word(reading.tables, "table")} so far. The preview counts what is read; Create waits for the rest, `
+    + "and leaving this page before Create discards what was read.";
+}
+
+/** Why Create can't take the tables chosen as they are read: databases that couldn't be read (by name), or a draft
+ *  discarded meanwhile. Null when nothing stops it. */
+export function draftCreateBlock(reading: DraftReading | null | undefined): string | null {
+  if (!reading) return null;
+  if (Number(reading.discarded)) return "The tables read for this choice were discarded: add them again";
+  const failed = reading.failed_databases ?? [];
+  if (!Number(reading.failed) && !failed.length) return null;
+  const names = failed.slice(0, 3).map(([name]) => name).join(", ");
+  const more = Number(reading.failed) > 3 ? ` and ${count(Number(reading.failed) - 3)} more` : "";
+  return `${count(reading.failed)} ${word(reading.failed, "database")} couldn't be read (${names}${more}): choose without them, or add them again`;
+}
