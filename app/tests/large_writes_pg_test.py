@@ -199,3 +199,24 @@ def test_a_discovery_is_a_source_too(client):
                       "from lakefed_ingest.control order by src_database, src_table")
     assert rows == [("SQL_A", True, "eng_001", "t1", "ct", "id, a"), ("SQL_A", True, "eng_002", "t1", "full", "id, a, b"),
                     ("SQL_A", True, "eng_002", "t2", "ct", "id")]
+
+
+def test_a_create_by_reference_spreads_its_databases_evenly_by_tables(client):
+    """queries.selected_databases_sql counts each chosen database's tables in Lakebase, and Create by reference spreads
+    the databases over the groups by those counts: the biggest first, each into the group with the fewest tables."""
+    import queries as q
+    sizes = [60, 50, 40, 40, 30, 30, 20, 20, 10, 10, 10, 10]
+    text = HEAD + "".join(f"sql_a,eng_{d:03d},gen,t{t:04d},\"id, a\",id\n" for d, n in enumerate(sizes) for t in range(n))
+    up = client.post("/api/uploads", json={"csv": text, "connection": "sql_a"}).json()["upload_id"]
+    counted = client.sql(q.selected_databases_sql("upload"), (up, True, "", [], []))
+    assert [(server, database, tables) for server, database, tables in counted] == [
+        ("sql_a", f"eng_{d:03d}", n) for d, n in enumerate(sizes)]
+    r = _create(client, "even-1", name="Even", source={"upload_id": up, "whole_server": True}, groups_per_server=3)
+    assert r.status_code in (200, 202)
+    groups = client.sql("select task_collection, count(*), count(distinct src_database) from lakefed_ingest.control "
+                        "group by task_collection order by task_collection")
+    assert [g for g, _, _ in groups] == ["even_sql_a_c01", "even_sql_a_c02", "even_sql_a_c03"]
+    assert sorted(tables for _, tables, _ in groups) == [110, 110, 110]
+    split = client.sql("select src_database from lakefed_ingest.control group by src_database "
+                       "having count(distinct task_collection) > 1")
+    assert split == []                                         # a database is never split
