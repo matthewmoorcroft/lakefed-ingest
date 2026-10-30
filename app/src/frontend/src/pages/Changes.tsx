@@ -1,6 +1,6 @@
 import { useQuery } from "@tanstack/react-query";
 import { api } from "../api";
-import { heading, PageHead, Stamp, readAt, ErrorBox, Grid, Section, autoColumns, fmtShort, fmtTime } from "../components";
+import { heading, PageHead, readAt, ErrorBox, Grid, Section, autoColumns, fmtShort, fmtTime, usePageStamp } from "../components";
 
 // Each change's action in words, as the Databricks audit and history views name events.
 const ACTIONS: Record<string, string> = {
@@ -11,10 +11,10 @@ const ACTIONS: Record<string, string> = {
 
 export default function Changes() {
   const changes = useQuery({ queryKey: ["changes"], queryFn: () => api.get("/changes?limit=500"), refetchInterval: 30_000 });
+  usePageStamp(readAt(changes), 30, changes.error);
   return (
     <>
-      <PageHead title="Changes" lead="Every change made in this app, newest first: who, what and when. Edits made directly with SQL aren't listed."
-        right={<Stamp at={readAt(changes)} every={30} error={changes.error} />} />
+      <PageHead title="Changes" lead="Every change made in this app, newest first: who, what and when. Edits made directly with SQL aren't listed." />
       <ErrorBox error={changes.error} />
       <Section title="Recent changes">
         <Grid rows={changes.data}

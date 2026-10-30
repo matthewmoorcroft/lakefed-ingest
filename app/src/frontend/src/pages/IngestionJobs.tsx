@@ -2,7 +2,7 @@ import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { api, qs, type Row } from "../api";
-import { ErrorBox, OutLink, PageHead, RunStatus, Section, Stamp, StateKey, fmtInt, fmtShort, fmtTime, type Outcome } from "../components";
+import { ErrorBox, OutLink, PageHead, RunStatus, Section, fmtInt, fmtShort, fmtTime, usePageStamp, type Outcome } from "../components";
 import { JobsTable, type JobSort } from "./Overview";
 
 const FILTERS = [["all", "All"], ["running", "Running"], ["failing", "Failing"], ["late", "Late"], ["paused", "Paused"]] as const;
@@ -25,12 +25,11 @@ export default function IngestionJobs() {
     refetchInterval: 15_000,
   });
   const counts = jobs.data?.counts ?? {};
+  usePageStamp(jobs.data?.read_at, 30, jobs.error);
   return (
     <>
       <PageHead title="Ingestion jobs"
-        lead="Each ingestion job is a schedule: a cadence and its ingestion groups. Failing first, then late, then by name."
-        right={<span className="card-actions"><Stamp at={jobs.data?.read_at} every={30} error={jobs.error} />
-          <button className="primary" onClick={() => navigate("/ingestion-jobs/new")}>New ingestion job</button></span>} />
+        lead="Each ingestion job is a schedule: a cadence and its ingestion groups. Failing first, then late, then by name." />
       <ErrorBox error={jobs.error} />
       <div className="toolbar">
         <span className="chips">
@@ -43,8 +42,9 @@ export default function IngestionJobs() {
         </span>
         <input type="search" className="search-wide" placeholder="Search jobs and groups" value={search}
           onChange={(e) => { setOffset(0); setSearch(e.target.value); }} />
+        <button className="primary toolbar-end" onClick={() => navigate("/ingestion-jobs/new")}>New ingestion job</button>
       </div>
-      <Section title={null} actions={<StateKey />}>
+      <Section title="Jobs">
         {jobs.data && <JobsTable jobs={jobs.data.jobs} notInJob={offset + PAGE >= jobs.data.total ? jobs.data.not_in_job : null}
           total={jobs.data.total} offset={offset} limit={PAGE} onPage={setOffset} fill
           sort={sort} onSort={(next) => { setOffset(0); setSort(next); }} />}

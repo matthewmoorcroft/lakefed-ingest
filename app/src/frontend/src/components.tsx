@@ -1,4 +1,5 @@
-import { Fragment, useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { Fragment, createContext, useCallback, useContext, useEffect, useId, useLayoutEffect, useMemo, useRef, useState,
+         type ReactNode } from "react";
 import { type BarPart, type BarSummary, type StateCounts, progressParts, progressSummary, stateParts, stateSummary } from "./bars";
 import { createPortal } from "react-dom";
 import { Link } from "react-router-dom";
@@ -465,6 +466,18 @@ export function Stamp({ at, every, error }: { at?: string; every?: number; error
     Not updated since {fmtClock(at)}: {(error as ApiError).message ?? String(error)}</span>;
   if (!at) return null;
   return <span className="stamp">Updated {fmtAgo(at)}{every ? `, every ${every} s` : ""}</span>;
+}
+
+export interface PageStampValue { at?: string; every?: number; error?: unknown }
+
+/** Where a page's "Updated ..." line goes when it is shown at the bottom of the left menu (App), not in the page head. */
+export const PageStampContext = createContext<(stamp: PageStampValue | null) => void>(() => {});
+
+/** Show this page's "Updated ..." line at the bottom of the left menu while the page is open. */
+export function usePageStamp(at?: string, every?: number, error?: unknown) {
+  const set = useContext(PageStampContext);
+  useEffect(() => { set({ at, every, error }); }, [set, at, every, error]);
+  useEffect(() => () => set(null), [set]);
 }
 
 /** The browser tab's title, as the workspace's "<page or object> - Databricks": the page or object first. */

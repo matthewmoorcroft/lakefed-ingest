@@ -2,10 +2,7 @@ import { type ReactNode } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { Link } from "react-router-dom";
 import { api, type Row } from "../api";
-import {
-  ErrorBox, FillBox, JobStatus, Name, Notice, PageHead, Pager, ProgressBar, RunStatus, Section, Stamp, StateBar,
-  fmtClock, fmtDuration, fmtInt, fmtShort, fmtSlot, fmtSpeed, fmtTime, jobRunName, jobRunPath, plural, progressFrom, progressText
-} from "../components";
+import { ErrorBox, FillBox, JobStatus, Name, Notice, PageHead, Pager, ProgressBar, RunStatus, Section, StateBar, fmtClock, fmtDuration, fmtInt, fmtShort, fmtSlot, fmtSpeed, fmtTime, jobRunName, jobRunPath, plural, progressFrom, progressText, usePageStamp } from "../components";
 
 interface Overview {
   jobs: Row[]; jobs_total: number; offset: number; limit: number; not_in_job: Row | null;
@@ -83,6 +80,8 @@ export function JobsTable({ jobs, notInJob, total, offset, limit, onPage, link, 
       </table></div>
   );
   const pager = <Pager offset={offset} limit={limit} total={total} noun="ingestion job" onPage={onPage} />;
+  // With no job to list, one short row and no pager: no tall empty box.
+  if (!jobs.length && !notInJob) return table;
   if (fill) return <><FillBox min={240} reserve={44}>{table}</FillBox>{pager}</>;
   return (
     <>
@@ -232,12 +231,12 @@ export default function OverviewPage() {
     ["Tables", "/tables", <>{fmtInt(enabled)}<small>enabled</small></>, <>{pct}% loaded</>],
     ["Rows written, 24 hours", "/runs", <>{d.rows_24h.partial ? "at least " : ""}{fmtInt(d.rows_24h.rows)}<small>rows</small></>,
       <>by every job's runs</>]] : [];
+  usePageStamp(d?.read_at, 30, ov.error);
   return (
     <>
       <PageHead title="Overview"
         lead={d && (enabled ? <>{pct}% of <strong>{fmtInt(enabled)}</strong> enabled {plural(enabled, "table")} {enabled === 1 ? "is" : "are"} loaded,
-          in <strong>{fmtInt(jobs)}</strong> {plural(jobs, "ingestion job")}.</> : "No enabled tables yet.")}
-        right={<Stamp at={d?.read_at} every={30} error={ov.error} />} />
+          in <strong>{fmtInt(jobs)}</strong> {plural(jobs, "ingestion job")}.</> : "No enabled tables yet.")} />
       <ErrorBox error={ov.error} />
       {d && !enabled && <Notice tone="info">No tables are set up yet. <Link to="/ingestion-jobs/new">New ingestion job</Link> makes a job with its tables.</Notice>}
       {/* Only once freshness targets are in use: until then no table can be late, and there is nothing to warn about. */}

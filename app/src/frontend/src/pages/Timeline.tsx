@@ -2,7 +2,7 @@ import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { useNavigate } from "react-router-dom";
 import { api, qs, type Row } from "../api";
-import { PageHead, Stamp, readAt, ErrorBox, Notice, fmtDuration, fmtTime, jobRunName, jobRunPath, plural, statusName, useWidth } from "../components";
+import { PageHead, readAt, ErrorBox, Notice, fmtDuration, fmtTime, jobRunName, jobRunPath, plural, statusName, useWidth, usePageStamp } from "../components";
 
 // One lane per ingestion job, as the Jobs UI's run timeline: each job run a bar from its first group run's start to
 // its last one's finish, coloured by its outcome, opening the job run; its groups on hover. Planned triggers are
@@ -57,10 +57,10 @@ export default function TimelinePage() {
   const skipped = lanes.reduce((n, l) => n + l.skipped.length, 0);
   const band = (i: number) => <rect x={0} y={AXIS_H + i * ROW_H} width={LABEL_W + CHART_W + 10} height={ROW_H}
     style={{ fill: i % 2 ? "var(--db-surface-subtle)" : "var(--db-surface-base)" }} />;
+  usePageStamp(readAt(t), 60, t.error);
   return (
     <>
-      <PageHead title="Timeline" lead="The job runs of every ingestion job in the window, one lane per job. Click a job run to open it."
-        right={<Stamp at={readAt(t)} every={60} error={t.error} />} />
+      <PageHead title="Timeline" lead="The job runs of every ingestion job in the window, one lane per job. Click a job run to open it." />
       <div className="toolbar">
         <label>Window
           <select value={hours} onChange={(e) => setHours(Number(e.target.value))}>

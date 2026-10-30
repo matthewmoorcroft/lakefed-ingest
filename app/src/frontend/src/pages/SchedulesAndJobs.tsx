@@ -1,7 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link } from "react-router-dom";
 import { api, type Row } from "../api";
-import { Badge, ErrorBox, Menu, Notice, PageHead, Section, Stamp, fmtTime, readAt, statusName } from "../components";
+import { Badge, ErrorBox, Menu, Notice, PageHead, Section, fmtTime, readAt, statusName, usePageStamp } from "../components";
 import { usePermissions } from "../permissions";
 import Jobs from "./Jobs";
 
@@ -52,10 +52,10 @@ function JobRow({ job }: { job: Row }) {
 
 export default function SchedulesAndJobs() {
   const list = useQuery({ queryKey: ["schedules"], queryFn: () => api.get<Row[]>("/schedules"), refetchInterval: 15_000 });
+  usePageStamp(readAt(list), 30, list.error);
   return (
     <>
-      <PageHead title="Schedules and jobs" lead="When each ingestion job runs, as set in its Edit view; then the Databricks jobs the app runs them with."
-        right={<Stamp at={readAt(list)} every={30} error={list.error} />} />
+      <PageHead title="Schedules and jobs" lead="When each ingestion job runs, as set in its Edit view; then the Databricks jobs the app runs them with." />
       <ErrorBox error={list.error} />
       <Section title="Ingestion jobs" note="Each one's schedule, as set in its Edit view (When it runs).">
         {list.data && list.data.length === 0 ? <Notice>No ingestion jobs yet: New ingestion job, on Ingestion jobs, makes one.</Notice> : (

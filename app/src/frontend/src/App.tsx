@@ -1,9 +1,9 @@
-import { createContext, useContext } from "react";
+import { createContext, useContext, useState } from "react";
 import { PageErrorBoundary } from "./errorBoundary";
 import { NavLink, Navigate, Route, Routes, useLocation } from "react-router-dom";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, type Config } from "./api";
-import { Menu } from "./components";
+import { Menu, PageStampContext, Stamp, type PageStampValue } from "./components";
 import Overview from "./pages/Overview";
 import Runs from "./pages/Runs";
 import RunDetail from "./pages/RunDetail";
@@ -43,8 +43,10 @@ export default function App() {
   const config = useQuery({ queryKey: ["config"], queryFn: () => api.get<Config>("/config") });
   const qc = useQueryClient();
   const { pathname } = useLocation();
+  const [stamp, setStamp] = useState<PageStampValue | null>(null);
   return (
     <SettingsContext.Provider value={{ config: config.data }}>
+      <PageStampContext.Provider value={setStamp}>
       <div className="layout">
         <aside className="sidebar">
           <div className="brand"><div>Lakefed Ingest<small>Operations</small></div></div>
@@ -59,11 +61,15 @@ export default function App() {
               </div>
             ))}
           </nav>
+          {/* When the data was read and Refresh data, at the bottom of the menu, out of the page's way. */}
+          <div className="sidebar-foot">
+            {stamp && <Stamp at={stamp.at} every={stamp.every} error={stamp.error} />}
+            <button className="ghost" onClick={() => qc.invalidateQueries()}>Refresh data</button>
+          </div>
         </aside>
         <main className="content">
           {/* As the Databricks workspace's top bar: actions and the signed-in user at the top right. */}
           <div className="topbar">
-            <button className="ghost" onClick={() => qc.invalidateQueries()}>Refresh data</button>
             <UserMenu config={config.data} />
           </div>
           {/* A page that throws shows what happened instead of a white window; a new page starts clean. */}
@@ -97,6 +103,7 @@ export default function App() {
           </PageErrorBoundary>
         </main>
       </div>
+      </PageStampContext.Provider>
     </SettingsContext.Provider>
   );
 }

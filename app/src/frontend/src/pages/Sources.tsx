@@ -2,7 +2,7 @@ import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { Link } from "react-router-dom";
 import { api, type Row } from "../api";
-import { ErrorBox, Host, Name, Notice, PageHead, Section, Stamp, StateBar, StateKey, Tip, fmtAgo, fmtInt, plural } from "../components";
+import { ErrorBox, Host, Name, Notice, PageHead, Section, StateBar, StateKey, Tip, fmtAgo, fmtInt, plural, usePageStamp } from "../components";
 
 /** How an instance is read: its UC connections (name, type and the host each points at, or that the app cannot see
  * it) or its JDBC hosts. */
@@ -24,13 +24,13 @@ export default function Sources() {
   const d = found.data;
   const instances: Row[] = d?.instances ?? [];
   const pick = instances.find((i) => i.server === chosen) ?? instances[0];
+  usePageStamp(d?.read_at, 60, found.error);
   return (
     <>
       <PageHead title="Sources"
         lead={d && <>{fmtInt(d.ingested)} {plural(d.ingested, "instance")} ingested, {fmtInt(d.nothing_registered)} with nothing registered;{" "}
           {fmtInt(d.not_registered)} {plural(d.not_registered, "table")} discovered and not registered yet. An instance is the source
-          server the tables' rows reach: their UC connection, or their host and port.</>}
-        right={<Stamp at={d?.read_at} every={60} error={found.error} />} />
+          server the tables' rows reach: their UC connection, or their host and port.</>} />
       <ErrorBox error={found.error} />
       {d?.connections_error && <Notice tone="warn">UC connections could not be listed, so connections with nothing registered are missing: {d.connections_error}</Notice>}
       <Section title={`Instances: ${fmtInt(instances.length)}`} actions={<StateKey />}>
