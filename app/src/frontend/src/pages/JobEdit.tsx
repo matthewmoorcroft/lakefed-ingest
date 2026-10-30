@@ -520,7 +520,7 @@ export default function JobEdit() {
       </Section>}
 
       {schedule && <Section title="When it runs">
-        <RunFields run={run} setRun={setRun} params={params} setParams={setParams} cadences={cadences} defaults={options.data?.defaults} />
+        <RunFields run={run} setRun={setRun} cadences={cadences} />
         <div className="form-grid">
           <label><span>Add new databases and tables<Info label="About adding new databases and tables">Once a day the servers are
             read again and the job adds what its selection allows: every new database matching a whole server's filter, with all its

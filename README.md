@@ -367,9 +367,10 @@ and errors it doesn't recognise fail at once, as without retries.
   then `ok` or `failed`, with `retry_count`. The run's `detail` has the totals (`table_retries`). See
   [monitoring.md](docs/monitoring.md).
 
-A run with a table still failed at its end ends as failed by default, after it has recorded the failures in Lakebase,
-so the job's failure email and any run alerts fire; the next run tries the tables again. Set the job parameter
-`fail_on_table_errors` to `false` to end such a run as succeeded, with the failures only recorded.
+A run with a table still failed at its end is a failed run: it ends as failed after it has recorded the failures in
+Lakebase, so the job's failure email and any run alerts fire, and the next run tries the tables again. The job
+parameter `fail_on_table_errors` (default `true`) gives this today; the operations app has no setting for it and never
+sends it, and an app job that stored a value earlier keeps it.
 
 ### Large estates
 

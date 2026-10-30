@@ -88,14 +88,7 @@ export function IdentityFields({ w, setW, identity, setIdentity, differing = {},
 }
 
 /** When it runs: the cadence, a start time and zone for set-time cadences, paused, and who is emailed on failure. */
-export function RunFields({ run, setRun, params, setParams, cadences = CADENCES, defaults }: { run: Row; setRun: (r: Row) => void;
-                           params: Record<string, string>; setParams: (p: Record<string, string>) => void; cadences?: number[];
-                           defaults?: Record<string, string> }) {
-  // Blank follows the ingestion job's default (on once the bundle sets it); only a choice away from it is kept.
-  const failDefault = defaults?.fail_on_table_errors || "true";
-  const failOnTables = (params.fail_on_table_errors || failDefault) === "true";
-  const setFailOnTables = (on: boolean) =>
-    setParams({ ...params, fail_on_table_errors: String(on) === failDefault ? "" : String(on) });
+export function RunFields({ run, setRun, cadences = CADENCES }: { run: Row; setRun: (r: Row) => void; cadences?: number[] }) {
   const atSetTimes = Number(run.cadence_minutes) > 60;
   return (
     <div className="form-grid">
@@ -110,9 +103,6 @@ export function RunFields({ run, setRun, params, setParams, cadences = CADENCES,
       <label className="checkbox wide"><input type="checkbox" checked={!!run.paused} onChange={(e) => setRun({ ...run, paused: e.target.checked })} /> Paused</label>
       <label className="wide emails">Emails when a run fails<input value={run.notify_emails} placeholder="a@example.com, b@example.com"
         onChange={(e) => setRun({ ...run, notify_emails: e.target.value })} /></label>
-      <label className="checkbox wide"><input type="checkbox" checked={failOnTables}
-        onChange={(e) => setFailOnTables(e.target.checked)} />
-        Also email when tables fail in a run</label>
     </div>
   );
 }
@@ -137,6 +127,7 @@ export const TUNING: Record<string, [string, string]> = {
  * the default is not saved, so the job follows the default if it changes; a changed one has Reset beside it. */
 export function ParameterFields({ params, setParams, options }: { params: Record<string, string>;
                                  setParams: (p: Record<string, string>) => void; options?: Row }) {
+  // A run with a table still failed at its end is a failed run, with no setting; an old job's stored value is kept.
   const names: string[] = (options?.parameters ?? []).filter((k: string) => k !== "fail_on_table_errors");
   const defaults: Record<string, string> = options?.defaults ?? {};
   const set = (k: string, value: string) => {

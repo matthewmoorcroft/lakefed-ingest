@@ -115,7 +115,8 @@ def test_the_tables_page_filters_and_shows_the_ingestion_job():
     assert 'ingestion_job: { headerName: "Ingestion job" }' in tables and 'params.get("job")' in tables
 
 
-def test_the_table_failure_email_box_keeps_only_a_choice_away_from_the_jobs_default():
-    assert 'const failDefault = defaults?.fail_on_table_errors || "true";' in FORM
-    assert 'fail_on_table_errors: String(on) === failDefault ? "" : String(on)' in FORM
-    assert "Also email when tables fail in a run" in FORM
+def test_a_run_with_failed_tables_fails_with_no_box_and_the_page_never_sets_the_parameter():
+    assert "Also email when tables fail" not in FORM
+    for text in (FORM, NEW_JOB, JOB_EDIT):
+        assert "fail_on_table_errors:" not in text and "fail_on_table_errors =" not in text
+    assert 'filter((k: string) => k !== "fail_on_table_errors")' in FORM      # not a tuning field either

@@ -213,8 +213,7 @@ export default function NewJob() {
         <IdentityFields w={w} setW={setW} identity={identity} setIdentity={setIdentity} />
       </Section>
       <Section title="When it runs" note="A new job starts paused: resume it from its page once you have checked it.">
-        <RunFields run={run} setRun={setRun} params={params} setParams={setParams} cadences={options.data?.cadences ?? CADENCES}
-          defaults={options.data?.defaults} />
+        <RunFields run={run} setRun={setRun} cadences={options.data?.cadences ?? CADENCES} />
       </Section>
 
       <details className="card advanced">
