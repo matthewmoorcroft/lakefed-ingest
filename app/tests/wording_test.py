@@ -102,9 +102,11 @@ def test_discover_can_list_an_azure_sql_server_through_azure_and_reads_the_whole
     assert "azure_credential" in discover and "azure_resource_id" in discover and "...(tested?.azure ?? {})" in discover
 
 
-def test_the_target_schema_field_says_a_new_schema_is_made_by_the_first_run():
+def test_the_target_fields_are_marked_required_with_no_help_under_them():
+    # The schema's how-it-is-made note is gone (his review); the fields carry the required mark instead.
     form = (FRONTEND / "pages" / "jobForm.tsx").read_text()
-    assert "A new schema is made by the first run" in form and "CREATE SCHEMA on the catalog" in form
+    assert "A new schema is made by the first run" not in form and "Needed to create the job" not in form
+    assert form.count("<Required />") >= 3
 
 
 def test_discover_offers_typed_or_csv_databases_on_the_lab_logins_real_errors():

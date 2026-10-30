@@ -28,12 +28,13 @@ interface Settings { config?: Config }
 const SettingsContext = createContext<Settings>({});
 export const useSettings = () => useContext(SettingsContext);
 
-const NAV = [
-  ["Monitor", [["/overview", "Overview"], ["/ingestion-jobs", "Ingestion jobs"], ["/runs", "Runs"], ["/sources", "Sources"], ["/timeline", "Timeline"]]],
-  // Add table, Bulk import and Import CSV are Add tables inside New ingestion job and Edit; their pages stay for
-  // groups in no job, reached from a group's page and from Sources.
-  ["Manage", [["/tables", "Tables"], ["/schedules-and-jobs", "Schedules and jobs"], ["/changes", "Changes"]]],
-] as const;
+// The left menu's links, in order, with no group labels: one list, so a link is added with one entry.
+// Add table, Bulk import and Import CSV are Add tables inside New ingestion job and Edit; their pages stay for
+// groups in no job, reached from a group's page and from Sources.
+const NAV: [string, string][] = [
+  ["/overview", "Overview"], ["/ingestion-jobs", "Ingestion jobs"], ["/runs", "Runs"], ["/sources", "Sources"],
+  ["/timeline", "Timeline"], ["/tables", "Tables"], ["/schedules-and-jobs", "Schedules and jobs"], ["/changes", "Changes"],
+];
 
 // Pages under an ingestion job keep Ingestion jobs selected, as the workspace keeps a job's section selected on its pages.
 // A group run (/runs/<id>) is under its job too, as its crumbs say; the Runs list itself stays under Runs.
@@ -51,14 +52,9 @@ export default function App() {
         <aside className="sidebar">
           <div className="brand"><div>Lakefed Ingest<small>Operations</small></div></div>
           <nav>
-            {NAV.map(([group, links]) => (
-              <div key={group}>
-                <div className="nav-group">{group}</div>
-                {links.map(([to, label]) => (
-                  <NavLink key={to} to={to} end className={({ isActive }) =>
-                    (isActive || (UNDER[to] ?? []).some((p) => pathname.startsWith(p)) ? "active" : "")}>{label}</NavLink>
-                ))}
-              </div>
+            {NAV.map(([to, label]) => (
+              <NavLink key={to} to={to} end className={({ isActive }) =>
+                (isActive || (UNDER[to] ?? []).some((p) => pathname.startsWith(p)) ? "active" : "")}>{label}</NavLink>
             ))}
           </nav>
           {/* When the data was read and Refresh data, at the bottom of the menu, out of the page's way. */}

@@ -2,7 +2,8 @@ import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { api, qs, type Row } from "../api";
-import { ErrorBox, OutLink, PageHead, RunStatus, Section, fmtInt, fmtShort, fmtTime, usePageStamp, type Outcome } from "../components";
+import { ErrorBox, Info, OutLink, PageHead, Pager, RunStatus, Section, Twisty, fmtInt, fmtShort, fmtTime, usePageStamp,
+         type Outcome } from "../components";
 import { JobsTable, type JobSort } from "./Overview";
 
 const FILTERS = [["all", "All"], ["running", "Running"], ["failing", "Failing"], ["late", "Late"], ["paused", "Paused"]] as const;
@@ -28,8 +29,7 @@ export default function IngestionJobs() {
   usePageStamp(jobs.data?.read_at, 30, jobs.error);
   return (
     <>
-      <PageHead title="Ingestion jobs"
-        lead="Each ingestion job is a schedule: a cadence and its ingestion groups. Failing first, then late, then by name." />
+      <PageHead title="Ingestion jobs" />
       <ErrorBox error={jobs.error} />
       <div className="toolbar">
         <span className="chips">
@@ -54,34 +54,48 @@ export default function IngestionJobs() {
   );
 }
 
-/** The latest deleted jobs whose Delete finished: history only. A job whose Delete is still pending, or failed, stays in
- * the jobs list (with its Deleting or Delete failed state and Run again on its own page). Shown only when there is one. */
+const DELETED_PAGE = 10;
+
+/** The deleted jobs whose Delete finished: history only, closed until opened, its count in the header, a page at a time.
+ * A job whose Delete is still pending, or failed, stays in the jobs list (with its Deleting or Delete failed state and
+ * Run again on its own page). Shown only when there is one. */
 function Deletions() {
-  const page = useQuery({ queryKey: ["ingestion-job-deletions"], queryFn: () => api.get<Row>("/ingestion-jobs/deletions"),
+  const [open, setOpen] = useState(false);
+  const [offset, setOffset] = useState(0);
+  const page = useQuery({ queryKey: ["ingestion-job-deletions", open, offset],
+    queryFn: () => api.get<Row>(`/ingestion-jobs/deletions${qs({ offset, limit: DELETED_PAGE, rows: open })}`),
     refetchInterval: 60_000 });
+  const total = Number(page.data?.total ?? 0);
   const rows: Row[] = page.data?.deletions ?? [];
-  if (!rows.length && !page.error) return null;
+  if (!total && !page.error) return null;
+  const title = <span className="section-toggle"><Twisty open={open} onToggle={() => setOpen(!open)}
+    label={open ? "Close the deleted jobs" : "Open the deleted jobs"}>Deleted jobs ({fmtInt(total)})</Twisty>
+    <Info label="About deleted jobs">Jobs whose Delete has finished: their tables and their state are gone, and the target
+      tables too when ticked. Run history stays.</Info></span>;
   return (
-    <Section title="Deleted jobs" note="History of finished deletes: the job's tables and their state are gone, and the target tables too when ticked. Run history stays.">
+    <Section title={title}>
       <ErrorBox error={page.error} />
-      <div className="table-wrap"><table className="data">
-        <thead><tr><th>Ingestion job</th><th>Deleted</th><th>Target tables</th><th>Delete job</th><th className="num">Tables left</th></tr></thead>
-        <tbody>
-          {rows.map((d) => {
-            const outcome = deletionOutcome(d);
-            return (
-              <tr key={d.id}>
-                <td className="name"><b>{d.name}</b></td>
-                <td title={fmtTime(d.deleted_at)}>{fmtShort(d.deleted_at)}</td>
-                <td>{d.drop_targets ? "Dropped" : "Kept"}</td>
-                <td><OutLink href={d.run?.url}><RunStatus status={null} outcome={outcome} /></OutLink>
-                  {outcome.note && outcome.tone === "bad" && <span className="sub">{outcome.note}</span>}</td>
-                <td className="num">{fmtInt(d.tables_left)}</td>
-              </tr>
-            );
-          })}
-        </tbody>
-      </table></div>
+      {open && <>
+        <div className="table-wrap"><table className="data">
+          <thead><tr><th>Ingestion job</th><th>Deleted</th><th>Target tables</th><th>Delete job</th><th className="num">Tables left</th></tr></thead>
+          <tbody>
+            {rows.map((d) => {
+              const outcome = deletionOutcome(d);
+              return (
+                <tr key={d.id}>
+                  <td className="name"><b>{d.name}</b></td>
+                  <td title={fmtTime(d.deleted_at)}>{fmtShort(d.deleted_at)}</td>
+                  <td>{d.drop_targets ? "Dropped" : "Kept"}</td>
+                  <td><OutLink href={d.run?.url}><RunStatus status={null} outcome={outcome} /></OutLink>
+                    {outcome.note && outcome.tone === "bad" && <span className="sub">{outcome.note}</span>}</td>
+                  <td className="num">{fmtInt(d.tables_left)}</td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table></div>
+        <Pager offset={offset} limit={DELETED_PAGE} total={total} noun="deleted job" onPage={setOffset} />
+      </>}
     </Section>
   );
 }

@@ -1,7 +1,7 @@
 import { Fragment, useEffect, useRef, useState } from "react";
 import { keepPreviousData, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, qs, type Row } from "../api";
-import { ErrorBox, Modal, Notice, OutLink, Pager, Tag, Tip, fmtInt, plural, Twisty } from "../components";
+import { ErrorBox, Info, Modal, Notice, OutLink, Pager, Tag, Tip, fmtInt, plural, Twisty } from "../components";
 import { useSettings } from "../App";
 import { DatabaseTables } from "./SourcePick";
 import { accessOf, countsText, likeContaining, readable, selectionCounts, serverRowPick, underFilter, type Pick, type ServerCount } from "./pickState";
@@ -181,7 +181,7 @@ function TypedDatabases({ onUse }: { onUse: (names: string[]) => void }) {
     <div className="form-grid">
       <label className="wide">Its databases<textarea rows={4} value={text} placeholder={"lfc_eng_001\nlfc_eng_002"}
           onChange={(e) => setText(e.target.value)} />
-        <span className="help">Type them one per line or separated by commas. Each is read on its own in the next step.</span></label>
+        <span className="help">One per line or separated by commas.</span></label>
       <div className="toolbar"><button disabled={!names.length} onClick={() => onUse(names)}>
         Use {names.length ? `these ${fmtInt(names.length)} ${plural(names.length, "database")}` : "these databases"}</button></div>
     </div>
@@ -209,9 +209,10 @@ function Step1({ chosen, setChosen, tested, setTested, testing, error, setError,
   const found: Row[] = (list.data?.connections ?? []).filter((c: Row) => c.discoverable && c.name.toLowerCase().includes(search.toLowerCase()));
   return (
     <>
-      <p className="muted">The Unity Catalog connection the tables are read through. Next tests it before anything is discovered,
-        listing every database on the server (you filter them on the next step), so a source that cannot be reached is found
-        here, not in the first run.</p>
+      <p className="muted">The Unity Catalog connection the tables are read through. <Info>Next tests it before anything is
+        discovered, listing every database on the server (you filter them on the next step), so a source that cannot be
+        reached is found here, not in the first run. Discover is the first choice: it reads the tables through the
+        connection. A CSV upload is the fallback, for a list Discover can't find.</Info></p>
       <label className="radio-row"><input type="radio" checked={how === "existing"} onChange={() => setHow("existing")} /> Use an existing connection</label>
       {how === "existing" && (
         <div className="radio-body">
@@ -241,10 +242,10 @@ function Step1({ chosen, setChosen, tested, setTested, testing, error, setError,
           <details className="advanced">
             <summary><b>Azure SQL</b> <span className="muted">list the databases through Azure instead of master
               {azure.azure_credential ? <>: on, with {azure.azure_credential}</> : ", for a login that can't open master"}</span></summary>
-            <p className="muted">The discovery job asks Azure for the server's databases with a Unity Catalog service credential
-              (Catalog Explorer, External data, Credentials) whose managed identity has Reader on the server, then reads each
-              database through the connection. Whoever runs the discovery job needs ACCESS on the credential. Azure SQL Database
-              and Managed Instance only.</p>
+            <p className="muted">Azure SQL Database and Managed Instance only. <Info>The discovery job asks Azure for the
+              server's databases with a Unity Catalog service credential (Catalog Explorer, External data, Credentials) whose
+              managed identity has Reader on the server, then reads each database through the connection. Whoever runs the
+              discovery job needs ACCESS on the credential.</Info></p>
             <div className="toolbar">
               <label className="inline">Service credential<input className="search" placeholder="e.g. sql_reader" value={azureCredential}
                 disabled={testing} onChange={(e) => { setAzureCredential(e.target.value); setTested(null); setError(null); }} /></label>
@@ -412,9 +413,10 @@ function Step2({ connection, discoveryId, checksOn, typedNames, picks, setPicks,
   });
   return (
     <>
-      <p className="muted">The connection passed its test. Tick the whole server, whole databases, or open a database for its tables.
-        {checksOn ? " Each database is checked through the SQL warehouse: one the connection's login can't open is greyed out, and"
-          + " hovering on it says why." : " Reading a database's catalog takes a few minutes when the discovery cluster starts cold."}</p>
+      <p className="muted">Tick the whole server, whole databases, or open a database for its tables.{" "}
+        <Info>{checksOn ? "Each database is checked through the SQL warehouse: one the connection's login can't open is greyed"
+          + " out, and hovering on it says why." : "Reading a database's catalog takes a few minutes when the discovery cluster"
+          + " starts cold."}</Info></p>
       <p className="pick-counts"><b>{countsText(counts, total)}</b>
         {counts.leftOut > 0 && <span className="muted"> · the whole server leaves out {fmtInt(counts.leftOut)} {plural(counts.leftOut, "database")} the
           login can't open</span>}
@@ -636,8 +638,6 @@ export function DiscoverDialog({ onClose, drafts = false }: { onClose: (pick: Di
         finish();
       }}>
       <div className="discover">
-        {step === 1 && <p className="muted">Discover is the first choice: it reads the tables through the connection. A CSV upload
-          is the fallback, for a list Discover can't find.</p>}
         {step === 1 && <Step1 chosen={connection} setChosen={choose} tested={tested} setTested={setTested} testing={testing}
           error={testError} setError={setTestError} azureCredential={azureCredential} setAzureCredential={setAzureCredential}
           azureResource={azureResource} setAzureResource={setAzureResource} />}

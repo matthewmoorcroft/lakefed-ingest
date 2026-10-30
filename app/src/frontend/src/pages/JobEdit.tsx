@@ -2,9 +2,10 @@ import { Fragment, useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate, useParams } from "react-router-dom";
 import { api, qs, type Row } from "../api";
-import { Crumbs, ConfirmButton, ErrorBox, Menu, Notice, PageHead, Pager, Section, StateBar, fmtInt, plural, useConfirm, Twisty, Chevron } from "../components";
+import { Crumbs, ConfirmButton, ErrorBox, Info, Menu, Notice, PageHead, Pager, Section, StateBar, fmtInt, plural, useConfirm, Twisty,
+         Chevron, Required } from "../components";
 import { usePermissions } from "../permissions";
-import { CADENCES, IdentityFields, ParameterFields, RunFields, WritesFields, paramsSummary } from "./jobForm";
+import { CADENCES, IdentityFields, ParameterFields, RunFields, WritesFields } from "./jobForm";
 import { ImportCsvDialog } from "./NewJob";
 import { TaskProgress, finished, newRequestId, resumableWrite } from "./tasks";
 import { DiscoverDialog } from "./Discover";
@@ -181,19 +182,18 @@ export function Tree({ jobId, locked, readOnly }: { jobId: string; locked: Locke
 function AddDatabases({ jobId, servers }: { jobId: string; servers: string[] }) {
   const [server, setServer] = useState(servers[0] ?? "");
   const [names, setNames] = useState("");
-  const [perServer, setPerServer] = useState(4);
   const [preview, setPreview] = useState<Row | null>(null);
   const [checked, setChecked] = useState<Row | null>(null);
   const qc = useQueryClient();
   const body = (dry_run: boolean): Row => ({
     databases: names.split(/[\n,]+/).map((n) => n.trim()).filter(Boolean).map((database) => ({ server, database })),
-    full_list: false, groups_per_server: perServer, dry_run });
+    full_list: false, dry_run });
   // The confirm applies exactly the request that was checked; any change to the inputs clears the check.
   const check = useMutation({
     mutationFn: () => { const b = body(false); return api.post<Row>(`/ingestion-jobs/${jobId}/databases`, { ...b, dry_run: true }).then((r) => ({ r, b })); },
     onSuccess: ({ r, b }) => { setPreview(r.summary); setChecked({ ...b, request_id: newRequestId() }); setTask(null); },
   });
-  useEffect(() => { setPreview(null); setChecked(null); }, [server, names, perServer]);
+  useEffect(() => { setPreview(null); setChecked(null); }, [server, names]);
   const [task, setTask] = useState<Row | null>(null);
   // One request id per checked request: applying it again (a retry after a timeout) finds the same task.
   const apply = useMutation({
@@ -204,17 +204,12 @@ function AddDatabases({ jobId, servers }: { jobId: string; servers: string[] }) 
   return (
     <div className="add-databases">
       <div className="form-grid">
-        <label>Server (a UC connection, or one of the job's servers)
+        <label><span>Server<Required /><Info label="About the server">A UC connection, or one of the job's servers. Each database
+          gets every table of the job, with the job's target names and identity columns filled in.</Info></span>
           <input list="job-servers" value={server} onChange={(e) => setServer(e.target.value)} />
           <datalist id="job-servers">{servers.map((s) => <option key={s} value={s} />)}</datalist></label>
-        <label className="wide">Database names, one per line<textarea rows={4} value={names} onChange={(e) => setNames(e.target.value)} /></label>
+        <label className="wide"><span>Database names, one per line<Required /></span><textarea rows={4} value={names} onChange={(e) => setNames(e.target.value)} /></label>
       </div>
-      <div className="form-grid">
-        <label>Groups per new server<input type="number" min={1} max={64} value={perServer} onChange={(e) => setPerServer(Number(e.target.value) || 1)} />
-          <span className="help">A server new to the job gets this many groups; each database joins one by its name.</span></label>
-      </div>
-      <p className="help">Each database gets every table of the job, with the job's target names and identity columns filled in.
-        To add a database's tables from a file instead, use Import a CSV of tables.</p>
       <div className="toolbar">
         <button className="ghost" disabled={check.isPending} onClick={() => check.mutate()}>Check</button>
         {preview && checked && !preview.applied && <ConfirmButton label={`Add ${fmtInt(preview.new_tables)} ${plural(preview.new_tables, "table")}`}
@@ -494,15 +489,15 @@ export default function JobEdit() {
       {saveLine && <Notice tone={saveLine.tone}>{saveLine.text}</Notice>}
 
       {schedule && <Section title="Name">
-        <div className="form-grid"><label>Job name<input value={name} onChange={(e) => setName(e.target.value)} />
-          <span className="help">Its Databricks jobs are renamed with it when you press Save.</span></label></div>
+        <div className="form-grid"><label><span>Job name<Required /></span><input value={name} onChange={(e) => setName(e.target.value)} /></label></div>
       </Section>}
 
-      <Section title="What it ingests" note="Open a server to see its databases, and a database to see its tables. A table's load type is the same in every database: change it and it changes in all of them."
+      <Section title={<>What it ingests<Info label="About what it ingests">Open a server to see its databases, and a database to see
+        its tables. A table's load type is the same in every database: change it and it changes in all of them.</Info></>}
         actions={locked ? <button className="ghost" disabled title={locked}>Add tables <Chevron open /></button> : <Menu label={<>Add tables <Chevron open /></>} buttonClass="ghost" title="Add tables">
-          <button onClick={addTables.discover}>Discover on a source<span className="sub">the first choice: a UC connection, tested first, then the whole server, whole databases or single tables</span></button>
-          <button onClick={addTables.open}>Import a CSV of tables<span className="sub">the fallback, for a list Discover can't find: a UC connection, then one line per table or database</span></button>
-          <button onClick={() => setAddOpen(true)}>Pick databases by hand<span className="sub">each database gets every table of the job</span></button>
+          <button onClick={addTables.discover}>Discover on a source</button>
+          <button onClick={addTables.open}>Import a CSV of tables</button>
+          <button onClick={() => setAddOpen(true)}>Pick databases by hand</button>
         </Menu>}>
         <p className="impact">Changes here apply as soon as you confirm them; Save does not cover them.</p>
         {addTables.dialog}{addTables.result}
@@ -511,41 +506,41 @@ export default function JobEdit() {
         <Tree jobId={id} locked={locked} />
       </Section>
 
-      {s && <Section title="How it writes" note="For every table of the job.">
+      {s && <Section title="How it writes">
         <WritesFields w={w} setW={setW} stored={s}
           modeNote={writeModeMoves && <p className={targetsChanged ? "help" : "impact"}>A new write mode makes new target tables and loads every
             table again{targetsChanged ? "." : ": change the target names below too."}</p>}
           targetsNote={targetsChanged && <p className="impact">New target names make new tables and load their tables again. The old tables are left in place.</p>} />
       </Section>}
 
-      {s && <Section title="Identity columns" note="Written on every row next to __client_id__, so the shared tables say whose rows they are.">
+      {s && <Section title={<>Identity columns<Info label="About identity columns">Written on every row next to __client_id__, so the
+        shared tables say whose rows they are.</Info></>}>
         <IdentityFields w={w} setW={setW} identity={identity} setIdentity={setIdentity} differing={differing}
           setDiffering={setDiffering} stored={s} tables={settings.data?.tables} />
       </Section>}
 
       {schedule && <Section title="When it runs">
-        <RunFields run={run} setRun={setRun} params={params} setParams={setParams} cadences={cadences} />
+        <RunFields run={run} setRun={setRun} params={params} setParams={setParams} cadences={cadences} defaults={options.data?.defaults} />
         <div className="form-grid">
-          <label>Add new databases and tables
+          <label><span>Add new databases and tables<Info label="About adding new databases and tables">Once a day the servers are
+            read again and the job adds what its selection allows: every new database matching a whole server's filter, with all its
+            tables, and the new tables of a whole database. Specific tables add nothing. Tables the source no longer has are kept and
+            listed on the job page.</Info></span>
             <select value={run.rediscover_hour ?? ""}
               onChange={(e) => setRun({ ...run, rediscover_hour: e.target.value === "" ? null : Number(e.target.value) })}>
               <option value="">Off</option>
               {Array.from({ length: 24 }, (_, hour) => <option key={hour} value={hour}>{`Daily at ${String(hour).padStart(2, "0")}:00 UTC`}</option>)}
-            </select>
-            <span className="help">Once a day the servers are read again and the job adds what its selection allows: every new
-              database matching a whole server's filter, with all its tables, and the new tables of a whole database. Specific
-              tables add nothing. Tables the source no longer has are kept and listed on the job page.</span></label>
+            </select></label>
         </div>
       </Section>}
 
       {/* Compute and the tuning keys are one closed section, at the defaults the job was tested with, as on the board. */}
       {schedule && <details className="card advanced">
-        <summary><b>Advanced configuration</b> <span className="muted">compute and tuning: {clusterSummary(clusterInfo.data, cluster)};
-          {" "}{paramsSummary(params) || "every key at its default"}</span></summary>
+        <summary><b>Advanced configuration</b></summary>
         <h3>Compute</h3>
         <ClusterFields info={clusterInfo.data} error={clusterInfo.error} cluster={cluster} setCluster={setCluster} locked={locked} />
         <Compute jobId={id} />
-        <Groups jobId={id} locked={locked} />
+        <Groups jobId={id} locked={locked} saved={Number(schedule.options?.tables_per_group) || null} />
         <h3>Tuning</h3>
         <ParameterFields params={params} setParams={setParams} options={options.data} />
       </details>}
@@ -593,16 +588,15 @@ export function ClusterFields({ info, error, cluster, setCluster, locked, after 
   };
   return (
     <div className="compute">
-      <h3>Job cluster</h3>
-      <p className="muted">The driver and worker types and the number of workers each run uses. The defaults are the Databricks
-        job's own: {d.driver_node_type_id} driver, {d.node_type_id} workers, {d.num_workers} {Number(d.num_workers) === 1 ? "worker" : "workers"}.
-        A change gives this job its own copy of the Databricks job, made a minute or so after {after}.</p>
+      <h3>Job cluster<Info label="About the job cluster">The driver and worker types and the number of workers each run uses. The
+        defaults are the Databricks job's own: {d.driver_node_type_id} driver, {d.node_type_id} workers, {d.num_workers}{" "}
+        {Number(d.num_workers) === 1 ? "worker" : "workers"}. A change gives this job its own copy of the Databricks job, made a
+        minute or so after {after}.</Info></h3>
       <div className="form-grid">
         <label>Driver type{typeSelect("driver_node_type_id")}</label>
         <label>Worker type{typeSelect("node_type_id")}</label>
-        <label>Workers<input type="number" min={0} max={info.max_workers} value={cluster.num_workers ?? ""} disabled={off}
-          onChange={(e) => setCluster({ ...cluster, num_workers: e.target.value })} />
-          <span className="help">0 to {info.max_workers}; 0 runs on the driver alone</span></label>
+        <label><span>Workers<Info label="About workers">0 to {info.max_workers}; 0 runs on the driver alone.</Info></span><input type="number" min={0} max={info.max_workers} value={cluster.num_workers ?? ""} disabled={off}
+          onChange={(e) => setCluster({ ...cluster, num_workers: e.target.value })} /></label>
       </div>
       <div className="toolbar">
         <span className="muted">{info.applying ? <>Applying: the cluster copies job is making this job's copy (<a href={info.applying.url}
@@ -620,18 +614,16 @@ export function ClusterFields({ info, error, cluster, setCluster, locked, after 
 // The job cluster's own settings, shown once: in Job cluster above, not again in the bundle's table.
 const CLUSTER_FIELDS = ["Driver node type", "Worker node type", "Workers"];
 
-/** The job's number of groups per server: set a new one (blank for the default by tables), preview what moves, then
- * change it. Each server's databases are spread again, as few moving as can be and none split; it waits for any run
+/** The job's tables per group: set a new size, preview what moves, then change it. Each server's databases are spread again, as few moving as can be and none split; it waits for any run
  * or write of the job to end. */
-function Groups({ jobId, locked }: { jobId: string; locked: Locked }) {
+function Groups({ jobId, locked, saved }: { jobId: string; locked: Locked; saved?: number | null }) {
   const qc = useQueryClient();
-  const [value, setValue] = useState("");
   const [preview, setPreview] = useState<Row | null>(null);
   const [error, setError] = useState<unknown>(null);
   const [done, setDone] = useState<string | null>(null);
-  const number = value.trim() ? Math.min(64, Math.max(1, Math.round(Number(value)) || 1)) : null;
+  const [size, setSize] = useState<number | null>(null);
   const ask = (dry_run: boolean) => api.post<Row>(`/ingestion-jobs/${jobId}/groups`,
-    { groups_per_server: number, dry_run, ...(dry_run ? {} : { request_id: newRequestId() }) });
+    { ...(size ? { tables_per_group: size } : {}), dry_run, ...(dry_run ? {} : { request_id: newRequestId() }) });
   const look = async () => {
     setError(null); setDone(null);
     try { setPreview(await ask(true)); } catch (e) { setError(e); }
@@ -648,15 +640,11 @@ function Groups({ jobId, locked }: { jobId: string; locked: Locked }) {
   const summary: Row | undefined = preview?.summary;
   return (
     <div className="compute">
-      <h3>Groups</h3>
-      <p className="muted">How many groups each server's databases are split between. Each database goes whole to the group
-        with the fewest tables, so the groups come out about even; changing the number spreads them again, moving as few
-        databases as it can. Each table keeps its progress, so nothing reloads.</p>
+      <h3>Groups<Info label="About changing the groups">Changing the size spreads each server's databases again over its new
+        number of groups, moving as few databases as it can and never splitting one. Each table keeps its progress, so nothing
+        reloads.</Info></h3>
       <div className="form-grid">
-        <label>Groups per server<input type="number" min={1} max={64} value={value} placeholder="by tables"
-          onChange={(e) => { setValue(e.target.value); setPreview(null); }} />
-          <span className="help">Blank: one group for about every 10,000 of a server's tables, a small remainder joining
-            the others (100,200 tables make 8).</span></label>
+        <TablesPerGroup value={size} saved={saved} onChange={(next) => { setSize(next); setPreview(null); }} />
       </div>
       <button className="ghost" onClick={look} disabled={!!locked} title={locked ?? undefined}>Preview the groups</button>
       <ErrorBox error={error} />
@@ -685,12 +673,37 @@ function Groups({ jobId, locked }: { jobId: string; locked: Locked }) {
   );
 }
 
+// The size the app splits a server's databases by unless the job sets its own (the backend's default).
+export const DEFAULT_TABLES_PER_GROUP = 10_000;
+const MIN_TABLES_PER_GROUP = 100, MAX_TABLES_PER_GROUP = 1_000_000;
+
+/** Tables per group, as New and Edit's Groups set it: the box shows the job's size (saved, else the default) until
+ * changed; a value left at it is sent as nothing (null), so the job keeps its size. Reset goes back to the default. */
+export function TablesPerGroup({ value, onChange, saved }: { value: number | null; onChange: (next: number | null) => void;
+                                                              saved?: number | null }) {
+  const baseline = saved || DEFAULT_TABLES_PER_GROUP;
+  const [text, setText] = useState(String(value ?? baseline));
+  const commit = (raw: string) => {
+    const n = Math.round(Number(raw.replace(/[, ]/g, "")));
+    const clamped = Number.isFinite(n) && raw.trim() ? Math.min(MAX_TABLES_PER_GROUP, Math.max(MIN_TABLES_PER_GROUP, n)) : baseline;
+    setText(String(clamped));
+    onChange(clamped === baseline ? null : clamped);
+  };
+  return (
+    <label><span>Tables per group<Info label="About tables per group">Each server's databases are split into groups of about this many
+      tables, each database whole in one group and spread evenly; a group runs on its own cluster.</Info>
+      {Number(text) !== DEFAULT_TABLES_PER_GROUP && <button className="ghost link reset"
+        onClick={() => commit(String(DEFAULT_TABLES_PER_GROUP))}>Reset</button>}</span>
+      <input type="number" min={MIN_TABLES_PER_GROUP} max={MAX_TABLES_PER_GROUP} step={100} value={text}
+        onChange={(e) => setText(e.target.value)} onBlur={(e) => commit(e.target.value)} /></label>
+  );
+}
+
 function Compute({ jobId }: { jobId: string }) {
   const compute = useQuery({ queryKey: ["job-compute", jobId], queryFn: () => api.get<Row>(`/ingestion-jobs/${jobId}/compute`) });
   return (
     <div className="compute">
       <h3>Everything else its runs use</h3>
-      <p className="muted">Read from the Databricks jobs now, and set by the bundle that deploys them.</p>
       <ErrorBox error={compute.error} />
       {(compute.data?.jobs ?? []).map((job: Row) => (
         <Fragment key={job.role}>

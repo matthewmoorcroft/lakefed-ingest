@@ -3,7 +3,7 @@ import { useSearchParams } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { type ColDef } from "ag-grid-community";
 import { api, qs, type Row } from "../api";
-import { PageHead, Badge, ConfirmButton, ErrorBox, Grid, Notice, Section, autoColumns, fmtInt, plural } from "../components";
+import { PageHead, Badge, ConfirmButton, ErrorBox, Grid, Info, Notice, Section, autoColumns, fmtInt, plural } from "../components";
 import { EditBulk, EditOne } from "./EditTables";
 import { groupsRefusal, usePermissions } from "../permissions";
 
@@ -23,6 +23,7 @@ const FILTER_LABELS: Record<string, string> = { all: "All tables", failing: "Fai
 export default function Tables() {
   const [params, setParams] = useSearchParams();
   const collection = params.get("collection") ?? "";
+  const job = params.get("job") ?? "";
   const [search, setSearch] = useState("");
   const [status, setStatus] = useState(FILTERS.includes(params.get("status") ?? "") ? params.get("status")! : "all");
   const database = params.get("database") ?? undefined;
@@ -32,10 +33,11 @@ export default function Tables() {
   const [message, setMessage] = useState<string | null>(null);
   const [editing, setEditing] = useState<"one" | "bulk" | null>(null);
   const qc = useQueryClient();
-  const collections = useQuery({ queryKey: ["collections"], queryFn: () => api.get<string[]>("/collections") });
+  // The user's unit is the ingestion job; a group is kept only as a column, and as the filter a group's page links with.
+  const jobs = useQuery({ queryKey: ["schedules", "names"], queryFn: () => api.get<Row[]>("/schedules?details=false") });
   const tables = useQuery({
-    queryKey: ["tables", collection, database, search, status, after],
-    queryFn: () => api.get<{ tables: Row[]; limit: number; next_after: unknown[] | null }>(`/tables${qs({ collection, database, search, status, after })}`),
+    queryKey: ["tables", job, collection, database, search, status, after],
+    queryFn: () => api.get<{ tables: Row[]; limit: number; next_after: unknown[] | null }>(`/tables${qs({ job, collection, database, search, status, after })}`),
   });
   const act = useMutation({
     mutationFn: ({ path, body }: { path: string; body: Row }) => api.post<{ updated: number }>(path, body),
@@ -48,14 +50,17 @@ export default function Tables() {
   const locked = groupsRefusal(usePermissions().data, selected.map((r) => r.task_collection));
   return (
     <>
-      <PageHead title="Tables" lead="Every table of every ingestion group: select tables to edit, enable, disable or reseed them." />
+      <PageHead title="Tables" lead="Every table of every ingestion job." />
       <div className="toolbar">
-        <label>Ingestion group
-          <select value={collection} onChange={(e) => { setPages([]); setParams(e.target.value ? { collection: e.target.value } : {}); }}>
+        <label>Ingestion job
+          <select value={job} onChange={(e) => { setPages([]); setParams(e.target.value ? { job: e.target.value } : {}); }}>
             <option value="">(all)</option>
-            {collections.data?.map((c) => <option key={c}>{c}</option>)}
+            {(jobs.data ?? []).filter((j) => !j.deleted_at).sort((a, b) => String(a.name).localeCompare(String(b.name)))
+              .map((j) => <option key={j.id} value={String(j.id)}>{j.name}</option>)}
           </select>
         </label>
+        {collection && <span className="tag">group {collection}
+          <button className="ghost" onClick={() => { setPages([]); setParams(job ? { job } : {}); }}>clear</button></span>}
         <label className="grow">Search
           <input placeholder="Database, table, target or client ID" value={search} onChange={(e) => { setPages([]); setSearch(e.target.value); }} />
         </label>
@@ -77,22 +82,23 @@ export default function Tables() {
             {ids.length === 1 ? "Edit" : "Bulk edit"}
           </button>
           <ConfirmButton label="Enable" plain disabled={!!locked} title={`Enable ${fmtInt(ids.length)} ${plural(ids.length, "table")}?`}
-            message="Their ingestion groups' next runs load them." onConfirm={() => act.mutateAsync({ path: "/tables/enable", body: { ids, enabled: true } })} />
+            message="Their ingestion jobs' next runs load them." onConfirm={() => act.mutateAsync({ path: "/tables/enable", body: { ids, enabled: true } })} />
           <ConfirmButton label="Disable" danger disabled={!!locked} title={`Disable ${fmtInt(ids.length)} ${plural(ids.length, "table")}?`}
             message="Runs stop loading them. Their target tables, checkpoints and history stay, so enabling them again carries on from where they were."
             onConfirm={() => act.mutateAsync({ path: "/tables/enable", body: { ids, enabled: false } })} />
           <ConfirmButton label="Force reseed" danger disabled={!!locked} title={`Reseed ${fmtInt(ids.length)} ${plural(ids.length, "table")}?`}
-            message="The next run of each table's ingestion group copies the whole table again from its source. Large tables take a while and load the source."
+            message="The next run of each table's ingestion job copies the whole table again from its source. Large tables take a while and load the source."
             confirmLabel="Reseed" onConfirm={() => act.mutateAsync({ path: "/tables/reseed", body: { ids } })} />
           </>}
         </>}>
-        <p className="muted small">Select one row to edit it, or several to bulk edit, enable, disable, or force a reseed
-          (the next run copies them again). Changes are refused while the table's ingestion group is running. 100 tables a page,
-          by ingestion group, database and table; selections are per page.</p>
+        <p className="muted small">Select one row to edit it, or several to bulk edit, enable, disable, or force a reseed.
+          <Info label="About editing tables">Changes are refused while the table's ingestion job is running. 100 tables a page, by
+            ingestion job, database and table; selections are per page.</Info></p>
         {locked && <p className="muted small">Edit, Enable, Disable and Force reseed: {locked}.</p>}
         <Grid rows={tables.data?.tables} filters={false} selection="multiple" onSelect={setSelected} getRowId={(r) => String(r.id)}
           columns={targetAfterEnabled(autoColumns(tables.data?.tables ?? [], {
-            task_collection: { headerName: "Ingestion group" },
+            ingestion_job: { headerName: "Ingestion job" },
+            task_collection: { headerName: "Group" },
             sla_min: { headerName: "Freshness target (min)", minWidth: 180, type: "rightAligned", valueFormatter: (p) => fmtInt(p.value) },
             sla_breached: { headerName: "Past target", cellRenderer: (p: any) => p.value ? <Badge value="breached" /> : null },
             status: { cellRenderer: (p: any) => <Badge value={p.value} /> },

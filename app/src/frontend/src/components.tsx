@@ -468,6 +468,22 @@ export function Stamp({ at, every, error }: { at?: string; every?: number; error
   return <span className="stamp">Updated {fmtAgo(at)}{every ? `, every ${every} s` : ""}</span>;
 }
 
+/** The Databricks UI's info icon beside a label: its explanation shows on hover, or on click or focus (keyboard and
+ * touch). The one place the app keeps an explanation a user may want but needn't read. */
+export function Info({ children, label = "More about this" }: { children: ReactNode; label?: string }) {
+  return (
+    <span className="info-tip" tabIndex={0} role="button" aria-label={label}>
+      <span aria-hidden>ⓘ</span>
+      <span className="info-pop" role="tooltip">{children}</span>
+    </span>
+  );
+}
+
+/** The mark of a field a job can't be created or saved without, as Databricks forms mark them. */
+export function Required() {
+  return <span className="required" aria-label="required">*</span>;
+}
+
 export interface PageStampValue { at?: string; every?: number; error?: unknown }
 
 /** Where a page's "Updated ..." line goes when it is shown at the bottom of the left menu (App), not in the page head. */

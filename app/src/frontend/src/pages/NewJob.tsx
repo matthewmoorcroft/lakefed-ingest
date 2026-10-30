@@ -2,11 +2,11 @@ import { useEffect, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "react-router-dom";
 import { api, type Row } from "../api";
-import { Crumbs, ErrorBox, Menu, Modal, Notice, PageHead, Section, fmtInt, plural, useConfirm, Chevron } from "../components";
-import { CADENCES, IdentityFields, ParameterFields, RunFields, WritesFields, paramsSummary } from "./jobForm";
+import { Crumbs, ErrorBox, Info, Menu, Modal, Notice, PageHead, Section, fmtInt, plural, useConfirm, Chevron } from "../components";
+import { CADENCES, IdentityFields, ParameterFields, RunFields, WritesFields } from "./jobForm";
 import { DiscoverDialog, discardDrafts } from "./Discover";
 import { serverRowCells, targetBlock } from "./previewRows";
-import { ClusterFields, clusterSummary, ownCluster } from "./JobEdit";
+import { ClusterFields, TablesPerGroup, ownCluster } from "./JobEdit";
 import { SourcePick, nothingPicked, pickedAny, pickedText, type Picked } from "./SourcePick";
 import { TaskProgress, finished, newRequestId, resumableWrite } from "./tasks";
 import { draftCreateBlock, draftReadingNote, isUnconfirmed, requestWriteNotice } from "../pending";
@@ -68,8 +68,8 @@ export default function NewJob() {
   const [identity, setIdentity] = useState<[string, string][]>([]);
   const [run, setRun] = useState<Row>({ cadence_minutes: 60, start: "00:00", timezone: "Europe/London", paused: true, notify_emails: "" });
   const [params, setParams] = useState<Record<string, string>>({});
-  const [variant, setVariant] = useState<string | null>(null);
-  const [groupsPerServer, setGroupsPerServer] = useState<number | null>(null);
+  // Unchanged, the job follows the default size (null); the field shows that default.
+  const [tablesPerGroup, setTablesPerGroup] = useState<number | null>(null);
   const [importing, setImporting] = useState(false);
   const [discovering, setDiscovering] = useState(false);
   // The job's own cluster, as in Edit's Job cluster: at the Databricks job's values unless changed here.
@@ -78,14 +78,15 @@ export default function NewJob() {
   const cluster = clusterChoice ?? clusterInfo.data?.defaults ?? null;
   const own = clusterInfo.data && cluster ? ownCluster(cluster, clusterInfo.data.defaults) : null;
   const variants: string[] = options.data?.variants ?? [];
-  // The check job is how the 1,000- and 100,000-table jobs were tested, so it is the default where there is one.
-  const jobVariant = variant ?? (variants.includes("check") ? "check" : "default");
+  // Runs start through the check job where there is one, as every job has been set up; there is no choice on the page.
+  const jobVariant = variants.includes("check") ? "check" : "default";
 
   const body = (dryRun: boolean) => {
     const cadence = Number(run.cadence_minutes);
     const [h, m] = String(run.start || "00:00").split(":").map(Number);
     return {
-      name: name.trim(), source: chosen?.source, groups_per_server: groupsPerServer, dry_run: dryRun, request_id: requestId,
+      name: name.trim(), source: chosen?.source, ...(tablesPerGroup ? { tables_per_group: tablesPerGroup } : {}), dry_run: dryRun,
+      request_id: requestId,
       settings: { ...w, load_type: loadType, freshness_sla_minutes: w.freshness_sla_minutes === "" ? null : Number(w.freshness_sla_minutes),
                   identity: Object.fromEntries(identity.filter(([n]) => n.trim()).map(([n, t]) => [n.trim(), t.trim()])) },
       run: { cadence_minutes: cadence, timezone: cadence <= 60 ? "UTC" : run.timezone || "Europe/London", paused: run.paused,
@@ -164,13 +165,12 @@ export default function NewJob() {
         : <ErrorBox error={isUnconfirmed(create.error) ? null : create.error} />}
       {create.data && !create.data.created && <Notice tone="warn">Not created: fix the invalid lines below first.</Notice>}
 
-      <Section title="What it ingests" note="The servers, databases and tables this job ingests."
+      <Section title="What it ingests"
         actions={<Menu label={<>Add tables <Chevron open /></>} buttonClass="ghost" title="Add tables">
-          <button onClick={() => setDiscovering(true)}>Discover on a source<span className="sub">the first choice: a UC connection, tested first; then the whole server, whole databases or single tables</span></button>
-          <button onClick={() => setImporting(true)}>Import a CSV<span className="sub">the fallback: one line per table or database, read through a connection; uploaded once, then choose from it</span></button>
+          <button onClick={() => setDiscovering(true)}>Discover on a source</button>
+          <button onClick={() => setImporting(true)}>Import a CSV</button>
         </Menu>}>
-        {!chosen ? <p className="empty-drop">No tables yet. <b>Add tables</b>: discover them on a source, the first choice, or import a CSV
-          of where each table or database is, the fallback.</p> : (
+        {!chosen ? <p className="empty-drop">No tables yet. Add them with <b>Add tables</b>.</p> : (
           <>
             <p className="muted">From {chosen.label}.</p>
             {readingNote && <Notice>{readingNote}</Notice>}
@@ -178,8 +178,8 @@ export default function NewJob() {
               {(reading?.failed_databases ?? []).slice(0, 20).map(([d, why]: [string, string]) => <li key={d}><b>{d}</b>: {why}</li>)}</ul></Notice>}
             {Number(reading?.left_out) > 0 && <p className="muted">The whole server leaves out {fmtInt(reading.left_out)}{" "}
               {plural(reading.left_out, "database")} the connection's login can't open.</p>}
-            {discoveringDatabases !== null && <Notice>Discovering the tables of {fmtInt(discoveringDatabases)} {plural(discoveringDatabases, "database")} by name through
-              the connection. This page checks again every few seconds, and Create is ready when it ends.</Notice>}
+            {discoveringDatabases !== null && <Notice>Discovering the tables of {fmtInt(discoveringDatabases)} {plural(discoveringDatabases, "database")}.
+              Create is ready when it ends.</Notice>}
             <div className="table-wrap"><table className="data">
               <thead><tr><th>Server</th><th>Read through · load type</th><th className="num">Databases · tables</th><th className="num">Groups</th></tr></thead>
               <tbody>
@@ -207,28 +207,20 @@ export default function NewJob() {
       {importing && <ImportCsvDialog loadType={loadType} onClose={(next) => {
         setImporting(false); if (next) { setChosen(next); setLoadType(next.loadType); } }} />}
 
-      <Section title="How it writes" note="For every table of the job."><WritesFields w={w} setW={setW} /></Section>
-      <Section title="Identity columns" note="Written on every row next to __client_id__, so the shared tables say whose rows they are.">
+      <Section title="How it writes"><WritesFields w={w} setW={setW} /></Section>
+      <Section title={<>Identity columns<Info label="About identity columns">Written on every row next to __client_id__, so the shared
+        tables say whose rows they are.</Info></>}>
         <IdentityFields w={w} setW={setW} identity={identity} setIdentity={setIdentity} />
       </Section>
       <Section title="When it runs" note="A new job starts paused: resume it from its page once you have checked it.">
-        <RunFields run={run} setRun={setRun} params={params} setParams={setParams} cadences={options.data?.cadences ?? CADENCES} />
+        <RunFields run={run} setRun={setRun} params={params} setParams={setParams} cadences={options.data?.cadences ?? CADENCES}
+          defaults={options.data?.defaults} />
       </Section>
 
       <details className="card advanced">
-        <summary><b>Advanced configuration</b> <span className="muted">compute and tuning, at the defaults we tested: {groupsPerServer ? `${groupsPerServer} groups per server` : "groups by tables"},
-          runs through the {jobVariant === "check" ? "check job" : "Databricks job"}, {clusterSummary(clusterInfo.data, cluster)};
-          {" "}{paramsSummary(params) || "every key at its default"}</span></summary>
+        <summary><b>Advanced configuration</b></summary>
         <h3>Compute</h3>
-        <div className="form-grid">
-          <label>Groups per server<input type="number" min={1} max={64} value={groupsPerServer ?? ""} placeholder="by tables"
-            onChange={(e) => setGroupsPerServer(e.target.value.trim() ? Math.min(64, Math.max(1, Math.round(Number(e.target.value)) || 1)) : null)} />
-            <span className="help">Blank: one group for about every 10,000 of a server's tables, a small remainder joining the
-              others (100,200 tables make 8). A number: that many groups for each server. Either way each database goes whole
-              to the group with the fewest tables, so the groups come out about even; the preview shows each server's groups.</span></label>
-          {variants.length > 1 && <label>Runs start<select value={jobVariant} onChange={(e) => setVariant(e.target.value)}>
-            {variants.map((v) => <option key={v} value={v}>{v === "check" ? "through the check job: only databases with changes" : "the Databricks job for every group"}</option>)}</select></label>}
-        </div>
+        <div className="form-grid"><TablesPerGroup value={tablesPerGroup} onChange={setTablesPerGroup} /></div>
         <ClusterFields info={clusterInfo.data} error={clusterInfo.error} cluster={cluster} setCluster={setCluster} locked={null} after="Create" />
         <h3>Tuning</h3>
         <ParameterFields params={params} setParams={setParams} options={options.data} />
@@ -253,13 +245,13 @@ function ConnectionPick({ value, onChange }: { value: string; onChange: (name: s
   const found: Row[] = (list.data?.connections ?? []).filter((c: Row) => c.discoverable);
   return (
     <>
-      <label>Connection
+      <label><span>Connection <Info>Every line of the file is read through it. A connection made in Catalog Explorer
+        shows after Refresh on the Discover page, once the app has USE CONNECTION on it.</Info></span>
         <select value={value} onChange={(e) => onChange(e.target.value)}>
           <option value="">Choose a connection</option>
           {found.map((c: Row) => <option key={c.name} value={c.name}>{c.name}</option>)}
         </select>
-        <span className="help">Chosen first: every line of the file is read through it. A connection made in Catalog Explorer shows
-          after Refresh on the Discover page, once the app has USE CONNECTION on it.</span></label>
+</label>
       {list.data?.error && <div className="wide"><Notice tone="warn">The app can't list connections: {list.data.error}</Notice></div>}
       <div className="wide"><ErrorBox error={list.error} /></div>
     </>
