@@ -5,7 +5,7 @@ import { type ColDef } from "ag-grid-community";
 import { api, type Row } from "../api";
 import { useSettings } from "../App";
 import { groupsRefusal, usePermissions } from "../permissions";
-import { Badge, ConfirmButton, ErrorBox, FillBox, Grid, Notice, PageHead, Section, Tag, autoColumns, fmtAgo, fmtInt, fmtTime, gridTheme, Host, plural } from "../components";
+import { Badge, Busy, ConfirmButton, ErrorBox, FillBox, ToastOn, Grid, Notice, PageHead, Section, Tag, autoColumns, fmtAgo, fmtInt, fmtTime, gridTheme, Host, plural } from "../components";
 
 const EDITABLE = ["include", "load_type", "primary_key", "cursor_column", "load_partitioned", "partition_col",
   "partition_size_mb", "sink_catalog", "sink_schema", "sink_table", "client_id", "freshness_sla_minutes"];
@@ -105,8 +105,7 @@ function DiscoverForm({ onStarted, prefill }: { onStarted: (id: string, runId: n
         <div className="wide"><button className="primary" disabled={start.isPending || !!discoveryRefusal}>{start.isPending ? "Starting…" : "Discover"}</button></div>
       </form>
       <ErrorBox error={start.error} />
-      {start.data && <Notice tone="ok">Discovery {start.data.discovery_id} started for {start.data.databases} {plural(start.data.databases, "database")}{" "}
-        (job run {start.data.run_id}). It appears below; results arrive in a few minutes.</Notice>}
+      <ToastOn text={start.data ? `Discovery started for ${fmtInt(start.data.databases)} ${plural(start.data.databases, "database")}` : null} />
     </Section>
   );
 }
@@ -247,9 +246,9 @@ export default function BulkImport() {
             columns={autoColumns(dbs.data, { status: { cellRenderer: (p: any) => <Badge value={p.value} /> },
               error: { flex: 1, minWidth: 300, tooltipField: "error" } })} />
         )}
-        {waiting && <Notice tone="warn">Waiting for the discovery job to start; this updates automatically.</Notice>}
+        {waiting && <Busy label="Starting the discovery" />}
         {jobEnded && (noRows || run.data?.result !== "SUCCESS") && (
-          <Notice tone="bad">The discovery job run ended ({run.data?.result ?? run.data?.state}
+          <Notice tone="bad">The discovery ended ({run.data?.result ?? run.data?.state}
             {run.data?.message ? `: ${run.data.message}` : ""}){noRows ? " without discovering any database" : ""}.{" "}
             {run.data?.url && <a href={run.data.url} target="_blank" rel="noreferrer">Open the run</a>}</Notice>
         )}

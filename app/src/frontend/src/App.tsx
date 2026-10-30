@@ -3,7 +3,7 @@ import { PageErrorBoundary } from "./errorBoundary";
 import { NavLink, Navigate, Route, Routes, useLocation } from "react-router-dom";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, type Config } from "./api";
-import { Menu, PageStampContext, Stamp, type PageStampValue } from "./components";
+import { Menu, PageStampContext, Stamp, Toaster, type PageStampValue } from "./components";
 import Overview from "./pages/Overview";
 import Runs from "./pages/Runs";
 import RunDetail from "./pages/RunDetail";
@@ -98,6 +98,7 @@ export default function App() {
           </Routes>
           </PageErrorBoundary>
         </main>
+        <Toaster />
       </div>
       </PageStampContext.Provider>
     </SettingsContext.Provider>

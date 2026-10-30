@@ -40,7 +40,7 @@ test("whole databases add their counted tables, and one not counted yet says the
   assert.equal(countsText(selectionCounts(null, [1000, 1000], []), 201), "Chosen: 2 of 201 databases, 2,000 tables");
   const counting = selectionCounts(null, [1000, null], []);
   assert.equal(counting.counting, true);
-  assert.equal(countsText(counting, 201), "Chosen: 2 of 201 databases, tables: counting, 1,000 so far");
+  assert.equal(countsText(counting, 201), "Chosen: 2 of 201 databases");
 });
 
 test("single tables count one each, and a server not fully checked is still counting", () => {

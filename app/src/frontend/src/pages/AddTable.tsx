@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { api } from "../api";
-import { PageHead, ErrorBox, Notice, Section } from "../components";
+import { PageHead, ErrorBox, Section, ToastOn } from "../components";
 import { groupsRefusal, usePermissions } from "../permissions";
 
 // The values in words, as the Edit view names them.
@@ -81,7 +81,7 @@ export default function AddTable() {
           <div className="wide"><button className="primary" disabled={add.isPending || !!locked}>Add table</button></div>
         </form>
         <ErrorBox error={add.error} />
-        {add.data && <Notice tone="ok">Added control row {add.data.id}.</Notice>}
+        <ToastOn text={add.data ? `Added control row ${add.data.id}` : null} />
       </Section>
     </>
   );

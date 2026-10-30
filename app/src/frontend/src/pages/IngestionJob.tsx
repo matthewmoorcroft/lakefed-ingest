@@ -1,4 +1,4 @@
-import { Fragment, useState } from "react";
+import { Fragment, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import { api, qs, type ApiError, type Row } from "../api";
@@ -8,7 +8,7 @@ import { changeInProgress, deleteNotice, rediscoveryBusy, rediscoveryButton, red
 import { Tree } from "./JobEdit";
 import { TargetTables } from "./TargetTables";
 import { RunningTasks } from "./tasks";
-import { OutLink, Crumbs, Badge, ErrorBox, Menu, Modal, Name, Notice, PageHead, ProgressBar, RunStatus, Section, StateBar, fmtClock, fmtDuration, fmtInt, fmtSlot, fmtSpeed, fmtTime, jobRunPath, plural, progressFrom, useConfirm, type ConfirmRequest, Twisty } from "../components";
+import { Busy, Info, Spinner, OutLink, Crumbs, Badge, ErrorBox, Menu, Modal, Name, Notice, PageHead, StatusLine, toast, ProgressBar, RunStatus, Section, StateBar, fmtClock, fmtDuration, fmtInt, fmtSlot, fmtSpeed, fmtTime, jobRunPath, plural, progressFrom, useConfirm, type ConfirmRequest, Twisty } from "../components";
 
 const PAGE = 25;
 
@@ -114,7 +114,7 @@ function RunningNow({ live }: { live: Row }) {
   const going = runs.filter((g) => g.active).length;
   const checking = check && (check.status?.label === "Running" || check.status?.label === "Starting");
   return (
-    <Section title="Running now" note={`Read from its Databricks runs every few seconds, so a run shows while its clusters are still starting. ${fmtClock(live.read_at)}.`}>
+    <Section title="Running now" note={`Updated ${fmtClock(live.read_at)}`}>
       {(live.wrappers ?? []).map((w: Row) => (
         <div className="run-head" key={`w-${w.run_id}`}>
           <b>The job's run</b><RunStatus status={null} outcome={w.status} /><span className="muted">started {fmtClock(w.started)}</span>
@@ -124,8 +124,8 @@ function RunningNow({ live }: { live: Row }) {
       <ol className="run-steps">
         {check && (
           <li>
-            <h3><span className="step-number">1</span>Check</h3>
-            <p className="muted small">Looks at each database for changes, then starts a group run for each group with work.</p>
+            <h3><span className="step-number">1</span>Check<Info label="About the check">Looks at each database for changes, then starts
+              a group run for each group with work.</Info></h3>
             <div className="table-wrap"><table className="data dense">
               <thead><tr><th>Status</th><th>Started</th><th>What it found</th><th></th></tr></thead>
               <tbody><tr>
@@ -134,7 +134,7 @@ function RunningNow({ live }: { live: Row }) {
                   ? <>{fmtInt(found.databases_with_work)} {plural(found.databases_with_work, "database")} changed
                     {found.unchanged_databases != null && <>, {fmtInt(found.unchanged_databases)} unchanged and stamped</>};{" "}
                     started {fmtInt(found.started)} of {fmtInt(found.groups)} {plural(found.groups, "group")}</>
-                  : <span className="muted">checking the job's databases</span>}</td>
+                  : <Busy label="Checking the databases" />}</td>
                 <td>{check.url && <OutLink href={check.url}>Open run</OutLink>}</td>
               </tr></tbody>
             </table></div>
@@ -143,7 +143,7 @@ function RunningNow({ live }: { live: Row }) {
         <li>
           <h3>{check && <span className="step-number">2</span>}Group runs: {fmtInt(runs.length)}{runs.length ? `, ${fmtInt(going)} going` : ""}</h3>
           {check && !runs.length
-            ? <p className="muted small">{checking || !found ? "Starts when the check ends: one run for each group with changes." : "The check found no group with work, so none started."}</p>
+            ? <p className="muted small">{checking || !found ? "Start when the check ends." : "No group had changes."}</p>
             : <div className="table-wrap"><table className="data dense">
               <thead><tr><th>Ingestion group</th><th>Status</th><th>Started</th><th>Progress</th><th></th></tr></thead>
               <tbody>
@@ -155,7 +155,7 @@ function RunningNow({ live }: { live: Row }) {
                       <td><RunStatus status={null} outcome={g.status} />{g.status?.note && <span className="sub">{g.status.note}</span>}</td>
                       <td>{fmtClock(g.started)}</td>
                       <td style={{ minWidth: 220 }}>{p ? <ProgressBar p={progressFrom({ total: p.planned, loaded: p.done, failed: p.failed })} />
-                        : <span className="muted">{g.active ? "shown once the run has started on its cluster" : ""}</span>}</td>
+                        : g.active ? <Spinner label="Starting" /> : null}</td>
                       <td>{g.url && <OutLink href={g.url}>Open run</OutLink>}</td>
                     </tr>
                   );
@@ -181,16 +181,16 @@ export default function IngestionJob() {
   const refresh = () => ["ingestion-job", "ingestion-job-live", "ingestion-job-runs"].forEach((k) => qc.invalidateQueries({ queryKey: [k, id] }));
   const runNow = useMutation({
     mutationFn: () => api.post<Row>(`/ingestion-jobs/${encodeURIComponent(id)}/run`, {}),
-    onSuccess: () => refresh(),
+    onSuccess: () => { toast("Run started"); refresh(); },
   });
   const stop = useMutation({
     mutationFn: () => api.post<Row>(`/ingestion-jobs/${encodeURIComponent(id)}/stop`, {}),
-    onSuccess: () => refresh(),
+    onSuccess: (r) => { if (!r.errors?.length) toast("Cancelling the run"); refresh(); },
   });
   const [deleting, setDeleting] = useState(false);
   const remove = useMutation({
     mutationFn: (dropTargets: boolean) => api.post<Row>(`/schedules/${encodeURIComponent(id)}/delete`, { drop_targets: dropTargets }),
-    onSuccess: () => { qc.invalidateQueries(); },
+    onSuccess: () => { toast("Deleting the job"); qc.invalidateQueries(); },
   });
   // Run it now for the daily re-discovery: its request, then the server's progress (the discovery run, then the tables).
   const rediscover = useMutation({
@@ -254,8 +254,9 @@ export default function IngestionJob() {
       {confirm.dialog}
       <RunningTasks jobId={id} />
       {deleting && j && <DeleteJobDialog job={j} onClose={(drop) => { setDeleting(false); if (drop !== null) remove.mutate(drop); }} />}
-      {deletion && <Notice tone={deletion.tone}>{deletion.text}{deletion.runAgain ? " Run again starts the delete job again." : ""}
-        {j?.delete?.run?.url && <> <OutLink href={j.delete.run.url}>Open the delete job's run</OutLink>.</>}</Notice>}
+      {deletion && (deletion.tone === "info" ? <Busy label={deletion.text} />
+        : <Notice tone={deletion.tone}>{deletion.text}{deletion.runAgain ? " Run again starts the delete again." : ""}
+          {j?.delete?.run?.url && <> <OutLink href={j.delete.run.url}>Open in Databricks</OutLink>.</>}</Notice>)}
       {timeout && <Notice tone="warn">{timeout}</Notice>}
       <Refused action="Run now" refusal={j?.run_now?.blocked} />
       <Refused action="Edit and Delete" refusal={j?.change_blocked} />
@@ -264,11 +265,7 @@ export default function IngestionJob() {
         and Databricks would skip a second one. Running now below follows it; cancel it, or Run now is open again when it ends.</Notice>
         : <ErrorBox error={runNow.error} />}
       <ErrorBox error={stop.error} />
-      {stop.isSuccess && <Notice tone={stop.data.errors?.length ? "warn" : "ok"}>Cancelled {fmtInt(stop.data.cancelled.length)}{" "}
-        {plural(stop.data.cancelled.length, "Databricks run")}{stop.data.closed ? `, and closed ${fmtInt(stop.data.closed)} ${plural(stop.data.closed, "group run")} as ended without finishing` : ""}.
-        {stop.data.errors?.length ? <> Not cancelled: {stop.data.errors.join("; ")}.</> : null}</Notice>}
-      {runNow.isSuccess && <Notice tone="ok">Started the ingestion run; Running now follows it below.
-        {runNow.data.started.length === 1 && runNow.data.started[0].url && <> <OutLink href={runNow.data.started[0].url}>Open in Databricks</OutLink></>}</Notice>}
+      {stop.isSuccess && stop.data.errors?.length > 0 && <Notice tone="warn">Not cancelled: {stop.data.errors.join("; ")}.</Notice>}
       <ErrorBox error={job.error} />
       {j && (
         <div className="metrics">
@@ -326,10 +323,17 @@ function RediscoveryRecord({ rediscovery, requesting, error, refused, onRunNow }
   return (
     <Section title="Adding new databases and tables" note={note}
       actions={<button disabled={button.disabled} title={button.title ?? undefined} onClick={onRunNow}>{button.label}</button>}>
-      {line && <Notice tone={line.tone}>{line.text}</Notice>}
+      <RediscoveryLine line={line} busy={rediscoveryBusy(progress, requesting)} />
       {last ? <RediscoveryLast last={last} /> : <p className="muted">It has not run yet.</p>}
     </Section>
   );
+}
+
+/** The re-discovery's line: going, a plain line with a spinner; ended while the page watched, a toast; failed, a notice. */
+function RediscoveryLine({ line, busy }: { line: { tone: "info" | "ok" | "warn" | "bad"; text: string } | null; busy: boolean }) {
+  const watched = useRef(false);
+  if (busy) watched.current = true;
+  return <StatusLine line={line?.tone === "ok" && !watched.current ? null : line} />;
 }
 
 function RediscoveryLast({ last }: { last: Row }) {

@@ -1,11 +1,12 @@
 import { Fragment, createContext, useCallback, useContext, useEffect, useId, useLayoutEffect, useMemo, useRef, useState,
-         type ReactNode } from "react";
+         useSyncExternalStore, type ReactNode } from "react";
 import { type BarPart, type BarSummary, type StateCounts, progressParts, progressSummary, stateParts, stateSummary } from "./bars";
 import { createPortal } from "react-dom";
 import { Link } from "react-router-dom";
 import { AgGridReact } from "ag-grid-react";
 import { themeQuartz, type ColDef, type GridApi, type GridOptions } from "ag-grid-community";
 import { ApiError, type Row } from "./api";
+import { longWait } from "./pending";
 
 // AG Grid in the workspace look: the design system's font, border, header and accent colors (styles.css).
 export const gridTheme = themeQuartz.withParams({
@@ -758,4 +759,82 @@ export function Menu({ label, title, buttonClass = "kebab", children }: { label:
       {open && <div className="menu-items" role="menu" onClick={(e) => (e.target as HTMLElement).closest("button") && setOpen(false)}>{children}</div>}
     </span>
   );
+}
+
+/** Now, read again every second while `on`, so a wait's elapsed time keeps counting on the page. */
+export function useNow(on: boolean): Date {
+  const [now, setNow] = useState(() => new Date());
+  useEffect(() => {
+    if (!on) return;
+    setNow(new Date());
+    const timer = setInterval(() => setNow(new Date()), 1000);
+    return () => clearInterval(timer);
+  }, [on]);
+  return now;
+}
+
+/** The small turning circle Databricks shows while something runs. */
+export function Spinner({ label }: { label?: string }) {
+  return <span className="spinner" role={label ? "status" : undefined} aria-label={label} aria-hidden={label ? undefined : true} />;
+}
+
+/** Something running, in one plain line: a spinner, what it does ("Reading tables"), the elapsed time once it runs long,
+ * and a thin bar when how far it is is known (done of total). */
+export function Busy({ label, since, done, total }: { label: string; since?: Date; done?: number; total?: number }) {
+  const now = useNow(since != null);
+  const long = since ? longWait(since, now) : null;
+  return (
+    <p className="busy" role="status">
+      <Spinner />{label}{long && <span className="muted"> · {long}</span>}
+      {total ? <progress className="busy-progress" max={total} value={Math.min(done ?? 0, total)} aria-label={`${label}: ${fmtInt(done ?? 0)} of ${fmtInt(total)}`} /> : null}
+    </p>
+  );
+}
+
+// Toasts: a brief line at the foot of the page that fades on its own, as Databricks confirms an action ("Run started").
+// Errors and refusals stay as notices on the page.
+export const TOAST_MS = 4000;
+type ToastItem = { id: number; text: string };
+let toastItems: ToastItem[] = [];
+let nextToastId = 1;
+const toastListeners = new Set<() => void>();
+const emitToasts = () => toastListeners.forEach((listener) => listener());
+
+/** Show a toast; it goes after TOAST_MS. */
+export function toast(text: string) {
+  const id = nextToastId++;
+  toastItems = [...toastItems, { id, text }];
+  emitToasts();
+  setTimeout(() => { toastItems = toastItems.filter((item) => item.id !== id); emitToasts(); }, TOAST_MS);
+}
+
+/** Toast `text` each time it turns up (a result's confirmation), not again while it stays the same. */
+export function useToastOn(text: string | null | undefined) {
+  const last = useRef<string | null>(null);
+  useEffect(() => {
+    if (text && text !== last.current) toast(text);
+    last.current = text ?? null;
+  }, [text]);
+}
+
+/** Where the toasts show: once, in the app's shell. */
+export function Toaster() {
+  const items = useSyncExternalStore((listener) => { toastListeners.add(listener); return () => { toastListeners.delete(listener); }; },
+                                     () => toastItems);
+  return <div className="toasts" role="status" aria-live="polite">{items.map((item) => <div key={item.id} className="toast">{item.text}</div>)}</div>;
+}
+
+/** A write's line as the page shows it: going, a plain line with a spinner; done, a toast; not confirmed or failed, a
+ * notice that stays. */
+export function StatusLine({ line }: { line: { tone: "info" | "ok" | "warn" | "bad"; text: string } | null }) {
+  useToastOn(line?.tone === "ok" ? line.text : null);
+  if (!line || line.tone === "ok") return null;
+  if (line.tone === "info") return <Busy label={line.text} />;
+  return <Notice tone={line.tone}>{line.text}</Notice>;
+}
+
+/** useToastOn as an element, for a page that confirms a result where it would have shown it. */
+export function ToastOn({ text }: { text: string | null }) {
+  useToastOn(text);
+  return null;
 }

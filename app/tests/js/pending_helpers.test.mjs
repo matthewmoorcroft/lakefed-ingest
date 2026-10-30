@@ -2,7 +2,7 @@
 // strips the types in pending.ts as it loads it). frontend_pending_test.py runs this file from pytest.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { changeInProgress, connectionFailure, connectionNextBlock, connectionNextLabel, deleteNotice, discoveryWait, readsProgress, warehouseReadsState, warehouseRunState, waitingSince, isUnconfirmed, requestWriteNotice, runButton, runTimeoutNotice, rediscoveryBusy, rediscoveryButton, rediscoveryNotice, saveNotice, setupRunBlocks, setupRunNotice, syncFailureLines }
+import { changeInProgress, connectionFailure, connectionNextBlock, connectionNextLabel, deleteNotice, longWait, readsDone, waitLine, isUnconfirmed, requestWriteNotice, runButton, runTimeoutNotice, rediscoveryBusy, rediscoveryButton, rediscoveryNotice, saveNotice, setupRunBlocks, setupRunNotice, syncFailureLines }
   from "../../src/frontend/src/pending.ts";
 
 const IDLE = { phase: "idle", timed_out: false, run_url: null, blocked: null, refused: null };
@@ -123,8 +123,7 @@ test("a deleting job says it is deleting, offers no Run again, and is not a fail
   const notice = deleteNotice({ state: "deleting", reason: null, run_again: false, run: null });
   assert.equal(notice.tone, "info");
   assert.equal(notice.runAgain, false);
-  assert.match(notice.text, /^Deleting: /);
-  assert.match(notice.text, /stays here until it has finished/);
+  assert.equal(notice.text, "Deleting");
 });
 
 test("a failed delete shows its reason and offers Run again when the server says so", () => {
@@ -152,8 +151,7 @@ test("a gone delete has no notice: the job has left the list", () => {
 test("a write sent as one request is pending until its answer, which comes after its jobs are synced", () => {
   const notice = requestWriteNotice("Adding databases", { pending: true, error: null });
   assert.equal(notice.tone, "info");
-  assert.match(notice.text, /^Adding databases: writing the tables, then syncing/);
-  assert.match(notice.text, /shows as done once both have finished/);
+  assert.equal(notice.text, "Adding databases");
 });
 
 test("a write that finished or failed with its own message has no pending notice", () => {
@@ -195,11 +193,11 @@ test("a setup run that is starting shows pending, with no end state", () => {
 
 test("a setup run Databricks still lists as going shows pending", () => {
   const notice = setupRunNotice({ state: "pending", url: SETUP_LINK }, NO_START);
-  assert.deepEqual(notice, { tone: "info", text: "Setup job running. It shows as done once Databricks reports its run ended." });
+  assert.deepEqual(notice, { tone: "info", text: "Setup job running" });
 });
 
 test("a setup run that ended with success shows succeeded", () => {
-  assert.deepEqual(setupRunNotice({ state: "succeeded" }, NO_START), { tone: "ok", text: "Setup job succeeded." });
+  assert.deepEqual(setupRunNotice({ state: "succeeded" }, NO_START), { tone: "ok", text: "Setup job succeeded" });
 });
 
 test("a setup run that failed shows failed with Databricks' message", () => {
@@ -236,13 +234,13 @@ const SAVED = "Saved: 2 tables changed.";
 test("a save is pending while its settings are written and its wrapper jobs synced", () => {
   const notice = saveNotice({ pending: true, done: false, savedText: SAVED, applying: false });
   assert.equal(notice.tone, "info");
-  assert.match(notice.text, /syncing the job's Databricks jobs/);
+  assert.equal(notice.text, "Saving");
 });
 
 test("a save is not done while the cluster copies run is still going", () => {
   const notice = saveNotice({ pending: false, done: true, savedText: SAVED, applying: true });
   assert.equal(notice.tone, "info");
-  assert.match(notice.text, /shows as saved once Databricks reports that run ended/);
+  assert.equal(notice.text, "Applying the job cluster");
 });
 
 test("a save whose cluster copies run is past its limit says not confirmed, not saved", () => {
@@ -250,7 +248,7 @@ test("a save whose cluster copies run is past its limit says not confirmed, not 
     applyTimeout: "Databricks has not reported it ended after 30 minutes: it is still listed as running" });
   assert.equal(notice.tone, "warn");
   assert.match(notice.text, /not confirmed yet/);
-  assert.match(notice.text, /It is not saved until Databricks reports the run ended\.$/);
+  assert.match(notice.text, /still being applied/);
 });
 
 test("a save is done with its summary once everything under it has finished", () => {
@@ -301,7 +299,7 @@ test("a re-discovery is busy from its request until its tables are written, and 
 
 test("Run it now is off while the discovery run goes, and says so", () => {
   const button = rediscoveryButton(RUNNING_HERE, false);
-  assert.deepEqual(button, { label: "Running…", disabled: true, title: "Waiting for Databricks to report the discovery run ended" });
+  assert.deepEqual(button, { label: "Running…", disabled: true, title: "Re-discovering" });
 });
 
 test("Run it now is off while the tables are written", () => {
@@ -325,12 +323,12 @@ test("Run it now is on once the re-discovery is done or failed, and off when the
 test("a re-discovery whose discovery run goes shows pending with its server and no end state", () => {
   const notice = rediscoveryNotice(RUNNING_HERE, false, null);
   assert.equal(notice.tone, "info");
-  assert.equal(notice.text, "Re-discovery running: reading h1 for new databases and tables. It shows as done once Databricks reports its discovery run ended.");
+  assert.equal(notice.text, "Re-discovering h1");
 });
 
 test("a re-discovery that is adding tables says so", () => {
   assert.deepEqual(rediscoveryNotice({ state: "adding" }, false, null),
-    { tone: "info", text: "Re-discovery adding tables. It shows as done once the tables are written." });
+    { tone: "info", text: "Adding tables" });
 });
 
 test("a finished re-discovery says what it found and added", () => {
@@ -359,49 +357,27 @@ test("a re-discovery whose start failed says so, and nothing when none has run",
 
 // Local times, as the page shows them: 20:42 and 20:45 on 29 Oct.
 const ASKED = new Date(2026, 9, 29, 20, 42, 46);
-const RUNNING_FROM = new Date(2026, 9, 29, 20, 45, 31);
 const LATER = new Date(2026, 9, 29, 20, 45, 30);
 
-test("a discovery run says what it waits for, for how long and since when, from its state", () => {
-  // Before the first answer the route isn't known, so no job or warehouse is named.
-  assert.equal(discoveryWait(null, ASKED, "Reading the server's databases", ASKED),
-               "Reading the server's databases: 0 s so far, since 20:42");
-  for (const state of ["QUEUED", "PENDING", "BLOCKED", "WAITING_FOR_RETRY"]) {
-    assert.equal(discoveryWait({ state, since: ASKED }, ASKED, "Reading the server's databases", LATER),
-                 "Waiting for compute: 2 min 44 s so far, since 20:42. The discovery job's compute is starting (its cluster "
-                 + "stops after an hour unused), which can take a few minutes");
+test("a wait is one plain line, with its elapsed time only once it runs long", () => {
+  assert.equal(waitLine("Testing the connection", ASKED, ASKED), "Testing the connection");
+  assert.equal(waitLine("Reading tables", ASKED, new Date(2026, 9, 29, 20, 43, 5)), "Reading tables");
+  assert.equal(waitLine("Reading tables", ASKED, new Date(2026, 9, 29, 20, 43, 6)), "Reading tables · 20 s");
+  assert.equal(waitLine("Reading tables", ASKED, LATER), "Reading tables · 2 min 44 s");
+  assert.equal(longWait(ASKED, ASKED), null);
+});
+
+test("no wait line names a warehouse, a job or a queue", () => {
+  for (const line of [waitLine("Testing the connection", ASKED, LATER), waitLine("Reading tables", ASKED, LATER)]) {
+    assert.doesNotMatch(line, /warehouse|job|queue|compute|so far|since/i);
   }
-  const reading = { state: "RUNNING", since: RUNNING_FROM };
-  assert.equal(discoveryWait(reading, ASKED, "Reading the server's databases", new Date(2026, 9, 29, 20, 45, 47)),
-               "Reading the server's databases: 16 s so far, since 20:45");
-  assert.equal(discoveryWait({ state: "TERMINATING", since: RUNNING_FROM }, ASKED, "Reading", RUNNING_FROM),
-               "Reading: 0 s so far, since 20:45");
-});
-
-test("the time a state began is kept while the state holds, and moves when it changes", () => {
-  const first = waitingSince(null, "PENDING", ASKED);
-  assert.deepEqual(first, { state: "PENDING", since: ASKED });
-  assert.equal(waitingSince(first, "PENDING", RUNNING_FROM), first);
-  assert.equal(waitingSince(first, "QUEUED", RUNNING_FROM), first, "queued and pending are one wait for compute");
-  assert.deepEqual(waitingSince(first, "RUNNING", RUNNING_FROM), { state: "RUNNING", since: RUNNING_FROM });
-});
-
-test("times before ten in the morning keep their leading zero, and an hour reads as minutes", () => {
-  const at = new Date(2026, 9, 29, 9, 5);
-  assert.equal(discoveryWait({ state: "RUNNING", since: at }, at, "Reading", new Date(2026, 9, 29, 10, 6, 3)),
-               "Reading: 61 min 3 s so far, since 09:05");
 });
 
 test("Next on the connection step runs the test itself: off until a connection is chosen, and while the test runs", () => {
   assert.equal(connectionNextBlock(false, false, null), "Choose a connection first");
   // Chosen and not tested yet, or after a failed test: Next is on, and pressing it tests.
   assert.equal(connectionNextBlock(true, false, null), undefined);
-  assert.equal(connectionNextBlock(true, false, "Waiting for compute: 5 s so far, since 20:42"),
-               "Testing the connection: Waiting for compute: 5 s so far, since 20:42");
-  // Said once, beside Next, in full: nothing else in the dialog repeats it.
-  assert.equal(connectionNextBlock(true, false, discoveryWait({ state: "PENDING", since: ASKED }, ASKED, "Reading", LATER)),
-               "Testing the connection: Waiting for compute: 2 min 44 s so far, since 20:42. "
-               + "The discovery job's compute is starting (its cluster stops after an hour unused), which can take a few minutes");
+  assert.equal(connectionNextBlock(true, false, waitLine("Testing the connection", ASKED, LATER)), "Testing the connection · 2 min 44 s");
   assert.equal(connectionNextBlock(true, true, null), undefined);
   assert.equal(connectionNextLabel(false), "Next: choose tables");
   assert.equal(connectionNextLabel(true), "Testing the connection…");
@@ -428,38 +404,16 @@ test("a failed test with no code, such as the app refusing the request, says so 
   assert.equal(connectionFailure("x", { error_class: "SOMETHING_NEW" }).hint, plain.hint);
 });
 
-test("a statement on the SQL warehouse says whether the warehouse is starting or busy, then what it reads", () => {
-  assert.equal(warehouseRunState({ state: "PENDING", warehouse: "STARTING" }), "WAREHOUSE_STARTING");
-  assert.equal(warehouseRunState({ state: "PENDING", warehouse: "STOPPED" }), "WAREHOUSE_STARTING");
-  assert.equal(warehouseRunState({ state: "PENDING", warehouse: "RUNNING" }), "WAREHOUSE_QUEUED");
-  assert.equal(warehouseRunState({ state: "RUNNING", warehouse: "RUNNING" }), "RUNNING");
-  assert.equal(discoveryWait({ state: "WAREHOUSE_STARTING", since: ASKED }, ASKED, "Reading the server's databases", LATER),
-               "The SQL warehouse is starting: 2 min 44 s so far, since 20:42. It usually takes a few seconds");
-  // Pending on a running warehouse is normal for a moment, and proves no queue: it just says what it reads.
-  assert.equal(discoveryWait({ state: "WAREHOUSE_QUEUED", since: ASKED }, ASKED, "Reading the server's databases", LATER),
-               "Reading the server's databases: 2 min 44 s so far, since 20:42");
-  assert.equal(connectionNextBlock(true, false, discoveryWait({ state: "WAREHOUSE_STARTING", since: ASKED }, ASKED, "Reading", LATER)),
-               "Testing the connection: The SQL warehouse is starting: 2 min 44 s so far, since 20:42. "
-               + "It usually takes a few seconds");
+test("a read of the chosen databases' tables counts the databases ended, for its progress bar", () => {
+  assert.deepEqual(readsDone({ databases: 100, done: 10, failed: 2, tables: 3400 }), { done: 12, total: 100 });
+  assert.deepEqual(readsDone({ databases: 1, done: 0 }), { done: 0, total: 1 });
 });
 
-test("reading tables through the warehouse waits for it to start, then counts the databases read", () => {
-  assert.equal(warehouseReadsState({ warehouse: "STARTING", done: 0, failed: 0 }), "WAREHOUSE_STARTING");
-  assert.equal(warehouseReadsState({ warehouse: "STOPPED" }), "WAREHOUSE_STARTING");
-  assert.equal(warehouseReadsState({ warehouse: "STARTING", done: 1 }), "RUNNING");
-  assert.equal(warehouseReadsState({ warehouse: "RUNNING" }), "RUNNING");
-  assert.equal(readsProgress("Reading", { databases: 100, done: 10, failed: 2, tables: 3400 }),
-               "Reading (12 of 100 databases read, 3,400 tables)");
-  assert.equal(readsProgress("Reading", { databases: 1, done: 0 }), "Reading (0 of 1 database read, 0 tables)");
-});
-
-test("a draft still being read says how far, and that Create waits for the rest", async () => {
-  const { draftReadingNote } = await import("../../src/frontend/src/pending.ts");
-  const note = draftReadingNote({ databases: 100, pending: 60, done: 38, failed: 2, tables: 38200 });
-  assert.match(note, /^Reading the chosen databases' tables: 40 of 100 databases read, 38,200 tables so far\./);
-  assert.match(note, /Create waits for the rest/);
-  assert.equal(draftReadingNote({ databases: 1, pending: 0, done: 1 }), null);
-  assert.equal(draftReadingNote(null), null);
+test("a draft still being read has a progress bar, none once all are read", async () => {
+  const { draftReadProgress } = await import("../../src/frontend/src/pending.ts");
+  assert.deepEqual(draftReadProgress({ databases: 100, pending: 60, done: 38, failed: 2, tables: 38200 }), { done: 40, total: 100 });
+  assert.equal(draftReadProgress({ databases: 1, pending: 0, done: 1 }), null);
+  assert.equal(draftReadProgress(null), null);
 });
 
 test("a draft with databases that couldn't be read, or discarded, holds Create back by name", async () => {

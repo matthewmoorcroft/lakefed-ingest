@@ -29,5 +29,6 @@ def test_leaving_or_choosing_again_discards_the_drafts_unless_a_create_took_them
 
 def test_new_job_keeps_the_read_going_and_says_how_far_it_is():
     assert "query.state.data?.reading?.pending ? 2000" in NEW_JOB
-    assert "draftReadingNote(reading)" in NEW_JOB and "draftCreateBlock(reading)" in NEW_JOB
+    assert "draftReadProgress(reading)" in NEW_JOB and "draftCreateBlock(reading)" in NEW_JOB
+    assert '<Busy label="Reading tables" {...readProgress} />' in NEW_JOB
     assert 'progress?.stage === "reading"' in TASKS

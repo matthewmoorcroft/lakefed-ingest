@@ -3,7 +3,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate, useParams } from "react-router-dom";
 import { api, qs, type Row } from "../api";
 import { Crumbs, ConfirmButton, ErrorBox, Info, Menu, Notice, PageHead, Pager, Section, StateBar, fmtInt, plural, useConfirm, Twisty,
-         Chevron, OutLink, Required } from "../components";
+         Busy, Chevron, OutLink, Required, StatusLine, toast } from "../components";
 import { usePermissions } from "../permissions";
 import { CADENCES, IdentityFields, ParameterFields, RunFields, WritesFields } from "./jobForm";
 import { ImportCsvDialog } from "./NewJob";
@@ -198,7 +198,10 @@ function AddDatabases({ jobId, servers }: { jobId: string; servers: string[] }) 
   // One request id per checked request: applying it again (a retry after a timeout) finds the same task.
   const apply = useMutation({
     mutationFn: async () => finished(await api.post<Row>(`/ingestion-jobs/${jobId}/databases`, checked!), setTask),
-    onSuccess: (r) => { setPreview(r.summary); qc.invalidateQueries({ queryKey: ["job-tree", jobId] }); },
+    onSuccess: (r) => {
+      setPreview(r.summary); qc.invalidateQueries({ queryKey: ["job-tree", jobId] });
+      toast(`Added ${fmtInt(r.summary.new_tables)} ${plural(r.summary.new_tables, "table")}`);
+    },
   });
   const note = requestWriteNotice("Adding databases", { pending: apply.isPending && !task, error: apply.error });
   return (
@@ -215,11 +218,11 @@ function AddDatabases({ jobId, servers }: { jobId: string; servers: string[] }) 
         {preview && checked && !preview.applied && <ConfirmButton label={`Add ${fmtInt(preview.new_tables)} ${plural(preview.new_tables, "table")}`}
           disabled={!preview.new_tables && !preview.enable && !preview.disable} onConfirm={() => apply.mutate()} />}
       </div>
-      {preview && <Notice tone={preview.applied ? "ok" : "info"}>
-        {preview.applied ? "Added: " : "Would add: "}{fmtInt(preview.new_tables)} {plural(preview.new_tables, "table")} from {fmtInt(preview.databases)} {plural(preview.databases, "database")}
+      {preview && !preview.applied && <Notice>
+        {"Would add: "}{fmtInt(preview.new_tables)} {plural(preview.new_tables, "table")} from {fmtInt(preview.databases)} {plural(preview.databases, "database")}
         {preview.skipped ? `, ${fmtInt(preview.skipped)} skipped (target taken)` : ""}; enable {fmtInt(preview.enable)}, disable {fmtInt(preview.disable)}
         {preview.new_groups?.length ? `; new groups ${preview.new_groups.join(", ")}` : ""}.</Notice>}
-      {note && <Notice tone={note.tone}>{note.text}</Notice>}
+      <StatusLine line={note} />
       {apply.isPending && <TaskProgress task={task} />}
       {!apply.isPending && resumableWrite(apply.error) && <TaskProgress task={task} onResume={() => apply.mutate()} />}
       <ErrorBox error={check.error || (isUnconfirmed(apply.error) || resumableWrite(apply.error) ? null : apply.error)} />
@@ -277,7 +280,8 @@ function useAddTables(jobId: string) {
           <p>Their first loads run at the job's next run.</p></> });
       return ok ? write(body) : null;
     },
-    onSuccess: (r) => { if (r) { setFound(r.summary); qc.invalidateQueries({ queryKey: ["job-tree", jobId] });
+    onSuccess: (r) => { if (r) { setFound(r.summary); toast(`Added ${fmtInt(r.summary.tables)} ${plural(r.summary.tables, "table")}`);
+      qc.invalidateQueries({ queryKey: ["job-tree", jobId] });
       qc.invalidateQueries({ queryKey: ["job-settings", jobId] }); qc.invalidateQueries({ queryKey: ["schedules"] }); } },
   });
   // Pending only while the write itself is sent: the checks and the confirm before it show their own state.
@@ -288,16 +292,15 @@ function useAddTables(jobId: string) {
     {confirm.dialog}
   </>;
   const result = <>
-    {note && <Notice tone={note.tone}>{note.text}</Notice>}
-    {discoveringDatabases !== null && <Notice>Discovering the tables of {fmtInt(discoveringDatabases)} {plural(discoveringDatabases, "database")}
-      by name through the connection, before the tables can be counted.</Notice>}
+    <StatusLine line={note} />
+    {discoveringDatabases !== null && <Busy label="Reading tables" />}
     {add.isPending && <TaskProgress task={task} />}
     {!add.isPending && resumableWrite(add.error)
       ? <TaskProgress task={task} onResume={() => add.mutate({ resume: sent as Row })} />
       : <ErrorBox error={isUnconfirmed(add.error) ? null : add.error} />}
     {found && found.invalid.length > 0 && <Notice tone="bad">Nothing was added: {fmtInt(found.invalid.length)} {plural(found.invalid.length, "line")} can't be
       added.<ul>{found.invalid.slice(0, 20).map((l: Row) => <li key={l.line}>line {l.line}, {l.table}: {l.errors.join("; ")}</li>)}</ul></Notice>}
-    {add.data && <Notice tone="ok">Added {fmtInt(add.data.summary.tables)} {plural(add.data.summary.tables, "table")}.</Notice>}
+
   </>;
   return { open: () => setOpen(true), discover: () => setDiscovering(true), dialog, result };
 }
@@ -486,7 +489,7 @@ export default function JobEdit() {
       {confirm.dialog}
       {locked && <Notice tone="info">You can see this job's settings but not change them: {locked}.</Notice>}
       <ErrorBox error={settings.error || (isUnconfirmed(save.error) ? null : save.error)} />
-      {saveLine && <Notice tone={saveLine.tone}>{saveLine.text}</Notice>}
+      <StatusLine line={saveLine} />
 
       {schedule && <Section title="Name">
         <div className="form-grid"><label><span>Job name<Required /></span><input value={name} onChange={(e) => setName(e.target.value)} /></label></div>
@@ -620,19 +623,18 @@ function Groups({ jobId, locked, saved }: { jobId: string; locked: Locked; saved
   const qc = useQueryClient();
   const [preview, setPreview] = useState<Row | null>(null);
   const [error, setError] = useState<unknown>(null);
-  const [done, setDone] = useState<string | null>(null);
   const [size, setSize] = useState<number | null>(null);
   const ask = (dry_run: boolean) => api.post<Row>(`/ingestion-jobs/${jobId}/groups`,
     { ...(size ? { tables_per_group: size } : {}), dry_run, ...(dry_run ? {} : { request_id: newRequestId() }) });
   const look = async () => {
-    setError(null); setDone(null);
+    setError(null);
     try { setPreview(await ask(true)); } catch (e) { setError(e); }
   };
   const change = async () => {
     setError(null);
     try {
       await ask(false);
-      setDone("The groups are changed; the job's Databricks jobs are synced.");
+      toast("Groups changed");
       setPreview(null);
       await qc.invalidateQueries();
     } catch (e) { setError(e); }
@@ -648,7 +650,6 @@ function Groups({ jobId, locked, saved }: { jobId: string; locked: Locked; saved
       </div>
       <button className="ghost" onClick={look} disabled={!!locked} title={locked ?? undefined}>Preview the groups</button>
       <ErrorBox error={error} />
-      {done && <Notice tone="ok">{done}</Notice>}
       {summary && (
         <>
           <table className="data dense">

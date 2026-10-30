@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { useMutation, useQuery } from "@tanstack/react-query";
 import { api, type Row } from "../api";
-import { ConfirmButton, ErrorBox, Notice, OutLink, Section } from "../components";
+import { Busy, ConfirmButton, ErrorBox, Notice, OutLink, Section, ToastOn } from "../components";
 import { usePermissions } from "../permissions";
 import { useSettings } from "../App";
 import { setupRunBlocks, setupRunNotice, type SetupRunOutcome } from "../pending";
@@ -46,7 +46,9 @@ export default function SchemaSetup() {
         title="Run the setup job?" message="It creates or migrates the state database's schema. It is safe to run again."
         confirmLabel="Run setup job" onConfirm={() => runSetup.mutateAsync()} />
       {refusals?.setup && <p className="muted small">Run setup job: {refusals.setup}.</p>}
-      {setupNote && <Notice tone={setupNote.tone}>{setupNote.text}{setupOutcome?.url && <> <OutLink href={setupOutcome.url}>View run</OutLink></>}</Notice>}
+      <ToastOn text={setupNote?.tone === "ok" ? setupNote.text : null} />
+      {setupNote && setupNote.tone !== "ok" && (setupNote.tone === "info" ? <Busy label={setupNote.text} />
+        : <Notice tone={setupNote.tone}>{setupNote.text}{setupOutcome?.url && <> <OutLink href={setupOutcome.url}>Open in Databricks</OutLink></>}</Notice>)}
       <ErrorBox error={setupRun.error} />
     </Section>
   );

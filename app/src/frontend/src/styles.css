@@ -421,3 +421,22 @@ ol.run-steps h3 { display: flex; align-items: center; gap: var(--db-space-2); ma
 .twisty:disabled { cursor: not-allowed; color: var(--muted); }
 .twisty:disabled .chevron { opacity: .35; }
 .twisty:disabled:hover { background: transparent; }
+
+/* Something running: one line with a spinner, the elapsed time once it runs long, and a thin bar when its share is known. */
+.busy { display: flex; align-items: center; gap: var(--db-space-2); margin: var(--db-space-2) 0; color: var(--text); }
+.spinner { width: 14px; height: 14px; flex: none; border-radius: 50%; border: 2px solid var(--border, #d1d9e1);
+  border-top-color: var(--accent); animation: spin .8s linear infinite; display: inline-block; vertical-align: middle; }
+@keyframes spin { to { transform: rotate(360deg); } }
+.busy-progress { width: 120px; height: 4px; }
+
+/* Toasts, as Databricks confirms an action: dark, at the foot of the page, fading on their own. */
+.toasts { position: fixed; bottom: var(--db-space-4); left: 50%; transform: translateX(-50%); z-index: 1000;
+  display: flex; flex-direction: column; gap: var(--db-space-2); pointer-events: none; }
+.toast { background: #1f272d; color: #fff; padding: 8px 16px; border-radius: 6px; box-shadow: 0 4px 12px rgba(0, 0, 0, .2);
+  animation: toast-fade 4s ease forwards; }
+@keyframes toast-fade { 0% { opacity: 0; } 8% { opacity: 1; } 85% { opacity: 1; } 100% { opacity: 0; } }
+
+/* A row's last cell with its count and, at the far right, an icon action (New job's Remove the tables). */
+.row-end { display: inline-flex; align-items: center; gap: var(--db-space-2); justify-content: flex-end; width: 100%; }
+button.icon.remove { padding: 0 6px; min-height: 0; line-height: 1.2; font-size: 16px; color: var(--muted); }
+button.icon.remove:hover { color: var(--text); }

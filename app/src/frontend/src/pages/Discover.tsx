@@ -1,12 +1,11 @@
 import { Fragment, useEffect, useRef, useState } from "react";
 import { keepPreviousData, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, qs, type Row } from "../api";
-import { ErrorBox, Info, Modal, Notice, OutLink, Pager, Tag, Tip, fmtInt, plural, Twisty } from "../components";
+import { Busy, ErrorBox, Info, Modal, Notice, OutLink, Pager, Spinner, Tag, Tip, fmtInt, plural, Twisty, useNow } from "../components";
 import { useSettings } from "../App";
 import { DatabaseTables } from "./SourcePick";
 import { accessOf, countsText, likeContaining, readable, selectionCounts, serverRowPick, underFilter, type Pick, type ServerCount } from "./pickState";
-import { connectionFailure, connectionNextBlock, connectionNextLabel, discoveryWait, readsProgress, warehouseReadsState, warehouseRunState, waitingSince,
-         type ErrorCodes, type RunWait } from "../pending";
+import { connectionFailure, connectionNextBlock, connectionNextLabel, readsDone, waitLine, type ErrorCodes } from "../pending";
 
 // Add tables, Discover on a source: as Lakeflow Connect's Connection and Source steps. Step 1 is the Unity Catalog
 // connection, tested by Next before anything is discovered; step 2 picks the whole server, whole databases or single tables in
@@ -18,20 +17,8 @@ export type { Pick };
 const RUNNING = new Set(["PENDING", "QUEUED", "RUNNING", "TERMINATING", "BLOCKED", "WAITING_FOR_RETRY"]);
 const wait = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
-/** A discovery run the dialog waits on: its state as last read, when the page started it, and what it does once going. */
-type DialogWait = { wait: RunWait | null; asked: Date; reading: string };
-
-/** Now, read again every second while `on`, so a wait's time so far keeps counting on the page. */
-function useNow(on: boolean): Date {
-  const [now, setNow] = useState(() => new Date());
-  useEffect(() => {
-    if (!on) return;
-    setNow(new Date());
-    const timer = setInterval(() => setNow(new Date()), 1000);
-    return () => clearInterval(timer);
-  }, [on]);
-  return now;
-}
+/** What the dialog waits on, in one plain line: what it does, since when, and how far when that is known. */
+type DialogWait = { asked: Date; reading: string; done?: number; total?: number };
 
 /** A discovery that failed, with the codes its error names (source_catalog.error_codes) when the backend read any. */
 class SourceError extends Error {
@@ -48,13 +35,10 @@ const azureOf = (credential: string, resource: string): Row => credential.trim()
  *  many databases it left out because the login can't open them. */
 type Discovered = { id: string; via: string; leftOut: number };
 
-/** Start a discovery through the connection and wait for it to end; its id, or the reason it failed. onWait hears
- *  each change of its state with when the page first saw it, so the page can say what it waits for; onProgress hears
+/** Start a discovery through the connection and wait for it to end; its id, or the reason it failed. onProgress hears
  *  each step of a read through the warehouse (its databases read so far). */
-async function discover(connection: string, request: Row, onWait?: (wait: RunWait) => void,
-                        onProgress?: (answer: Row) => void): Promise<Discovered> {
+async function discover(connection: string, request: Row, onProgress?: (answer: Row) => void): Promise<Discovered> {
   const started = await api.post<Row>("/discoveries/source", { src_connection: connection, ...request });
-  let waiting: RunWait | null = null;
   if (started.via === "warehouse") {
     // Through the SQL warehouse: a listing is one statement, asked about until it ends; a read is a step at a time
     // (each database one statement), asked for until none is left.
@@ -64,8 +48,6 @@ async function discover(connection: string, request: Row, onWait?: (wait: RunWai
       if (answer.state === "SUCCEEDED") return { id, via: "warehouse", leftOut: Number(started.left_out ?? 0) };
       if (answer.state === "FAILED" || answer.error) throw new SourceError(String(answer.error ?? "the listing failed").split("\n")[0], answer.codes);
       const listing = answer.statement_id != null;
-      const next = waitingSince(waiting, listing ? warehouseRunState(answer) : warehouseReadsState(answer), new Date());
-      if (next !== waiting) { waiting = next; onWait?.(next); }
       if (!listing) onProgress?.(answer);
       await wait(1000);
       answer = listing
@@ -75,13 +57,11 @@ async function discover(connection: string, request: Row, onWait?: (wait: RunWai
   }
   for (;;) {
     const run = await api.get<Row>(`/discoveries/runs/${started.run_id}`);
-    const next = waitingSince(waiting, String(run.state ?? ""), new Date());
-    if (next !== waiting) { waiting = next; onWait?.(next); }
     if (!RUNNING.has(run.state)) {
       if (run.result && run.result !== "SUCCESS") {
         const rows = await api.get<Row[]>(`/discoveries/${started.discovery_id}/databases`);
         const failed = rows.find((r) => r.status === "failed");
-        throw new SourceError(failed?.error ? String(failed.error).split("\n")[0] : run.message || `the discovery run ended ${run.result}`,
+        throw new SourceError(failed?.error ? String(failed.error).split("\n")[0] : run.message || `the discovery ended ${run.result}`,
                               failed?.codes);
       }
       return { id: String(started.discovery_id), via: "job", leftOut: 0 };
@@ -92,9 +72,9 @@ async function discover(connection: string, request: Row, onWait?: (wait: RunWai
 
 /** Read the tables of some databases into Lakebase: the discovery's id, and each database that couldn't be read with
  *  the first line of why. A database the login can name but not open fails on its own; the others are still read. */
-async function readTables(connection: string, request: Row, onWait?: (wait: RunWait) => void, onProgress?: (answer: Row) => void):
+async function readTables(connection: string, request: Row, onProgress?: (answer: Row) => void):
     Promise<{ id: string; failed: [string, string][]; leftOut: number }> {
-  const { id, leftOut } = await discover(connection, request, onWait, onProgress);
+  const { id, leftOut } = await discover(connection, request, onProgress);
   const rows = await api.get<Row[]>(`/discoveries/${id}/databases`);
   return { id, leftOut,
            failed: rows.filter((r) => r.status === "failed").map((r) => [r.src_database, String(r.error ?? "").split("\n")[0]]) };
@@ -242,10 +222,10 @@ function Step1({ chosen, setChosen, tested, setTested, testing, error, setError,
           <details className="advanced">
             <summary><b>Azure SQL</b> <span className="muted">list the databases through Azure instead of master
               {azure.azure_credential ? <>: on, with {azure.azure_credential}</> : ", for a login that can't open master"}</span></summary>
-            <p className="muted">Azure SQL Database and Managed Instance only. <Info>The discovery job asks Azure for the
-              server's databases with a Unity Catalog service credential (Catalog Explorer, External data, Credentials) whose
-              managed identity has Reader on the server, then reads each database through the connection. Whoever runs the
-              discovery job needs ACCESS on the credential.</Info></p>
+            <p className="muted">Azure SQL Database and Managed Instance only. <Info>The server's databases are listed through
+              Azure with a Unity Catalog service credential (Catalog Explorer, External data, Credentials) whose managed identity
+              has Reader on the server, then each database is read through the connection. Whoever adds the tables needs ACCESS
+              on the credential.</Info></p>
             <div className="toolbar">
               <label className="inline">Service credential<input className="search" placeholder="e.g. sql_reader" value={azureCredential}
                 disabled={testing} onChange={(e) => { setAzureCredential(e.target.value); setTested(null); setError(null); }} /></label>
@@ -413,14 +393,12 @@ function Step2({ connection, discoveryId, checksOn, typedNames, picks, setPicks,
   });
   return (
     <>
-      <p className="muted">Tick the whole server, whole databases, or open a database for its tables.{" "}
-        <Info>{checksOn ? "Each database is checked through the SQL warehouse: one the connection's login can't open is greyed"
-          + " out, and hovering on it says why." : "Reading a database's catalog takes a few minutes when the discovery cluster"
-          + " starts cold."}</Info></p>
-      <p className="pick-counts"><b>{countsText(counts, total)}</b>
+      <p className="muted">Tick the whole server, whole databases, or open a database for its tables.
+        {checksOn && <>{" "}<Info>A database the connection's login can't open is greyed out; hover on it for why.</Info></>}</p>
+      <p className="pick-counts"><b>{countsText(counts, total)}</b>{counts.counting && <> <Spinner label="Counting tables" /></>}
         {counts.leftOut > 0 && <span className="muted"> · the whole server leaves out {fmtInt(counts.leftOut)} {plural(counts.leftOut, "database")} the
           login can't open</span>}
-        {checking && <span className="muted"> · checking which databases the login can open</span>}</p>
+        {checking && <> <Spinner label="Checking access" /></>}</p>
       <div className="toolbar"><input className="search" placeholder="Filter databases, e.g. eng_0" value={filter}
         onChange={(e) => { setFilter(e.target.value); setOffset(0); }} />
         <button className="ghost" onClick={() => setAll(shown.filter((d) => !covered(d) && !closed(d)), "all")}>Select all shown</button></div>
@@ -493,7 +471,7 @@ export function DiscoverDialog({ onClose, drafts = false }: { onClose: (pick: Di
   // What a discovery run the dialog waits on is doing, and since when: the connection test, or the reading on Add.
   const [waiting, setWaiting] = useState<DialogWait | null>(null);
   const now = useNow(waiting !== null);
-  const waitText = waiting ? discoveryWait(waiting.wait, waiting.asked, waiting.reading, now) : null;
+  const waitText = waiting ? waitLine(waiting.reading, waiting.asked, now) : null;
   const discoveryId: string | null = tested?.discovery_id ?? null;
   const throughWarehouse = tested?.via === "warehouse";
   const [counts, setCounts] = useState<Counts | null>(null);
@@ -505,10 +483,9 @@ export function DiscoverDialog({ onClose, drafts = false }: { onClose: (pick: Di
     const azure = azureOf(azureCredential, azureResource);
     setTesting(true); setTestError(null);
     const asked = new Date();
-    const reading = "Reading the server's databases";
-    setWaiting({ wait: null, asked, reading });
+    setWaiting({ asked, reading: "Testing the connection" });
     try {
-      const { id, via } = await discover(connection, { kind: "list", ...azure }, (wait) => setWaiting({ wait, asked, reading }));
+      const { id, via } = await discover(connection, { kind: "list", ...azure });
       const rows = await api.get<Row[]>(`/discoveries/${id}/databases`);
       setTested({ discovery_id: id, via, databases: rows.filter((r) => r.status === "listed").map((r) => r.src_database), azure });
       setStep(2);
@@ -591,10 +568,8 @@ export function DiscoverDialog({ onClose, drafts = false }: { onClose: (pick: Di
     }
     setStep(3); setError(null);
     const asked = new Date();
-    const reading = "Reading the chosen databases' tables";
-    const onWait = (wait: RunWait) => setWaiting((now) => ({ wait, asked, reading: now?.reading ?? reading }));
-    const onProgress = (answer: Row) => setWaiting((now) => now && { ...now, reading: readsProgress(reading, answer) });
-    setWaiting({ wait: null, asked, reading });
+    const onProgress = (answer: Row) => setWaiting((now) => now && { ...now, ...readsDone(answer) });
+    setWaiting({ asked, reading: "Reading tables" });
     try {
       let readServer = serverRead;
       if (wholeServer.on && !readServer) {
@@ -603,7 +578,7 @@ export function DiscoverDialog({ onClose, drafts = false }: { onClose: (pick: Di
         const pattern = likeContaining(wholeServer.filter);
         const request = throughWarehouse ? { whole_server: true, listing_id: discoveryId, filter: wholeServer.filter }
           : { whole_server: true, ...(pattern ? { pattern } : {}), ...(tested?.azure ?? {}) };
-        const got = await readTables(connection, request, onWait, onProgress);
+        const got = await readTables(connection, request, onProgress);
         if (got.failed.length) { setFailed(() => got.failed); setStep(2); return; }
         readServer = got.id; setServerRead(got.id);
       }
@@ -611,7 +586,7 @@ export function DiscoverDialog({ onClose, drafts = false }: { onClose: (pick: Di
       const ids = new Set([...(readServer ? [readServer] : []), ...Object.values(read)]);
       if (unread.length) {
         // Databases typed by hand are read by name.
-        const got = await readTables(connection, { databases: unread }, onWait, onProgress);
+        const got = await readTables(connection, { databases: unread }, onProgress);
         ids.add(got.id);
         if (got.failed.length) {
           // Keep what was read, and say which databases weren't, before anything is added.
@@ -629,7 +604,7 @@ export function DiscoverDialog({ onClose, drafts = false }: { onClose: (pick: Di
   };
   const title = step === 1 ? "Add tables · Step 1 of 2: the connection" : `Add tables · Step 2 of 2: choose on ${connection}`;
   const blocked = step === 1 ? connectionNextBlock(Boolean(connection), Boolean(tested), testing ? waitText ?? "starting" : null)
-    : step === 3 ? waitText ?? "Reading the chosen databases' tables" : chosen ? undefined : "Choose the server, databases or tables first";
+    : step === 3 ? waitText ?? "Reading tables" : chosen ? undefined : "Choose the server, databases or tables first";
   return (
     <Modal title={title} action={step === 1 ? connectionNextLabel(testing) : step === 3 ? "Reading…" : "Add the tables chosen"}
       actionDisabled={blocked} actionNote={step === 1 && testError != null ? testFailedNote(testError) : undefined} onClose={(ok) => {
@@ -644,10 +619,9 @@ export function DiscoverDialog({ onClose, drafts = false }: { onClose: (pick: Di
         {step >= 2 && <Step2 connection={connection} discoveryId={discoveryId} checksOn={throughWarehouse} typedNames={typedNames}
           picks={picks} setPicks={setPicks} wholeServer={wholeServer} setWholeServer={setWholeServer} read={read} setRead={setRead}
           failed={failed} setFailed={setFailed} onCounts={setCounts} />}
-        {step === 3 && <p className="muted">The tables are added to the job's page when the reading ends.</p>}
+        {waiting && <Busy label={waiting.reading} since={waiting.asked} done={waiting.done} total={waiting.total} />}
         {step === 2 && chosen > 0 && <p className="muted">{chosenWords} chosen. {countsLine}.</p>}
-        {step === 2 && drafting && draftProgress.databases > 0 && <p className="muted">
-          {readsProgress("Reading their tables now", draftProgress)}{draftProgress.pending ? ": Add doesn't wait for it, Create does" : ""}.</p>}
+        {step === 2 && drafting && draftProgress.pending > 0 && <Busy label="Reading tables" {...readsDone(draftProgress)} />}
         <ErrorBox error={error} />
       </div>
     </Modal>

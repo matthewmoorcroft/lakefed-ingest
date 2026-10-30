@@ -1,15 +1,16 @@
-import { useEffect, useRef, useState } from "react";
+import { Fragment, useEffect, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "react-router-dom";
 import { api, type Row } from "../api";
-import { Crumbs, ErrorBox, Info, Menu, Modal, Notice, PageHead, Section, fmtInt, plural, useConfirm, Chevron } from "../components";
+import { Busy, StatusLine, Crumbs, ErrorBox, Info, Menu, Modal, Notice, PageHead, Section, Twisty, fmtInt, plural, useConfirm, Chevron } from "../components";
 import { CADENCES, IdentityFields, ParameterFields, RunFields, WritesFields } from "./jobForm";
 import { DiscoverDialog, discardDrafts } from "./Discover";
 import { serverRowCells, targetBlock } from "./previewRows";
 import { ClusterFields, TablesPerGroup, ownCluster } from "./JobEdit";
 import { SourcePick, nothingPicked, pickedAny, pickedText, type Picked } from "./SourcePick";
 import { TaskProgress, finished, newRequestId, resumableWrite } from "./tasks";
-import { draftCreateBlock, draftReadingNote, isUnconfirmed, requestWriteNotice } from "../pending";
+import { draftCreateBlock, draftReadProgress, isUnconfirmed, requestWriteNotice } from "../pending";
+import { ChosenDatabases } from "./ChosenTree";
 import { defaultJobName, nameTaken } from "../jobName";
 
 // New ingestion job: the Edit view, empty, with Create in place of Save. Its tables are added in What it ingests
@@ -19,6 +20,8 @@ import { defaultJobName, nameTaken } from "../jobName";
 // and Create name it, and the server reads the tables from Lakebase. A large Create is written by a background task,
 // whose progress the page shows before it opens the job.
 
+// Removing at least this many chosen tables asks first.
+export const REMOVE_CONFIRM_TABLES = 100;
 const LOAD_TYPES: [string, string][] = [["ct", "Change tracking"], ["cursor", "Cursor column"], ["full", "Full reload"]];
 const CSV_EXAMPLE = "src_database,src_schema,src_table,select_list,primary_key\nsales_01,dbo,orders,\"id, amount\",id";
 // One line per table, and one per database: every table of a database line is found by name when the job is created.
@@ -124,18 +127,26 @@ export default function NewJob() {
   const summary: Row | undefined = preview.data?.summary;
   const discoveringDatabases: number | null = preview.data?.discovering ? Number(preview.data.databases) : null;
   const reading = preview.data?.reading ?? null;
-  const readingNote = draftReadingNote(reading);
+  const readProgress = draftReadProgress(reading);
+  const [openServer, setOpenServer] = useState<string | null>(null);
   // A default name another job's groups already use (made the same second) is made again; a typed one is said taken.
   const taken = nameTaken(summary?.invalid);
   useEffect(() => {
     if (taken && name === defaultName) { const next = defaultJobName(); setDefaultName(next); setName(next); }
   }, [taken, name, defaultName]);
   const blocked = !name.trim() ? "Name the job first" : !chosen ? "Add its tables first"
-    : discoveringDatabases !== null ? `Discovering the tables of ${fmtInt(discoveringDatabases)} ${plural(discoveringDatabases, "database")}`
+    : discoveringDatabases !== null ? "Reading tables"
     : (preview.isFetching && preview.data === undefined) || settled !== current ? "Checking the tables"
     : preview.error ? "Fix what the check found first" : draftCreateBlock(reading)
     ?? (summary?.invalid?.length ? "Fix the invalid lines first" : targetBlock(w));
   const confirm = useConfirm();
+  // As Databricks asks before a bulk delete: removing many tables is confirmed, a few go at once.
+  const removeTables = () => {
+    const tables = Number(summary?.tables ?? 0);
+    if (tables < REMOVE_CONFIRM_TABLES) return setChosen(null);
+    confirm.ask({ title: `Remove ${fmtInt(tables)} ${plural(tables, "table")}?`, action: "Remove", danger: true,
+                  body: "They leave this new job. Add tables chooses them again." }).then((ok) => ok && setChosen(null));
+  };
   const cancel = () => {
     if ((!name || name === defaultName) && !chosen) return navigate("/ingestion-jobs");
     confirm.ask({ title: "Leave without creating the job?", action: "Leave", danger: true, body: "Nothing of it is saved." })
@@ -151,14 +162,14 @@ export default function NewJob() {
           {taken && name !== defaultName && <span className="title-note">Another job uses this name</span>}</span>}
         lead={summary ? <><strong>{fmtInt(summary.tables)}</strong> {plural(summary.tables, "table")} in{" "}
           <strong>{fmtInt(summary.groups.length)}</strong> {plural(summary.groups.length, "group")}.</>
-          : discoveringDatabases !== null ? `Discovering the tables of ${fmtInt(discoveringDatabases)} ${plural(discoveringDatabases, "database")}…`
+          : discoveringDatabases !== null ? "Reading tables…"
           : "No tables yet: add them in What it ingests."}
         right={<span className="card-actions">
           <button onClick={cancel}>Cancel</button>
           <button className="primary" disabled={!!blocked || create.isPending} title={blocked ?? undefined}
             onClick={() => create.mutate(body(false))}>{create.isPending ? "Creating…" : "Create"}</button></span>} />
       {confirm.dialog}
-      {note && <Notice tone={note.tone}>{note.text}</Notice>}
+      <StatusLine line={note} />
       {create.isPending && <TaskProgress task={task} />}
       {!create.isPending && resumableWrite(create.error)
         ? <TaskProgress task={task} onResume={() => create.mutate(create.variables as Row)} />
@@ -173,21 +184,25 @@ export default function NewJob() {
         {!chosen ? <p className="empty-drop">No tables yet. Add them with <b>Add tables</b>.</p> : (
           <>
             <p className="muted">From {chosen.label}.</p>
-            {readingNote && <Notice>{readingNote}</Notice>}
+            {readProgress && <Busy label="Reading tables" {...readProgress} />}
             {draftCreateBlock(reading) && <Notice tone="bad">{draftCreateBlock(reading)}:<ul>
               {(reading?.failed_databases ?? []).slice(0, 20).map(([d, why]: [string, string]) => <li key={d}><b>{d}</b>: {why}</li>)}</ul></Notice>}
             {Number(reading?.left_out) > 0 && <p className="muted">The whole server leaves out {fmtInt(reading.left_out)}{" "}
               {plural(reading.left_out, "database")} the connection's login can't open.</p>}
-            {discoveringDatabases !== null && <Notice>Discovering the tables of {fmtInt(discoveringDatabases)} {plural(discoveringDatabases, "database")}.
-              Create is ready when it ends.</Notice>}
-            <div className="table-wrap"><table className="data">
-              <thead><tr><th>Server</th><th>Read through · load type</th><th className="num">Databases · tables</th><th className="num">Groups</th></tr></thead>
+            {discoveringDatabases !== null && <Busy label="Reading tables" />}
+            <div className="table-wrap"><table className="data tree">
+              <thead><tr><th>Server › database › table</th><th>Read through · load type</th><th className="num">Databases · tables</th></tr></thead>
               <tbody>
                 {(Array.isArray(summary?.servers) ? summary.servers : []).map((s: Row) => {
                   const cells = serverRowCells(s, LOAD_TYPES);
-                  return <tr key={cells.server}><td className="name"><b>{cells.server}</b></td>
-                    <td>{cells.readThrough} · {cells.loadTypes}</td>
-                    <td className="num">{cells.counts}</td><td className="num">{cells.groups}</td></tr>;
+                  const open = openServer === cells.server;
+                  return <Fragment key={cells.server}>
+                    <tr><td className="name"><Twisty open={open} onToggle={() => setOpenServer(open ? null : cells.server)}><b>{cells.server}</b></Twisty></td>
+                      <td>{cells.readThrough} · {cells.loadTypes}</td>
+                      <td className="num"><span className="row-end">{cells.counts}
+                        <button className="ghost icon remove" aria-label="Remove the tables" title="Remove the tables" onClick={removeTables}>×</button></span></td></tr>
+                    {open && <ChosenDatabases source={chosen.source} server={cells.server} />}
+                  </Fragment>;
                 })}
               </tbody>
             </table></div>
@@ -198,8 +213,6 @@ export default function NewJob() {
               added:<ul>{summary!.invalid.slice(0, 20).map((l: Row) => <li key={l.line}>line {l.line}, {l.table}: {l.errors.join("; ")}</li>)}</ul>
               {summary!.invalid.length > 20 && <span className="muted">and {fmtInt(summary!.invalid.length - 20)} more.</span>}</Notice>}
             <ErrorBox error={preview.error} />
-            <div className="toolbar"><button className="ghost" onClick={() => setImporting(true)}>Import a file instead</button>
-              <button className="ghost" onClick={() => setChosen(null)}>Remove the tables</button></div>
           </>
         )}
       </Section>

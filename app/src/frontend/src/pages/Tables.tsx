@@ -3,7 +3,7 @@ import { useSearchParams } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { type ColDef } from "ag-grid-community";
 import { api, qs, type Row } from "../api";
-import { PageHead, Badge, ConfirmButton, ErrorBox, Grid, Info, Notice, Section, autoColumns, fmtInt, plural } from "../components";
+import { PageHead, Badge, ConfirmButton, ErrorBox, Grid, Info, Section, autoColumns, fmtInt, plural, toast } from "../components";
 import { EditBulk, EditOne } from "./EditTables";
 import { groupsRefusal, usePermissions } from "../permissions";
 
@@ -30,7 +30,6 @@ export default function Tables() {
   const [pages, setPages] = useState<string[]>([]);
   const after = pages[pages.length - 1];
   const [selected, setSelected] = useState<Row[]>([]);
-  const [message, setMessage] = useState<string | null>(null);
   const [editing, setEditing] = useState<"one" | "bulk" | null>(null);
   const qc = useQueryClient();
   // The user's unit is the ingestion job; a group is kept only as a column, and as the filter a group's page links with.
@@ -42,7 +41,7 @@ export default function Tables() {
   const act = useMutation({
     mutationFn: ({ path, body }: { path: string; body: Row }) => api.post<{ updated: number }>(path, body),
     onSuccess: (r, v) => {
-      setMessage(`${v.path.endsWith("reseed") ? "Reseed requested for" : "Updated"} ${r.updated} ${plural(r.updated, "table")}.`);
+      toast(`${v.path.endsWith("reseed") ? "Reseed requested for" : "Updated"} ${fmtInt(r.updated)} ${plural(r.updated, "table")}`);
       qc.invalidateQueries();
     },
   });
@@ -71,7 +70,6 @@ export default function Tables() {
           <button className="ghost" onClick={() => { setPages([]); setParams(collection ? { collection } : {}); }}>clear</button></span>}
       </div>
       <ErrorBox error={tables.error || act.error} />
-      {message && <Notice tone="ok">{message}</Notice>}
       <Section title={tables.data ? `Page ${pages.length + 1}: ${tables.data.tables.length} ${plural(tables.data.tables.length, "table")}` : "Tables"}
         actions={<>
           <button className="ghost" disabled={!pages.length} onClick={() => setPages(pages.slice(0, -1))}>Previous page</button>

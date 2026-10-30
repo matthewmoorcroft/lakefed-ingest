@@ -42,4 +42,4 @@ def test_running_now_lists_the_check_before_the_group_runs():
     page = (SOURCE / "pages" / "IngestionJob.tsx").read_text()
     running = re.search(r"function RunningNow\b.*?\n}\n", page, re.S).group(0)
     assert running.index("The job's run") < running.index(">1</span>Check") < running.index(">2</span>}Group runs")
-    assert "Starts when the check ends" in running
+    assert "Start when the check ends." in running

@@ -28,4 +28,4 @@ def test_the_choice_is_counted_at_the_top_on_add_and_in_the_jobs_chosen_summary(
 
 def test_the_whole_server_is_read_from_the_tests_listing_through_the_warehouse():
     assert "{ whole_server: true, listing_id: discoveryId, filter: wholeServer.filter }" in DISCOVER
-    assert "readTables(connection, request, onWait, onProgress)" in DISCOVER
+    assert "readTables(connection, request, onProgress)" in DISCOVER

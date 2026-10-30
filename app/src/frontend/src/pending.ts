@@ -73,8 +73,7 @@ export function runTimeoutNotice(runNow: RunNowState | undefined): string | null
 export function deleteNotice(deleteState: DeleteState | null | undefined): { tone: "info" | "bad"; text: string; runAgain: boolean } | null {
   if (!deleteState) return null;
   if (deleteState.state === "deleting") {
-    return { tone: "info", text: "Deleting: the job's delete job is running, and the job stays here until it has finished. "
-             + "Its runs and tables can't change meanwhile.", runAgain: false };
+    return { tone: "info", text: "Deleting", runAgain: false };
   }
   if (deleteState.state === "failed") {
     const why = deleteState.reason ? ` ${deleteState.reason}` : "";
@@ -95,7 +94,7 @@ export function isUnconfirmed(error: unknown): boolean {
  * page has nothing to say (the write is done, or it failed with its own message). */
 export function requestWriteNotice(what: string, state: { pending: boolean; error: unknown }): { tone: "info" | "warn"; text: string } | null {
   if (state.pending) {
-    return { tone: "info", text: `${what}: writing the tables, then syncing the job's Databricks jobs. It shows as done once both have finished.` };
+    return { tone: "info", text: what };
   }
   if (isUnconfirmed(state.error)) {
     return { tone: "warn", text: `${what}: not confirmed. The app did not answer in time, so the write may have finished. `
@@ -122,7 +121,7 @@ export function setupRunBlocks(outcome: SetupRunOutcome | null | undefined, star
 export function setupRunNotice(outcome: SetupRunOutcome | null | undefined, start: { starting: boolean; error: unknown }):
   { tone: "info" | "ok" | "warn" | "bad"; text: string } | null {
   if (start.starting) {
-    return { tone: "info", text: "Starting the setup job. It shows as done once Databricks reports its run ended." };
+    return { tone: "info", text: "Starting the setup job" };
   }
   if (start.error) {
     if (isUnconfirmed(start.error)) {
@@ -135,9 +134,9 @@ export function setupRunNotice(outcome: SetupRunOutcome | null | undefined, star
   if (!outcome) return null;
   switch (outcome.state) {
     case "pending":
-      return { tone: "info", text: "Setup job running. It shows as done once Databricks reports its run ended." };
+      return { tone: "info", text: "Setup job running" };
     case "succeeded":
-      return { tone: "ok", text: "Setup job succeeded." };
+      return { tone: "ok", text: "Setup job succeeded" };
     case "failed":
       return { tone: "bad", text: `Setup job failed: ${outcome.reason || "Databricks gave no reason"}.` };
     case "timeout":
@@ -171,15 +170,13 @@ export function saveNotice(state: {
       : null;
   }
   if (state.pending) {
-    return { tone: "info", text: "Saving: writing the changes and syncing the job's Databricks jobs. It shows as saved once both have finished." };
+    return { tone: "info", text: "Saving" };
   }
   if (state.applying) {
     if (state.applyTimeout) {
-      return { tone: "warn", text: `Saving: not confirmed yet. The cluster copies run has not ended: ${state.applyTimeout}. `
-               + "It is not saved until Databricks reports the run ended." };
+      return { tone: "warn", text: `Saving: not confirmed yet, the job cluster is still being applied: ${state.applyTimeout}.` };
     }
-    return { tone: "info", text: "Saving: applying the job cluster. The cluster copies job is making this job's copy; "
-             + "it shows as saved once Databricks reports that run ended." };
+    return { tone: "info", text: "Applying the job cluster" };
   }
   if (!state.done) return null;
   if (state.applyError) {
@@ -215,9 +212,9 @@ export function rediscoveryBusy(progress: RediscoveryProgress | null | undefined
 /** The job page's Run it now for a re-discovery: off while one is going, with the reason in its title. */
 export function rediscoveryButton(progress: RediscoveryProgress | null | undefined, requesting: boolean, refused?: string | null):
   { label: string; disabled: boolean; title: string | null } {
-  if (requesting) return { label: "Starting…", disabled: true, title: "Waiting for the re-discovery to start" };
-  if (progress?.state === "pending") return { label: "Running…", disabled: true, title: "Waiting for Databricks to report the discovery run ended" };
-  if (progress?.state === "adding") return { label: "Adding tables…", disabled: true, title: "Waiting for the tables to be written" };
+  if (requesting) return { label: "Starting…", disabled: true, title: "Starting the re-discovery" };
+  if (progress?.state === "pending") return { label: "Running…", disabled: true, title: "Re-discovering" };
+  if (progress?.state === "adding") return { label: "Adding tables…", disabled: true, title: "Adding tables" };
   if (progress?.state === "timeout") return { label: "Run it now", disabled: true, title: "Not confirmed yet: it stays off until the re-discovery ends" };
   return { label: "Run it now", disabled: !!refused, title: refused ?? null };
 }
@@ -225,15 +222,14 @@ export function rediscoveryButton(progress: RediscoveryProgress | null | undefin
 /** The re-discovery's line on the job page: what it is doing, or how it ended. Null when none has run. */
 export function rediscoveryNotice(progress: RediscoveryProgress | null | undefined, requesting: boolean, error: unknown):
   { tone: "info" | "ok" | "warn" | "bad"; text: string } | null {
-  if (requesting) return { tone: "info", text: "Starting the re-discovery. It shows as done once its tables are added." };
+  if (requesting) return { tone: "info", text: "Starting the re-discovery" };
   if (error) return { tone: "bad", text: `Re-discovery did not start: ${error instanceof Error ? error.message : String(error)}.` };
   if (!progress) return null;
   switch (progress.state) {
     case "pending":
-      return { tone: "info", text: `Re-discovery running: reading ${progress.server ?? "the job's servers"} for new databases and tables. `
-               + "It shows as done once Databricks reports its discovery run ended." };
+      return { tone: "info", text: `Re-discovering ${progress.server ?? "the job's servers"}` };
     case "adding":
-      return { tone: "info", text: "Re-discovery adding tables. It shows as done once the tables are written." };
+      return { tone: "info", text: "Adding tables" };
     case "timeout":
       return { tone: "warn", text: `Re-discovery not confirmed: ${progress.reason || "Databricks has not reported it ended"}. `
                + "Run it now stays off until it ends." };
@@ -245,47 +241,27 @@ export function rediscoveryNotice(progress: RediscoveryProgress | null | undefin
   }
 }
 
-/** A discovery run's state and when the page first saw it: the time a wait is said to have begun. */
-export interface RunWait { state: string; since: Date }
+/** A wait shows its elapsed time only once it has run this long, as Databricks' own progress lines do. */
+export const LONG_WAIT_S = 20;
 
-const COMPUTE_WAIT = new Set(["QUEUED", "PENDING", "BLOCKED", "WAITING_FOR_RETRY"]);
-
-/** The wait after a new reading of the run's state: the same wait (and its time) while it holds, queued and pending
- *  counting as one wait for compute, else a new one from now. */
-export function waitingSince(current: RunWait | null, state: string, now: Date): RunWait {
-  if (current && (current.state === state || (COMPUTE_WAIT.has(current.state) && COMPUTE_WAIT.has(state)))) return current;
-  return { state, since: now };
-}
-
-const clock = (at: Date) => `${String(at.getHours()).padStart(2, "0")}:${String(at.getMinutes()).padStart(2, "0")}`;
-
-function elapsed(since: Date, now: Date): string {
+/** How long a wait has run ("25 s", "1 min 5 s") once past LONG_WAIT_S; null before that. */
+export function longWait(since: Date, now: Date): string | null {
   const seconds = Math.max(0, Math.floor((now.getTime() - since.getTime()) / 1000));
+  if (seconds < LONG_WAIT_S) return null;
   return seconds < 60 ? `${seconds} s` : `${Math.floor(seconds / 60)} min ${seconds % 60} s`;
 }
 
-/** What a discovery run waits for, in plain words with how long so far and the time it began, so a button it holds
- *  off never just says no: "Waiting for compute" while Databricks queues the discovery job's run or starts its
- *  compute, then `reading` once the run is going. `asked` is when the page started the run, for before its first
- *  state: the route isn't known yet then (most go through the SQL warehouse), so it says only `reading`. A statement
- *  pending on a running warehouse is `reading` too: a moment's pending is normal and proves no queue. */
-export function discoveryWait(wait: RunWait | null, asked: Date, reading: string, now: Date = new Date()): string {
-  const since = wait?.since ?? asked;
-  const time = `${elapsed(since, now)} so far, since ${clock(since)}`;
-  if (!wait || wait.state === "WAREHOUSE_QUEUED") return `${reading}: ${time}`;
-  if (wait.state === "WAREHOUSE_STARTING") return `The SQL warehouse is starting: ${time}. It usually takes a few seconds`;
-  if (COMPUTE_WAIT.has(wait.state)) {
-    return `Waiting for compute: ${time}. The discovery job's compute is starting (its cluster stops after an hour unused), `
-           + "which can take a few minutes";
-  }
-  return `${reading}: ${time}`;
+/** A wait in one plain line: what is being done, and how long once it runs long ("Reading tables · 1 min 5 s"). */
+export function waitLine(doing: string, since: Date, now: Date = new Date()): string {
+  const long = longWait(since, now);
+  return long ? `${doing} · ${long}` : doing;
 }
 
 /** Why Next is off on the connection step, said once beside it: a connection is chosen first, and while Next tests it,
  *  what the test is doing. Nothing once a connection is chosen: Next tests it, or moves on once a test has passed. */
 export function connectionNextBlock(chosen: boolean, passed: boolean, testing: string | null): string | undefined {
   if (passed) return undefined;
-  if (testing) return `Testing the connection: ${testing}`;
+  if (testing) return testing;
   if (!chosen) return "Choose a connection first";
   return undefined;
 }
@@ -329,27 +305,9 @@ export function connectionFailure(message: string, codes?: ErrorCodes | null): C
   return { code: code || null, message, hint };
 }
 
-/** A warehouse statement's state as the wait reads it: a statement not started yet waits for the warehouse to start
- *  (it is starting or stopped) or for room on it (it is running); once running, it reads. */
-export function warehouseRunState(answer: { state?: string; warehouse?: string }): string {
-  if (answer.state === "PENDING") return answer.warehouse === "RUNNING" ? "WAREHOUSE_QUEUED" : "WAREHOUSE_STARTING";
-  return String(answer.state ?? "");
-}
-
-/** Where reading the chosen databases' tables through the warehouse stands, as the wait reads it: the warehouse is
- *  starting while nothing has ended yet and it isn't running; after that, it reads. */
-export function warehouseReadsState(answer: { warehouse?: string; done?: number; failed?: number }): string {
-  const ended = Number(answer.done ?? 0) + Number(answer.failed ?? 0);
-  return !ended && answer.warehouse && answer.warehouse !== "RUNNING" ? "WAREHOUSE_STARTING" : "RUNNING";
-}
-
-/** "Reading the chosen databases' tables (12 of 100 databases read, 3,400 tables)", for the wait to add its time to. */
-export function readsProgress(reading: string, answer: { databases?: number; done?: number; failed?: number; tables?: number }): string {
-  const ended = Number(answer.done ?? 0) + Number(answer.failed ?? 0);
-  const databases = Number(answer.databases ?? 0);
-  const tables = Number(answer.tables ?? 0);
-  return `${reading} (${ended.toLocaleString("en-US")} of ${databases.toLocaleString("en-US")} `
-    + `${databases === 1 ? "database" : "databases"} read, ${tables.toLocaleString("en-US")} ${tables === 1 ? "table" : "tables"})`;
+/** How far a read of the chosen databases' tables is, for a progress bar: the databases ended (read or failed) of all. */
+export function readsDone(answer: { databases?: number; done?: number; failed?: number }): { done: number; total: number } {
+  return { done: Number(answer.done ?? 0) + Number(answer.failed ?? 0), total: Number(answer.databases ?? 0) };
 }
 
 /** Where a draft's read stands, as a preview answers it (main._draft_reading): its databases, those still to read,
@@ -362,13 +320,10 @@ export interface DraftReading {
 const count = (value: unknown) => Number(value ?? 0).toLocaleString("en-US");
 const word = (n: unknown, one: string) => `${one}${Number(n ?? 0) === 1 ? "" : "s"}`;
 
-/** New job's line while the tables chosen are still being read: how far, and that Create waits for the rest. */
-export function draftReadingNote(reading: DraftReading | null | undefined): string | null {
+/** How far New job's chosen tables are read, for its progress line, while some are still to read; null once all are. */
+export function draftReadProgress(reading: DraftReading | null | undefined): { done: number; total: number } | null {
   if (!reading || !Number(reading.pending)) return null;
-  const read = Number(reading.done ?? 0) + Number(reading.failed ?? 0);
-  return `Reading the chosen databases' tables: ${count(read)} of ${count(reading.databases)} ${word(reading.databases, "database")} read, `
-    + `${count(reading.tables)} ${word(reading.tables, "table")} so far. The preview counts what is read; Create waits for the rest, `
-    + "and leaving this page before Create discards what was read.";
+  return readsDone(reading);
 }
 
 /** Why Create can't take the tables chosen as they are read: databases that couldn't be read (by name), or a draft
