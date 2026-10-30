@@ -83,6 +83,12 @@ def _split(csv: Optional[str]) -> List[str]:
     return [c.strip() for c in (csv or "").split(",") if c.strip()]
 
 
+def delta_column(name: str) -> str:
+    """A column name quoted for Delta SQL. Always quoted, and any backtick inside the name is doubled,
+    so ``a`b`` reaches Delta as the column it is."""
+    return "`" + str(name).replace("`", "``") + "`"
+
+
 def _without(cols: List[str], names: List[str]) -> List[str]:
     """``cols`` minus ``names``, compared case-insensitively (SQL Server and Delta both resolve
     column names that way, so ``OrderLineID`` in primary_key and ``orderLineID`` in
@@ -144,7 +150,7 @@ def ct_read_query(cfg: dict, from_version: int, to_version: Optional[int] = None
 
 def merge_on(primary_key: str) -> str:
     """MERGE ON clause (Delta backtick-quoted) keyed on the (composite) PK."""
-    return " AND ".join(f"tgt.`{c}` = s.`{c}`" for c in _split(primary_key))
+    return " AND ".join(f"tgt.{delta_column(c)} = s.{delta_column(c)}" for c in _split(primary_key))
 
 
 def merge_set(select_list: str, primary_key: str) -> str:
@@ -154,15 +160,15 @@ def merge_set(select_list: str, primary_key: str) -> str:
     target doesn't have yet only resolves unqualified (``tgt.`c` `` fails on DBR 18)."""
     non_pk = _without(_split(select_list), _split(primary_key))
     cols = non_pk or _split(primary_key)
-    return ", ".join(f"`{c}` = s.`{c}`" for c in cols)
+    return ", ".join(f"{delta_column(c)} = s.{delta_column(c)}" for c in cols)
 
 
 def merge_insert_cols(select_list: str) -> str:
-    return ", ".join(f"`{c}`" for c in _split(select_list))
+    return ", ".join(delta_column(c) for c in _split(select_list))
 
 
 def merge_insert_vals(select_list: str) -> str:
-    return ", ".join(f"s.`{c}`" for c in _split(select_list))
+    return ", ".join(f"s.{delta_column(c)}" for c in _split(select_list))
 
 
 # ======================================================================================
@@ -353,7 +359,7 @@ def quote_delta_ident(name: str) -> str:
     name = str(name)
     if len(name) >= 2 and name[0] == name[-1] == "`" and "`" not in name[1:-1].replace("``", ""):
         return name
-    return "`" + name.replace("`", "``") + "`"
+    return delta_column(name)
 
 
 def sink_fqn(cfg: dict) -> str:
@@ -874,7 +880,7 @@ def insert_sql(mode: str, target: str, cols: List[str], source: str, evolve: boo
     BY NAME maps columns by name, so a reordered/edited select_list can never shift values into the
     wrong columns; with ``evolve`` the target gains any select_list column it lacks (spike-validated
     on DBR 18 — an explicit column list instead would require the columns to already exist)."""
-    collist = ", ".join(f"`{c}`" for c in cols)
+    collist = ", ".join(delta_column(c) for c in cols)
     evo = "WITH SCHEMA EVOLUTION " if evolve else ""
     return f"INSERT {evo}{mode} {target} BY NAME SELECT {collist} FROM {source}"
 
@@ -885,7 +891,7 @@ def insert_overwrite_sql(sink_fqn: str, cols: List[str], source: str, cfg: Optio
     __client_id__ = '<id>' SELECT ...``; validated on DBR: other clients untouched, BY NAME mapping,
     new columns added. BY NAME must precede REPLACE WHERE)."""
     if cfg is not None and client_id(cfg):
-        collist = ", ".join(f"`{c}`" for c in cols)
+        collist = ", ".join(delta_column(c) for c in cols)
         return (f"INSERT WITH SCHEMA EVOLUTION INTO {sink_fqn} BY NAME REPLACE WHERE {client_predicate(cfg)} "
                 f"SELECT {collist} FROM {source}")
     return insert_sql("OVERWRITE", sink_fqn, cols, source, evolve=True)

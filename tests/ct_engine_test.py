@@ -64,6 +64,32 @@ def test_sink_fqn_keeps_names_that_are_already_quoted():
     assert ce.quote_delta_ident("`") == "````"
 
 
+def test_delta_column_quotes_every_name_and_doubles_embedded_backticks():
+    assert ce.delta_column("Order-Lines") == "`Order-Lines`"
+    assert ce.delta_column("Sales (2024)") == "`Sales (2024)`"
+    assert ce.delta_column("a--b") == "`a--b`"
+    assert ce.delta_column("a`b") == "`a``b`"
+    assert ce.delta_column("a b") == "`a b`"
+    assert ce.delta_column("`a`") == "```a```"   # a column never passes through as already quoted
+
+
+def test_merge_and_insert_columns_quote_names_with_dashes_spaces_and_backticks():
+    assert ce.merge_on("id, a`b") == "tgt.`id` = s.`id` AND tgt.`a``b` = s.`a``b`"
+    assert ce.merge_set("id, Order-Lines, Sales (2024)", "id") == (
+        "`Order-Lines` = s.`Order-Lines`, `Sales (2024)` = s.`Sales (2024)`")
+    assert ce.merge_insert_cols("a--b, a`b") == "`a--b`, `a``b`"
+    assert ce.merge_insert_vals("a--b, a`b") == "s.`a--b`, s.`a``b`"
+
+
+def test_insert_sql_quotes_column_names_for_every_insert_mode():
+    cols = ["Order-Lines", "Sales (2024)", "a`b"]
+    assert ce.insert_sql("INTO", "`c`.`s`.`t`", cols, "v") == (
+        "INSERT INTO `c`.`s`.`t` BY NAME SELECT `Order-Lines`, `Sales (2024)`, `a``b` FROM v")
+    assert ce.insert_sql("OVERWRITE", "`c`.`s`.`t`", cols, "v", evolve=True) == (
+        "INSERT WITH SCHEMA EVOLUTION OVERWRITE `c`.`s`.`t` BY NAME "
+        "SELECT `Order-Lines`, `Sales (2024)`, `a``b` FROM v")
+
+
 def test_staging_table_name_stays_valid_for_quoted_sinks():
     assert ce.staging_table_name("`c-1`.`s`.`t`") == "`c-1`.`s`.`t__seed_staging`"
     assert ce.staging_table_name("`c-1`.`s`.`t`", _CONS).startswith("`c-1`.`s`.`t__seed_staging__tenant_001_")
