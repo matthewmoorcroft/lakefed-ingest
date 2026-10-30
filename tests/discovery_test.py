@@ -147,6 +147,8 @@ def test_listing_keeps_how_a_discovery_listed_but_never_the_secret():
     assert d.listing_of(spec) == {"pattern": "lfc_%", "secret_key_template": "creds-{database}",
                                   "azure_resource_id": "/subscriptions/x"}
     assert d.listing_of({"src_connection": "sql_a", "databases": ["a"]}) == {}
+    assert d.listing_of({"src_host": "h1", "secret_key": "creds-a", "jdbc_connection": "orders_jdbc"}) == {
+        "jdbc_connection": "orders_jdbc"}
 
 
 @pytest.mark.parametrize("spec,error", [

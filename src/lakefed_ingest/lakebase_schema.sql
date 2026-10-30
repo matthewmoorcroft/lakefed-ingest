@@ -674,3 +674,21 @@ create table if not exists lakefed_ingest.rollup_group (
 -- A rollup rewrite reads one database's control rows by (collection, database name) instead of the whole collection.
 create index if not exists control_collection_database_idx
     on lakefed_ingest.control (task_collection, (coalesce(src_database, '')));
+
+-- A JDBC connection the operations app's users entered by hand (app/src/jdbc_connections.py): a host and port, and the
+-- secret scope and key an admin created beforehand, the secret itself never stored here. A discovery and an ingestion
+-- job made through it carry the scope and trust as job parameters, so the engine reads the source over Spark JDBC.
+-- The app writes and reads this table only (INSERT and SELECT, no UPDATE or DELETE).
+create table if not exists lakefed_ingest.jdbc_connection (
+    name                     text        primary key,
+    src_type                 text        not null,              -- sqlserver, oracle, postgresql or mysql
+    src_host                 text        not null,
+    src_port                 int         not null,
+    secret_scope             text        not null,              -- a Databricks secret scope the admin created
+    secret_key               text        not null,              -- the key in that scope; may hold {database}
+    trust_server_certificate text        not null default 'false',
+    created_by               text,
+    created_at               timestamptz not null default now(),
+    constraint jdbc_connection_port_range check (src_port between 1 and 65535),
+    constraint jdbc_connection_trust_values check (trust_server_certificate in ('true', 'false'))
+);

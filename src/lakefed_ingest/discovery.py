@@ -386,11 +386,12 @@ def secret_key_for(spec: dict, database: str) -> str:
     return tpl.replace("{database}", database) if tpl else spec.get("secret_key")
 
 
-LISTING_KEYS = ("pattern", "azure_credential", "azure_resource_id", "secret_key_template")
+LISTING_KEYS = ("pattern", "azure_credential", "azure_resource_id", "secret_key_template", "jdbc_connection")
 
 
 def listing_of(spec: dict) -> dict:
     """How the spec listed its databases, kept on each of its discovery rows so a later re-discovery of the same
-    selection reads the same way: the LIKE pattern, the Azure resource and its credential, and the secret template.
-    Only the keys the spec has (the secret itself is never kept), so an empty dict means none of them."""
+    selection reads the same way: the LIKE pattern, the Azure resource and its credential, the secret template,
+    and the name of the JDBC connection it was made through. Only the keys the spec has (the secret itself is
+    never kept), so an empty dict means none of them."""
     return {key: spec[key] for key in LISTING_KEYS if str(spec.get(key) or "").strip()}

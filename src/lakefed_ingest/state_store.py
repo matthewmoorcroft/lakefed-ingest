@@ -141,7 +141,8 @@ def split_sql_statements(ddl: str) -> List[str]:
 #   12 = app_task.progress (a by-database write's progress)
 #   13 = rollup_database, rollup_group (the monitoring rollups) and an index on control by group and database
 #   14 = ingest_event.error_kind and error_class (how a failed attempt was classified, for the failing-tables list)
-SCHEMA_VERSION = 14
+#   16 = jdbc_connection (JDBC connections entered by hand in the operations app: a host, port, secret scope and key)
+SCHEMA_VERSION = 16
 # Advisory lock that serializes migrations (the setup job and ingestion runs of any collection): two
 # int keys, so it can't collide with a collection's one-key lock whatever the collection is named,
 # and a class of its own (not SOURCE_LOCK_CLASS).
