@@ -92,9 +92,9 @@ def test_a_run_holding_a_groups_lock_refuses_the_delete_and_the_deletion_is_list
     finally:
         run.close()
     assert pg.execute("select count(*) from lakefed_ingest.control").fetchone()[0] == 1
-    assert pg.execute(q.deletions_sql(), (10,)).fetchall() == []       # not finished: listed as deleting, not history
+    assert pg.execute(q.deletions_sql(), (10, 0)).fetchall() == []       # not finished: listed as deleting, not history
     pg.execute(q.set_schedule_flag_sql(), (["delete_finished"], True, sid))
-    listed = pg.execute(q.deletions_sql(), (10,)).fetchall()
+    listed = pg.execute(q.deletions_sql(), (10, 0)).fetchall()
     assert [(r[0], r[2]["delete_drop_targets"]) for r in listed] == [(sid, True)]
 
 

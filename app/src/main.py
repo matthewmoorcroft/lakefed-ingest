@@ -146,7 +146,7 @@ def _lock_collections(cur, collections):
     for c in sorted({c for c in collections if c}):
         cur.execute(q.collection_lock_sql(), (q.collection_lock_key(c),))
         if not cur.fetchone()[0]:
-            raise HTTPException(409, f"ingestion group '{c}' is running; try again after the run finishes")
+            raise HTTPException(409, f"its ingestion job is running (group '{c}'); try again after the run finishes")
 
 
 def _lock_collections_together(cur, collections):
@@ -158,7 +158,7 @@ def _lock_collections_together(cur, collections):
     got = {key: taken for key, taken in cur.fetchall()}
     for c in collections:
         if not got.get(q.collection_lock_key(c)):
-            raise HTTPException(409, f"ingestion group '{c}' is running; try again after the run finishes")
+            raise HTTPException(409, f"its ingestion job is running (group '{c}'); try again after the run finishes")
 
 
 def _refuse_mixed_sinks(cur, rows):
@@ -1335,17 +1335,21 @@ def groups_not_in_job():
 
 
 @app.get("/api/ingestion-jobs/deletions")
-def job_deletions():
-    """The latest deleted jobs whose Delete runs the delete job, newest first: each one's delete job run (going,
-    finished or failed, with its message), whether it drops the target tables, and how many of its tables are left
-    (none once the delete job has finished)."""
+def job_deletions(offset: int = 0, limit: int = 0, rows: bool = True):
+    """The deleted jobs whose Delete runs the delete job, newest first, a page at a time (limit 0: DELETIONS_LISTED),
+    and how many there are; with rows false only how many, for the closed list's header. Each row: its delete job run
+    (going, finished or failed, with its message), whether it drops the target tables, and how many of its tables are
+    left (none once the delete job has finished). Each row asks Databricks for its run, so a page is kept small."""
+    limit = min(max(int(limit or DELETIONS_LISTED), 1), DELETIONS_PAGE_MAX)
+    total = int(db.query(q.deletions_count_sql())[0]["total"])
     out = []
-    for s in db.query(q.deletions_sql(), (DELETIONS_LISTED,)):
+    for s in db.query(q.deletions_sql(), (limit, max(0, int(offset)))) if rows else []:
         plan = _delete_plan(s["id"])
         out.append({"id": s["id"], "name": s["name"], "deleted_at": s["deleted_at"],
                     "drop_targets": bool(sch.options_of(s).get("delete_drop_targets")), "run": _delete_run(s),
                     "tables_left": plan["tables"], "groups_left": len(plan["groups"])})
-    return {"deletions": out, "configured": bool(jobs.DELETE_JOB_ID)}
+    return {"deletions": out, "total": total, "offset": max(0, int(offset)), "limit": limit,
+            "configured": bool(jobs.DELETE_JOB_ID)}
 
 
 @app.get("/api/ingestion-jobs/{job_id}/delete-preview")
@@ -2632,7 +2636,7 @@ TABLES_PAGE = 100
 
 @app.get("/api/tables")
 def tables(collection: Optional[str] = None, search: Optional[str] = None, status: str = "all",
-           database: Optional[str] = None, after: Optional[str] = None, limit: int = 0):
+           database: Optional[str] = None, after: Optional[str] = None, limit: int = 0, job: Optional[int] = None):
     """Control rows with their checkpoint, TABLES_PAGE at a time (queries.TABLES_ORDER). `after` is the
     previous page's `next_after` (JSON); `database` filters on one database exactly."""
     if status not in q.TABLE_FILTERS:
@@ -2641,7 +2645,8 @@ def tables(collection: Optional[str] = None, search: Optional[str] = None, statu
     cursor = json.loads(after) if after else None
     if cursor is not None and (not isinstance(cursor, list) or len(cursor) != 5):
         raise HTTPException(400, "after must be the previous page's next_after")
-    sql, params = q.tables_sql(collection or None, search or None, status, limit + 1, database=database, after=cursor)
+    sql, params = q.tables_sql(collection or None, search or None, status, limit + 1, database=database, after=cursor,
+                               job=job)
     rows = db.query(sql, params)
     last = rows[limit - 1] if len(rows) > limit else None      # one row more than a page says there is a next page
     rows = rows[:limit]
@@ -4309,6 +4314,7 @@ NO_DELETE_JOB = ("no delete job is configured for this app, so the job's groups 
                  "outside any job: deploy the engine bundle, then the app, and delete again")
 # Deleted jobs the Ingestion jobs page lists with their delete job run.
 DELETIONS_LISTED = 10
+DELETIONS_PAGE_MAX = 50
 
 
 def _delete_plan(sid: int) -> dict:

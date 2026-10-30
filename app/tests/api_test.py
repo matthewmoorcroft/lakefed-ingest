@@ -202,7 +202,7 @@ def test_bulk_move_takes_both_collection_locks_and_does_not_reseed(client):
 def test_edit_refused_while_collection_runs(client):
     client.db.running = {"lakefed_ingest:c2"}
     r = _edit(client, [7], {"task_collection": "c2"})
-    assert r.status_code == 409 and "ingestion group 'c2' is running" in r.json()["detail"]
+    assert r.status_code == 409 and "its ingestion job is running (group 'c2')" in r.json()["detail"]
 
 
 def test_bulk_edit_rejects_single_row_fields_and_invalid_rows(client):

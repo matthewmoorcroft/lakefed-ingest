@@ -1142,9 +1142,12 @@ TABLES_ORDER = "t.task_collection, coalesce(t.src_database, ''), t.src_schema, t
 
 
 def tables_sql(collection: Optional[str], search: Optional[str], status_filter: str,
-               limit: int, database: Optional[str] = None, after: Optional[list] = None) -> Tuple[str, tuple]:
+               limit: int, database: Optional[str] = None, after: Optional[list] = None,
+               job: Optional[int] = None) -> Tuple[str, tuple]:
     """Control rows joined with their checkpoint, a page of `limit` in TABLES_ORDER after the cursor `after`
-    (the last row's group, database, schema, table and id). `database` filters on one database exactly.
+    (the last row's group, database, schema, table and id), each with the ingestion job its group belongs to. `database`
+    filters on one database exactly, `job` on one ingestion job's groups (through schedule_member's task_collection
+    index; no new index). Groups are named after their job, so TABLES_ORDER also keeps a job's tables together.
     Returns (sql, params)."""
     if status_filter not in TABLE_FILTERS:
         raise ValueError(f"status_filter must be one of {TABLE_FILTERS}")
@@ -1152,6 +1155,10 @@ def tables_sql(collection: Optional[str], search: Optional[str], status_filter: 
     if collection:
         conds.append("t.task_collection = %s")
         params.append(collection)
+    if job is not None:
+        conds.append(f"t.task_collection in (select m.task_collection from {SCHEMA}.schedule_member m "
+                     f"where m.schedule_id = %s and m.removed_at is null)")
+        params.append(int(job))
     if database is not None:
         conds.append("coalesce(t.src_database, '') = %s")
         params.append(database)
@@ -1174,7 +1181,9 @@ def tables_sql(collection: Optional[str], search: Optional[str], status_filter: 
         conds.append(f"({TABLES_ORDER}) > (%s, %s, %s, %s, %s)")
         params.extend(after)
     where = ("where " + " and ".join(conds) + " ") if conds else ""
-    sql = (f"select t.id, t.task_collection, t.task_enabled, t.src_type, t.load_type, "
+    sql = (f"select t.id, (select s.name from {SCHEMA}.schedule_member m join {SCHEMA}.schedule s on s.id = m.schedule_id "
+           f"where m.task_collection = t.task_collection and m.removed_at is null and s.deleted_at is null "
+           f"order by s.id limit 1) as ingestion_job, t.task_collection, t.task_enabled, t.src_type, t.load_type, "
            f"t.src_database, t.src_schema, t.src_table, "
            f"t.sink_catalog || '.' || t.sink_schema || '.' || t.sink_table as sink, t.client_id, "
            f"cp.phase, cp.status, {LAST_SUCCESS} as last_success_at, "
@@ -2482,9 +2491,15 @@ def delete_targets_sql() -> str:
 def deletions_sql() -> str:
     """The latest deleted jobs whose Delete finished (the app marked them ``delete_finished``, once the delete job
     succeeded and no tables were left), newest first: the Deleted jobs history on the Ingestion jobs page. Pending and
-    failed deletions are in the jobs list instead. Param: how many."""
+    failed deletions are in the jobs list instead, a page at a time. Params: how many, how many to skip."""
     return (f"select id, name, options, deleted_at from {SCHEMA}.schedule where deleted_at is not null "
-            f"and options ? 'delete_finished' order by deleted_at desc limit %s")
+            f"and options ? 'delete_finished' order by deleted_at desc, id desc limit %s offset %s")
+
+
+def deletions_count_sql() -> str:
+    """How many deleted jobs the Deleted jobs history has (deletions_sql's rows, all pages)."""
+    return (f"select count(*) as total from {SCHEMA}.schedule where deleted_at is not null "
+            f"and options ? 'delete_finished'")
 
 
 def member_synced_sql() -> str:

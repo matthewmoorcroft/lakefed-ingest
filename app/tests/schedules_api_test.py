@@ -126,7 +126,10 @@ class Store:
         if sql == q.deletions_sql():
             rows = [dict(x) for x in self.schedules.values()
                     if x["deleted_at"] is not None and "delete_finished" in sch.options_of(x)]
-            return sorted(rows, key=lambda x: x["deleted_at"], reverse=True)[:params[0]]
+            return sorted(rows, key=lambda x: x["deleted_at"], reverse=True)[params[1]:params[1] + params[0]]
+        if sql == q.deletions_count_sql():
+            return [{"total": sum(1 for x in self.schedules.values()
+                                  if x["deleted_at"] is not None and "delete_finished" in sch.options_of(x))}]
         if sql == q.schedule_members_sql():
             pending = lambda m: bool(m["removed_at"] and m["job_id"] and (m["synced_at"] is None or m["synced_at"] < m["removed_at"]))
             return [dict(m, delete_pending=pending(m)) for m in self.members.values() if m["schedule_id"] in params[0]]

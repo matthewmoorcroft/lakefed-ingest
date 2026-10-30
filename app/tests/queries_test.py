@@ -37,7 +37,9 @@ def test_table_filters(flt, frag):
 
 def test_table_filter_all_and_invalid():
     sql, params = q.tables_sql(None, None, "all", 5)
-    assert "where" not in sql and params == (5,)
+    assert sql.split(" as ingestion_job,")[1].count("where") == 0 and params == (5,)      # the job name's subquery aside
+    sql, params = q.tables_sql(None, None, "all", 5, job=7)
+    assert "m.schedule_id = %s" in sql and params == (7, 5)
     with pytest.raises(ValueError):
         q.tables_sql(None, None, "bogus", 5)
 
