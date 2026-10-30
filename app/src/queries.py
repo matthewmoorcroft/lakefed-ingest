@@ -2789,17 +2789,25 @@ def databricks_run_params(row: dict) -> dict:
     return {k: row.get(k) for k in keys}
 
 
+# A run's life cycle states before it starts stopping. Right after a cancel the Jobs API still says one of these, so a
+# run the app marked TERMINATING (mark_terminating_sql) keeps that until the API names an ended state.
+NOT_YET_STOPPING_STATES = ("QUEUED", "PENDING", "RUNNING", "BLOCKED", "WAITING_FOR_RETRY")
+
+
 def databricks_run_upsert_sql() -> str:
-    """Insert or update one Databricks run as the poller sees it. Params: the named fields of databricks_run_params."""
+    """Insert or update one Databricks run as the poller sees it. Params: the named fields of databricks_run_params.
+    A run recorded as TERMINATING stays so while the API still lists it as going; any other state replaces it."""
     columns = ("run_id, job_id, kind, schedule_id, task_collection, trigger, parameters, life_cycle_state, "
                "result_state, state_message, run_page_url, started_at, ended_at, seen_at")
     values = ("%(run_id)s, %(job_id)s, %(kind)s, %(schedule_id)s, %(task_collection)s, %(trigger)s, "
               "%(parameters)s::jsonb, %(life_cycle_state)s, %(result_state)s, %(state_message)s, %(run_page_url)s, "
               "%(started_at)s, %(ended_at)s, now()")
-    return (f"insert into {SCHEMA}.databricks_run ({columns}) values ({values}) "
+    going = ", ".join(f"'{state}'" for state in NOT_YET_STOPPING_STATES)
+    return (f"insert into {SCHEMA}.databricks_run as stored ({columns}) values ({values}) "
             "on conflict (run_id) do update set job_id = excluded.job_id, kind = excluded.kind, "
             "schedule_id = excluded.schedule_id, task_collection = excluded.task_collection, trigger = excluded.trigger, "
-            "parameters = excluded.parameters, life_cycle_state = excluded.life_cycle_state, "
+            "parameters = excluded.parameters, life_cycle_state = case when stored.life_cycle_state = 'TERMINATING' "
+            f"and excluded.life_cycle_state in ({going}) then 'TERMINATING' else excluded.life_cycle_state end, "
             "result_state = excluded.result_state, state_message = excluded.state_message, "
             "run_page_url = excluded.run_page_url, started_at = excluded.started_at, ended_at = excluded.ended_at, "
             "seen_at = now()")

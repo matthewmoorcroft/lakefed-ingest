@@ -208,6 +208,17 @@ def test_a_cancel_marks_the_active_runs_it_asked_to_stop_as_terminating(lakebase
     assert lakebase.runs[9]["life_cycle_state"] == "TERMINATING"
 
 
+def test_the_poller_keeps_a_cancelled_run_terminating_until_databricks_says_it_ended():
+    # Right after jobs.cancel the API still says RUNNING; only an ended state replaces the app's TERMINATING.
+    assert set(q.NOT_YET_STOPPING_STATES) == set(rp.ACTIVE_STATES) - {"TERMINATING"}
+    sql = q.databricks_run_upsert_sql()
+    assert "insert into lakefed_ingest.databricks_run as stored (" in sql
+    assert ("life_cycle_state = case when stored.life_cycle_state = 'TERMINATING' and excluded.life_cycle_state in "
+            "('QUEUED', 'PENDING', 'RUNNING', 'BLOCKED', 'WAITING_FOR_RETRY') then 'TERMINATING' "
+            "else excluded.life_cycle_state end") in sql
+    assert "result_state = excluded.result_state" in sql and "ended_at = excluded.ended_at" in sql
+
+
 def test_a_new_run_is_recorded_as_pending_when_the_table_exists_and_never_raises_without_it(lakebase, monkeypatch):
     rp.note_started(10, 500, {"task_collection": "c2"})
     assert lakebase.runs[500]["life_cycle_state"] == "PENDING" and lakebase.runs[500]["task_collection"] == "c2"
