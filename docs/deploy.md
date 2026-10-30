@@ -108,6 +108,13 @@ The one-time and ad hoc jobs shouldn't wait several minutes for a job cluster to
   without use. Deploying creates it, and Databricks starts a new cluster on creation. To use a cluster
   you already have, override the task's `existing_cluster_id` in your target. A source that is paused
   or resuming (Azure SQL serverless) is retried three times, with pauses doubling from 15-30 s.
+  With the operations app, Discover on a source runs on the app bundle's small serverless SQL warehouse
+  instead (`lakefed_ingest discovery`, 2X-Small, up to 2 clusters, stopping after 5 idle minutes: bundle variables
+  `discovery_warehouse_size`, `discovery_warehouse_max_clusters`, `discovery_warehouse_auto_stop_mins`), through the
+  Unity Catalog connection, so the test, the database list and the table reads answer in seconds; the warehouse
+  needs the same network path to the sources (serverless network connectivity). The discovery job stays for listing
+  through Azure and for sources read by host and password. See [app/README.md](../app/README.md), Discovery through
+  the SQL warehouse.
 - **Ingestion** runs on job clusters with the source network path (scheduled, recurring work).
 - **The operations app's helper jobs**, `lakefed_ingest_cluster_copies` and `lakefed_ingest_delete_job`, run on
   serverless as the deployer. The delete job finishes an app job's Delete: it deletes the job's groups' rows in

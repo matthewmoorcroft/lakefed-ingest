@@ -122,6 +122,44 @@ minutes is not confirmed). Add databases, Add tables and Create show done only o
 job's Databricks jobs are synced; a wrapper job that did not sync is named. Edit's Save shows saved only once the
 wrapper jobs are synced and any cluster copies run has ended; a copies run that failed says the cluster was not applied.
 
+## Discovery through the SQL warehouse
+
+Discover on a source runs on a small serverless SQL warehouse the app bundle makes (`lakefed_ingest discovery`), not on
+the discovery job's cluster, so each step answers in seconds rather than waiting minutes for a cluster. Every statement
+is plain SQL sent to SQL Server through the Unity Catalog connection (`remote_query`); the app can't open the
+connection itself (Unity Catalog lends its login only to Databricks compute), so the warehouse does it, as the app's
+service principal.
+
+| Step | What runs on the warehouse |
+|---|---|
+| Test connection | one statement in master listing the server's online user databases (`source_catalog.DATABASES_SQL`); the filter works on the next step |
+| The database list | one statement per database (`warehouse_reads.ACCESS_SQL`): opening it is the check, and it counts its tables. The page shown is checked first, then the rest while the step is open. A database the login can't open is greyed out, can't be ticked, and says why on hover; ticking the whole server takes only the others and says how many it left out |
+| Reading the chosen tables | one statement per database (`source_catalog.TABLE_SUMMARY_SQL`, one row per user table), saved to `discovered_table` with the same recommendations as the discovery job |
+
+At most 16 statements of one discovery are going at once (`warehouse_reads.IN_FLIGHT`). Each request the page makes
+does one step: it reads the statements going, saves the ones that ended and starts more. Where each database stands
+is kept on its `discovery` row (`listing`: its statement, its claim, and a check's answer), and a request claims the
+databases it starts, so two pages or app instances never start the same one twice.
+
+The step's top line counts the choice: databases chosen of those listed and their tables (counting while some aren't
+checked yet); the same numbers end the step's last line and the job's Chosen summary.
+
+**The warehouse.** Serverless, PRO, set by three bundle variables: `discovery_warehouse_size` (default `2X-Small`),
+`discovery_warehouse_max_clusters` (default 2: it scales out by clusters when statements queue, not by size) and
+`discovery_warehouse_auto_stop_mins` (default 5). A serverless warehouse starts in a few seconds. 2X-Small is 4 DBUs an
+hour per cluster while it runs: at a list price of about 0.70 USD per serverless SQL DBU, about 2.80 USD an hour, about
+5.60 USD with both clusters; it stops after 5 idle minutes, so it costs only while someone chooses tables. Your
+contract's price may differ. The app gets `CAN_USE` on it as an app resource (`WAREHOUSE_ID`).
+
+**At a whole server's size** (estimates): a check takes about a second, so 22,000 databases at 16 at once take about
+20 to 25 minutes in the background, about 2.50 USD of warehouse time with both clusters running; the page shown is checked first, so the list
+is usable at once. A read of 1,000 tables is about 2 to 5 seconds per database, about 1 to 2 hours for 22,000 at 16 at
+once. Without a warehouse set (`WAREHOUSE_ID` empty), Discover runs the discovery job as before.
+
+**What stays on the discovery job:** listing an Azure SQL server's databases through Azure (it takes a service
+credential only Databricks compute holds; the tables are then read through the warehouse), and sources read by host
+and password (no connection to send through). The job stays in the bundle for those.
+
 ## Re-discovery
 
 A job made from a discovery can add new databases and tables by itself. On its Edit page, under When it runs,
@@ -129,7 +167,9 @@ A job made from a discovery can add new databases and tables by itself. On its E
 `rediscover_hour`, and the job page shows the hour and the last run.
 
 Once a day at that hour, the scheduler in the app process (a thread; `REDISCOVERY_TICK_S`, default 300 seconds, 0
-turns it off) runs the discover job again over the job's selection and adds what the rules allow:
+turns it off) reads the job's selection again and adds what the rules allow. A server reached through a connection is
+read through the discovery warehouse, as Add tables reads it (its databases listed again for a whole-server part,
+then each database's tables); one listed through Azure, or read by host and password, runs the discovery job:
 
 | The job was chosen as | Re-discovery adds |
 |---|---|
@@ -223,6 +263,8 @@ The app runs as its own service principal (created with the app):
   holds `USE CONNECTION` on; the connections aren't the bundle's, so they are named, not created. A connection
   the job can't grant on is reported in its output and the others are still granted; Discover's screen names
   the grant for any connection it can't see.
+- **Discovery warehouse:** `CAN_USE` on the bundle's `lakefed_ingest discovery` SQL warehouse, through an app
+  resource. The statements run as the service principal, which holds `USE CONNECTION` on the connections above.
 - **Azure SQL listing (optional):** for a login that can't open master, Discover's Test connection can have the
   discovery job list an Azure SQL server's (or Managed Instance's) databases through Azure Resource Manager instead.
   It takes a Unity Catalog service credential (Catalog Explorer, External data, Credentials) on an access connector
