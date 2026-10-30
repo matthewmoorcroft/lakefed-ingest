@@ -132,3 +132,25 @@ def test_two_runs_recounting_one_group_at_once_leave_it_exact(sessions):
         t.join(30)
     assert setup.execute("select databases, tables from lakefed_ingest.rollup_group where task_collection = 'g1'"
                          ).fetchone() == (2, 2)
+
+
+def test_a_work_list_spanning_collections_reads_back_whole_and_per_collection(sessions):
+    """A run of a cycle's share: its work list is recorded per collection under one work id, and the run reads it
+    whole (its parts) while each part reads its own collection's databases."""
+    store = ss.StateStore(sessions())
+    store.record_check_work("L:run1", "g1", [("srv", "a"), ("srv", "b")])
+    store.record_check_work("L:run1", "g2", [("srv", "c")])
+    store.record_check_work("L:run2", "g1", [("srv", "d")])
+    assert store.get_check_work_all("L:run1") == {("g1", "srv", "a"), ("g1", "srv", "b"), ("g2", "srv", "c")}
+    assert store.get_check_work("L:run1", "g2") == {("srv", "c")}
+
+
+def test_a_check_and_a_run_of_one_collection_go_at_once_on_different_databases(sessions):
+    """The check (shared, groups B) and a work-list run both hold the collection; each has its own databases, and a
+    whole-collection run is refused while either goes."""
+    check, run, whole = (ss.StateStore(sessions()) for _ in range(3))
+    assert check.try_lock_collection_shared("g1") and run.try_lock_collection_shared("g1")
+    assert run.try_lock_databases([ss.database_lock_key("g1", "srv", "a")])
+    held = check.try_lock_databases([ss.database_lock_key("g1", "srv", n) for n in ("a", "b")])
+    assert held == {ss.database_lock_key("g1", "srv", "b")}           # the check leaves the run's database out
+    assert whole.try_lock_collection("g1") is False
