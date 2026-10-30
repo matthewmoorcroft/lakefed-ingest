@@ -665,7 +665,8 @@ def record_event_start_sql() -> str:
 
 def record_event_finish_sql() -> str:
     """Finalize an ingest_event row: finished_at/duration + outcome + metrics. ``retry_count`` is the
-    number of earlier attempts of the table in this run (``table_retry``)."""
+    number of earlier attempts of the table in this run (``table_retry``). Only a running event is finished: a table
+    the cancel or a sweep marked keeps that status when its engine finishes late."""
     return (
         f"update {EVENT_TABLE} set "
         "finished_at = now(), "
@@ -673,7 +674,7 @@ def record_event_finish_sql() -> str:
         "status = %s, stage = %s, rows_read = %s, rows_merged = %s, "
         "position_from = %s, position_to = %s, error = %s, error_kind = %s, error_class = %s, "
         "action = coalesce(%s, action), pool = coalesce(%s, pool), retry_count = coalesce(%s, retry_count) "
-        "where id = %s"
+        "where id = %s and status = 'running'"
     )
 
 
@@ -978,12 +979,13 @@ def prune_check_work_sql() -> str:
 
 
 def finish_run_sql() -> str:
-    """Finalize an ingest_run row with roll-up counts."""
+    """Finalize an ingest_run row with roll-up counts. Only a running run is finished: one the app cancelled, or a
+    sweep closed, keeps that status when its engine finishes late."""
     return (
         f"update {RUN_TABLE} set "
         "finished_at = now(), status = %s, total = %s, ok = %s, failed = %s, "
         "skipped = %s, reseeded = %s, detail = %s "
-        "where run_id = %s"
+        "where run_id = %s and status = 'running'"
     )
 
 

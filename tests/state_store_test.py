@@ -238,6 +238,7 @@ def test_record_event_finish_sql_updates_event_by_id():
     assert "position_from = %s, position_to = %s" in sql
     assert "action = coalesce(%s, action)" in sql and "pool = coalesce(%s, pool)" in sql
     assert "retry_count = coalesce(%s, retry_count)" in sql
+    assert sql.endswith("where id = %s and status = 'running'")
 
 
 def test_touch_last_success_sql_stamps_checkpoint_from_event():
@@ -251,7 +252,7 @@ def test_finish_run_sql_updates_run_by_id():
     sql = ss.finish_run_sql()
     assert sql.startswith(f"update {ss.RUN_TABLE} set")
     assert "finished_at = now()" in sql
-    assert "where run_id = %s" in sql
+    assert sql.endswith("where run_id = %s and status = 'running'")
     # status, total, ok, failed, skipped, reseeded, detail, run_id
     assert sql.count("%s") == 8
 

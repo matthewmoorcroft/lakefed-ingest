@@ -223,6 +223,32 @@ def test_a_sweep_closes_a_cancelled_run_as_cancelled_and_any_other_dead_run_as_f
     assert events == {"t10": "cancelled", "t11": "cancelled", "t12": "failed"}
 
 
+def test_a_late_run_finish_does_not_overwrite_a_cancelled_run(conn):
+    """A run cancelled while its engine was still going keeps its status when the engine finishes late; a run still
+    running finishes as usual."""
+    conn.execute("insert into lakefed_ingest.ingest_run (run_id, task_collection, status, finished_at) values "
+                 "(1, 'c', 'cancelled', now()), (2, 'c', 'running', null)")
+    store = ss.StateStore(conn)
+    store.finish_run(1, total=3, ok=3, failed=0, status="completed")
+    store.finish_run(2, total=3, ok=3, failed=0, status="completed")
+    runs = dict(conn.execute("select run_id, status from lakefed_ingest.ingest_run order by run_id").fetchall())
+    assert runs == {1: "cancelled", 2: "completed"}
+
+
+def test_a_late_event_finish_does_not_overwrite_a_cancelled_event(conn):
+    """A table the cancel marked keeps that status when its engine's finish arrives late; a table still running
+    finishes as usual."""
+    conn.execute("insert into lakefed_ingest.ingest_event (run_id, task_collection, control_id, src_table, status) "
+                 "values (1, 'c', 10, 't10', 'cancelled'), (1, 'c', 11, 't11', 'running')")
+    event_ids = {src_table: event_id for event_id, src_table in conn.execute(
+        "select id, src_table from lakefed_ingest.ingest_event").fetchall()}
+    store = ss.StateStore(conn)
+    store.record_event_finish(event_ids["t10"], "ok", stage="merge", rows_merged=3)
+    store.record_event_finish(event_ids["t11"], "ok", stage="merge", rows_merged=3)
+    statuses = dict(conn.execute("select src_table, status from lakefed_ingest.ingest_event").fetchall())
+    assert statuses == {"t10": "cancelled", "t11": "ok"}
+
+
 def _cfg(control_id):
     return {"id": control_id, "task_collection": "c", "src_database": "d", "src_schema": "s",
             "src_table": f"t{control_id}", "sink_catalog": "cat", "sink_schema": "sch",
