@@ -249,6 +249,39 @@ def test_a_late_event_finish_does_not_overwrite_a_cancelled_event(conn):
     assert statuses == {"t10": "cancelled", "t11": "ok"}
 
 
+def test_typed_logins_name_each_keys_newest_connection_and_its_host(conn):
+    """The engine's guard reads, per key of one scope, the connection its newest login was typed for and that
+    connection's host, port and type; a connection that isn't stored has no host, and another scope's keys stay out."""
+    conn.execute("insert into lakefed_ingest.jdbc_connection (name, src_type, src_host, src_port, secret_scope, "
+                 "secret_key) values ('orders', 'sqlserver', 'orders.example', 1433, 'logins', 'creds-{database}'), "
+                 "('evil', 'sqlserver', 'attacker.example', 1433, 'logins', '{database}')")
+    for at, (entry, connection, scope, key) in enumerate((("1", "evil", "logins", "creds-sales"),
+                                                         ("2", "orders", "logins", "creds-sales"),
+                                                         ("3", "gone", "logins", "creds-hr"),
+                                                         ("4", "evil", "other", "creds-sales"))):
+        conn.execute("insert into lakefed_ingest.jdbc_login_write (id, connection, secret_scope, secret_key, entered_by, "
+                     "entered_at, outcome) values (%s, %s, %s, %s, 'ann', now() + make_interval(secs => %s), 'saved')",
+                     (entry, connection, scope, key, at))
+    typed = ss.StateStore(conn).typed_logins("logins")
+    assert typed == {"creds-sales": {"connection": "orders", "src_host": "orders.example", "src_port": 1433,
+                                     "src_type": "sqlserver"},
+                     "creds-hr": {"connection": "gone", "src_host": None, "src_port": None, "src_type": None}}
+
+
+def test_typed_logins_are_none_on_a_database_without_the_apps_login_tables():
+    psycopg = pytest.importorskip("psycopg")
+    name = f"lakefed_test_{uuid.uuid4().hex[:8]}"
+    admin = psycopg.connect(URI, autocommit=True)
+    admin.execute(f"create database {name}")
+    bare = psycopg.connect(psycopg.conninfo.make_conninfo(URI, dbname=name), autocommit=True)
+    try:
+        assert ss.StateStore(bare).typed_logins("logins") == {}
+    finally:
+        bare.close()
+        admin.execute(f"drop database {name}")
+        admin.close()
+
+
 def _cfg(control_id):
     return {"id": control_id, "task_collection": "c", "src_database": "d", "src_schema": "s",
             "src_table": f"t{control_id}", "sink_catalog": "cat", "sink_schema": "sch",

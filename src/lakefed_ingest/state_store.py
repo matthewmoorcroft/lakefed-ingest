@@ -955,6 +955,15 @@ def schedule_collections_sql() -> str:
             "where m.schedule_id = %s and m.removed_at is null and s.deleted_at is null order by m.task_collection")
 
 
+def typed_logins_sql() -> str:
+    """For each secret key of one scope with a login typed into the operations app: the JDBC connection its newest
+    login was typed for, and that connection's host, port and source type (null when no such connection is stored).
+    Param: secret_scope."""
+    return (f"select distinct on (w.secret_key) w.secret_key, w.connection, c.src_host, c.src_port, c.src_type "
+            f"from {SCHEMA}.jdbc_login_write w left join {SCHEMA}.jdbc_connection c on c.name = w.connection "
+            "where w.secret_scope = %s order by w.secret_key, w.entered_at desc, w.id desc")
+
+
 def record_check_work_sql() -> str:
     """One database with work for a run the check job starts. Params: work_id, task_collection, source,
     src_database."""
@@ -1510,6 +1519,19 @@ class StateStore:
         with self._cursor() as cur:
             cur.execute(schedule_collections_sql(), (int(schedule_id),))
             return [row[0] for row in cur.fetchall()]
+
+    def typed_logins(self, scope: str) -> dict:
+        """The logins typed into the operations app in this scope, by secret key: the connection each key's newest
+        login was typed for, with its host, port and source type (typed_logins_sql). Empty on a database without the
+        app's login tables, which then holds no typed login."""
+        with self._cursor() as cur:
+            cur.execute(f"select to_regclass('{SCHEMA}.jdbc_login_write') is not null "
+                        f"and to_regclass('{SCHEMA}.jdbc_connection') is not null")
+            if not cur.fetchone()[0]:
+                return {}
+            cur.execute(typed_logins_sql(), (scope,))
+            return {key: {"connection": connection, "src_host": host, "src_port": port, "src_type": src_type}
+                    for key, connection, host, port, src_type in cur.fetchall()}
 
     def record_check_work(self, work_id: str, task_collection: str, databases) -> None:
         """Record the databases with work, [(source, src_database)], of the run the check job is about
