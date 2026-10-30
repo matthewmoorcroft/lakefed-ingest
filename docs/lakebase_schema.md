@@ -172,7 +172,7 @@ at the start of a run.
 | `strategy` | Load strategy that wrote the row (`ct`, `cursor`, `full`). A different `load_type` in control means a reseed |
 | `phase` | `seeding` (needs a full copy) → `incremental` (seeded; applying increments, for `ct` and `cursor`); `loaded` for `full` |
 | `position` | Resume point, owned by the strategy. `ct`: the source database's CT version. `cursor`: JSON `{"col", "type", "value"}` (the watermark). `full`: NULL |
-| `status`, `detail` | `ok` or `failed`, with the last error in `detail` |
+| `status`, `detail` | `ok` or `failed`, with the last error in `detail`. A table stopped by a cancel keeps its status: a cancel never writes `failed` here |
 | `select_list` | Columns the sink was last written with; compared with `control.select_list` to detect added columns |
 | `source_identity`, `sink_identity`, `merge_key` | What the checkpoint was written for: `engine://host:port/db/schema/table`, the sink (`catalog.schema.table`, plus `#client_id` for a shared sink) and the normalized primary key. A control row that now points elsewhere reseeds (`source_changed`, `sink_changed`, `primary_key_changed`). NULL until first recorded |
 | `ct_begin_version` | `ct`: the table's Change Tracking begin version at seed time. A change means CT was turned off and on, so the table reseeds |
@@ -254,17 +254,18 @@ Inserted when a run starts (`status = 'running'`) and finalized when it ends.
 | `job_run_id`, `cluster_id` | The Databricks job run and cluster, for cross-referencing the Jobs UI |
 | `parallelism` | The run's concurrency budget |
 | `started_at`, `finished_at` | Timing |
-| `status` | `running` → `completed` \| `failed` (any table failed, or a run with a `work_id` found the collection locked by another run: its databases were not ingested); `skipped` when another run of the same collection held the lock and the run had no `work_id`; a check run that raised is `failed` with `detail.check.error` |
+| `status` | `running` → `completed` \| `failed` (any table failed, or a run with a `work_id` found the collection locked by another run: its databases were not ingested); `cancelled` when a table was cancelled and none failed for real (see [Cancelled runs and tables](#cancelled-runs-and-tables)); `skipped` when another run of the same collection held the lock and the run had no `work_id`; a check run that raised is `failed` with `detail.check.error` |
 | `total`, `ok`, `failed` | Table counts (`total` holds the tables the run planned while it runs) |
 | `skipped` | Tables that were unchanged (nothing to read) |
 | `reseeded` | Tables queued for a reseed |
 | `work_id` | The check job's work list the run was started for (`<launch_id>:<collection>`): the runs of one launch share its launch id, and the operations app shows them as one job run. `check-<job run>` on the check job's own record of a check (`detail.check` holds what it found): not a group run, so leave these rows out when counting or timing runs. Null for a run started otherwise |
-| `detail` | JSON with run details: change-detection counts per route, timings, peak concurrency, and with `max_queries_per_source` set, each source's share and peak permits (`source_caps`), the rows batched appends committed (`batch_rows`, with `batch_rows_unknown` tables not counted), and table retry totals (`table_retries`) |
+| `detail` | JSON with run details: change-detection counts per route, timings, peak concurrency, and with `max_queries_per_source` set, each source's share and peak permits (`source_caps`), the rows batched appends committed (`batch_rows`, with `batch_rows_unknown` tables not counted), and table retry totals (`table_retries`), and `cancelled_tables`, how many tables a cancel stopped |
 
 ## `ingest_event` — one row per table per run
 
 Inserted when a table starts (`status = 'running'`) and updated when it finishes. Tables that fail
-before any work (stage `plan` or `detect`) also get a `failed` event. CT tables that skip-no-change
+before any work (stage `plan` or `detect`) also get a `failed` event (`cancelled` when their run is being
+cancelled). CT tables that skip-no-change
 finds unchanged don't get an event: they're advanced in bulk, counted in `ingest_run.skipped`, and
 their `checkpoint.last_success_at` is still stamped (or, for a whole unchanged database, its
 `database_check` row). Cursor tables always get one, with no rows
@@ -278,7 +279,7 @@ when the watermark hasn't moved.
 | `action` | `seed`, `increment`, `reseed` or `full` |
 | `phase` | Checkpoint phase when the table started |
 | `stage` | How far it got: `plan`, `detect`, `verify` (checking a pending append), `ensure_sink`, `read`, `seed`, `merge`, `load`, `checkpoint`. On a failure, this is where it failed |
-| `status` | `running` → `ok` \| `failed`; `skipped` for a reseed that was only queued (no data copied); `retried` for an attempt that failed and was tried again in the same run (`table_retries`), so the table has a later row for its next attempt |
+| `status` | `running` → `ok` \| `failed` \| `cancelled` (see [Cancelled runs and tables](#cancelled-runs-and-tables)); `skipped` for a reseed that was only queued (no data copied); `retried` for an attempt that failed and was tried again in the same run (`table_retries`), so the table has a later row for its next attempt |
 | `started_at`, `finished_at`, `duration_ms` | Timing |
 | `rows_read`, `rows_merged` | Row counts from the Delta commit metrics (NULL when the runtime doesn't report them) |
 | `position_from`, `position_to` | Checkpoint position before and after (CT version, or cursor value) |
@@ -301,6 +302,23 @@ not partial, so the `ok` and the `failed` lookups both use it. The migration bui
 [Locks and waiting](#locks-and-waiting)). The build therefore holds that lock for its whole run, and reads of
 `ingest_event` wait with it. On a large `ingest_event`, build the index first with `create index concurrently`
 (see [deploy.md](deploy.md)): the migration then skips it.
+
+### Cancelled runs and tables
+
+A Cancel asks Databricks to stop a run. Such a run must not read as failed: the failing views, the counts and the
+failure e-mail read `failed` only, so a cancelled load is recorded as `cancelled` throughout.
+
+- **A run is stopping** when its own `ingest_run.status` is `cancelled`, or its Databricks run (`databricks_run`,
+  matched on `ingest_run.job_run_id`) has `cancel_requested_at` set, is `TERMINATING`, or ended `CANCELED`.
+  `state_store.run_is_stopping` and `stopping_run_sql` state these rules; a Databricks run the poller hasn't recorded
+  yet doesn't count.
+- **A table's failed attempt is `cancelled`** when its run is stopping, or when Spark reports a cancelled job
+  (`SPARK_JOB_CANCELLED`, "Job aborted due to cancellation"). It is not retried, and its `checkpoint` keeps its status:
+  a cancel never marks a table `failed`. Its `ingest_event` row is `cancelled`, with the error as it was.
+- **A run's status** is `failed` when any table really failed, else `cancelled` when any table was cancelled, else
+  `completed`. A run that is cancelled after every table finished is `completed`.
+- **A dead run closes as `cancelled`** when its Databricks run ended `CANCELED` or was asked to stop, and as `failed`
+  otherwise (`close_abandoned_runs_sql`). Its open events close with it, as the same status.
 
 ## `control_change` — change log
 
@@ -418,6 +436,9 @@ Written by the operations app's run poller (`app/src/run_poller.py`), which list
   SKIPPED, INTERNAL_ERROR, or NOT_FOUND when the Jobs API has no such run), **`result_state`**, **`state_message`**,
   **`run_page_url`**, **`started_at`**, **`ended_at`**, and **`seen_at`** (when the poller last saw a change).
 - The app has no DELETE on Lakebase, so rows are never removed: prune old ones as the owner, as with `ingest_run`.
+- **`cancel_requested_at`** (schema 15): when the app's Cancel asked Databricks to stop the run, null otherwise. The
+  engine and the poller read it to tell a load stopped by a cancel from a failure (see
+  [Cancelled runs and tables](#cancelled-runs-and-tables)).
 - Added by the schema version that created it. Its statements are `create table if not exists` and `create index if not exists` only,
   so the upgrade takes no lock on an existing table.
 
@@ -503,6 +524,13 @@ it can't decide from the catalog still runs. A fresh database runs the whole fil
   the framework doesn't have yet.
 - **Valid from any earlier version:** the statement may run on a database several versions behind.
 - **Valid in a transaction:** no `CREATE INDEX CONCURRENTLY`, no `DO $$` blocks.
+
+Status values (`ingest_run.status`, `ingest_event.status`) have no check constraint, so a new value needs no DDL:
+list it in the table's comment in `lakebase_schema.sql` and in this document. Schema 15 adds a column
+(`databricks_run.cancel_requested_at`), so it bumps the version.
+
+Versions are numbered in the order changes land on the main branch. When two changes in flight both claim a number,
+renumber the later one, with its fingerprint pin, before merging.
 
 Renames go in `state_store.RENAMES`, which runs only the ones still pending. Prefer adding a column over
 renaming one: add the new column, write both, move the readers, and drop the old one in a later version.

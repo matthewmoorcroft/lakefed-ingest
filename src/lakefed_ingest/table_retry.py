@@ -43,11 +43,13 @@ DEFAULT_BUDGET = 0
 
 TRANSIENT, PERMANENT, UNKNOWN = "transient", "permanent", "unknown"
 
+# What Spark says when a job was cancelled (a cancelled Databricks run, or a cancel of its stages).
+CANCELLATION_MARKERS = ("SPARK_JOB_CANCELLED", "Job aborted due to cancellation")
 # Never retried, whatever else the error says: the run must stop writing, or another path owns it.
 _NEVER = (
     "collection lock lost",            # the sweep lost its lock: the next sweep redoes the table
     ct_engine.RETENTION_LAPSED_MARKER,  # CT retention passed the checkpoint: the worker reseeds
-    "SPARK_JOB_CANCELLED", "Job aborted due to cancellation", "OutOfMemoryError", "DRIVER_OOM",
+    *CANCELLATION_MARKERS, "OutOfMemoryError", "DRIVER_OOM",
 )
 # Permanent: the same attempt would fail again. Checked before the transient rules, because Spark
 # wraps a refused login in the same FAILED_JDBC.CONNECTION error as a dropped connection.
@@ -160,6 +162,13 @@ def _call(obj, method: str):
         return getattr(obj, method)()
     except Exception:
         return None
+
+
+def is_cancellation(error) -> bool:
+    """Whether an error (an exception, or its text) is Spark reporting that a job was cancelled. Such a table was
+    stopped by a cancel, not by its source, so it is recorded as cancelled and never retried."""
+    text = error if isinstance(error, str) else error_text(error)
+    return any(marker in text for marker in CANCELLATION_MARKERS)
 
 
 def classify(exc: BaseException) -> str:

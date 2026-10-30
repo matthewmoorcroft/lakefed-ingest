@@ -565,3 +565,12 @@ def test_the_spark_condition_is_read_once_preferring_the_current_name():
             return "08001"
     error = _Captured("Failed to connect to the database.")
     assert tr.classify(error) == tr.TRANSIENT and _Captured.calls == ["getCondition"]
+
+
+def test_a_spark_cancellation_is_recognised_from_text_and_exception_and_never_retried():
+    cancelled = "org.apache.spark.SparkException: [SPARK_JOB_CANCELLED] Job 12 cancelled part of cancelled job group"
+    aborted = RuntimeError("Job aborted due to cancellation: stage 4 was cancelled")
+    assert tr.is_cancellation(cancelled) and tr.is_cancellation(aborted)
+    assert tr.classify(aborted) == tr.PERMANENT
+    assert not tr.is_cancellation("Connection reset by peer")
+    assert not tr.is_cancellation("")

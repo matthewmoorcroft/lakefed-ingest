@@ -333,7 +333,7 @@ create table if not exists lakefed_ingest.ingest_run (
     parallelism     int,
     started_at      timestamptz not null default now(),
     finished_at     timestamptz,
-    status          text        not null default 'running',   -- running | completed | failed | skipped
+    status          text        not null default 'running',   -- running | completed | failed | skipped | cancelled
     total           int,
     ok              int,
     failed          int,
@@ -365,7 +365,7 @@ create table if not exists lakefed_ingest.ingest_event (
     action          text,                                     -- seed | increment | reseed | full
     phase           text,
     stage           text,                                     -- plan | detect | ensure_sink | read | seed | merge | load | checkpoint
-    status          text        not null default 'running',   -- running | ok | failed | skipped | retried (an attempt tried again)
+    status          text        not null default 'running',   -- running | ok | failed | skipped | retried (an attempt tried again) | cancelled
     started_at      timestamptz not null default now(),
     finished_at     timestamptz,
     duration_ms     bigint,
@@ -627,6 +627,10 @@ create table if not exists lakefed_ingest.databricks_run (
 );
 create index if not exists databricks_run_job_started_idx
     on lakefed_ingest.databricks_run (job_id, started_at desc);
+
+-- Cancel (schema 15): when the app's Cancel run asked Databricks to stop this run, and when (null otherwise). The
+-- engine and the poller read it to tell a load stopped by a cancel from a failure, and to close the run as cancelled.
+alter table lakefed_ingest.databricks_run add column if not exists cancel_requested_at timestamptz;
 
 -- Monitoring rollups (the operations app's pages read these, not a scan of control). One row per database and
 -- ingestion group, rewritten from the database's own rows as its work ends (state_store.StateStore.rewrite_rollups)

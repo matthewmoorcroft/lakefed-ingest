@@ -165,3 +165,65 @@ def test_a_failed_attempt_records_how_it_was_classified(conn):
                                             error_class="FAILED_JDBC.CONNECTION")
     assert conn.execute("select error_kind, error_class from lakefed_ingest.ingest_event where id = %s",
                         (event_id,)).fetchone() == ("transient", "FAILED_JDBC.CONNECTION")
+
+
+def test_stopping_run_is_true_for_a_cancelled_run_or_one_asked_to_stop_and_never_fails_on_a_non_numeric_job_run(conn):
+    """The cancel rules of run_is_stopping, in one statement: the run's own status, or its Databricks run (matched on
+    job_run_id) asked to stop, terminating or ended CANCELED. A job_run_id that is not a number matches nothing."""
+    conn.execute("insert into lakefed_ingest.ingest_run (run_id, task_collection, job_run_id, status) values "
+                 "(1, 'c', '101', 'running'), (2, 'c', '102', 'running'), (3, 'c', 'not-a-number', 'running'), "
+                 "(4, 'c', '104', 'cancelled'), (5, 'c', '105', 'running'), (6, 'c', '106', 'running')")
+    conn.execute("insert into lakefed_ingest.databricks_run (run_id, job_id, kind, life_cycle_state, result_state, "
+                 "cancel_requested_at) values (102, 1, 'group', 'RUNNING', null, now()), "
+                 "(105, 1, 'group', 'TERMINATED', 'CANCELED', null), (106, 1, 'group', 'TERMINATING', null, null)")
+    store = ss.StateStore(conn)
+    got = {run_id: store.stopping_run(run_id) for run_id in (1, 2, 3, 4, 5, 6)}
+    assert got == {1: False, 2: True, 3: False, 4: True, 5: True, 6: True}
+
+
+def test_a_failed_table_in_a_cancelled_run_is_a_cancelled_event_and_keeps_its_checkpoint(conn):
+    """A cancel is not a failure: its tables are cancelled events and their checkpoints keep their status. A table
+    that fails in a run that is not stopping is failed, and only it gets its checkpoint marked failed."""
+    conn.execute("insert into lakefed_ingest.ingest_run (run_id, task_collection, job_run_id, status) values "
+                 "(7, 'c', '701', 'running'), (8, 'c', '801', 'running')")
+    conn.execute("insert into lakefed_ingest.databricks_run (run_id, job_id, kind, life_cycle_state, "
+                 "cancel_requested_at) values (701, 1, 'group', 'RUNNING', now())")
+    conn.execute("insert into lakefed_ingest.checkpoint (control_id, src_database, src_schema, src_table, strategy, "
+                 "status) values (21, 'd', 's', 't21', 'ct', 'ok'), (22, 'd', 's', 't22', 'ct', 'ok')")
+    store = ss.StateStore(conn)
+    store.record_failed_tables(7, [(_cfg(21), {"phase": "incremental"}, "connection reset")])
+    store.record_failed_tables(8, [(_cfg(22), None, "[SPARK_JOB_CANCELLED] Job 9 cancelled"),
+                                   (_cfg(23), None, "login failed")])
+    events = dict(conn.execute(
+        "select control_id, status from lakefed_ingest.ingest_event order by control_id").fetchall())
+    assert events == {21: "cancelled", 22: "cancelled", 23: "failed"}
+    checkpoints = dict(conn.execute("select control_id, status from lakefed_ingest.checkpoint "
+                                    "order by control_id").fetchall())
+    assert checkpoints == {21: "ok", 22: "ok", 23: "failed"}
+
+
+def test_a_sweep_closes_a_cancelled_run_as_cancelled_and_any_other_dead_run_as_failed(conn):
+    """The run holding the lock closes the other open runs: a run whose Databricks run was cancelled closes as
+    cancelled with its events, a run whose Databricks run failed or is unknown closes as failed."""
+    conn.execute("insert into lakefed_ingest.ingest_run (run_id, task_collection, job_run_id, status) values "
+                 "(1, 'c', '201', 'running'), (2, 'c', '202', 'running'), (3, 'c', '203', 'running'), "
+                 "(4, 'c', '204', 'running')")
+    conn.execute("insert into lakefed_ingest.databricks_run (run_id, job_id, kind, life_cycle_state, result_state, "
+                 "cancel_requested_at) values (201, 1, 'group', 'TERMINATED', 'CANCELED', null), "
+                 "(202, 1, 'group', 'RUNNING', null, now()), (203, 1, 'group', 'INTERNAL_ERROR', 'FAILED', null)")
+    conn.execute("insert into lakefed_ingest.ingest_event (run_id, task_collection, control_id, src_table, status) "
+                 "values (1, 'c', 10, 't10', 'running'), (2, 'c', 11, 't11', 'running'), "
+                 "(3, 'c', 12, 't12', 'running')")
+    store = ss.StateStore(conn)
+    assert store.close_abandoned_runs("c", 4) == (3, 3)
+    runs = dict(conn.execute("select run_id, status from lakefed_ingest.ingest_run order by run_id").fetchall())
+    assert runs == {1: "cancelled", 2: "cancelled", 3: "failed", 4: "running"}
+    events = dict(conn.execute(
+        "select src_table, status from lakefed_ingest.ingest_event order by src_table").fetchall())
+    assert events == {"t10": "cancelled", "t11": "cancelled", "t12": "failed"}
+
+
+def _cfg(control_id):
+    return {"id": control_id, "task_collection": "c", "src_database": "d", "src_schema": "s",
+            "src_table": f"t{control_id}", "sink_catalog": "cat", "sink_schema": "sch",
+            "sink_table": f"t{control_id}", "load_type": "ct"}

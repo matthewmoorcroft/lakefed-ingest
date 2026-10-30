@@ -32,6 +32,8 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Callable, List, Optional
 
+import table_retry
+
 SCHEMA = "lakefed_ingest"
 CONTROL_TABLE = f"{SCHEMA}.control"
 CHECKPOINT_TABLE = f"{SCHEMA}.checkpoint"
@@ -40,6 +42,7 @@ RUN_TABLE = f"{SCHEMA}.ingest_run"        # observability: one row per ingestion
 EVENT_TABLE = f"{SCHEMA}.ingest_event"    # observability: one row per (run, table)
 DATABASE_CHECK_TABLE = f"{SCHEMA}.database_check"   # one check stamp per unchanged source database
 CHECK_WORK_TABLE = f"{SCHEMA}.check_work"           # the check job's work list, per run it starts
+DATABRICKS_RUN_TABLE = f"{SCHEMA}.databricks_run"   # the Databricks runs the operations app tracks (its poller)
 
 SEEDING = "seeding"
 INCREMENTAL = "incremental"  # ct / cursor: seeded, applying increments
@@ -141,6 +144,7 @@ def split_sql_statements(ddl: str) -> List[str]:
 #   12 = app_task.progress (a by-database write's progress)
 #   13 = rollup_database, rollup_group (the monitoring rollups) and an index on control by group and database
 #   14 = ingest_event.error_kind and error_class (how a failed attempt was classified, for the failing-tables list)
+#   15 = databricks_run.cancel_requested_at (a Cancel run is recorded as cancelled, not failed)
 #   16 = jdbc_connection (JDBC connections entered by hand in the operations app: a host, port, secret scope and key)
 SCHEMA_VERSION = 16
 # Advisory lock that serializes migrations (the setup job and ingestion runs of any collection): two
@@ -674,14 +678,15 @@ def record_event_finish_sql() -> str:
 
 def record_event_failed_sql() -> str:
     """Insert an already-FINISHED failed ingest_event row (bulk, via executemany) — used when a whole
-    source database fails change detection, so its tables are visible as failed without per-table
-    work. Params: run_id, task_collection, control_id, src_database, src_schema, src_table,
-    sink_fqn, action, phase, stage, error."""
+    source database fails change detection, or a batched append's member fails, so its tables are
+    visible without per-table work. The status is 'failed', or 'cancelled' for a cancel (failure_status).
+    Params: run_id, task_collection, control_id, src_database, src_schema, src_table,
+    sink_fqn, action, phase, stage, error, status."""
     return (
         f"insert into {EVENT_TABLE} "
         "(run_id, task_collection, control_id, src_database, src_schema, src_table, sink_fqn, "
         "action, phase, stage, error, status, finished_at, duration_ms) "
-        "values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'failed', now(), 0)"
+        "values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, now(), 0)"
     )
 
 
@@ -969,19 +974,68 @@ def finish_run_sql() -> str:
 
 ABANDONED_RUN_REASON = "the run ended without finishing (cancelled, or its cluster went away)"
 
+# Cancel: a run or table the user stopped is 'cancelled', never 'failed' (the counts, the failing tables and the
+# failure e-mail read failures only). The rules below are the SQL's too (stopping_run_sql, close_abandoned_runs_sql):
+# a Databricks run is stopping when the app asked for the cancel (cancel_requested_at), when Databricks is
+# terminating it, or when it ended CANCELED; a run is stopping once its own record says cancelled.
+CANCELLED = "cancelled"
+
+
+def run_is_stopping(run_status, databricks_run) -> bool:
+    """Whether a group run is being (or has been) cancelled: its own status is cancelled, or its Databricks run (a
+    dict of databricks_run's columns, or None when the poller has not recorded it) was asked to stop, is terminating,
+    or ended CANCELED. A load that fails while the run is stopping is a cancel, not a failure."""
+    run = databricks_run or {}
+    return (run_status == CANCELLED or run.get("cancel_requested_at") is not None
+            or run.get("life_cycle_state") == "TERMINATING" or run.get("result_state") == "CANCELED")
+
+
+def failure_status(error, stopping) -> str:
+    """The status a table's failed attempt is recorded with: cancelled when its run is stopping or Spark reports a
+    cancelled job (table_retry.is_cancellation), else failed. ``error`` is an exception or its text."""
+    return CANCELLED if stopping or table_retry.is_cancellation(error if error is not None else "") else "failed"
+
+
+def abandoned_run_status(databricks_run) -> str:
+    """The status a run that ended without finishing is closed with: cancelled when its Databricks run ended CANCELED
+    or was asked to stop, else failed (its cluster went away, or it died)."""
+    run = databricks_run or {}
+    cancelled = run.get("result_state") == "CANCELED" or run.get("cancel_requested_at") is not None
+    return CANCELLED if cancelled else "failed"
+
+
+def _databricks_run_of_sql(run: str) -> str:
+    """Matches the databricks_run row of an ingest_run (``run`` is its alias) on job_run_id, when that is a number."""
+    return f"d.run_id = (case when {run}.job_run_id ~ '^[0-9]+$' then {run}.job_run_id::bigint end)"
+
+
+def stopping_run_sql() -> str:
+    """Whether an ingest run is stopping: the same rules as run_is_stopping, in one row. Params: run_id.
+    Returns no row for a run the table doesn't hold."""
+    return (
+        f"select r.status = 'cancelled' or exists (select 1 from {DATABRICKS_RUN_TABLE} d "
+        f"where {_databricks_run_of_sql('r')} "
+        "and (d.cancel_requested_at is not null or d.life_cycle_state = 'TERMINATING' or d.result_state = 'CANCELED')) "
+        f"from {RUN_TABLE} r where r.run_id = %s"
+    )
+
 
 def close_abandoned_runs_sql() -> str:
-    """Close a collection's other runs still 'running', and their events still 'running', as failed.
+    """Close a collection's other runs still 'running', and their events still 'running', as failed, or as
+    cancelled when the run was cancelled (abandoned_run_status): a cancel is not a failure.
     Only a run holding the collection's lock may call it: no other sweep of the collection is then
     alive, so an open run is one that was cancelled or lost its cluster and will never finish its rows.
     A table that was waiting for its retry (table_retries) when the run died has a last attempt
-    'retried' and no later one: it is closed as failed too, keeping its own error and timing.
+    'retried' and no later one: it is closed the same way too, keeping its own error and timing.
     Params: detail, task_collection, run_id, error (appended to a retried attempt's), error.
     Returns (runs closed, events closed)."""
     return (
-        f"with dead as (update {RUN_TABLE} set status = 'failed', finished_at = now(), detail = %s "
-        "where task_collection = %s and status = 'running' and run_id <> %s returning run_id), "
-        f"events as (update {EVENT_TABLE} e set status = 'failed', finished_at = coalesce(e.finished_at, now()), "
+        f"with dead as (update {RUN_TABLE} r set status = case when exists (select 1 from {DATABRICKS_RUN_TABLE} d "
+        f"where {_databricks_run_of_sql('r')} "
+        "and (d.result_state = 'CANCELED' or d.cancel_requested_at is not null)) then 'cancelled' else 'failed' end, "
+        "finished_at = now(), detail = %s "
+        "where r.task_collection = %s and r.status = 'running' and r.run_id <> %s returning r.run_id, r.status), "
+        f"events as (update {EVENT_TABLE} e set status = dead.status, finished_at = coalesce(e.finished_at, now()), "
         "duration_ms = coalesce(e.duration_ms, (extract(epoch from (now() - e.started_at)) * 1000)::bigint), "
         "error = case when e.status = 'retried' then concat(e.error, ' | ', %s::text) else %s end "
         "from dead where e.run_id = dead.run_id and (e.status = 'running' or ("
@@ -1543,26 +1597,38 @@ class StateStore:
             if status == "ok":
                 cur.execute(touch_last_success_sql(), (int(event_id),))
 
+    def stopping_run(self, run_id) -> bool:
+        """Whether the run is being cancelled (stopping_run_sql; run_is_stopping's rules)."""
+        with self._cursor() as cur:
+            cur.execute(stopping_run_sql(), (int(run_id),))
+            row = cur.fetchone()
+        return bool(row and row[0])
+
     def record_failed_tables(self, run_id, items, stage="detect", action=None) -> int:
         """Bulk-record tables that failed before per-table work (their source database was
         unreachable during change detection, or the planner rejected the row: stage 'plan'), or in
-        a batched append: one finished 'failed' ingest_event row each and the checkpoint status set to
-        'failed' (phase/position untouched). items = [(cfg, cp, error)]; ``action`` defaults to
-        'full' / 'increment' by the row's strategy."""
+        a batched append: one finished ingest_event row each. The row is 'failed', or 'cancelled' when the
+        run is stopping or Spark cancelled the job (failure_status); only a failed table gets its checkpoint
+        status set to 'failed' (phase/position untouched), a cancelled one keeps its checkpoint as it was.
+        items = [(cfg, cp, error)]; ``action`` defaults to 'full' / 'increment' by the row's strategy."""
         if not items:
             return 0
+        stopping = self.stopping_run(run_id)
         events, statuses = [], []
         for cfg, cp, err in items:
             sink = _sink_label(cfg)
             e = (err or "")[:2000]
             action_ = action or ("full" if strategy_name(cfg) == "full" else "increment")
+            status = failure_status(err, stopping)
             events.append((int(run_id), cfg.get("task_collection"), cfg.get("id"),
                            cfg.get("src_database"), cfg.get("src_schema"), cfg.get("src_table"),
-                           sink, action_, (cp or {}).get("phase"), stage, e))
-            statuses.append((*task_identity(cfg), strategy_name(cfg), "failed", e[:500]))
+                           sink, action_, (cp or {}).get("phase"), stage, e, status))
+            if status == "failed":
+                statuses.append((*task_identity(cfg), strategy_name(cfg), "failed", e[:500]))
         with self._cursor() as cur:
             cur.executemany(record_event_failed_sql(), events)
-            cur.executemany(set_status_sql(), statuses)
+            if statuses:
+                cur.executemany(set_status_sql(), statuses)
         return len(items)
 
     def finish_run(self, run_id, total, ok, failed, skipped=0, reseeded=0,

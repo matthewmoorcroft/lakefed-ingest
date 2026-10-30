@@ -33,12 +33,14 @@ an earlier run left pending, or a retry checking for the rows of the attempt tha
 With `table_retries` set and the run's `table_retry_budget` above 0 (its default is 0, so nothing is retried:
 README "Table retries"), an attempt that fails with a transient source error and is tried again finishes as `retried`, with its stage and error, and the table gets another row for
 its next attempt; `retry_count` numbers them (0, 1, ...). Only a final failure is `failed`, so the
-failure query below lists tables that are still failing.
+failure query below lists tables that are still failing. A table stopped by a Cancel is `cancelled`
+instead, so it is not in that list.
 
 A run that ends without finishing (cancelled, or its cluster went away) can't close its own rows. The
 next run of the same collection holds the collection's lock, so it closes them at launch: the dead
-run's `ingest_run` row and its `running` events become `failed`, with the run's `detail` naming the
-run that closed it (`closed_by_run`). So does the last `retried` event of a table that was waiting for
+run's `ingest_run` row and its `running` events become `failed`, or `cancelled` when its Databricks run
+ended cancelled or was asked to stop, with the run's `detail` naming the run that closed it (`closed_by_run`).
+So does the last `retried` event of a table that was waiting for
 its retry, keeping its error with the reason added. Until then the dead run still reads `running`,
 unless the operations app is running: its run poller, every 15 seconds, asks the Jobs API about each
 one's Databricks run (`job_run_id`) and closes those that have ended (terminated, skipped or an internal error;
@@ -80,6 +82,8 @@ WHERE run_id = (
   AND status = 'failed'
 ORDER BY finished_at DESC;
 ```
+
+The tables a Cancel stopped in the latest run are the same query with `status = 'cancelled'`.
 
 Per-table freshness / lag. A table's last success is its own stamp or its database's
 check stamp, whichever is later, when that stamp vouches for it (see `database_check` in
@@ -178,6 +182,8 @@ JOIN (SELECT *, row_number() OVER (PARTITION BY task_collection ORDER BY started
   ON r.task_collection = m.task_collection AND r.rn = 1
 WHERE m.removed_at IS NULL AND s.deleted_at IS NULL AND NOT s.paused AND r.status = 'failed';
 ```
+
+A run that was cancelled is `cancelled` and does not match, so a Cancel does not alert.
 
 Runs longer than their schedule's cadence in the last 24 hours (the next trigger was skipped):
 ```sql

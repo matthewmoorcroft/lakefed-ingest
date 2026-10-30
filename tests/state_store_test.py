@@ -262,9 +262,11 @@ def test_close_abandoned_runs_sql_closes_the_collections_other_open_runs_and_the
     # collection is dead: close it as failed, with its events, in one statement.
     sql = ss.close_abandoned_runs_sql()
     run_update, event_update = sql.split("), events as (")
-    assert f"update {ss.RUN_TABLE} set status = 'failed'" in run_update
-    assert "where task_collection = %s and status = 'running' and run_id <> %s" in run_update
-    assert f"update {ss.EVENT_TABLE} e set status = 'failed'" in event_update
+    assert f"update {ss.RUN_TABLE} r set status = case when exists" in run_update
+    assert ("and (d.result_state = 'CANCELED' or d.cancel_requested_at is not null)) "
+            "then 'cancelled' else 'failed' end") in run_update
+    assert "where r.task_collection = %s and r.status = 'running' and r.run_id <> %s" in run_update
+    assert f"update {ss.EVENT_TABLE} e set status = dead.status" in event_update
     assert "e.run_id = dead.run_id and (e.status = 'running'" in event_update
     # A table waiting for its retry when the run died: its last attempt is 'retried' and no later one
     # exists, so it is closed as failed too, keeping its error and timing.
@@ -275,6 +277,61 @@ def test_close_abandoned_runs_sql_closes_the_collections_other_open_runs_and_the
     assert sql.rstrip().endswith("select (select count(*) from dead), (select count(*) from events)")
     # detail, task_collection, run_id, error (twice: a running event's, appended to a retried one's)
     assert sql.count("%s") == 5
+
+
+def test_close_abandoned_runs_sql_closes_a_cancelled_run_as_cancelled_and_leaves_others_failed():
+    # Only a run whose Databricks run was cancelled (ended CANCELED, or asked to stop) closes as cancelled; its events
+    # follow their run (dead.status). Any other dead run closes as failed, as before.
+    sql = ss.close_abandoned_runs_sql()
+    assert sql.count("'cancelled'") == 1 and sql.count("'failed'") == 1
+    assert f"{ss.DATABRICKS_RUN_TABLE} d" in sql
+    assert "d.run_id = (case when r.job_run_id ~ '^[0-9]+$' then r.job_run_id::bigint end)" in sql
+
+
+def test_stopping_run_sql_reads_the_run_and_its_databricks_run_by_job_run_id():
+    sql = ss.stopping_run_sql()
+    assert sql.count("%s") == 1 and sql.rstrip().endswith(f"from {ss.RUN_TABLE} r where r.run_id = %s")
+    assert "r.status = 'cancelled'" in sql
+    assert f"from {ss.DATABRICKS_RUN_TABLE} d" in sql
+    assert "d.run_id = (case when r.job_run_id ~ '^[0-9]+$' then r.job_run_id::bigint end)" in sql
+    for condition in ("d.cancel_requested_at is not null", "d.life_cycle_state = 'TERMINATING'",
+                      "d.result_state = 'CANCELED'"):
+        assert condition in sql
+
+
+def test_stopping_run_binds_the_run_id_and_reads_the_flag():
+    for got, stopping in ((True, True), (False, False), (None, False)):
+        conn = FakeConn(fetch=[(got,)] if got is not None else [])
+        assert ss.StateStore(conn).stopping_run(9) is stopping
+        assert conn.calls == [(ss.stopping_run_sql(), (9,))]
+
+
+def test_record_event_failed_takes_its_status_as_a_twelfth_parameter():
+    sql = ss.record_event_failed_sql()
+    assert "'failed'" not in sql and "'cancelled'" not in sql
+    assert sql.count("%s") == 12 and "error, status, finished_at, duration_ms" in sql
+
+
+def test_record_failed_tables_a_cancelled_run_records_cancelled_events_and_leaves_checkpoints_alone():
+    conn = FakeConn(fetch=[(True,)])
+    cfg = dict(CFG, task_collection="tc", sink_catalog="c", sink_schema="s", sink_table="t")
+    ss.StateStore(conn).record_failed_tables(3, [(cfg, {"phase": "incremental"}, "connection reset")])
+    stopping_sql, (ev_sql, ev_rows) = conn.calls
+    assert stopping_sql[0] == ss.stopping_run_sql()
+    assert ev_sql == ss.record_event_failed_sql()
+    assert [row[-1] for row in ev_rows] == ["cancelled"]
+    assert all(sql != ss.set_status_sql() for sql, _ in conn.calls)
+
+
+def test_record_failed_tables_a_spark_cancel_in_a_live_run_is_cancelled_and_a_real_error_is_failed():
+    conn = FakeConn()
+    cfg = dict(CFG, task_collection="tc", sink_catalog="c", sink_schema="s", sink_table="t")
+    items = [(cfg, None, "[SPARK_JOB_CANCELLED] Job 4 cancelled"), (dict(cfg, id=8), None, "login failed")]
+    ss.StateStore(conn).record_failed_tables(3, items)
+    _, (_, ev_rows), (st_sql, st_rows) = conn.calls
+    assert [row[-1] for row in ev_rows] == ["cancelled", "failed"]
+    assert st_sql == ss.set_status_sql() and [row[0] for row in st_rows] == [8]
+    assert st_rows[0][5:] == ("failed", "login failed")
 
 
 # ---- per-collection run lock --------------------------------------------------------------
@@ -535,9 +592,10 @@ def test_record_failed_tables_bulk_events_and_status():
     cfg = dict(CFG, task_collection="tc", sink_catalog="c", sink_schema="s", sink_table="t")
     n = ss.StateStore(conn).record_failed_tables(3, [(cfg, {"phase": "incremental"}, "db unreachable")])
     assert n == 1
-    (ev_sql, ev_rows), (st_sql, st_rows) = conn.calls
-    assert ev_sql == ss.record_event_failed_sql() and "'failed'" in ev_sql
-    assert ev_rows == [(3, "tc", 7, "d", "s", "t", "c.s.t", "increment", "incremental", "detect", "db unreachable")]
+    _, (ev_sql, ev_rows), (st_sql, st_rows) = conn.calls
+    assert ev_sql == ss.record_event_failed_sql()
+    assert ev_rows == [(3, "tc", 7, "d", "s", "t", "c.s.t", "increment", "incremental", "detect", "db unreachable",
+                        "failed")]
     assert st_sql == ss.set_status_sql() and st_rows == [(7, "d", "s", "t", "ct", "failed", "db unreachable")]
 
 
@@ -545,7 +603,7 @@ def test_record_failed_tables_full_rows_and_plan_stage():
     conn = FakeConn()
     cfg = dict(CFG, load_type="full", task_collection="tc", sink_catalog="c", sink_schema="s", sink_table="t")
     ss.StateStore(conn).record_failed_tables(3, [(cfg, None, "unsupported")], stage="plan")
-    (_, ev_rows), (_, st_rows) = conn.calls
+    _, (_, ev_rows), (_, st_rows) = conn.calls
     assert ev_rows[0][7:10] == ("full", None, "plan") and st_rows[0][4] == "full"
 
 
@@ -616,7 +674,8 @@ SCHEMA_FINGERPRINTS = {
     12: "3c4da8d33b1512088b091acb8548088962d3220648a7d497ff4378c043f269f8",
     13: "02ab6eceb01e8c75509c88f496d08f187e6cbf746cc0019f3477977968854cc0",
     14: "f125d8ae5701120edba627816947a339119e6d8d6d1c4690632b975e52f6ddf7",
-    16: "032ab40f6c87329c79400d7b4a78e850323c25fa34c3b81a45c63587a29564c5",
+    15: "9ee71a536e5e38ff4c1222cc650c8eb2f1cab4dc6fbbfaebd49473c24640ab40",
+    16: "7ce59a107931d2ee279e1b52c60746fe7feab54cb3bd70cb504b6d898e01835b",
 }
 
 
@@ -1279,7 +1338,7 @@ def test_record_failed_tables_action_override():
     conn = FakeConn()
     cfg = dict(CFG, task_collection="tc", sink_catalog="c", sink_schema="s", sink_table="t")
     ss.StateStore(conn).record_failed_tables(3, [(cfg, None, "x")], stage="checkpoint", action="seed")
-    (_, ev_rows), _ = conn.calls
+    _, (_, ev_rows), _ = conn.calls
     assert ev_rows[0][7:10] == ("seed", None, "checkpoint")
 
 
@@ -1607,3 +1666,31 @@ def _start(name, target, *args, done=None):
 def _wait_all(events):
     for event in events:
         event.wait(WAIT_S)
+
+
+# ---- cancel: a stopped run is cancelled, not failed --------------------------------------------
+
+def test_a_run_is_stopping_when_its_own_status_or_its_databricks_run_says_so():
+    assert ss.run_is_stopping("cancelled", None)
+    assert not ss.run_is_stopping("running", None)
+    assert not ss.run_is_stopping("running", {"life_cycle_state": "RUNNING", "result_state": None,
+                                              "cancel_requested_at": None})
+    assert ss.run_is_stopping("running", {"life_cycle_state": "RUNNING", "cancel_requested_at": "2026-10-30T15:00"})
+    assert ss.run_is_stopping("running", {"life_cycle_state": "TERMINATING", "cancel_requested_at": None})
+    assert ss.run_is_stopping("running", {"life_cycle_state": "TERMINATED", "result_state": "CANCELED"})
+    assert not ss.run_is_stopping("running", {"life_cycle_state": "TERMINATED", "result_state": "FAILED"})
+
+
+def test_a_failed_attempt_is_cancelled_when_its_run_is_stopping_or_spark_cancelled_the_job():
+    assert ss.failure_status(RuntimeError("Connection reset"), stopping=True) == "cancelled"
+    assert ss.failure_status("[SPARK_JOB_CANCELLED] cancelled", stopping=False) == "cancelled"
+    assert ss.failure_status(RuntimeError("Login failed for user"), stopping=False) == "failed"
+    assert ss.failure_status(None, stopping=False) == "failed"
+
+
+def test_an_abandoned_run_is_cancelled_only_when_databricks_ended_it_cancelled_or_was_asked_to_stop():
+    assert ss.abandoned_run_status({"life_cycle_state": "TERMINATED", "result_state": "CANCELED"}) == "cancelled"
+    assert ss.abandoned_run_status({"life_cycle_state": "RUNNING", "cancel_requested_at": "2026-10-30"}) == "cancelled"
+    assert ss.abandoned_run_status({"life_cycle_state": "TERMINATED", "result_state": "FAILED"}) == "failed"
+    assert ss.abandoned_run_status(None) == "failed"
+
