@@ -164,7 +164,9 @@ as before (each request reads the statements going, saves the ones that ended an
   divided by the saturated seconds they took (`warehouse_reads.ServerCaps`). A step up is kept while each step adds at
   least 10 percent to the databases a second; a step that adds less steps back down one level and holds there until the
   server has been idle for 15 minutes or a slow-down fires. A median read past 1.5 times the starting level's median
-  steps down whatever the rate says, so a queue at the warehouse shows as a read that takes longer, not as a gain.
+  steps down whatever the rate says, so a queue at the warehouse shows as a read that takes longer, not as a gain, and
+  holds there until a window of reads is back within 1.25 times that median, so a source that stays slow can't swing
+  the cap between two levels.
   On the lab, a 100-eDTU pool's CPU capped a 1,000-table server's reads at about 0.65 databases a second, each read
   slower the more were in flight, and a 2X-Small warehouse began queueing at 16. Each instance keeps its own cap in
   memory and holds the shared count to it, so a restarted instance starts again at 8.

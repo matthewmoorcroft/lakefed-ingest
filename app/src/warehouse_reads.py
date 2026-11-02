@@ -68,6 +68,10 @@ CAP_STEP = 4
 CAP_WINDOW = 8          # reads finished at one level, while the server is held at its cap, before the level is judged
 MIN_GAIN = 0.10         # a step up must add this share to the databases a second of the level below, or it is undone
 GROWN = 1.5             # past this, the source or the warehouse's queue is slowing each read down: step back
+RECOVERED = 1.25        # a median read back within this of the start level's ends the hold a slow-down set
+# Why a level is held: a step up that added too little (held until the server is forgotten), or a slow-down (held
+# until reads recover, so a source that stays slow never swings the cap between two levels).
+NO_GAIN, SLOW = "no_gain", "slow"
 CAP_FORGET_S = 15 * 60  # a server with no read finished for this long starts again at START_CAP (and a hold ends)
 SATURATED_GAP_S = 10.0  # saturated time between two looks counts for at most this long: a longer gap wasn't looked at
 
@@ -75,6 +79,11 @@ SATURATED_GAP_S = 10.0  # saturated time between two looks counts for at most th
 def slowed(times: Sequence[float], baseline: Optional[float], window: int) -> bool:
     """Whether the median of the last ``window`` reads took past GROWN times the start level's median (baseline)."""
     return baseline is not None and len(times) >= window and statistics.median(times[-window:]) > GROWN * baseline
+
+
+def recovered(times: Sequence[float], baseline: Optional[float], window: int) -> bool:
+    """Whether the median of the last ``window`` reads is back within RECOVERED times the start level's median."""
+    return baseline is not None and len(times) >= window and statistics.median(times[-window:]) <= RECOVERED * baseline
 
 
 def server_key(connection: str) -> str:
@@ -94,7 +103,8 @@ class ServerCaps:
     The cap moves by throughput. While the server is held at its cap (saturated), the reads finished in a window of
     CAP_WINDOW are divided by the saturated seconds they took: a step up is kept while each step adds MIN_GAIN to that
     rate, and a step that adds less steps back down one level and holds there until the server is forgotten. A median
-    read past GROWN times the start level's steps down whatever the rate says."""
+    read past GROWN times the start level's steps down whatever the rate says, and holds there until a window of reads
+    there is back within RECOVERED times it, so a source that stays slow can't swing the cap between two levels."""
 
     def __init__(self, start: int = START_CAP, clock: Callable[[], float] = time.monotonic, window: int = CAP_WINDOW):
         self.start, self.clock, self.window = start, clock, window
@@ -102,7 +112,7 @@ class ServerCaps:
         self._servers: Dict[str, dict] = {}
 
     @staticmethod
-    def _level(cap: int, below: Optional[float] = None, holding: bool = False) -> dict:
+    def _level(cap: int, below: Optional[float] = None, holding: Optional[str] = None) -> dict:
         """The counts for one level of the cap: its reads and saturated seconds so far, and the rate of the level below
         (None until one is judged, which makes the next window's rate the one to beat)."""
         return {"cap": cap, "times": [], "done": 0, "busy": 0.0, "below": below, "holding": holding}
@@ -137,7 +147,9 @@ class ServerCaps:
             if state["baseline"] is None and state["cap"] == self.start and len(state["times"]) >= self.window:
                 state["baseline"] = statistics.median(state["times"])
             if slowed(state["times"], state["baseline"], self.window):
-                state.update(self._level(max(MIN_CAP, state["cap"] - CAP_STEP)))
+                state.update(self._level(max(MIN_CAP, state["cap"] - CAP_STEP), holding=SLOW))
+            elif state["holding"] == SLOW and recovered(state["times"], state["baseline"], self.window):
+                state.update(self._level(state["cap"]))
             elif state["saturated"] and not state["holding"]:
                 state["done"] += 1
                 if state["done"] >= self.window:
@@ -155,7 +167,7 @@ class ServerCaps:
         elif state["below"] is None or rate >= state["below"] * (1 + MIN_GAIN):
             state.update(self._level(min(MAX_CAP, cap + CAP_STEP), below=rate))
         else:
-            state.update(self._level(max(MIN_CAP, cap - CAP_STEP), holding=True))
+            state.update(self._level(max(MIN_CAP, cap - CAP_STEP), holding=NO_GAIN))
 
     @staticmethod
     def _accrue(state: dict, now: float) -> None:

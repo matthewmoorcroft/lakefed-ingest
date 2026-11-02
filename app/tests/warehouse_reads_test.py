@@ -463,7 +463,7 @@ def test_a_step_that_gains_less_than_ten_percent_steps_back_down_and_holds_until
     assert caps.cap("sql_a") == 12, "and is not held any more"
 
 
-def test_a_slow_down_past_one_and_a_half_times_the_start_median_steps_down_and_ends_a_hold():
+def test_a_slow_down_past_one_and_a_half_times_the_start_median_steps_down_and_holds_until_reads_recover():
     caps, now = _caps()
     _reads(caps, now, 8, each_s=1.0)
     _reads(caps, now, 8, each_s=1 / 1.05)
@@ -471,7 +471,20 @@ def test_a_slow_down_past_one_and_a_half_times_the_start_median_steps_down_and_e
     _reads(caps, now, 8, each_s=1.0, seconds=1.6)
     assert caps.cap("sql_a") == 4, "the median read is past 1.5 seconds: down a step"
     _reads(caps, now, 8, each_s=1.0)
-    assert caps.cap("sql_a") == 8, "no longer held, so a window at 4 steps up again"
+    assert caps.cap("sql_a") == 4, "reads are back within 1.25 times the start median: the hold ends, at 4"
+    _reads(caps, now, 8, each_s=1.0)
+    assert caps.cap("sql_a") == 8, "no longer held, so the next window at 4 steps up again"
+
+
+def test_a_source_that_stays_slow_keeps_the_cap_down_instead_of_swinging_between_two_levels():
+    caps, now = _caps()
+    _reads(caps, now, 8, each_s=1.0)
+    assert caps.cap("sql_a") == 12
+    _reads(caps, now, 8, each_s=1.0, seconds=1.6)
+    assert caps.cap("sql_a") == 8, "slowed: down a step"
+    for _ in range(5):
+        _reads(caps, now, 8, each_s=0.5, seconds=1.4)
+        assert caps.cap("sql_a") == 8, "still slower than 1.25 times the start median: held, however fast the rate"
 
 
 def test_the_slow_down_guard_reads_the_median_not_the_worst():
