@@ -67,6 +67,16 @@ def _draft(conn, names):
                                      "touched_at": datetime.now(timezone.utc).isoformat()})
 
 
+def _listed(conn, names):
+    """A listing of these databases through the warehouse, as the connection test saves it: its discovery id."""
+    did = uuid.uuid4().hex[:12]
+    listing = json.dumps({"via": "warehouse"})
+    conn.execute(q.insert_discovery_rows_sql(len(names)),
+                 tuple(v for n in names
+                       for v in (did, "sqlserver", "sql_a", n, "listed", None, None, "op@example.com", listing)))
+    return did
+
+
 def _rows(conn, sql, params=()):
     cur = conn.execute(sql, params)
     columns = [d.name for d in cur.description]
@@ -79,7 +89,7 @@ def _row(conn, did, database):
 
 
 def _going(conn, server="sql_a"):
-    return _rows(conn, q.warehouse_reads_going_sql(), (server, wr.CLAIM_S))[0]["going"]
+    return _rows(conn, q.warehouse_going_sql(), (server, wr.CLAIM_S))[0]["going"]
 
 
 def _lapse(conn, did, database):
@@ -116,6 +126,21 @@ def test_concurrent_claimers_of_two_discoveries_of_one_server_never_pass_its_cap
     held = owner.execute("select count(*) from pg_locks where locktype = 'advisory' and database = "
                          "(select oid from pg_database where datname = current_database())").fetchone()[0]
     assert held == 0, "a transaction lock, gone with its transaction"
+
+
+def test_checks_and_reads_of_two_discoveries_of_one_server_share_one_cap(owner):
+    store = main.WarehouseReadStore()
+    checks = [f"c{i:02d}" for i in range(12)]
+    checking = _listed(owner, checks)
+    reading = _read(owner, [f"a{i:02d}" for i in range(10)], connection="SQL_A")
+    claimed = store.claim_checks("sql_a", checking, checks, 16, 8, wr.CLAIM_S)
+    assert len(claimed) == 8 and _going(owner) == 8
+    assert store.claim_reads("sql_a", [reading], 8, 8, wr.CLAIM_S) == ([], True), "the 4 checks left wait for a place"
+    for database in claimed[:5]:
+        store.finish_check(checking, database, True, 1, None)
+    assert _going(owner) == 3
+    got, full = store.claim_reads("sql_a", [reading], 8, 8, wr.CLAIM_S)
+    assert len(got) == 1 and full and _going(owner) == 4, "one read in the room the 4 waiting checks leave"
 
 
 def test_a_claim_waits_for_the_servers_lock_held_elsewhere(owner):

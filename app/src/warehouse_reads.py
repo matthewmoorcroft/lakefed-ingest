@@ -14,9 +14,10 @@ database claims it first (FOR UPDATE SKIP LOCKED), so two app instances, a page 
 the same one twice; a claim not renewed after CLAIM_S (the app stopped in between) is free again, and a statement saved
 before then is read again, never sent again.
 
-The reads in flight for one server (its connection) never pass that server's cap, counted across every discovery and
-app instance in the claim's transaction (queries.warehouse_claim_reads_sql). The cap starts at START_CAP and moves with
-the databases a second its reads get through while the server is held at the cap (ServerCaps).
+The checks and reads in flight for one server (its connection) never pass that server's cap, counted across every
+discovery and app instance in the claim's transaction (queries.warehouse_going_sql). A check takes a free place first;
+one the server had no room for is wanted for WANT_S, and reads leave that many places free meanwhile. The cap starts at
+START_CAP and moves with the databases a second its reads get through while the server is held at the cap (ServerCaps).
 
 The store passed in holds the Lakebase calls (main.WarehouseReadStore), and the warehouse the Statement Execution
 calls (warehouse.py), so this module is tested with fakes."""
@@ -34,8 +35,10 @@ CLAIM_S = 60
 # The two kinds of work: a check of a listed database (status 'listed'), and a read of a chosen one (status 'running').
 CHECK, READ = "check", "read"
 # Checks kept going at once for one discovery: the page shown, so a page of 100 databases is checked in a few steps.
-# Reads keep instead to their server's cap.
+# A second limit beside the server's cap, which checks and reads share.
 IN_FLIGHT = {CHECK: 16}
+# A check the server had no room for is wanted for this long, and reads leave that many places free meanwhile.
+WANT_S = 10
 # A check waits this long for its answer when it is sent (the Statement Execution API takes 0, or 5 to 50 seconds):
 # most answer within it, so the step that sends them saves them too.
 CHECK_WAIT_S = 5
@@ -261,9 +264,9 @@ def advance(store, warehouse, kind: str, discovery_id: str, connection: str, fir
             caps: Optional[ServerCaps] = None) -> dict:
     """One step of a discovery's checks or reads: read the statements going, save the ended ones, start more (the
     names in ``first`` before the rest), and say where it stands (store.progress). A statement that can't be read any
-    more (it expired, or the warehouse lost it) is cleared, so its database is started again. Checks are sent with a
-    short wait (CHECK_WAIT_S), so most are saved in this step; reads are sent without one, within the server's cap
-    (caps, CAPS by default), and the next step collects them."""
+    more (it expired, or the warehouse lost it) is cleared, so its database is started again. Checks and reads are both
+    held to the server's cap (caps, CAPS by default), a check taking a free place first. Checks are sent with a short
+    wait (CHECK_WAIT_S), so most are saved in this step; reads are sent without one, and the next step collects them."""
     going = store.in_flight(kind, discovery_id)
     watched = []
     for database, statement_id in going:
@@ -276,15 +279,15 @@ def advance(store, warehouse, kind: str, discovery_id: str, connection: str, fir
             watched.append(database)
             continue
         finish(store, kind, discovery_id, database, statement_id, answer)
+    if watched:
+        store.hold([(discovery_id, d) for d in watched])
+    server = server_key(connection)
+    cap = (caps or CAPS).cap(server)
     if kind == CHECK:
         still = len(store.in_flight(kind, discovery_id))
-        claimed = store.claim(kind, discovery_id, list(first), max(0, IN_FLIGHT[kind] - still), CLAIM_S)
+        claimed = store.claim_checks(server, discovery_id, list(first), max(0, IN_FLIGHT[kind] - still), cap, CLAIM_S)
         wait_s = CHECK_WAIT_S
     else:
-        if watched:
-            store.hold([(discovery_id, d) for d in watched])
-        server = server_key(connection)
-        cap = (caps or CAPS).cap(server)
         taken, _ = store.claim_reads(server, [discovery_id], cap, cap, CLAIM_S)
         claimed = [database for _, database in taken]
         wait_s = 0

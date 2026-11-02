@@ -12,9 +12,10 @@ next.
 - Each database is claimed before it is sent, with the claim the page's own steps take (FOR UPDATE SKIP LOCKED,
   warehouse_reads.CLAIM_S), so two app instances, a page and re-discovery's loop never start one database twice. The
   claims of the reads this instance's workers hold are renewed every HOLD_S, well inside CLAIM_S.
-- A server's reads in flight never pass its cap, counted in Lakebase in the claim's transaction under that server's
-  lock, across every discovery and instance (store.claim_reads). warehouse_reads.ServerCaps moves the cap by the
-  databases a second this instance's reads get through while the server is held at it.
+- A server's reads and checks in flight never pass its cap, counted in Lakebase in the claim's transaction under that
+  server's lock, across every discovery and instance (store.claim_reads, store.claim_checks). warehouse_reads.ServerCaps
+  moves the cap by the databases a second this instance's reads get through while the server is held at it; checks
+  don't feed it.
 - While the warehouse is starting (or stopped), one statement is sent at a time, and it isn't timed: its slow first
   answer holds one worker, not all of them, and sets no cap. Its answer says the warehouse is up.
 - After a restart nothing is lost and nothing is sent twice: a claim with no statement is free again after CLAIM_S and
