@@ -157,9 +157,9 @@ while it is still going, saves it, and takes the next. The page, Create's wait a
 reads stand. `BACKGROUND_READS=0` turns the reader off on an instance; the page's requests then take the reads' steps
 as before (each request reads the statements going, saves the ones that ended and starts more, without a wait).
 
-- **Each source server has a cap** on its reads in flight, counted across every discovery and app instance: in
-  Lakebase, in the claim's own transaction, under a transaction lock of that server's (its connection's name), so two
-  claimers never both take its last places. It starts at 8 (`reads_start_cap`) and moves by 4 between 4 and 32
+- **Each source server has a cap** on its reads and checks in flight, counted across every discovery and app
+  instance: in Lakebase, in the claim's own transaction, under a transaction lock of that server's (its connection's
+  name), so two claimers never both take its last places. It starts at 8 (`reads_start_cap`) and moves by 4 between 4 and 32
   (`reads_max_cap`), by throughput: while the server is held at its cap, the reads that finish in a window of 8 are
   divided by the saturated seconds they took (`warehouse_reads.ServerCaps`). A step up is kept while each step adds at
   least 10 percent to the databases a second; a step that adds less steps back down one level and holds there until the
@@ -175,9 +175,10 @@ as before (each request reads the statements going, saves the ones that ended an
   SKIP LOCKED`), so two app instances, a page and the reader never start the same one twice. A claim lasts 60 seconds
   unless whoever watches the statement renews it (the reader does every 20): after a restart, a claim with no
   statement is free again then, and a statement saved before the restart is read again from its id, never sent again.
-- **The check of the page shown** stays with the page: at most 16 statements of one discovery at once
-  (`warehouse_reads.IN_FLIGHT`), sent together, each with a 5-second wait, so most answers are saved by the request
-  that sent them.
+- **The check of the page shown** stays with the page: the databases the page lists, at most 16 statements of one
+  discovery at once (`warehouse_reads.IN_FLIGHT`), sent together, each with a 5-second wait, so most answers are saved
+  by the request that sent them. A check counts toward its server's cap; one the server had no room for is wanted for
+  10 seconds (`warehouse_reads.WANT_S`), and the reads leave that many places free meanwhile.
 - The reader only reads what someone started through the app's checks (a read through a connection the app can see,
   or a job's re-discovery), each through the connection saved on its rows; a page's request naming another connection
   is refused. A read started more than 6 hours ago, a discarded draft and one nobody has asked about for two hours are
