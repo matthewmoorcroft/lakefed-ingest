@@ -339,51 +339,110 @@ def test_a_dropped_database_is_neither_started_nor_counted():
 
 # ---- the cap rule ----------------------------------------------------------------------------------------------------
 
-def test_the_cap_holds_until_a_window_of_reads_is_timed_and_there_is_a_baseline():
-    assert wr.next_cap(8, [1.0] * 7, 1.0, True) == 8
-    assert wr.next_cap(8, [1.0] * 8, None, True) == 8
+def _caps(start=8):
+    """A server's caps on a fake clock, held at its cap from the start, so each read finished counts toward a window."""
+    now = [0.0]
+    caps = wr.ServerCaps(start=start, clock=lambda: now[0])
+    caps.saturated("sql_a", True)
+    return caps, now
 
 
-def test_the_cap_steps_up_by_4_while_reads_keep_their_time_and_the_server_is_held_at_it():
-    assert wr.next_cap(8, [1.0] * 8, 1.0, True) == 12
-    assert wr.next_cap(12, [1.2] * 8, 1.0, True) == 16
-    assert wr.next_cap(8, [1.0] * 8, 1.0, False) == 8, "a cap the server isn't held at isn't raised"
+def _reads(caps, now, count, each_s, seconds=1.0):
+    """``count`` reads of ``seconds`` each, finishing ``each_s`` apart while the server is held at its cap."""
+    for _ in range(count):
+        now[0] += each_s
+        caps.timed("sql_a", seconds, now[0])
 
 
-def test_the_cap_holds_while_reads_slow_a_little():
-    assert wr.next_cap(16, [1.4] * 8, 1.0, True) == 16
-    assert wr.next_cap(16, [1.5] * 8, 1.0, True) == 16
+def test_the_cap_holds_until_a_window_of_reads_finishes_held_at_it_and_then_steps_up():
+    caps, now = _caps()
+    _reads(caps, now, 7, each_s=0.5)
+    assert caps.cap("sql_a") == 8
+    _reads(caps, now, 1, each_s=0.5)
+    assert caps.cap("sql_a") == 12, "the starting level's rate is the one the next level has to beat"
 
 
-def test_the_cap_steps_down_by_4_once_the_median_read_is_clearly_slower_than_at_the_start():
-    assert wr.next_cap(16, [1.6] * 8, 1.0, True) == 12
-    assert wr.next_cap(16, [1.0, 1.0, 1.0, 9.0, 9.0, 9.0, 9.0, 9.0], 1.0, False) == 12
-    assert wr.next_cap(16, [9.0, 9.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0], 1.0, True) == 20, "the median, not the worst"
+def test_reads_finished_while_the_server_is_not_held_at_its_cap_are_not_counted():
+    caps, now = _caps()
+    caps.saturated("sql_a", False)
+    _reads(caps, now, 8, each_s=1.0)
+    assert caps.cap("sql_a") == 8
+
+
+def test_a_step_up_is_kept_while_each_step_adds_ten_percent_to_the_databases_a_second():
+    caps, now = _caps()
+    _reads(caps, now, 8, each_s=1.0)
+    assert caps.cap("sql_a") == 12
+    _reads(caps, now, 8, each_s=1 / 1.2)
+    assert caps.cap("sql_a") == 16, "20 percent more a second"
+    _reads(caps, now, 8, each_s=1 / 1.25)
+    assert caps.cap("sql_a") == 12, "4 percent more: back a step, and held there"
+
+
+def test_a_step_that_gains_less_than_ten_percent_steps_back_down_and_holds_until_forgotten():
+    caps, now = _caps()
+    _reads(caps, now, 8, each_s=1.0)
+    _reads(caps, now, 8, each_s=1 / 1.05)
+    assert caps.cap("sql_a") == 8, "5 percent more: back to the level below"
+    _reads(caps, now, 24, each_s=0.2)
+    assert caps.cap("sql_a") == 8, "held there while the rate goes up"
+    now[0] += wr.CAP_FORGET_S + 1
+    caps.saturated("sql_a", True)
+    assert caps.cap("sql_a") == 8, "a server not read for a while starts again"
+    _reads(caps, now, 8, each_s=1.0)
+    assert caps.cap("sql_a") == 12, "and is not held any more"
+
+
+def test_a_slow_down_past_one_and_a_half_times_the_start_median_steps_down_and_ends_a_hold():
+    caps, now = _caps()
+    _reads(caps, now, 8, each_s=1.0)
+    _reads(caps, now, 8, each_s=1 / 1.05)
+    assert caps.cap("sql_a") == 8
+    _reads(caps, now, 8, each_s=1.0, seconds=1.6)
+    assert caps.cap("sql_a") == 4, "the median read is past 1.5 seconds: down a step"
+    _reads(caps, now, 8, each_s=1.0)
+    assert caps.cap("sql_a") == 8, "no longer held, so a window at 4 steps up again"
+
+
+def test_the_slow_down_guard_reads_the_median_not_the_worst():
+    caps, now = _caps()
+    _reads(caps, now, 8, each_s=1.0)
+    for seconds in (9.0, 9.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0):
+        now[0] += 0.1
+        caps.timed("sql_a", seconds, now[0])
+    assert caps.cap("sql_a") == 16
 
 
 def test_the_cap_never_goes_below_4_or_above_32():
-    assert wr.next_cap(4, [5.0] * 8, 1.0, True) == 4
-    assert wr.next_cap(32, [1.0] * 8, 1.0, True) == 32
-    assert wr.next_cap(64, [1.2] * 8, 1.0, False) == 32 and wr.next_cap(1, [1.2] * 8, 1.0, False) == 4
+    caps, now = _caps()
+    rate = 1.0
+    for _ in range(6):
+        _reads(caps, now, 8, each_s=1 / rate)
+        rate *= 1.2
+    assert caps.cap("sql_a") == 32
+    _reads(caps, now, 8, each_s=1 / rate)
+    assert caps.cap("sql_a") == 32
+    caps, now = _caps()
+    _reads(caps, now, 8, each_s=1.0)
+    _reads(caps, now, 8, each_s=1.0, seconds=1.6)
+    _reads(caps, now, 8, each_s=1.0, seconds=1.6)
+    assert caps.cap("sql_a") == 4
+    _reads(caps, now, 8, each_s=1.0, seconds=1.6)
+    assert caps.cap("sql_a") == 4
 
 
-def test_a_servers_cap_starts_at_8_takes_its_baseline_there_and_moves_a_step_per_window():
-    now = [0.0]
-    caps = wr.ServerCaps(start=8, clock=lambda: now[0])
-    assert caps.cap("sql_a") == 8
-    caps.saturated("sql_a", True)
-    for _ in range(7):
-        assert caps.timed("sql_a", 1.0) == 8
-    assert caps.timed("sql_a", 1.0) == 12                 # the starting level's median is 1 s, and 1 s is flat
-    for _ in range(8):
-        caps.timed("sql_a", 1.1)
-    assert caps.cap("sql_a") == 16
-    for _ in range(8):
-        caps.timed("sql_a", 1.8)                          # past 1.5 times the starting level's: back a step
+def test_each_server_has_its_own_cap():
+    caps, now = _caps()
+    _reads(caps, now, 8, each_s=1.0)
     assert caps.cap("sql_a") == 12
-    assert caps.cap("sql_b") == 8, "each server has its own"
-    now[0] += wr.CAP_FORGET_S + 1
-    assert caps.cap("sql_a") == 8, "a server not read for a while starts again"
+    assert caps.cap("sql_b") == 8
+
+
+def test_saturated_time_between_looks_counts_for_at_most_the_gap_limit():
+    caps, now = _caps()
+    now[0] = 100.0
+    caps.timed("sql_a", 1.0, now[0])
+    assert caps._servers["sql_a"]["busy"] == wr.SATURATED_GAP_S
 
 
 @pytest.mark.parametrize("error,plain", [

@@ -160,9 +160,11 @@ as before (each request reads the statements going, saves the ones that ended an
 - **Each source server has a cap** on its reads in flight, counted across every discovery and app instance: in
   Lakebase, in the claim's own transaction, under a transaction lock of that server's (its connection's name), so two
   claimers never both take its last places. It starts at 8 (`reads_start_cap`) and moves by 4 between 4 and 32
-  (`reads_max_cap`), from the time each read takes from send to answer, the warehouse's queue included
-  (`warehouse_reads.next_cap`): while the median of the last 8 reads stays within 1.25 times the median at the
-  starting level and the server is held at its cap, it steps up; once that median passes 1.5 times, it steps down.
+  (`reads_max_cap`), by throughput: while the server is held at its cap, the reads that finish in a window of 8 are
+  divided by the saturated seconds they took (`warehouse_reads.ServerCaps`). A step up is kept while each step adds at
+  least 10 percent to the databases a second; a step that adds less steps back down one level and holds there until the
+  server has been idle for 15 minutes or a slow-down fires. A median read past 1.5 times the starting level's median
+  steps down whatever the rate says, so a queue at the warehouse shows as a read that takes longer, not as a gain.
   On the lab, a 100-eDTU pool's CPU capped a 1,000-table server's reads at about 0.65 databases a second, each read
   slower the more were in flight, and a 2X-Small warehouse began queueing at 16. Each instance keeps its own cap in
   memory and holds the shared count to it, so a restarted instance starts again at 8.
