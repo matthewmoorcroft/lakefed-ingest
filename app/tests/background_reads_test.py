@@ -94,9 +94,9 @@ def test_a_warehouse_starting_takes_one_statement_at_a_time_and_its_slow_first_a
     timed = []
 
     class Caps(wr.ServerCaps):
-        def timed(self, server, seconds):
+        def timed(self, server, seconds, finished):
             timed.append(server)
-            return super().timed(server, seconds)
+            return super().timed(server, seconds, finished)
 
     class Starting(_Warehouse):
         def read(self, statement_id):
@@ -225,12 +225,18 @@ def test_the_claims_of_the_reads_held_are_renewed_well_inside_their_time():
     _until(lambda: store.row("d1", "eng_001")["status"] == "ok")
 
 
-def test_the_reads_the_reader_times_move_its_servers_cap():
-    store = _Store(_names("db", 40))
-    fake = _Warehouse({n: [_ok([SUMMARY_ROW])] for n in _names("db", 40)}, in_call=True, hold_s=0.01)
-    caps = wr.ServerCaps(start=8, window=4, flat=100.0)
-    _drain(store, _reader(store, fake, caps=caps))
-    assert caps.cap("sql_a") > 8
+def test_each_timed_read_is_reported_with_how_long_it_took_and_when_it_finished():
+    store = _Store(_names("db", 12))
+    fake = _Warehouse({n: [_ok([SUMMARY_ROW])] for n in _names("db", 12)}, in_call=True, hold_s=0.01)
+    reports = []
+
+    class Caps(wr.ServerCaps):
+        def timed(self, server, seconds, finished):
+            reports.append((server, seconds, finished))
+            return super().timed(server, seconds, finished)
+    _drain(store, _reader(store, fake, caps=Caps(start=8, window=10 ** 6)))
+    assert len(reports) == 12 and all(server == "sql_a" for server, _, _ in reports)
+    assert all(0 <= seconds <= finished for _, seconds, finished in reports)
 
 
 def test_the_app_starts_the_reader_with_a_warehouse_and_not_when_turned_off(monkeypatch):
