@@ -1,6 +1,8 @@
-# lakefed-ingest
+# Ingestion Workbench
 
-`lakefed-ingest` copies tables from external databases (SQL Server, Oracle, PostgreSQL, MySQL) into Delta tables on
+*Formerly lakefed-ingest, and the EDW Ingestion Accelerator.*
+
+Ingestion Workbench copies tables from external databases (SQL Server, Oracle, PostgreSQL, MySQL) into Delta tables on
 Databricks, and keeps them up to date. You describe the tables to copy as rows of metadata; it reads each source,
 writes its Delta tables and records where each one is, so the next run reads only what changed. It is built for
 estates of many databases: thousands of source databases and hundreds of thousands of tables. The
@@ -134,6 +136,18 @@ changes to it, and reconciles the Delta tables with the source; see [tests/synth
 The `cdc` load strategy (a placeholder with a documented contract in `load_strategies.py`), watermark and `cdc` loads
 for sources other than SQL Server (placeholders), and built-in alerts beyond the jobs' failure emails
 ([Monitoring](docs/monitoring.md) has the queries an alert can run).
+
+## Usage attribution
+
+So Databricks can see how widely the tool is used, it identifies itself in three ways. Nothing else is collected: no
+names, hosts, queries or data.
+
+- **API calls.** Every Databricks SDK client the jobs and the operations app make identifies itself as
+  `ingestion-workbench/<version>` in its user agent (`src/lakefed_ingest/product.py`, `app/src/app_product.py`).
+- **Resource tags.** Every job, job cluster, the discovery cluster and the app's SQL warehouse carry the tag
+  `project: ingestion-workbench` (bundle variable `project_tag`).
+- **Query tags.** The operations app's SQL warehouse statements carry the query tags `application:
+  ingestion-workbench` and `component: discovery`.
 
 ## Help and security
 
